@@ -1,0 +1,6 @@
+# incompatible_msrv (checked against rust-version in Cargo.toml) skips test
+# code by default; the Win7 targets cannot compile tests on Rust 1.75 (the
+# dev-dependencies' MSRVs are newer), so this lint is the only automated guard
+# against test-only use of std APIs newer than the MSRV. See the win7-msrv CI
+# job, which denies it across all targets.
+check-incompatible-msrv-in-tests = true
