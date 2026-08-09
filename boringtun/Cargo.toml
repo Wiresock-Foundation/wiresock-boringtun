@@ -14,6 +14,10 @@ readme = "../README.md"
 repository = "https://github.com/Wiresock-Foundation/wiresock-boringtun"
 documentation = "https://github.com/Wiresock-Foundation/wiresock-boringtun"
 edition = "2018"
+# The WireSock client builds the Win7 i686/x86_64 targets with Rust 1.75, the
+# last toolchain that supports Windows 7. Also keeps clippy from suggesting
+# std APIs newer than this.
+rust-version = "1.75"
 
 [features]
 default = []

@@ -299,7 +299,7 @@ pub(super) fn binding_request_len(data: &[u8]) -> Option<usize> {
         return None;
     }
     let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-    if !msg_len.is_multiple_of(4) || data.len() != HEADER_LEN + msg_len {
+    if msg_len % 4 != 0 || data.len() != HEADER_LEN + msg_len {
         return None;
     }
     Some(msg_len)
