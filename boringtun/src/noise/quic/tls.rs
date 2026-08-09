@@ -1,4 +1,4 @@
-// Copyright (c) 2024 BoringTun contributors. All rights reserved.
+// Copyright (c) 2024-2026 WireSock. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! TLS 1.3 ClientHello serialization for the QUIC imitation generator.

@@ -1,16 +1,18 @@
 [package]
 name = "boringtun"
-description = "an implementation of the WireGuard® protocol designed for portability and speed"
+description = "a userspace WireGuard® implementation with AmneziaWG and WireSock protocol extensions, forked from Cloudflare BoringTun"
 version = "0.7.1"
+# Upstream authorship retained; this fork's additions credited alongside it.
 authors = [
     "Noah Kennedy <nkennedy@cloudflare.com>",
     "Andy Grover <agrover@cloudflare.com>",
     "Jeff Hiner <jhiner@cloudflare.com>",
+    "WireSock <support@wiresock.net>",
 ]
 license = "BSD-3-Clause"
 readme = "../README.md"
-repository = "https://github.com/cloudflare/boringtun"
-documentation = "https://docs.rs/boringtun/0.7.1/boringtun/"
+repository = "https://github.com/Wiresock-Foundation/wiresock-boringtun"
+documentation = "https://github.com/Wiresock-Foundation/wiresock-boringtun"
 edition = "2018"
 
 [features]
