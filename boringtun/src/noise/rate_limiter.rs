@@ -1,4 +1,6 @@
-use super::handshake::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_24};
+use super::handshake::{
+    b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_24, ObfuscationRanges,
+};
 use crate::noise::handshake::{LABEL_COOKIE, LABEL_MAC1};
 use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, WireGuardError};
 
@@ -10,12 +12,12 @@ use std::net::IpAddr;
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 
+use super::handshake::constant_time_eq;
 use aead::generic_array::GenericArray;
 use aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305};
 use parking_lot::Mutex;
 use rand_core::{OsRng, RngCore};
-use ring::constant_time::verify_slices_are_equal;
 
 const COOKIE_REFRESH: u64 = 128; // Use 128 and not 120 so the compiler can optimize out the division
 const COOKIE_SIZE: usize = 16;
@@ -114,6 +116,8 @@ impl RateLimiter {
 
     pub(crate) fn format_cookie_reply<'a>(
         &self,
+        obf: ObfuscationRanges,
+        rng: &mut impl RngCore,
         idx: u32,
         cookie: Cookie,
         mac1: &[u8],
@@ -130,7 +134,7 @@ impl RateLimiter {
 
         // msg.message_type = 3
         // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&super::COOKIE_REPLY.to_le_bytes());
+        message_type.copy_from_slice(&obf.random_h3(rng).to_le_bytes());
         // msg.receiver_index = little_endian(initiator.sender_index)
         receiver_index.copy_from_slice(&idx.to_le_bytes());
         nonce.copy_from_slice(&self.nonce()[..]);
@@ -152,11 +156,13 @@ impl RateLimiter {
     /// Verify the MAC fields on the datagram, and apply rate limiting if needed
     pub fn verify_packet<'a, 'b>(
         &self,
+        obf: ObfuscationRanges,
+        rng: &mut impl RngCore,
         src_addr: Option<IpAddr>,
         src: &'a [u8],
         dst: &'b mut [u8],
     ) -> Result<Packet<'a>, TunnResult<'b>> {
-        let packet = Tunn::parse_incoming_packet(src)?;
+        let packet = Tunn::parse_incoming_packet(obf, src)?;
 
         // Verify and rate limit handshake messages only
         if let Packet::HandshakeInit(HandshakeInit { sender_idx, .. })
@@ -166,8 +172,9 @@ impl RateLimiter {
             let (mac1, mac2) = macs.split_at(16);
 
             let computed_mac1 = b2s_keyed_mac_16(&self.mac1_key, msg);
-            verify_slices_are_equal(&computed_mac1[..16], mac1)
-                .map_err(|_| TunnResult::Err(WireGuardError::InvalidMac))?;
+            if !constant_time_eq(&computed_mac1[..16], mac1) {
+                return Err(TunnResult::Err(WireGuardError::InvalidMac));
+            }
 
             if self.is_under_load() {
                 let addr = match src_addr {
@@ -179,9 +186,9 @@ impl RateLimiter {
                 let cookie = self.current_cookie(addr);
                 let computed_mac2 = b2s_keyed_mac_16_2(&cookie, msg, mac1);
 
-                if verify_slices_are_equal(&computed_mac2[..16], mac2).is_err() {
+                if !constant_time_eq(&computed_mac2[..16], mac2) {
                     let cookie_packet = self
-                        .format_cookie_reply(sender_idx, cookie, mac1, dst)
+                        .format_cookie_reply(obf, rng, sender_idx, cookie, mac1, dst)
                         .map_err(TunnResult::Err)?;
                     return Err(TunnResult::WriteToNetwork(cookie_packet));
                 }

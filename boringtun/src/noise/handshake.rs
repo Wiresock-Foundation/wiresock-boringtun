@@ -1,7 +1,10 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::{HandshakeInit, HandshakeResponse, PacketCookieReply};
+use super::{
+    HandshakeInit, HandshakeResponse, PacketCookieReply, COOKIE_REPLY, DATA, HANDSHAKE_INIT,
+    HANDSHAKE_RESP,
+};
 use crate::noise::errors::WireGuardError;
 use crate::noise::session::Session;
 #[cfg(not(feature = "mock-instant"))]
@@ -11,7 +14,8 @@ use aead::{Aead, Payload};
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::XChaCha20Poly1305;
-use rand_core::OsRng;
+use rand_chacha::ChaCha8Rng;
+use rand_core::{OsRng, SeedableRng};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
@@ -78,6 +82,29 @@ pub(crate) fn b2s_keyed_mac_16_2(key: &[u8], data1: &[u8], data2: &[u8]) -> [u8;
     blake2::digest::Update::update(&mut hmac, data1);
     blake2::digest::Update::update(&mut hmac, data2);
     hmac.finalize_fixed().into()
+}
+
+/// Constant-time slice equality, for the handshake MACs and the peer static key.
+///
+/// These are the comparisons an attacker can drive: mac1 gates every handshake
+/// packet, mac2 gates them again under load, and the static-key check runs on
+/// the decrypted contents of an attacker-supplied initiation. A comparison that
+/// returned early on the first differing byte would leak the correct prefix a
+/// byte at a time.
+///
+/// `subtle` rather than `ring::constant_time::verify_slices_are_equal`, which
+/// `ring` 0.17 re-exports from `deprecated_constant_time` and deprecates with
+/// "Internal function not intended for external use with no promises regarding
+/// side channels" -- the one promise these callers actually need.
+///
+/// Behaviour matches what it replaces: `false` when the lengths differ, and
+/// otherwise a comparison whose time does not depend on the contents. Both
+/// short-circuit on length, which is not secret here -- every caller compares
+/// fixed-size MACs or keys.
+#[inline]
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 pub(crate) fn b2s_mac_24(key: &[u8], data1: &[u8]) -> [u8; 24] {
@@ -294,6 +321,181 @@ enum HandshakeState {
     Expired,
 }
 
+/// An inclusive range `[start..=end]` of obfuscation tag values for a packet type.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct TagRange {
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+}
+
+impl TagRange {
+    pub fn start(&self) -> u32 {
+        self.start
+    }
+    pub fn end(&self) -> u32 {
+        self.end
+    }
+
+    /// Returns `true` if `value` falls within `[start..=end]`.
+    pub fn contains(&self, value: u32) -> bool {
+        value >= self.start && value <= self.end
+    }
+
+    /// Returns a uniformly random value from `[start..=end]`.
+    /// If `start == end` the result is always that value.
+    pub fn random(&self, rng: &mut impl rand_core::RngCore) -> u32 {
+        if self.start == self.end {
+            return self.start;
+        }
+        // Special-case the full u32 range to avoid a 2^32-sized modulus.
+        if self.start == 0 && self.end == u32::MAX {
+            return rng.next_u32();
+        }
+        let range_size = (u64::from(self.end) - u64::from(self.start)) + 1;
+        let threshold = u64::MAX - (u64::MAX % range_size);
+        loop {
+            let val = rng.next_u64();
+            if val < threshold {
+                return self.start + (val % range_size) as u32;
+            }
+        }
+    }
+
+    /// Returns `true` if `self` and `other` overlap (inclusive boundaries).
+    pub fn overlaps(&self, other: &TagRange) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
+}
+
+/// Non-overlapping inclusive tag ranges for the four WireGuard packet types.
+///
+/// * H1 – handshake initiation
+/// * H2 – handshake response
+/// * H3 – cookie reply
+/// * H4 – data
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct ObfuscationRanges {
+    pub(crate) h1_init: TagRange,
+    pub(crate) h2_resp: TagRange,
+    pub(crate) h3_cookie: TagRange,
+    pub(crate) h4_data: TagRange,
+}
+
+impl Default for ObfuscationRanges {
+    fn default() -> Self {
+        ObfuscationRanges {
+            h1_init: TagRange {
+                start: HANDSHAKE_INIT,
+                end: HANDSHAKE_INIT,
+            },
+            h2_resp: TagRange {
+                start: HANDSHAKE_RESP,
+                end: HANDSHAKE_RESP,
+            },
+            h3_cookie: TagRange {
+                start: COOKIE_REPLY,
+                end: COOKIE_REPLY,
+            },
+            h4_data: TagRange {
+                start: DATA,
+                end: DATA,
+            },
+        }
+    }
+}
+
+impl ObfuscationRanges {
+    /// Construct and validate obfuscation ranges from raw start/end pairs.
+    ///
+    /// `(0, 0)` → default WireGuard constant for that packet type.
+    /// `(start, 0)` where `start != 0` → `[start..=start]` (back-compat convenience).
+    /// Otherwise `start <= end` is required.
+    ///
+    /// All four ranges must be non-overlapping.
+    // Eight scalars, which are four `(start, end)` pairs. Taking four tuples
+    // would drop this to four arguments and read better -- `api.rs` already
+    // holds them that way and unpacks at the call. Not done here only because
+    // this is `pub` and the change belongs in an API revision rather than a
+    // lint fix; the `#[allow]` is a deferral, not a defence of the shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        h1_start: u32,
+        h1_end: u32,
+        h2_start: u32,
+        h2_end: u32,
+        h3_start: u32,
+        h3_end: u32,
+        h4_start: u32,
+        h4_end: u32,
+    ) -> Result<Self, String> {
+        let resolve =
+            |name: &str, start: u32, end: u32, default: u32| -> Result<TagRange, String> {
+                match (start, end) {
+                    (0, 0) => Ok(TagRange {
+                        start: default,
+                        end: default,
+                    }),
+                    (s, 0) => Ok(TagRange { start: s, end: s }),
+                    (s, e) if s <= e => Ok(TagRange { start: s, end: e }),
+                    (s, e) => Err(format!("Invalid {name} range: start ({s}) > end ({e})")),
+                }
+            };
+
+        let h1 = resolve("H1", h1_start, h1_end, HANDSHAKE_INIT)?;
+        let h2 = resolve("H2", h2_start, h2_end, HANDSHAKE_RESP)?;
+        let h3 = resolve("H3", h3_start, h3_end, COOKIE_REPLY)?;
+        let h4 = resolve("H4", h4_start, h4_end, DATA)?;
+
+        let ranges = [("H1", h1), ("H2", h2), ("H3", h3), ("H4", h4)];
+        for i in 0..ranges.len() {
+            for j in (i + 1)..ranges.len() {
+                let (name_a, a) = &ranges[i];
+                let (name_b, b) = &ranges[j];
+                if a.overlaps(b) {
+                    let overlap_start = a.start.max(b.start);
+                    let overlap_end = a.end.min(b.end);
+                    return Err(format!(
+                        "{name_a} [{}..{}] overlaps {name_b} [{}..{}] at {overlap_start}..{overlap_end}",
+                        a.start, a.end, b.start, b.end,
+                    ));
+                }
+            }
+        }
+
+        Ok(ObfuscationRanges {
+            h1_init: h1,
+            h2_resp: h2,
+            h3_cookie: h3,
+            h4_data: h4,
+        })
+    }
+
+    pub fn matches_h1(&self, v: u32) -> bool {
+        self.h1_init.contains(v)
+    }
+    pub fn matches_h2(&self, v: u32) -> bool {
+        self.h2_resp.contains(v)
+    }
+    pub fn matches_h3(&self, v: u32) -> bool {
+        self.h3_cookie.contains(v)
+    }
+    pub fn matches_h4(&self, v: u32) -> bool {
+        self.h4_data.contains(v)
+    }
+    pub fn random_h1(&self, rng: &mut impl rand_core::RngCore) -> u32 {
+        self.h1_init.random(rng)
+    }
+    pub fn random_h2(&self, rng: &mut impl rand_core::RngCore) -> u32 {
+        self.h2_resp.random(rng)
+    }
+    pub fn random_h3(&self, rng: &mut impl rand_core::RngCore) -> u32 {
+        self.h3_cookie.random(rng)
+    }
+    pub fn random_h4(&self, rng: &mut impl rand_core::RngCore) -> u32 {
+        self.h4_data.random(rng)
+    }
+}
+
 pub struct Handshake {
     params: NoiseParams,
     /// Index of the next session
@@ -308,6 +510,10 @@ pub struct Handshake {
     // TODO: make TimeStamper a singleton
     stamper: TimeStamper,
     pub(super) last_rtt: Option<u32>,
+    // Packet type obfuscation ranges
+    pub(super) obf: ObfuscationRanges,
+    // Fast CSPRNG for tag randomization (seeded once from OsRng)
+    pub(super) rng: ChaCha8Rng,
 }
 
 #[derive(Default)]
@@ -414,7 +620,8 @@ impl Handshake {
         peer_static_public: x25519::PublicKey,
         global_idx: u32,
         preshared_key: Option<[u8; 32]>,
-    ) -> Handshake {
+        obf: ObfuscationRanges,
+    ) -> Result<Handshake, String> {
         let params = NoiseParams::new(
             static_private,
             static_public,
@@ -422,7 +629,10 @@ impl Handshake {
             preshared_key,
         );
 
-        Handshake {
+        let rng = ChaCha8Rng::from_rng(OsRng)
+            .map_err(|e| format!("Failed to seed RNG from OS entropy: {e}"))?;
+
+        Ok(Handshake {
             params,
             next_index: global_idx,
             previous: HandshakeState::None,
@@ -431,7 +641,9 @@ impl Handshake {
             stamper: TimeStamper::new(),
             cookies: Default::default(),
             last_rtt: None,
-        }
+            obf,
+            rng,
+        })
     }
 
     pub(crate) fn is_in_progress(&self) -> bool {
@@ -478,6 +690,23 @@ impl Handshake {
         self.params.set_static_private(private_key, public_key)
     }
 
+    /// Replace the message-type tag ranges. Purely a framing change — no key or
+    /// Noise state is affected.
+    pub(crate) fn set_obfuscation(&mut self, obf: ObfuscationRanges) {
+        self.obf = obf;
+    }
+
+    pub(crate) fn preshared_key(&self) -> Option<[u8; KEY_LEN]> {
+        self.params.preshared_key
+    }
+
+    /// Replace the peer's optional pre-shared key. The caller is responsible for
+    /// discarding existing sessions: the key is mixed into the handshake, so any
+    /// session derived under the old value stays valid until dropped.
+    pub(crate) fn set_preshared_key(&mut self, preshared_key: Option<[u8; KEY_LEN]>) {
+        self.params.preshared_key = preshared_key;
+    }
+
     pub(super) fn receive_handshake_initialization<'a>(
         &mut self,
         packet: HandshakeInit,
@@ -521,11 +750,12 @@ impl Handshake {
             &hash,
         )?;
 
-        ring::constant_time::verify_slices_are_equal(
+        if !constant_time_eq(
             self.params.peer_static_public.as_bytes(),
             &peer_static_public_decrypted,
-        )
-        .map_err(|_| WireGuardError::WrongKey)?;
+        ) {
+            return Err(WireGuardError::WrongKey);
+        }
 
         // initiator.hash = HASH(initiator.hash || msg.encrypted_static)
         hash = b2s_hash(&hash, packet.encrypted_static);
@@ -731,7 +961,7 @@ impl Handshake {
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
         // msg.message_type = 1
         // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&super::HANDSHAKE_INIT.to_le_bytes());
+        message_type.copy_from_slice(&self.obf.random_h1(&mut self.rng).to_le_bytes());
         // msg.sender_index = little_endian(initiator.sender_index)
         sender_index.copy_from_slice(&local_index.to_le_bytes());
         // msg.unencrypted_ephemeral = DH_PUBKEY(initiator.ephemeral_private)
@@ -818,7 +1048,7 @@ impl Handshake {
         let local_index = self.inc_index();
         // msg.message_type = 2
         // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&super::HANDSHAKE_RESP.to_le_bytes());
+        message_type.copy_from_slice(&self.obf.random_h2(&mut self.rng).to_le_bytes());
         // msg.sender_index = little_endian(responder.sender_index)
         sender_index.copy_from_slice(&local_index.to_le_bytes());
         // msg.receiver_index = little_endian(initiator.sender_index)
@@ -936,5 +1166,49 @@ mod tests {
 
         aead_chacha20_open(&mut [], &key, counter, &encrypted_nothing, &aad)
             .expect("Should open what we just sealed");
+    }
+}
+
+#[cfg(test)]
+mod constant_time_tests {
+    use super::constant_time_eq;
+
+    /// Matches what `ring::constant_time::verify_slices_are_equal` returned:
+    /// equal contents of equal length, and nothing else.
+    #[test]
+    fn it_accepts_only_equal_slices_of_equal_length() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(&[0u8; 16], &[0u8; 16]));
+        assert!(constant_time_eq(b"mac1----mac1----", b"mac1----mac1----"));
+
+        // Differs in the last byte: the case a byte-at-a-time comparison would
+        // take longest to reject, and the one an attacker walks backwards.
+        assert!(!constant_time_eq(b"mac1----mac1----", b"mac1----mac1---X"));
+        // ... and in the first.
+        assert!(!constant_time_eq(b"mac1----mac1----", b"Xac1----mac1----"));
+
+        // Length mismatch is a mismatch, not a panic and not a prefix match.
+        assert!(!constant_time_eq(b"mac1----mac1----", b"mac1----mac1---"));
+        assert!(!constant_time_eq(b"mac1----mac1---", b"mac1----mac1----"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(!constant_time_eq(b"a", b""));
+    }
+
+    /// A prefix that matches must not read as equal. This is the property the
+    /// MAC checks depend on: an attacker who can get "longest matching prefix"
+    /// accepted recovers a 16-byte MAC in 16*256 tries instead of 2^128.
+    #[test]
+    fn a_matching_prefix_is_not_a_match() {
+        let mac = [0xABu8; 16];
+        for prefix in 0..16usize {
+            let mut guess = [0x00u8; 16];
+            guess[..prefix].copy_from_slice(&mac[..prefix]);
+            assert!(
+                !constant_time_eq(&mac, &guess),
+                "a {}-byte matching prefix must still be rejected",
+                prefix
+            );
+        }
+        assert!(constant_time_eq(&mac, &mac));
     }
 }

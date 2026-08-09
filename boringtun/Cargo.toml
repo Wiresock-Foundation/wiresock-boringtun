@@ -1,16 +1,18 @@
 [package]
 name = "boringtun"
-description = "an implementation of the WireGuard® protocol designed for portability and speed"
+description = "a userspace WireGuard® implementation with AmneziaWG and WireSock protocol extensions, forked from Cloudflare BoringTun"
 version = "0.7.1"
+# Upstream authorship retained; this fork's additions credited alongside it.
 authors = [
     "Noah Kennedy <nkennedy@cloudflare.com>",
     "Andy Grover <agrover@cloudflare.com>",
     "Jeff Hiner <jhiner@cloudflare.com>",
+    "WireSock <support@wiresock.net>",
 ]
 license = "BSD-3-Clause"
 readme = "../README.md"
-repository = "https://github.com/cloudflare/boringtun"
-documentation = "https://docs.rs/boringtun/0.7.1/boringtun/"
+repository = "https://github.com/Wiresock-Foundation/wiresock-boringtun"
+documentation = "https://github.com/Wiresock-Foundation/wiresock-boringtun"
 edition = "2018"
 
 [features]
@@ -33,15 +35,25 @@ tracing-subscriber = { version = "0.3", features = ["fmt"], optional = true }
 ip_network = "0.4.1"
 ip_network_table = "0.2.0"
 ring = "0.17"
+# Constant-time comparison for the handshake MACs and the peer static key.
+# `ring` deprecated its own `verify_slices_are_equal` with "no promises
+# regarding side channels", which is precisely the promise those call sites
+# need. Already in the tree via curve25519-dalek, digest and poly1305, so this
+# is a new edge rather than a new crate.
+subtle = { version = "2.6", default-features = false }
 x25519-dalek = { version = "2.0.1", features = [
     "reusable_secrets",
     "static_secrets",
 ] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+rand_chacha = { version = "0.3", default-features = false }
 chacha20poly1305 = "0.10.0-pre.1"
 aead = "0.5.0-pre.2"
 blake2 = "0.10"
 hmac = "0.12"
+# AES-128 block cipher for the QUIC Initial header protection (RFC 9001 §5.4) in
+# the always-on QUIC imitation. AEAD/HKDF come from `ring`.
+aes = "0.8"
 jni = { version = "0.19.0", optional = true }
 mock_instant = { version = "0.3", optional = true }
 socket2 = { version = "0.4.7", features = ["all"], optional = true }
