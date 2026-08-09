@@ -24,8 +24,51 @@ jobs:
       - tests
       - integration-tests
       - test-windows
+      - win7-msrv
     steps:
       - run: exit 0
+
+  # The WireSock client builds the i686/x86_64 Windows targets with Rust 1.75,
+  # the last toolchain that supports Windows 7 (declared as rust-version in
+  # boringtun/Cargo.toml). Modern Cargo writes a v4 lockfile that Cargo 1.75
+  # cannot read, and some locked crates' manifests need edition2024 support it
+  # cannot parse, so this mirrors the client's boringtun.cmd: pin the last
+  # 1.75-safe crate versions, rewrite only the lockfile format header to v3,
+  # then build with 1.75 against that lock.
+  #
+  # Build-only, deliberately: the dev-dependencies' MSRVs exceed 1.75, so test
+  # code cannot compile on it. Syntax-level breakage in test code still fails
+  # this build (feature gates are checked before cfg-stripping -- the
+  # inline-const this job was added for lived in a #[cfg(test)] module), but a
+  # too-new std API call confined to tests would not; rust-version in
+  # Cargo.toml plus clippy's MSRV-aware lints cover that hole.
+  win7-msrv:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - name: Install Rust 1.75
+        run: |
+          rustup toolchain install 1.75.0 --profile minimal
+          rustup target add i686-pc-windows-msvc --toolchain 1.75.0
+      - name: Prepare a 1.75-compatible lockfile
+        # The per-line exit checks match boringtun.cmd's `|| goto :win7_fail`:
+        # the pwsh wrapper only inspects the final exit code, and a masked
+        # update failure would surface as a confusing error at the build step.
+        run: |
+          cargo +stable update -p zeroize --precise 1.8.2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo +stable update -p zeroize_derive --precise 1.4.3
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo +stable update -p time --precise 0.3.47
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          (Get-Content Cargo.lock) -replace '^version = [0-9]+$','version = 3' | Set-Content Cargo.lock -Encoding ascii
+      - name: Build with Rust 1.75 (x86_64)
+        run: cargo +1.75.0 build -p boringtun --target=x86_64-pc-windows-msvc --features=ffi-bindings --locked
+      - name: Build with Rust 1.75 (i686)
+        run: cargo +1.75.0 build -p boringtun --target=i686-pc-windows-msvc --features=ffi-bindings --locked
 
   test-windows:
     runs-on: windows-latest
