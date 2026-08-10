@@ -13,19 +13,27 @@
 //! process. Every entry point below therefore wraps its body in a closure.
 //!
 //! The closure's outcome is resolved with [`LogErrorAndDefault`], which logs
-//! and returns `Default::default()` -- a null handle or `0`. That is
-//! deliberately the same contract these functions had before the migration:
-//! they returned null or 0 on failure and never threw. `ThrowRuntimeExAndDefault`
-//! would raise a Java exception instead, which no current caller is written to
-//! catch, so switching to it is a decision for the Java side rather than a
-//! side effect of a dependency bump. The logging is new, and replaces silence.
+//! and returns `Default::default()` -- a null handle or `0`.
+//! `ThrowRuntimeExAndDefault` would raise a Java `RuntimeException` on every
+//! error path instead, which no current caller is written to catch; making
+//! errors throw is a change to the Java contract and belongs with the Android
+//! work rather than with a dependency bump.
+//!
+//! That is *not* the whole contract, though, and the difference cost a
+//! regression here before review caught it. Three entry points take a `byte[]`
+//! key, and under 0.19 a wrong-length array did reach Java as an
+//! `ArrayIndexOutOfBoundsException` -- not because the code threw it, but
+//! because `check_exception!` returned `Err` without clearing the JVM's pending
+//! exception. 0.22 catches and clears it, so `LogErrorAndDefault` alone would
+//! have turned a thrown exception into a silent `null`. [`read_key_region`]
+//! re-throws it. See its comment.
 
 use std::ffi::CStr;
 
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteArray, JByteBuffer, JClass, JString};
 use jni::sys::{jint, jlong, jshort};
-use jni::EnvUnowned;
+use jni::{jni_str, Env, EnvUnowned};
 use parking_lot::Mutex;
 use std::os::raw::c_char;
 
@@ -70,6 +78,39 @@ unsafe fn take_ffi_string(ptr: *const c_char) -> Option<String> {
     owned
 }
 
+/// Read a 32-byte key out of a Java byte array, preserving the Java-visible
+/// failure contract.
+///
+/// This is not a convenience wrapper. jni 0.19's `get_byte_array_region` went
+/// through `check_exception!`, which returns `Err` *without* calling
+/// `ExceptionClear` -- so a short array left the JVM's
+/// `ArrayIndexOutOfBoundsException` pending, and the Java caller saw it thrown.
+/// 0.22's `get_region` uses `jni_call_with_catch!`, which catches that
+/// exception, clears it, and hands back `Error::IndexOutOfBounds`. Combined
+/// with `LogErrorAndDefault` the exception would vanish and Java would silently
+/// receive null -- a caller passing a 31-byte key would get no diagnostic at
+/// all. Re-throwing restores what Java used to observe.
+fn read_key_region<'local>(
+    env: &mut Env<'local>,
+    array: &JByteArray<'local>,
+) -> jni::errors::Result<[u8; 32]> {
+    let mut buf = [0i8; 32];
+    match array.get_region(env, 0, &mut buf) {
+        // `as u8` per element rather than a `transmute` of the whole array:
+        // same bytes, no `unsafe`.
+        Ok(()) => Ok(buf.map(|b| b as u8)),
+        Err(e) => {
+            // 0.22 has already cleared the JVM's exception, so throwing here
+            // cannot collide with a pending one.
+            let _ = env.throw_new(
+                jni_str!("java/lang/ArrayIndexOutOfBoundsException"),
+                jni_str!("key must be 32 bytes"),
+            );
+            Err(e)
+        }
+    }
+}
+
 /// Generates new x25519 secret key and converts into java byte array.
 #[export_name = "Java_com_cloudflare_app_boringtun_BoringTunJNI_x25519_1secret_1key"]
 pub extern "C" fn generate_secret_key<'local>(
@@ -90,13 +131,8 @@ pub extern "C" fn generate_public_key1<'local>(
     arg_secret_key: JByteArray<'local>,
 ) -> JByteArray<'local> {
     env.with_env(|env| -> jni::errors::Result<_> {
-        let mut key_inner = [0i8; 32];
-        arg_secret_key.get_region(env, 0, &mut key_inner)?;
-
-        // `as u8` per element rather than a `transmute` of the whole array:
-        // same bytes, no `unsafe`.
         let secret_key = x25519_key {
-            key: key_inner.map(|b| b as u8),
+            key: read_key_region(env, &arg_secret_key)?,
         };
 
         env.byte_array_from_slice(&x25519_public_key(secret_key).key)
@@ -112,11 +148,8 @@ pub extern "C" fn convert_x25519_key_to_hex<'local>(
     arg_key: JByteArray<'local>,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<_> {
-        let mut key = [0i8; 32];
-        arg_key.get_region(env, 0, &mut key)?;
-
         let x25519_key = x25519_key {
-            key: key.map(|b| b as u8),
+            key: read_key_region(env, &arg_key)?,
         };
 
         let hex = unsafe { take_ffi_string(x25519_key_to_hex(x25519_key)) }
@@ -135,11 +168,8 @@ pub extern "C" fn convert_x25519_key_to_base64<'local>(
     arg_key: JByteArray<'local>,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<_> {
-        let mut key = [0i8; 32];
-        arg_key.get_region(env, 0, &mut key)?;
-
         let x25519_key = x25519_key {
-            key: key.map(|b| b as u8),
+            key: read_key_region(env, &arg_key)?,
         };
 
         let b64 = unsafe { take_ffi_string(x25519_key_to_base64(x25519_key)) }
