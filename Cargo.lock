@@ -143,7 +143,6 @@ dependencies = [
 name = "boringtun"
 version = "0.7.1"
 dependencies = [
- "aead",
  "aes",
  "base64",
  "blake2",

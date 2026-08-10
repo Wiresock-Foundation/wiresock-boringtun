@@ -51,8 +51,11 @@ x25519-dalek = { version = "2.0.1", features = [
 ] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 rand_chacha = { version = "0.3", default-features = false }
+# `aead` is not a direct dependency: its traits reach us through
+# `chacha20poly1305::aead`, so the two cannot drift into different major
+# versions of the same trait. Pinning it here separately is what made the
+# graph hold two `aead` (and two `crypto-common`) at once.
 chacha20poly1305 = "0.10.0-pre.1"
-aead = "0.5.0-pre.2"
 blake2 = "0.10"
 hmac = "0.12"
 # AES-128 block cipher for the QUIC Initial header protection (RFC 9001 §5.4) in

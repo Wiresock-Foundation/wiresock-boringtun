@@ -10,9 +10,9 @@ use crate::noise::session::Session;
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 use crate::x25519;
-use aead::{Aead, Payload};
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
+use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{OsRng, SeedableRng};

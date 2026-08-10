@@ -13,8 +13,8 @@ use std::net::IpAddr;
 use crate::sleepyinstant::Instant;
 
 use super::handshake::constant_time_eq;
-use aead::generic_array::GenericArray;
-use aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::aead::generic_array::GenericArray;
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305};
 use parking_lot::Mutex;
 use rand_core::{OsRng, RngCore};
