@@ -618,6 +618,19 @@ impl Tunn {
             remote_idx = p.sender_idx
         );
 
+        // Checked before the response is consumed, not after. The keepalive
+        // below is a data packet with an empty payload, so it needs exactly
+        // DATA_OVERHEAD_SZ -- a fixed requirement, knowable here.
+        // `receive_handshake_response` clears the handshake state
+        // (handshake.rs:869-873) and the session is not stored until further
+        // down, so an error raised between those two points would discard a
+        // valid response and leave the retry -- with a correct buffer -- failing
+        // as UnexpectedPacket. Unlike the data path, whose equivalent error is
+        // retryable, that would cost a whole handshake.
+        if dst.len() < DATA_OVERHEAD_SZ {
+            return Err(WireGuardError::DestinationBufferTooSmall);
+        }
+
         let session = self.handshake.receive_handshake_response(p)?;
 
         let keepalive_packet =
@@ -1540,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn handshake_response_errors_when_dst_cannot_hold_the_keepalive() {
+    fn handshake_response_with_a_short_dst_errors_and_stays_retryable() {
         // A dst that comfortably held the 148-byte initiation, but not the
         // 32-byte keepalive the response path emits on the way to a session.
         let (mut my_tun, mut their_tun) = create_two_tuns();
@@ -1552,6 +1565,17 @@ mod tests {
             my_tun.decapsulate(None, &resp, &mut too_small),
             TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
         ));
+
+        // The refusal must not have consumed the response.
+        // `receive_handshake_response` clears the handshake state, and the
+        // session is not stored until after the keepalive is formatted -- so an
+        // error raised between those two points destroys a perfectly good
+        // handshake, and the retry below comes back as UnexpectedPacket
+        // instead. An error a caller cannot recover from is barely better than
+        // the panic this replaced.
+        let mut dst = vec![0u8; 2048];
+        let keepalive = unwrap_network_packet(my_tun.decapsulate(None, &resp, &mut dst));
+        assert_eq!(keepalive.len(), DATA_OVERHEAD_SZ);
     }
 
     #[test]
