@@ -94,6 +94,16 @@ fn read_key_region<'local>(
     env: &mut Env<'local>,
     array: &JByteArray<'local>,
 ) -> jni::errors::Result<[u8; 32]> {
+    // Checked before `get_region`, which would otherwise report a null array as
+    // an out-of-bounds one -- the wrong diagnostic for the wrong mistake.
+    if array.is_null() {
+        let _ = env.throw_new(
+            jni_str!("java/lang/NullPointerException"),
+            jni_str!("key must not be null"),
+        );
+        return Err(jni::errors::Error::NullPtr("key array"));
+    }
+
     let mut buf = [0i8; 32];
     match array.get_region(env, 0, &mut buf) {
         // `as u8` per element rather than a `transmute` of the whole array:
@@ -109,6 +119,48 @@ fn read_key_region<'local>(
             Err(e)
         }
     }
+}
+
+/// A caller-supplied length, checked against the buffer it actually indexes.
+///
+/// `jint` is signed and these values come straight from Java, while the FFI
+/// layer builds `slice::from_raw_parts(ptr, size as usize)` out of them
+/// (`ffi::wireguard_write` and friends). So `-1` becomes a slice of about four
+/// billion bytes, and a length merely *larger than the array* is just as bad:
+/// `encapsulate` copies the whole claimed range into the packet it seals, so
+/// adjacent heap goes out over the wire encrypted. Neither is exotic -- passing
+/// an MTU where the filled length was wanted is an ordinary mistake.
+///
+/// Throws `IllegalArgumentException`, because this is the caller's error and a
+/// silent `0` would leave them guessing.
+fn checked_len(
+    env: &mut Env<'_>,
+    size: jint,
+    capacity: usize,
+    what: &'static jni::strings::JNIStr,
+) -> jni::errors::Result<u32> {
+    if size < 0 || size as usize > capacity {
+        let _ = env.throw_new(jni_str!("java/lang/IllegalArgumentException"), what);
+        // An exception is now pending, which is exactly what this variant means.
+        return Err(jni::errors::Error::JavaException);
+    }
+    Ok(size as u32)
+}
+
+/// The address *and* capacity of a direct buffer.
+///
+/// 0.19's `get_direct_buffer_address` returned a `&mut [u8]` built from
+/// `get_direct_buffer_capacity`, so the bound travelled with the pointer and
+/// the old code threw it away with `.as_mut_ptr()`. 0.22 returns a bare
+/// pointer, so the capacity has to be asked for separately -- and it must be,
+/// or nothing here knows how big the buffer is.
+fn direct_buffer<'local>(
+    env: &mut Env<'local>,
+    buf: &JByteBuffer<'local>,
+) -> jni::errors::Result<(*mut u8, usize)> {
+    let ptr = env.get_direct_buffer_address(buf)?;
+    let capacity = env.get_direct_buffer_capacity(buf)?;
+    Ok((ptr, capacity))
 }
 
 /// Generates new x25519 secret key and converts into java byte array.
@@ -244,21 +296,35 @@ pub extern "C" fn encrypt_raw_packet<'local>(
     op: JByteBuffer<'local>,
 ) -> jint {
     env.with_env(|env| -> jni::errors::Result<_> {
-        // 0.22 returns the address directly; 0.19 returned a slice that this
-        // code then took `.as_mut_ptr()` of.
-        let dst_ptr = env.get_direct_buffer_address(&dst)?;
-        let op_ptr = env.get_direct_buffer_address(&op)?;
+        let (dst_ptr, dst_cap) = direct_buffer(env, &dst)?;
+        let (op_ptr, op_cap) = direct_buffer(env, &op)?;
 
         // Bound to a local: the pointer must not outlive the Vec that owns it.
         let mut src_bytes = env.convert_byte_array(&src)?;
+
+        let src_len = checked_len(
+            env,
+            src_size,
+            src_bytes.len(),
+            jni_str!("src_size is negative or larger than the source array"),
+        )?;
+        let dst_len = checked_len(
+            env,
+            dst_size,
+            dst_cap,
+            jni_str!("dst_size is negative or larger than the destination buffer"),
+        )?;
+        // One byte is written to `op` below; a zero-capacity direct buffer is
+        // non-null, so the null check alone would not catch it.
+        checked_len(env, 1, op_cap, jni_str!("the op buffer must hold one byte"))?;
 
         let output: wireguard_result = unsafe {
             wireguard_write(
                 tunnel as *const Mutex<Tunn>,
                 src_bytes.as_mut_ptr(),
-                src_size as u32,
+                src_len,
                 dst_ptr,
-                dst_size as u32,
+                dst_len,
             )
         };
         unsafe { *op_ptr = output.op as u8 };
@@ -281,18 +347,35 @@ pub extern "C" fn decrypt_to_raw_packet<'local>(
     op: JByteBuffer<'local>,
 ) -> jint {
     env.with_env(|env| -> jni::errors::Result<_> {
-        let dst_ptr = env.get_direct_buffer_address(&dst)?;
-        let op_ptr = env.get_direct_buffer_address(&op)?;
+        let (dst_ptr, dst_cap) = direct_buffer(env, &dst)?;
+        let (op_ptr, op_cap) = direct_buffer(env, &op)?;
 
+        // Bound to a local: the pointer must not outlive the Vec that owns it.
         let mut src_bytes = env.convert_byte_array(&src)?;
+
+        let src_len = checked_len(
+            env,
+            src_size,
+            src_bytes.len(),
+            jni_str!("src_size is negative or larger than the source array"),
+        )?;
+        let dst_len = checked_len(
+            env,
+            dst_size,
+            dst_cap,
+            jni_str!("dst_size is negative or larger than the destination buffer"),
+        )?;
+        // One byte is written to `op` below; a zero-capacity direct buffer is
+        // non-null, so the null check alone would not catch it.
+        checked_len(env, 1, op_cap, jni_str!("the op buffer must hold one byte"))?;
 
         let output: wireguard_result = unsafe {
             wireguard_read(
                 tunnel as *const Mutex<Tunn>,
                 src_bytes.as_mut_ptr(),
-                src_size as u32,
+                src_len,
                 dst_ptr,
-                dst_size as u32,
+                dst_len,
             )
         };
         unsafe { *op_ptr = output.op as u8 };
@@ -313,11 +396,19 @@ pub extern "C" fn run_periodic_task<'local>(
     op: JByteBuffer<'local>,
 ) -> jint {
     env.with_env(|env| -> jni::errors::Result<_> {
-        let dst_ptr = env.get_direct_buffer_address(&dst)?;
-        let op_ptr = env.get_direct_buffer_address(&op)?;
+        let (dst_ptr, dst_cap) = direct_buffer(env, &dst)?;
+        let (op_ptr, op_cap) = direct_buffer(env, &op)?;
+
+        let dst_len = checked_len(
+            env,
+            dst_size,
+            dst_cap,
+            jni_str!("dst_size is negative or larger than the destination buffer"),
+        )?;
+        checked_len(env, 1, op_cap, jni_str!("the op buffer must hold one byte"))?;
 
         let output: wireguard_result =
-            unsafe { wireguard_tick(tunnel as *const Mutex<Tunn>, dst_ptr, dst_size as u32) };
+            unsafe { wireguard_tick(tunnel as *const Mutex<Tunn>, dst_ptr, dst_len) };
 
         unsafe { *op_ptr = output.op as u8 };
 

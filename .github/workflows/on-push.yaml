@@ -25,8 +25,32 @@ jobs:
       - integration-tests
       - test-windows
       - win7-msrv
+      - jni-smoke
     steps:
       - run: exit 0
+
+  # `src/jni.rs` cannot be reached by `cargo test`: its entry points take a
+  # `JNIEnv` and only exist to be called through JNI dispatch, so every other
+  # job in this file proves the bindings compile and nothing more. That gap let
+  # the jni 0.22 migration turn a thrown ArrayIndexOutOfBoundsException into a
+  # silent null -- found only because a reviewer built the library and ran a
+  # Java harness by hand. This runs that harness on every push.
+  #
+  # `-Xcheck:jni` is set inside the script: it makes the JVM validate each JNI
+  # call the library makes, which is most of the value of using a real VM rather
+  # than trusting a compile.
+  jni-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - run: bash scripts/jni-smoke.sh
 
   # The WireSock client builds the i686/x86_64 Windows targets with Rust 1.75,
   # the last toolchain that supports Windows 7 (declared as rust-version in
