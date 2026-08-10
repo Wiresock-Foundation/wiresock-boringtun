@@ -55,6 +55,65 @@ public class BoringTunJNI {
     private static final String KNOWN_B64 =
         "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
 
+    /** `result_type` in src/ffi/mod.rs. */
+    private static final byte WIREGUARD_DONE = 0;
+    private static final byte WRITE_TO_NETWORK = 1;
+    private static final byte WIREGUARD_ERROR = 2;
+    private static final byte WRITE_TO_TUNNEL_IPV4 = 4;
+    private static final byte WRITE_TO_TUNNEL_IPV6 = 6;
+
+    /**
+     * A value no `result_type` can hold, written into the op buffer before every
+     * call. `LogErrorAndDefault` returns 0 when the native body fails, and 0 is a
+     * legal size *and* a legal op code, so the return value alone cannot
+     * distinguish "worked" from "failed silently". Whether this byte survived can.
+     */
+    private static final byte OP_SENTINEL = 0x7f;
+
+    private static void armOp(ByteBuffer op) {
+        op.put(0, OP_SENTINEL);
+    }
+
+    private static byte opOf(ByteBuffer op) {
+        return op.get(0);
+    }
+
+    private static boolean isRealOp(byte op) {
+        return op == WIREGUARD_DONE || op == WRITE_TO_NETWORK || op == WIREGUARD_ERROR
+            || op == WRITE_TO_TUNNEL_IPV4 || op == WRITE_TO_TUNNEL_IPV6;
+    }
+
+    /** The first {@code n} bytes of a direct buffer, without disturbing its position. */
+    private static byte[] taken(ByteBuffer b, int n) {
+        byte[] out = new byte[n];
+        ByteBuffer view = b.duplicate();
+        view.position(0);
+        view.get(out);
+        return out;
+    }
+
+    /**
+     * A well-formed IPv4 packet of exactly {@code totalLen} bytes.
+     *
+     * boringtun's decapsulate reads the version nibble and the total-length field
+     * and hands back {@code &packet[..len]}, so the length written here has to be
+     * the real one for the round trip to compare equal.
+     */
+    private static byte[] ipv4Packet(int totalLen) {
+        byte[] p = new byte[totalLen];
+        p[0] = 0x45;                                  // IPv4, IHL 5
+        p[2] = (byte) (totalLen >> 8);
+        p[3] = (byte) totalLen;
+        p[8] = 64;                                    // TTL
+        p[9] = 17;                                    // UDP
+        p[12] = 10; p[13] = 0; p[14] = 0; p[15] = 1;  // 10.0.0.1
+        p[16] = 10; p[17] = 0; p[18] = 0; p[19] = 2;  // 10.0.0.2
+        for (int i = 20; i < totalLen; i++) {
+            p[i] = (byte) (i * 31);                   // recognisable body
+        }
+        return p;
+    }
+
     public static void main(String[] args) {
         System.out.println("== key generation ==");
         byte[] secret = x25519_secret_key();
@@ -138,6 +197,7 @@ public class BoringTunJNI {
         ByteBuffer opBuf = ByteBuffer.allocateDirect(4);
         byte[] small = new byte[64];
 
+        armOp(opBuf);
         check(throwsIAE(() -> wireguard_write(tunnel, small, -1, dstBuf, 2048, opBuf)),
               "wireguard_write rejects a negative src_size");
         check(throwsIAE(() -> wireguard_write(tunnel, small, 1500, dstBuf, 2048, opBuf)),
@@ -157,9 +217,89 @@ public class BoringTunJNI {
         check(throwsIAE(() -> wireguard_tick(tunnel, dstBuf, 2048, emptyOp)),
               "wireguard_tick rejects a zero-capacity op buffer");
 
-        // ... and a well-formed call must still be accepted.
-        check(wireguard_tick(tunnel, dstBuf, 2048, opBuf) >= 0,
-              "wireguard_tick accepts valid sizes");
+        // Every rejection above must short-circuit *before* the FFI call and its
+        // trailing `op` write. Throwing afterwards would still pass the seven
+        // checks above while having already done the unsafe thing.
+        check(opOf(opBuf) == OP_SENTINEL,
+              "a rejected call never reaches the op write");
+
+        System.out.println("== the success path must actually reach the FFI ==");
+        // Everything above returns from checked_len before the migrated FFI calls
+        // are reached, so on its own it would stay green through a regression in
+        // wireguard_write/read/tick themselves -- including src_bytes being
+        // dropped before its pointer is used. Two tunnels are handshaked against
+        // each other here and a packet is carried A->B, so the bytes are the
+        // proof; the return code cannot be, because 0 means both "empty" and
+        // "the native body failed and LogErrorAndDefault swallowed it".
+
+        armOp(opBuf);
+        int tickN = wireguard_tick(tunnel, dstBuf, 2048, opBuf);
+        check(opOf(opBuf) != OP_SENTINEL, "wireguard_tick reaches the op write");
+        check(isRealOp(opOf(opBuf)),
+              "wireguard_tick reports a real result_type"
+                  + " (op " + opOf(opBuf) + ", size " + tickN + ")");
+
+        byte[] secretA = x25519_secret_key();
+        byte[] secretB = x25519_secret_key();
+        long tunA = new_tunnel(x25519_key_to_base64(secretA),
+                               x25519_key_to_base64(x25519_public_key(secretB)),
+                               null, (short) 0, 10);
+        long tunB = new_tunnel(x25519_key_to_base64(secretB),
+                               x25519_key_to_base64(x25519_public_key(secretA)),
+                               null, (short) 0, 11);
+        check(tunA != 0 && tunB != 0, "two mutually-configured peer tunnels were created");
+
+        ByteBuffer netA = ByteBuffer.allocateDirect(2048);
+        ByteBuffer netB = ByteBuffer.allocateDirect(2048);
+        ByteBuffer opA = ByteBuffer.allocateDirect(1);
+        ByteBuffer opB = ByteBuffer.allocateDirect(1);
+        byte[] payload = ipv4Packet(64);
+
+        // A has no session, so this queues the packet and emits a handshake init.
+        armOp(opA);
+        int n1 = wireguard_write(tunA, payload, payload.length, netA, netA.capacity(), opA);
+        check(opOf(opA) == WRITE_TO_NETWORK,
+              "wireguard_write on a fresh tunnel asks for a handshake initiation");
+        check(n1 == 148, "the initiation is 148 bytes (got " + n1 + ")");
+        check(taken(netA, 1)[0] == 1, "the initiation carries WireGuard message type 1");
+
+        // B answers it.
+        armOp(opB);
+        int n2 = wireguard_read(tunB, taken(netA, n1), n1, netB, netB.capacity(), opB);
+        check(opOf(opB) == WRITE_TO_NETWORK,
+              "wireguard_read turns the initiation into a response");
+        check(n2 == 92, "the response is 92 bytes (got " + n2 + ")");
+        check(taken(netB, 1)[0] == 2, "the response carries WireGuard message type 2");
+
+        // A consumes the response; the session is now up on both sides.
+        armOp(opA);
+        int n3 = wireguard_read(tunA, taken(netB, n2), n2, netA, netA.capacity(), opA);
+        check(opOf(opA) != OP_SENTINEL,
+              "wireguard_read reaches the op write on the handshake-response path");
+
+        // Now carry the payload. Whatever A has to send goes to B until B hands
+        // a tunnel packet back. Equality with `payload` is the assertion that
+        // matters: nothing else in this file would notice src being read from
+        // freed memory, because a wrong pointer still produces *some* ciphertext.
+        boolean roundTripped = false;
+        byte[] inFlight = (opOf(opA) == WRITE_TO_NETWORK && n3 > 0) ? taken(netA, n3) : null;
+        for (int round = 0; round < 4 && !roundTripped; round++) {
+            if (inFlight == null) {
+                armOp(opA);
+                int m = wireguard_write(tunA, payload, payload.length, netA, netA.capacity(), opA);
+                if (opOf(opA) != WRITE_TO_NETWORK || m <= 0) {
+                    break;
+                }
+                inFlight = taken(netA, m);
+            }
+            armOp(opB);
+            int got = wireguard_read(tunB, inFlight, inFlight.length, netB, netB.capacity(), opB);
+            inFlight = null;
+            if (opOf(opB) == WRITE_TO_TUNNEL_IPV4 && got > 0) {
+                roundTripped = java.util.Arrays.equals(payload, taken(netB, got));
+            }
+        }
+        check(roundTripped, "a packet written by A arrives at B byte-for-byte identical");
 
         System.out.println();
         if (failures == 0) {
@@ -184,13 +324,19 @@ public class BoringTunJNI {
 
     /// Returns false, loudly, when nothing was thrown or the wrong type was --
     /// a silent return is precisely the failure these checks exist to catch.
+    ///
+    /// The comparison is on the exact runtime class rather than `isInstance`,
+    /// which would accept a subclass: NumberFormatException is-an
+    /// IllegalArgumentException, so `isInstance` would let a regression that
+    /// throws a related-but-wrong type pass a check named `throwsExactly`. What
+    /// is being pinned here is the precise type Java callers see.
     private static boolean throwsExactly(Runnable r, Class<? extends Throwable> expected) {
         try {
             r.run();
             System.out.println("        (returned normally, threw nothing)");
             return false;
         } catch (Throwable t) {
-            if (expected.isInstance(t)) {
+            if (t.getClass() == expected) {
                 return true;
             }
             System.out.println("        (threw " + t.getClass().getName() + " instead)");
