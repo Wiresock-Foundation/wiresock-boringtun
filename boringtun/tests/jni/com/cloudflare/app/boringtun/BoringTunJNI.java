@@ -105,15 +105,26 @@ public class BoringTunJNI {
         long tunnel2 = new_tunnel(secretB64, peerB64, KNOWN_B64, (short) 25, 1);
         check(tunnel2 != 0, "new_tunnel with a preshared key returns a handle");
 
-        // The three UTF-8 arrays this used to leak per call.
-        for (int i = 0; i < 1000; i++) {
-            new_tunnel(secretB64, peerB64, KNOWN_B64, (short) 25, 2);
-        }
-        check(new_tunnel(secretB64, peerB64, null, (short) 25, 3) != 0,
-              "new_tunnel still works after 1000 calls");
-
         check(new_tunnel("not-a-key", peerB64, null, (short) 25, 4) == 0,
               "new_tunnel with a malformed key returns 0");
+
+        // Exercise the three UTF-8 arrays that create_new_tunnel used to leak.
+        //
+        // A *malformed* secret key is used deliberately. All three MUTF8Chars
+        // guards are acquired before new_tunnel is reached, so the acquire and
+        // release path is covered either way -- but a malformed key returns 0
+        // without allocating. Looping on valid keys would leak 1000 Tunn
+        // objects (ffi/mod.rs hands them out via Box::into_raw, and the JNI
+        // surface exposes no tunnel_free), which is a far larger leak than the
+        // one this loop exists to make visible.
+        for (int i = 0; i < 1000; i++) {
+            if (new_tunnel("not-a-key", peerB64, KNOWN_B64, (short) 25, 2) != 0) {
+                check(false, "a malformed key must never produce a tunnel");
+                break;
+            }
+        }
+        check(new_tunnel(secretB64, peerB64, null, (short) 25, 3) != 0,
+              "new_tunnel still works after 1000 guard acquire/release cycles");
 
         System.out.println("== a null key must be an NPE, not an index error ==");
         check(throwsNPE(() -> x25519_public_key(null)),
