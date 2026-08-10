@@ -17,7 +17,9 @@
 
 package com.cloudflare.app.boringtun;
 
+import java.io.File;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
 
 public class BoringTunJNI {
@@ -115,6 +117,11 @@ public class BoringTunJNI {
     }
 
     public static void main(String[] args) {
+        if (args.length > 0 && "nullhandle".equals(args[0])) {
+            nullHandleChild();
+            return;
+        }
+
         System.out.println("== key generation ==");
         byte[] secret = x25519_secret_key();
         check(secret != null && secret.length == 32, "x25519_secret_key returns 32 bytes");
@@ -301,12 +308,73 @@ public class BoringTunJNI {
         }
         check(roundTripped, "a packet written by A arrives at B byte-for-byte identical");
 
+        System.out.println("== a zero tunnel handle must not kill the JVM ==");
+        check(nullHandleChildSurvives(),
+              "a zero tunnel handle throws instead of aborting the process");
+
         System.out.println();
         if (failures == 0) {
             System.out.println("ALL JNI SMOKE CHECKS PASSED");
         } else {
             System.out.println(failures + " JNI SMOKE CHECK(S) FAILED");
             System.exit(1);
+        }
+    }
+
+    /**
+     * The zero-handle checks, run in a JVM of their own.
+     *
+     * They cannot run inline. `create_new_tunnel` returns 0 when creation fails,
+     * and an unguarded 0 reaches `tunnel.as_ref().unwrap()` inside
+     * `ffi::wireguard_write` -- an `extern "C"` function, so the panic cannot
+     * unwind back to `with_env` and the process aborts. Inline, that would not
+     * fail this check; it would delete the harness mid-run, and every check
+     * after it, and report an exit code indistinguishable from a build problem.
+     *
+     * A child process turns process death back into an observable value. It also
+     * keeps the guard mutation-testable: remove the check in jni.rs and the child
+     * dies, the parent sees a nonzero exit, and this reports FAIL like anything
+     * else.
+     */
+    private static void nullHandleChild() {
+        ByteBuffer dst = ByteBuffer.allocateDirect(2048);
+        ByteBuffer op = ByteBuffer.allocateDirect(1);
+        byte[] src = ipv4Packet(64);
+
+        int rejected = 0;
+        if (throwsIAE(() -> wireguard_write(0L, src, src.length, dst, 2048, op))) rejected++;
+        if (throwsIAE(() -> wireguard_read(0L, src, src.length, dst, 2048, op))) rejected++;
+        if (throwsIAE(() -> wireguard_tick(0L, dst, 2048, op))) rejected++;
+
+        // Reaching this line at all is most of the point.
+        if (rejected == 3) {
+            System.out.println("NULL_HANDLE_REJECTED");
+        }
+    }
+
+    private static boolean nullHandleChildSurvives() {
+        try {
+            String java = System.getProperty("java.home")
+                + File.separator + "bin" + File.separator + "java";
+            ProcessBuilder pb = new ProcessBuilder(
+                java,
+                "-Djava.library.path=" + System.getProperty("java.library.path"),
+                "-cp", System.getProperty("java.class.path"),
+                BoringTunJNI.class.getName(),
+                "nullhandle");
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            int code = p.waitFor();
+            if (code == 0 && out.contains("NULL_HANDLE_REJECTED")) {
+                return true;
+            }
+            System.out.println("        (child exited " + code + "; output: "
+                + out.trim().replace('\n', '|') + ")");
+            return false;
+        } catch (Exception e) {
+            System.out.println("        (could not run the child JVM: " + e + ")");
+            return false;
         }
     }
 

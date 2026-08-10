@@ -9,8 +9,15 @@
 //! jni 0.22 split `JNIEnv` into two types. What a native method receives is an
 //! [`EnvUnowned`], which is FFI-safe and has no JNI methods of its own; the
 //! usable [`jni::Env`] is obtained by calling [`EnvUnowned::with_env`], which
-//! also catches panics so they cannot unwind into the JVM and abort the
-//! process. Every entry point below therefore wraps its body in a closure.
+//! also catches panics raised in the closure body. Every entry point below
+//! therefore wraps its body in a closure.
+//!
+//! That catch stops at the closure, and it is worth being precise about where.
+//! `ffi::wireguard_write` and its siblings are `extern "C"`, so a panic inside
+//! *them* aborts the process before control can return here -- rustc's own
+//! words are `panic in a function that cannot unwind`. Nothing at this layer
+//! can catch it, so anything a caller can do to make those panic has to be
+//! rejected before the call: see [`checked_len`] and [`checked_tunnel`].
 //!
 //! The closure's outcome is resolved with [`LogErrorAndDefault`], which logs
 //! and returns `Default::default()` -- a null handle or `0`.
@@ -145,6 +152,37 @@ fn checked_len(
         return Err(jni::errors::Error::JavaException);
     }
     Ok(size as u32)
+}
+
+/// A caller-supplied tunnel handle, checked before it crosses the FFI boundary.
+///
+/// `create_new_tunnel` hands back `0` when creation fails, so a caller who does
+/// not check its return value arrives here with `0` -- an ordinary mistake, not
+/// a hostile one. `ffi::wireguard_write` and its siblings open with
+/// `tunnel.as_ref().unwrap()`, and because they are `extern "C"` that panic
+/// cannot unwind back to `with_env`: the process aborts, taking the JVM with it.
+///
+/// The check is on the *pointer*, after the cast, not on the `jlong`. On a
+/// 32-bit target -- this crate builds `i686-pc-windows-msvc` -- the cast
+/// truncates, so `0x1_0000_0000` is a nonzero handle that becomes a null
+/// pointer. Nothing rejects a negative handle: a pointer widened to `jlong` is
+/// never negative on the targets built here, so `< 0` would risk rejecting
+/// something valid without catching anything `is_null` misses.
+///
+/// This does not make the entry points panic-free. A `dst` buffer that is legal
+/// per [`checked_len`] but too small for what the tunnel is about to write still
+/// reaches an unconditional `panic!` in `noise::session`, by the same route.
+/// That one cannot be fixed from here and is not fixed here.
+fn checked_tunnel(env: &mut Env<'_>, tunnel: jlong) -> jni::errors::Result<*const Mutex<Tunn>> {
+    let ptr = tunnel as *const Mutex<Tunn>;
+    if ptr.is_null() {
+        let _ = env.throw_new(
+            jni_str!("java/lang/IllegalArgumentException"),
+            jni_str!("tunnel handle is not a tunnel; new_tunnel returns 0 on failure"),
+        );
+        return Err(jni::errors::Error::JavaException);
+    }
+    Ok(ptr)
 }
 
 /// The address *and* capacity of a direct buffer.
@@ -296,6 +334,7 @@ pub extern "C" fn encrypt_raw_packet<'local>(
     op: JByteBuffer<'local>,
 ) -> jint {
     env.with_env(|env| -> jni::errors::Result<_> {
+        let tunnel = checked_tunnel(env, tunnel)?;
         let (dst_ptr, dst_cap) = direct_buffer(env, &dst)?;
         let (op_ptr, op_cap) = direct_buffer(env, &op)?;
 
@@ -318,15 +357,8 @@ pub extern "C" fn encrypt_raw_packet<'local>(
         // non-null, so the null check alone would not catch it.
         checked_len(env, 1, op_cap, jni_str!("the op buffer must hold one byte"))?;
 
-        let output: wireguard_result = unsafe {
-            wireguard_write(
-                tunnel as *const Mutex<Tunn>,
-                src_bytes.as_mut_ptr(),
-                src_len,
-                dst_ptr,
-                dst_len,
-            )
-        };
+        let output: wireguard_result =
+            unsafe { wireguard_write(tunnel, src_bytes.as_mut_ptr(), src_len, dst_ptr, dst_len) };
         unsafe { *op_ptr = output.op as u8 };
 
         Ok(output.size as jint)
@@ -347,6 +379,7 @@ pub extern "C" fn decrypt_to_raw_packet<'local>(
     op: JByteBuffer<'local>,
 ) -> jint {
     env.with_env(|env| -> jni::errors::Result<_> {
+        let tunnel = checked_tunnel(env, tunnel)?;
         let (dst_ptr, dst_cap) = direct_buffer(env, &dst)?;
         let (op_ptr, op_cap) = direct_buffer(env, &op)?;
 
@@ -369,15 +402,8 @@ pub extern "C" fn decrypt_to_raw_packet<'local>(
         // non-null, so the null check alone would not catch it.
         checked_len(env, 1, op_cap, jni_str!("the op buffer must hold one byte"))?;
 
-        let output: wireguard_result = unsafe {
-            wireguard_read(
-                tunnel as *const Mutex<Tunn>,
-                src_bytes.as_mut_ptr(),
-                src_len,
-                dst_ptr,
-                dst_len,
-            )
-        };
+        let output: wireguard_result =
+            unsafe { wireguard_read(tunnel, src_bytes.as_mut_ptr(), src_len, dst_ptr, dst_len) };
         unsafe { *op_ptr = output.op as u8 };
 
         Ok(output.size as jint)
@@ -396,6 +422,7 @@ pub extern "C" fn run_periodic_task<'local>(
     op: JByteBuffer<'local>,
 ) -> jint {
     env.with_env(|env| -> jni::errors::Result<_> {
+        let tunnel = checked_tunnel(env, tunnel)?;
         let (dst_ptr, dst_cap) = direct_buffer(env, &dst)?;
         let (op_ptr, op_cap) = direct_buffer(env, &op)?;
 
@@ -407,8 +434,7 @@ pub extern "C" fn run_periodic_task<'local>(
         )?;
         checked_len(env, 1, op_cap, jni_str!("the op buffer must hold one byte"))?;
 
-        let output: wireguard_result =
-            unsafe { wireguard_tick(tunnel as *const Mutex<Tunn>, dst_ptr, dst_len) };
+        let output: wireguard_result = unsafe { wireguard_tick(tunnel, dst_ptr, dst_len) };
 
         unsafe { *op_ptr = output.op as u8 };
 
