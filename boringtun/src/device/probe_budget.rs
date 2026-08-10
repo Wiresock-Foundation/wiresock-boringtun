@@ -49,7 +49,7 @@ use std::convert::TryFrom;
 use portable_atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "mock-instant")]
-use mock_instant::Instant;
+use mock_instant::thread_local::Instant;
 
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;

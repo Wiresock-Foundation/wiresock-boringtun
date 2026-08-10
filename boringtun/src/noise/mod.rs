@@ -34,7 +34,7 @@ use std::time::Duration;
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 #[cfg(feature = "mock-instant")]
-use mock_instant::Instant;
+use mock_instant::thread_local::Instant;
 
 /// The default value to use for rate limiting, when no other rate limiter is defined
 const PEER_HANDSHAKE_RATE_LIMIT: u64 = 10;
@@ -1183,7 +1183,7 @@ mod tests {
     /// sleeping, and no dependence on the scheduler waking us late enough.
     fn advance_past_pacing_gate(d: Duration) {
         #[cfg(feature = "mock-instant")]
-        mock_instant::MockClock::advance(d);
+        mock_instant::thread_local::MockClock::advance(d);
         #[cfg(not(feature = "mock-instant"))]
         std::thread::sleep(d);
     }
@@ -1250,7 +1250,7 @@ mod tests {
 
         // Advance time 1 second and "send" 1 packet so that we send a handshake
         // after the timeout
-        mock_instant::MockClock::advance(Duration::from_secs(1));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
         assert!(matches!(their_tun.update_timers(&mut []), TunnResult::Done));
         assert!(matches!(
             my_tun.update_timers(&mut my_dst),
@@ -1261,7 +1261,7 @@ mod tests {
         assert!(matches!(data, TunnResult::WriteToNetwork(_)));
 
         //Advance to timeout
-        mock_instant::MockClock::advance(REKEY_AFTER_TIME);
+        mock_instant::thread_local::MockClock::advance(REKEY_AFTER_TIME);
         assert!(matches!(their_tun.update_timers(&mut []), TunnResult::Done));
         update_timer_results_in_handshake(&mut my_tun);
     }
@@ -1275,7 +1275,7 @@ mod tests {
         let packet = Tunn::parse_incoming_packet(my_tun.handshake.obf, &init).unwrap();
         assert!(matches!(packet, Packet::HandshakeInit(_)));
 
-        mock_instant::MockClock::advance(REKEY_TIMEOUT);
+        mock_instant::thread_local::MockClock::advance(REKEY_TIMEOUT);
         update_timer_results_in_handshake(&mut my_tun)
     }
 
