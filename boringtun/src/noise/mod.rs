@@ -482,22 +482,31 @@ impl Tunn {
     /// Encapsulate a single packet from the tunnel interface.
     /// Returns TunnResult.
     ///
-    /// # Panics
-    /// Panics if dst is too small for the base WireGuard packet formatter.
-    /// Without Amnezia padding, dst should be at least src.len() + 32, and no
-    /// less than 148 bytes. With Amnezia enabled, callers must also allow for
-    /// the configured S-prefix on the emitted packet type; when no session is
+    /// A `dst` too small for the packet this would produce yields
+    /// `TunnResult::Err(WireGuardError::DestinationBufferTooSmall)`. Without
+    /// Amnezia padding, dst should be at least src.len() + 32, and no less than
+    /// 148 bytes. With Amnezia enabled, callers must also allow for the
+    /// configured S-prefix on the emitted packet type; when no session is
     /// established, the first output can instead be a standalone pre-handshake
-    /// junk packet up to 1280 bytes. If dst fits the base WireGuard packet but
-    /// not the configured Amnezia output, this returns
-    /// TunnResult::Err(WireGuardError::DestinationBufferTooSmall).
+    /// junk packet up to 1280 bytes.
+    ///
+    /// The established-session path used to *panic* on a short dst while the
+    /// no-session path beside it returned this error. Since both are reached
+    /// through `extern "C"` FFI callees, where a panic aborts instead of
+    /// unwinding, that inconsistency cost the caller their process.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet =
-                session.format_packet_data(self.handshake.obf, &mut self.handshake.rng, src, dst);
-            let packet_size = packet.len();
+            let packet_size = match session.format_packet_data(
+                self.handshake.obf,
+                &mut self.handshake.rng,
+                src,
+                dst,
+            ) {
+                Ok(packet) => packet.len(),
+                Err(e) => return TunnResult::Err(e),
+            };
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
@@ -612,7 +621,7 @@ impl Tunn {
         let session = self.handshake.receive_handshake_response(p)?;
 
         let keepalive_packet =
-            session.format_packet_data(self.handshake.obf, &mut self.handshake.rng, &[], dst);
+            session.format_packet_data(self.handshake.obf, &mut self.handshake.rng, &[], dst)?;
         let keepalive_packet_size = keepalive_packet.len();
         // Store new session in ring buffer
         let l_idx = session.local_index();
@@ -987,6 +996,10 @@ mod tests {
     use std::convert::TryInto;
 
     fn create_two_tuns() -> (Tunn, Tunn) {
+        create_two_tuns_with_keepalive(None)
+    }
+
+    fn create_two_tuns_with_keepalive(persistent_keepalive: Option<u16>) -> (Tunn, Tunn) {
         let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
         let my_idx = OsRng.next_u32();
@@ -999,7 +1012,7 @@ mod tests {
             my_secret_key,
             their_public_key,
             None,
-            None,
+            persistent_keepalive,
             my_idx,
             None,
             0,
@@ -1141,7 +1154,13 @@ mod tests {
     }
 
     fn create_two_tuns_and_handshake() -> (Tunn, Tunn) {
-        let (mut my_tun, mut their_tun) = create_two_tuns();
+        create_two_tuns_and_handshake_with_keepalive(None)
+    }
+
+    fn create_two_tuns_and_handshake_with_keepalive(
+        persistent_keepalive: Option<u16>,
+    ) -> (Tunn, Tunn) {
+        let (mut my_tun, mut their_tun) = create_two_tuns_with_keepalive(persistent_keepalive);
         let init = create_handshake_init(&mut my_tun);
         let resp = create_handshake_response(&mut their_tun, &init);
         let keepalive = parse_handshake_resp(&mut my_tun, &resp);
@@ -1414,6 +1433,144 @@ mod tests {
             };
             assert_eq!(sent_packet_buf, recv_packet_buf, "protocol={protocol:?}");
         }
+    }
+
+    /// The counter a data packet carries, read straight out of the wire format.
+    ///
+    /// The sending counter is private to `Session`, and the point of these
+    /// checks is what a peer would see anyway.
+    fn counter_of(packet: &[u8]) -> u64 {
+        u64::from_le_bytes(packet[8..16].try_into().unwrap())
+    }
+
+    // The four checks below cover the two `dst`-too-small sites in
+    // `noise::session`, which used to `panic!`. Every caller reaches them
+    // through `ffi::wireguard_write` / `_read` / `_tick`, and those are
+    // `extern "C"` -- so the panic met rustc's nounwind shim and aborted the
+    // process instead of unwinding. What reads here as an ordinary error was,
+    // for anyone coming through the C or JNI bindings, the loss of their whole
+    // process, and for JNI callers specifically the loss of the JVM.
+
+    #[test]
+    fn encapsulate_errors_when_dst_cannot_hold_the_data_packet() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        let packet = create_ipv4_udp_packet();
+
+        let mut one_short = vec![0u8; packet.len() + DATA_OVERHEAD_SZ - 1];
+        assert!(matches!(
+            my_tun.encapsulate(&packet, &mut one_short),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+
+        // The boundary itself, not just the error: an off-by-one in the check
+        // would satisfy the assertion above while rejecting valid calls.
+        let mut exact = vec![0u8; packet.len() + DATA_OVERHEAD_SZ];
+        assert!(matches!(
+            my_tun.encapsulate(&packet, &mut exact),
+            TunnResult::WriteToNetwork(_)
+        ));
+    }
+
+    #[test]
+    fn encapsulate_at_the_tunnel_mtu_errors_rather_than_aborting() {
+        // The most ordinary way in: size both buffers to the tunnel MTU. 1420
+        // bytes of payload needs 1452 to seal.
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        let src = vec![0u8; 1420];
+        let mut dst = vec![0u8; 1420];
+        assert!(matches!(
+            my_tun.encapsulate(&src, &mut dst),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+    }
+
+    #[test]
+    fn a_rejected_encapsulate_does_not_advance_the_nonce() {
+        // The size check runs before the sending counter is incremented. If it
+        // ran after, every rejected call would burn a nonce -- invisible until
+        // a peer with a tight replay window started dropping live traffic.
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        let packet = create_ipv4_udp_packet();
+        let mut dst = vec![0u8; 2048];
+
+        let first = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        let before = counter_of(&first);
+
+        let mut too_small = vec![0u8; 8];
+        for _ in 0..4 {
+            assert!(matches!(
+                my_tun.encapsulate(&packet, &mut too_small),
+                TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+            ));
+        }
+
+        let next = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        assert_eq!(
+            counter_of(&next),
+            before + 1,
+            "four rejected calls advanced the nonce"
+        );
+    }
+
+    #[test]
+    fn decapsulate_errors_when_dst_cannot_hold_the_plaintext() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let packet = create_ipv4_udp_packet();
+        let mut dst = vec![0u8; 2048];
+        let sent = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+
+        // A caller who sized dst for the plaintext is one AEAD tag short.
+        let mut too_small = vec![0u8; packet.len()];
+        assert!(matches!(
+            their_tun.decapsulate(None, &sent, &mut too_small),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+
+        // ... and the datagram survives the refusal. The size check runs before
+        // the replay counter is marked, so retrying with a real buffer works
+        // rather than being rejected as a replay.
+        let mut big = vec![0u8; 2048];
+        match their_tun.decapsulate(None, &sent, &mut big) {
+            TunnResult::WriteToTunnelV4(recv, _) => assert_eq!(&packet[..], recv),
+            // Positional, not `{other:?}`: this crate is edition 2018, where a
+            // single-argument `panic!` is not a format string and would print
+            // the braces verbatim.
+            other => panic!("expected the retry to be accepted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn handshake_response_errors_when_dst_cannot_hold_the_keepalive() {
+        // A dst that comfortably held the 148-byte initiation, but not the
+        // 32-byte keepalive the response path emits on the way to a session.
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, &init);
+
+        let mut too_small = vec![0u8; DATA_OVERHEAD_SZ - 1];
+        assert!(matches!(
+            my_tun.decapsulate(None, &resp, &mut too_small),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+    }
+
+    #[test]
+    fn update_timers_errors_when_dst_cannot_hold_a_keepalive() {
+        // The nastiest shape of the original defect: identical calls with
+        // identical arguments return Done, until a persistent keepalive falls
+        // due and the same call reaches the formatter. Nothing the caller can
+        // inspect beforehand tells the two apart, so this could not be fixed by
+        // validating arguments at the FFI boundary.
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake_with_keepalive(Some(1));
+        let mut small = vec![0u8; DATA_OVERHEAD_SZ - 1];
+
+        assert!(matches!(my_tun.update_timers(&mut small), TunnResult::Done));
+
+        advance_past_pacing_gate(Duration::from_millis(1100));
+        assert!(matches!(
+            my_tun.update_timers(&mut small),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
     }
 
     #[test]
