@@ -61,7 +61,7 @@ hmac = "0.12"
 # AES-128 block cipher for the QUIC Initial header protection (RFC 9001 §5.4) in
 # the always-on QUIC imitation. AEAD/HKDF come from `ring`.
 aes = "0.8"
-jni = { version = "0.19.0", optional = true }
+jni = { version = "0.22", optional = true }
 mock_instant = { version = "0.6", optional = true }
 socket2 = { version = "0.6.5", features = ["all"], optional = true }
 thiserror = { version = "2", optional = true }
