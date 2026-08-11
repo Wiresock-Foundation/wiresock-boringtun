@@ -14,40 +14,68 @@ updates:
     schedule:
       interval: weekly
     # This crate declares rust-version = "1.75", because WireSock supports
-    # Windows 7 and that is the last toolchain targeting it. The whole
-    # rand 0.10 generation, and the x25519/curve25519 releases that moved
-    # with it, declare rust-version 1.85 and edition 2024:
+    # Windows 7 and that is the last toolchain targeting it. Two dependency
+    # families have moved past that, and each moves as a set, so none of
+    # these can be taken alone. Taking any of them means taking Rust 1.85,
+    # which means dropping Windows 7 -- a product decision, not a dependency
+    # bump, so Dependabot should stop proposing them weekly. (#12, #21, #22
+    # and #24 were the instances; CI failed each one.)
     #
-    #   rand_chacha     0.10.0   1.85 / 2024
-    #   rand_core       0.10.0   1.85 / 2024
-    #   rand            0.10.0   1.85 / 2024
-    #   getrandom       0.4.0    1.85 / 2024
-    #   x25519-dalek    3.0.0    1.85 / 2024
-    #   curve25519-dalek 5.0.0   1.85 / 2024
+    # THE RAND FAMILY. The 0.10 generation declares 1.85 / edition 2024
+    # outright. The 0.9 generation does not (rand_chacha 0.9 is msrv 1.63)
+    # -- it breaks by COUPLING instead: rand_chacha 0.9 requires
+    # rand_core ^0.9, while x25519-dalek 2.x and this crate's RngCore
+    # bounds speak rand_core 0.6. Two rand_core majors in one graph means
+    # `ChaCha8Rng: RngCore is not satisfied` (measured on #12 and #22).
+    # Only the 0.3/0.6 generation speaks rand_core 0.6, so the floors sit
+    # directly above the versions in use, not at 0.10:
     #
-    # They also move as a set: rand_chacha 0.10 requires rand_core ^0.10,
-    # and the only x25519-dalek speaking rand_core 0.10 is 3.0. So there is
-    # no partial upgrade -- taking any one of them means taking 1.85, which
-    # means dropping Windows 7. That is a product decision, not a dependency
-    # bump, so Dependabot should stop proposing it weekly (it already did,
-    # in #12, which CI correctly failed on win7-msrv).
+    #   rand_chacha      >=0.4    0.9 couples to rand_core 0.9; 0.10 is 1.85
+    #   rand_core        >=0.7    same, from the other end
+    #   rand             >=0.9    rand 0.9 is the same generation
+    #   getrandom        >=0.4    0.4.0 is 1.85 / 2024
+    #   x25519-dalek     >=3      3.0.0 is 1.85 / 2024, first on rand_core 0.10
+    #   curve25519-dalek >=5      5.0.0 is 1.85 / 2024
     #
-    # These are scoped to the MSRV-raising majors on purpose. A patch or
-    # minor release inside the ranges we actually use -- including a
-    # security fix -- is NOT ignored and will still open a PR.
+    # THE RUSTCRYPTO FAMILY. The digest-0.11 / aead-0.6 generation declares
+    # 1.85 / edition 2024, and it also cannot be taken piecemeal: aead 0.6
+    # and digest 0.11 bring crypto-common 0.2, and any crate still on the
+    # 0.10 generation holds crypto-common 0.1 -- two copies of the same
+    # traits, and `new_from_slice` stops resolving (measured on #21).
     #
-    # Revisit when Windows 7 support ends: delete this block, and the whole
-    # set can be taken together in one change.
+    #   chacha20poly1305 >=0.11   1.85 / 2024, brings aead 0.6
+    #   hmac             >=0.13   1.85 / 2024, brings digest 0.11
+    #   blake2           >=0.11   unpublished yet; will be this generation
+    #   aes              >=0.9    0.9.2 is 1.85 / 2024
+    #
+    # aead, digest and crypto-common need no entries: they are not direct
+    # dependencies (aead reaches us through chacha20poly1305, by design --
+    # see boringtun/Cargo.toml), so Dependabot never proposes them.
+    #
+    # All floors are version-scoped on purpose. A patch or minor inside the
+    # ranges actually in use -- including a security fix -- is NOT ignored
+    # and still opens a PR.
+    #
+    # Revisit when Windows 7 support ends: delete this block and migrate
+    # each family as one coordinated change.
     ignore:
       - dependency-name: "rand_chacha"
-        versions: [">=0.10"]
+        versions: [">=0.4"]
       - dependency-name: "rand_core"
-        versions: [">=0.10"]
+        versions: [">=0.7"]
       - dependency-name: "rand"
-        versions: [">=0.10"]
+        versions: [">=0.9"]
       - dependency-name: "getrandom"
         versions: [">=0.4"]
       - dependency-name: "x25519-dalek"
         versions: [">=3"]
       - dependency-name: "curve25519-dalek"
         versions: [">=5"]
+      - dependency-name: "chacha20poly1305"
+        versions: [">=0.11"]
+      - dependency-name: "hmac"
+        versions: [">=0.13"]
+      - dependency-name: "blake2"
+        versions: [">=0.11"]
+      - dependency-name: "aes"
+        versions: [">=0.9"]
