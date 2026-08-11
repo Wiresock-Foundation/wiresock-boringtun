@@ -1198,56 +1198,74 @@ mod tests {
         // And the catch-all this function replaced still rejects everything it
         // does not list.
         assert_eq!(handle_awg3_device_key("not_a_real_key", "1"), Err(EINVAL));
-        // A live `header_protection_key` is refused rather than tolerated. "0"
-        // is a separate case and is refused for a different reason -- it is one
-        // hex character, not a key at all. See the test below for the
-        // distinction, which is why this assertion does not cover the all-zero
-        // key despite looking like it might.
+        // `header_protection_key` reaches this fallback only if the `api_set`
+        // arm above stops handling it, which is what makes removing the feature
+        // surface as EINVAL rather than as silent tolerance. Any value does,
+        // including a well-formed one -- "0" is used here because it is also not
+        // a key (one hex character), so the assertion holds either way.
         assert_eq!(
             handle_awg3_device_key("header_protection_key", "0"),
             Err(EINVAL)
         );
     }
 
-    /// An all-zero header-protection key means "off", which is what we do.
+    /// An all-zero header-protection key means "off", not "reject".
     ///
-    /// This is the one AWG-3 key we refuse outright, because a peer that masks
-    /// the message-type field is mutually unreachable rather than degraded. The
-    /// zero key is not that peer: amneziawg-go accepts it and then builds no
-    /// cipher from it, so header protection is off on both ends and the tunnel
-    /// works. Refusing it would abort the whole `set=1` transaction over a line
-    /// that asks nothing of us -- the exact failure mode this function exists to
-    /// remove.
+    /// amneziawg-go accepts the key -- its `FromHex` is a length-checked hex
+    /// decode with no zero test -- and then builds no cipher from it, so a peer
+    /// sending 32 zero bytes has protection off and interoperates with a build
+    /// that has it off too. Refusing the line would abort the whole `set=1`
+    /// transaction mid-stream over a configuration that asks nothing of us.
+    ///
+    /// It is also the only way to turn protection off over UAPI, since `set=1`
+    /// is seeded from the live device and an omitted key preserves the old one.
+    /// So this pins two things at once: the zero key parses, and the merge that
+    /// applies it leaves protection disabled rather than storing a "key" that
+    /// masks with an all-zero keystream.
     #[test]
-    fn a_zeroed_header_protection_key_means_off_and_is_tolerated() {
-        assert_eq!(
-            handle_awg3_device_key("header_protection_key", &"0".repeat(64)),
-            Ok(()),
-            "an all-zero key is amneziawg-go's 'off'"
+    fn a_zeroed_header_protection_key_means_off_not_a_key() {
+        let current = AmneziaConfig::default();
+
+        // A live key needs every junk size at or above `NONCE_SIZE`, because
+        // the nonce is read out of the junk prefix. The default sizes are below
+        // it, so a live key must be configured together with them.
+        let mut live = AwgParams::default();
+        live.set_size("s1", 16);
+        live.set_size("s2", 16);
+        live.set_size("s3", 16);
+        live.set_size("s4", 16);
+        live.set_header_protection([0xab; 32]);
+        let (_, with_key) = live
+            .merged(ObfuscationRanges::default(), &current)
+            .expect("a live key with junk sizes >= NONCE_SIZE is valid");
+        assert!(
+            with_key.header_protection_enabled(),
+            "precondition: a live key must enable protection, or the zero case \
+             below proves nothing"
         );
-        // The same 32 zero bytes in base64; `KeyBytes` takes both spellings and
-        // so does the UAPI.
-        assert_eq!(
-            handle_awg3_device_key(
-                "header_protection_key",
-                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-            ),
-            Ok(()),
-            "base64 spells the same 32 zero bytes"
+
+        // The zero key carries no junk sizes at all, and is still accepted --
+        // the nonce requirement applies only when protection is on, which is
+        // also why amneziawg-go's UAPI skips that check for a zero key. If the
+        // zero key were treated as set, this would fail the merge with EINVAL.
+        let mut zeroed = AwgParams::default();
+        zeroed.set_header_protection([0u8; 32]);
+        let (_, merged) = zeroed
+            .merged(ObfuscationRanges::default(), &current)
+            .expect("an all-zero key does not require junk sizes");
+        assert!(
+            !merged.header_protection_enabled(),
+            "32 zero bytes is amneziawg-go's 'off', not a key"
         );
-        // A live key still aborts the transaction.
-        assert_eq!(
-            handle_awg3_device_key("header_protection_key", &"ab".repeat(32)),
-            Err(EINVAL),
-            "a live key is still refused"
-        );
-        // And a value that is not a key at all is still refused. "0" is one hex
-        // character, not 32 zero bytes -- which is why the assertion above that
-        // uses it never reached this case.
-        assert_eq!(
-            handle_awg3_device_key("header_protection_key", "0"),
-            Err(EINVAL),
-            "one hex char is not a key"
+
+        // And it clears a key the device already had -- the UAPI's only way to
+        // turn protection off, since an omitted key preserves the old value.
+        let (_, cleared) = zeroed
+            .merged(ObfuscationRanges::default(), &with_key)
+            .expect("an all-zero key does not require junk sizes");
+        assert!(
+            !cleared.header_protection_enabled(),
+            "an all-zero key must clear a live one, not be ignored as 'unset'"
         );
     }
 
