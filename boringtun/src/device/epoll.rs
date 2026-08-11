@@ -103,6 +103,50 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    /// `register_event` must report epoll's errno, not its own rollback's.
+    ///
+    /// The rollback runs between the failing `epoll_ctl` and the errno read, and
+    /// everything it does can overwrite errno: `events.lock()` parks on a futex
+    /// under contention, and `H` is a type parameter whose `Drop` runs whatever
+    /// the caller supplied -- in this crate, `close(2)` on a `socket2::Socket`.
+    /// The contract is that *nothing* runs in between, and the errno matters
+    /// because `register_conn_handler`'s warning reports it to an operator as
+    /// the difference between `max_user_watches` and fd exhaustion.
+    ///
+    /// This pins the destructor half only. The lock half needs a contending
+    /// thread to lose the futex race, which is not deterministic; it was
+    /// measured out-of-tree at ~1% of registrations with one contender.
+    #[test]
+    fn the_reported_errno_is_epolls_not_the_rollbacks() {
+        struct FailingCloseOnDrop;
+        impl Drop for FailingCloseOnDrop {
+            fn drop(&mut self) {
+                // The shape of `socket2::Socket`'s `Drop`, made to fail: EBADF.
+                unsafe { close(-1) };
+            }
+        }
+
+        let poll: EventPoll<FailingCloseOnDrop> = EventPoll::new().unwrap();
+        let path = std::env::temp_dir().join(format!("bt-epoll-errno-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+
+        let err = poll
+            .new_event(file.as_raw_fd(), FailingCloseOnDrop)
+            .err()
+            .expect("precondition: epoll_ctl on a regular file must fail, or this proves nothing");
+        let raw = match err {
+            Error::EventQueue(e) => e.raw_os_error(),
+            other => panic!("expected EventQueue, got {:?}", other),
+        };
+        assert_eq!(
+            raw,
+            Some(EPERM),
+            "the rollback's destructor overwrote epoll_ctl's errno"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 impl<H: Sync + Send> EventPoll<H> {
@@ -194,8 +238,15 @@ impl<H: Sync + Send> EventPoll<H> {
         };
 
         if unsafe { timerfd_settime(tfd, 0, &spec, std::ptr::null_mut()) } == -1 {
+            // errno before the cleanup, for the reason spelled out in
+            // `register_event`. This site is the milder one -- `close` on a
+            // timerfd we just created succeeds, and a successful `close` does
+            // not touch errno on glibc or musl -- but the rule is "read errno
+            // before anything else runs", and a rule with an exception in it is
+            // the one that gets re-broken.
+            let err = io::Error::last_os_error();
             unsafe { close(tfd) };
-            return Err(Error::Timer(io::Error::last_os_error()));
+            return Err(Error::Timer(err));
         }
 
         let ev = Event {
@@ -325,8 +376,18 @@ impl<H: Sync + Send> EventPoll<H> {
             // Only a handler that *borrows* its fd (`register_iface_handler`'s
             // `Arc<TunSocket>`) could ever be cleaned up by a later insert at the
             // same index, which is why "it self-heals on reuse" is not a defence.
+            //
+            // errno first: the rollback below can destroy it twice over. The
+            // `lock()` parks on a futex under contention, and parking_lot's
+            // Linux parker leaves EAGAIN in errno whenever the wait races the
+            // unparker -- no destructor needed. Then `H` is a type parameter,
+            // and `EventPoll` makes no promise about what its `Drop` runs; in
+            // this crate it closes a `socket2::Socket`. The errno is not
+            // decorative here, it is what tells an operator whether they hit
+            // `max_user_watches` (ENOSPC) or ran out of descriptors (EMFILE).
+            let err = io::Error::last_os_error();
             self.events.lock()[trigger as usize].take();
-            return Err(Error::EventQueue(io::Error::last_os_error()));
+            return Err(Error::EventQueue(err));
         }
 
         Ok(EventRef { trigger })

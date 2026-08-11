@@ -166,15 +166,33 @@ impl Peer {
             udp_conn.set_mark(fwmark)?;
         }
 
-        tracing::info!(
-            message="Connected endpoint",
-            port=port,
-            endpoint=?endpoint.addr.unwrap()
-        );
-
         // `try_clone` is a `dup(2)`, which fails on fd exhaustion -- reachable
         // on a server with many peers, and not a reason to abort.
         endpoint.conn = Some(udp_conn.try_clone()?);
+
+        // Logged after the commit, not before. The `?` above returns with
+        // `endpoint.conn` still `None` and the caller discards that `Err`
+        // without logging it, so a line placed above would be the only record
+        // of the attempt and it would report a connection that does not exist.
+        // A `None` conn also stops the `is_some()` check at the top from
+        // short-circuiting, so every later datagram from this peer retries and
+        // repeats the false line.
+        //
+        // What this line means is "`connect_endpoint` committed", not "a
+        // connected socket is in service": `register_conn_handler` can still
+        // fail in the caller, which rolls `conn` back to `None` and returns the
+        // peer to the shared socket. Ordering cannot fix that -- only moving
+        // the line to the caller could, which would put it further from the
+        // thing it describes.
+        //
+        // Logging `addr` rather than `endpoint.addr.unwrap()`: same value under
+        // the write guard held since the top of the function, one less `unwrap`
+        // on a path this commit is removing them from.
+        tracing::info!(
+            message = "Connected endpoint",
+            port = port,
+            endpoint = ?addr
+        );
 
         Ok(udp_conn)
     }
