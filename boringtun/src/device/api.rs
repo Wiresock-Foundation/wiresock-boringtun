@@ -7,6 +7,7 @@ use super::{AllowedIP, Device, Error, SocketAddr};
 use crate::device::Action;
 use crate::noise::amnezia::AmneziaConfig;
 use crate::noise::handshake::ObfuscationRanges;
+use crate::noise::timers::{KEEPALIVE_TIMEOUT, REJECT_AFTER_TIME, REKEY_AFTER_TIME, REKEY_TIMEOUT};
 use crate::serialization::KeyBytes;
 use crate::x25519;
 use hex::encode as encode_hex;
@@ -567,6 +568,67 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                         // tolerate these; accept and ignore rather than failing
                         // the whole transaction on a config that carries them.
                         "i1" | "i2" | "i3" | "i4" | "i5" => {}
+                        // AmneziaWG 3.0 device keys we do not implement yet.
+                        //
+                        // Tolerated rather than rejected because one unknown key
+                        // aborts the *entire* `set=1`: an AWG-3 profile would
+                        // otherwise land nothing at all, not even the jc/s/h
+                        // lines that precede the offending one. That failure is
+                        // both silent and total, which is worse than running
+                        // without the feature.
+                        //
+                        // Each still warns, because ignoring a value the peer
+                        // actually set is not free -- see the individual notes.
+                        "content_padding_addition" => match val.parse::<u16>() {
+                            // Sender-side only: it pads its own plaintext, and
+                            // we already tolerate the padded keepalive that
+                            // results. Nothing breaks; our own transport just
+                            // keeps a different length distribution to theirs.
+                            Ok(0) => {}
+                            Ok(v) => tracing::warn!(
+                                message = "content_padding_addition is not implemented; \
+                                           our transport packets will not be padded",
+                                requested = v
+                            ),
+                            Err(_) => return EINVAL,
+                        },
+                        "reject_after_time"
+                        | "rekey_after_time"
+                        | "rekey_timeout"
+                        | "keepalive_timeout"
+                        | "max_handshake_attempts" => match parse_awg3_seconds(val) {
+                            // Silence is only safe while the value matches what
+                            // we hardcode. A peer that shortens
+                            // reject_after_time discards a keypair we still
+                            // consider live, which shows up as one-way
+                            // blackholing minutes later rather than as a
+                            // handshake failure -- so a mismatch has to say so.
+                            Some(v) if awg3_timer_matches_ours(key, v) => {}
+                            Some(v) => tracing::warn!(
+                                message = "tunable timers are not implemented; \
+                                           using the built-in WireGuard constant",
+                                key = key,
+                                requested = ?v,
+                                ours = awg3_our_timer(key)
+                            ),
+                            None => return EINVAL,
+                        },
+                        // Deliberately NOT tolerated. Header protection masks the
+                        // message-type field with a ChaCha20 keystream, so a peer
+                        // that sets it cannot classify our packets and we cannot
+                        // classify theirs -- the tunnel is mutually unreachable,
+                        // not degraded. Accepting the key silently would turn
+                        // that into an unexplained dead port; failing here at
+                        // least names the reason.
+                        "header_protection_key" => {
+                            tracing::error!(
+                                "header_protection_key is not implemented: a peer \
+                                 using it cannot interoperate with this build, so \
+                                 the configuration is refused rather than applied \
+                                 without protection"
+                            );
+                            return EINVAL;
+                        }
                         _ => return EINVAL,
                     }
                 }
@@ -577,6 +639,43 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
         },
     )
     .unwrap_or(EIO)
+}
+
+/// An AmneziaWG 3.0 tunable-timer value: a bare count of seconds, or the
+/// `min-max` form amneziawg-go's `UintRange` also accepts.
+///
+/// Returned as a pair so a range can be compared against our fixed constant at
+/// both ends -- `120-140` is not equivalent to our 120 even though it contains it.
+fn parse_awg3_seconds(val: &str) -> Option<(u32, u32)> {
+    match val.split_once('-') {
+        Some((lo, hi)) => Some((lo.trim().parse().ok()?, hi.trim().parse().ok()?)),
+        None => {
+            let v: u32 = val.trim().parse().ok()?;
+            Some((v, v))
+        }
+    }
+}
+
+/// The constant this build actually uses for an AWG-3 tunable timer, in seconds.
+///
+/// `max_handshake_attempts` has no constant of its own: we bound handshake
+/// retries by wall clock instead of by a counter, and REKEY_ATTEMPT_TIME /
+/// REKEY_TIMEOUT is 90/5 = 18, which is what amneziawg-go's default counter is.
+/// So the two agree by construction even though the mechanisms differ.
+fn awg3_our_timer(key: &str) -> u64 {
+    match key {
+        "reject_after_time" => REJECT_AFTER_TIME.as_secs(),
+        "rekey_after_time" => REKEY_AFTER_TIME.as_secs(),
+        "rekey_timeout" => REKEY_TIMEOUT.as_secs(),
+        "keepalive_timeout" => KEEPALIVE_TIMEOUT.as_secs(),
+        "max_handshake_attempts" => 18,
+        _ => 0,
+    }
+}
+
+fn awg3_timer_matches_ours(key: &str, (lo, hi): (u32, u32)) -> bool {
+    let ours = awg3_our_timer(key);
+    u64::from(lo) == ours && u64::from(hi) == ours
 }
 
 fn api_set_peer(
@@ -629,15 +728,50 @@ fn api_set_peer(
                     Ok(addr) => sec.endpoint = Some(addr),
                     Err(_) => return EINVAL,
                 },
-                "persistent_keepalive_interval" => match val.parse::<u16>() {
-                    Ok(interval) => sec.keepalive = Some(interval),
-                    Err(_) => return EINVAL,
+                // amneziawg-go stores this as a `UintRange` and re-picks within
+                // it, so a v3 config may carry `25-35` rather than a bare `25`.
+                // A bare value is by far the common form; the range only has to
+                // not abort the transaction.
+                "persistent_keepalive_interval" => match parse_awg3_seconds(val) {
+                    Some((lo, hi)) if lo == hi && lo <= u32::from(u16::MAX) => {
+                        sec.keepalive = Some(lo as u16)
+                    }
+                    Some((lo, hi)) if lo <= hi && hi <= u32::from(u16::MAX) => {
+                        // The low end, not the middle: sending keepalives more
+                        // often than asked is safe, sending them less often
+                        // risks the NAT mapping expiring, which is the failure
+                        // this setting exists to prevent.
+                        tracing::warn!(
+                            message = "randomised keepalive intervals are not implemented; \
+                                       using the low end of the range",
+                            requested_low = lo,
+                            requested_high = hi
+                        );
+                        sec.keepalive = Some(lo as u16)
+                    }
+                    _ => return EINVAL,
                 },
                 "replace_allowed_ips" => match val.parse::<bool>() {
                     Ok(true) => sec.replace_ips = true,
                     Ok(false) => sec.replace_ips = false,
                     Err(_) => return EINVAL,
                 },
+                // A leading `-` is wireguard-go's remove-one-prefix form
+                // (amneziawg-go device/uapi.go:663). Deliberately refused rather
+                // than tolerated: ignoring it would leave a prefix routable that
+                // the operator asked to revoke, and an allowed-IP that outlives
+                // its revocation is the one silent failure here with a security
+                // consequence. `replace_allowed_ips=true`, which is what
+                // `awg setconf` emits, is supported and expresses the same
+                // intent.
+                "allowed_ip" if val.starts_with('-') => {
+                    tracing::error!(
+                        message = "removing a single allowed_ip is not implemented; \
+                                   refusing rather than leaving the prefix routable",
+                        prefix = &val[1..]
+                    );
+                    return EINVAL;
+                }
                 "allowed_ip" => match val.parse::<AllowedIP>() {
                     Ok(ip) => sec.allowed_ips.push(ip),
                     Err(_) => return EINVAL,
@@ -674,6 +808,22 @@ fn api_set_peer(
                     Ok(1) => {} // Only version 1 is legal
                     _ => return EINVAL,
                 },
+                // "create this peer only if it already exists". We always
+                // create, so honouring this needs an existence check threaded
+                // through `update_peer`; until then say so rather than abort the
+                // transaction. `awg setconf` does not emit it -- it comes from
+                // `wg set <if> peer <key> update-only` -- so the common paths are
+                // unaffected. amneziawg-go also rejects any value but "true".
+                "update_only" => {
+                    if val != "true" {
+                        return EINVAL;
+                    }
+                    tracing::warn!(
+                        message = "update_only is not implemented; the peer will be \
+                                   created if it does not already exist",
+                        peer = encode_hex(public_key.as_bytes()).as_str()
+                    );
+                }
                 _ => return EINVAL,
             }
         }
@@ -731,6 +881,38 @@ mod tests {
         // And the keys the transaction did not mention keep their old values.
         assert_eq!(merged.cookie_packet_junk_size, 1, "s3 untouched");
         assert_eq!(merged.transport_packet_junk_size, 1, "s4 untouched");
+    }
+
+    #[test]
+    fn awg3_timer_values_parse_in_both_forms() {
+        // amneziawg-go's UintRange accepts a bare value or `min-max`.
+        assert_eq!(parse_awg3_seconds("120"), Some((120, 120)));
+        assert_eq!(parse_awg3_seconds(" 120 "), Some((120, 120)));
+        assert_eq!(parse_awg3_seconds("100-140"), Some((100, 140)));
+        assert_eq!(parse_awg3_seconds(" 100 - 140 "), Some((100, 140)));
+        assert_eq!(parse_awg3_seconds("notanumber"), None);
+        assert_eq!(parse_awg3_seconds(""), None);
+    }
+
+    #[test]
+    fn an_awg3_timer_is_silent_only_when_it_matches_what_we_implement() {
+        // The point of the warning is the mismatch case: a peer that shortens
+        // reject_after_time discards a keypair we still consider live, which
+        // surfaces as one-way blackholing minutes later rather than as a
+        // handshake failure. Silence there would be the wrong default.
+        assert_eq!(awg3_our_timer("reject_after_time"), 180);
+        assert_eq!(awg3_our_timer("rekey_after_time"), 120);
+        assert_eq!(awg3_our_timer("rekey_timeout"), 5);
+        assert_eq!(awg3_our_timer("keepalive_timeout"), 10);
+        // We have no attempt counter -- REKEY_ATTEMPT_TIME / REKEY_TIMEOUT is
+        // 90/5, which equals amneziawg-go's default of 18 by construction.
+        assert_eq!(awg3_our_timer("max_handshake_attempts"), 18);
+
+        assert!(awg3_timer_matches_ours("reject_after_time", (180, 180)));
+        assert!(!awg3_timer_matches_ours("reject_after_time", (60, 60)));
+        // A range that merely *contains* our value is not equivalent to it:
+        // the peer would be re-picking, we would not.
+        assert!(!awg3_timer_matches_ours("reject_after_time", (120, 200)));
     }
 
     #[test]
