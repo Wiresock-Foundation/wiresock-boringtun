@@ -55,7 +55,15 @@ rand_chacha = { version = "0.3", default-features = false }
 # `chacha20poly1305::aead`, so the two cannot drift into different major
 # versions of the same trait. Pinning it here separately is what made the
 # graph hold two `aead` (and two `crypto-common`) at once.
-chacha20poly1305 = "0.10.0-pre.1"
+#
+# "0.10", not the upstream-inherited "0.10.0-pre.1": a pre-release
+# requirement makes Dependabot treat pre-releases as update candidates,
+# and rc versions sort below the ignore floors meant to stop them --
+# which is how a chacha20poly1305 0.11.0-rc.3 bump (#27) got proposed
+# with green-but-vacuous CI after stable 0.11.0 (#21) was already
+# blocked. The stable 0.10.1 in the lockfile satisfies both spellings,
+# so nothing re-resolves.
+chacha20poly1305 = "0.10"
 blake2 = "0.10"
 hmac = "0.12"
 # AES-128 block cipher for the QUIC Initial header protection (RFC 9001 §5.4) in
