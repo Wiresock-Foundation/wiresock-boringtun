@@ -1170,8 +1170,22 @@ impl Device {
                     p.set_endpoint(from);
                     if d.config.use_connected_socket {
                         if let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark) {
-                            d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
-                                .unwrap();
+                            // Not `unwrap`: this is `epoll_ctl(EPOLL_CTL_ADD)`,
+                            // which fails with ENOSPC once the process hits
+                            // `max_user_watches` -- a reachable state on a
+                            // server with many peers, and one an unauthenticated
+                            // flood of new source addresses can drive. The
+                            // connected socket is an optimisation, so falling
+                            // back to the anonymous path costs throughput, not
+                            // correctness. Note the sibling `Result` one line
+                            // above is already handled this way.
+                            if let Err(e) = d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
+                            {
+                                tracing::warn!(
+                                    message = "Failed to register connected socket for peer",
+                                    error = ?e
+                                );
+                            }
                         }
                     }
                 }

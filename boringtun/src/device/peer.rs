@@ -16,6 +16,19 @@ pub struct Endpoint {
     pub conn: Option<socket2::Socket>,
 }
 
+/// Report a failed endpoint shutdown without taking the process with it.
+///
+/// Both callers are dropping the socket regardless, so there is nothing to
+/// recover; the only question is whether the failure is visible. It is logged
+/// at debug rather than warn because ENOTCONN here is ordinary -- the kernel
+/// drops the association on an ICMP error, and the next datagram from that
+/// peer re-establishes it.
+fn log_shutdown_error(result: std::io::Result<()>) {
+    if let Err(e) = result {
+        tracing::debug!(message = "Endpoint shutdown failed", error = ?e);
+    }
+}
+
 pub struct Peer {
     /// The associated tunnel struct
     pub(crate) tunnel: Tunn,
@@ -83,7 +96,12 @@ impl Peer {
     pub fn shutdown_endpoint(&self) {
         if let Some(conn) = self.endpoint.write().conn.take() {
             tracing::info!("Disconnecting from endpoint");
-            conn.shutdown(Shutdown::Both).unwrap();
+            // Best-effort: the socket is being dropped either way. `shutdown(2)`
+            // on a connected UDP socket returns ENOTCONN once the kernel has
+            // torn the association down -- after an ICMP error, for instance --
+            // and this runs from the 250 ms timer tick for every peer, so an
+            // unwrap here is a remote-triggerable way to abort the daemon.
+            log_shutdown_error(conn.shutdown(Shutdown::Both));
         }
     }
 
@@ -92,7 +110,10 @@ impl Peer {
         if endpoint.addr != Some(addr) {
             // We only need to update the endpoint if it differs from the current one
             if let Some(conn) = endpoint.conn.take() {
-                conn.shutdown(Shutdown::Both).unwrap();
+                // Same as `shutdown_endpoint`, and more exposed: this fires on
+                // every roam, so the trigger is an authenticated peer changing
+                // source address -- a remote input on the ingress path.
+                log_shutdown_error(conn.shutdown(Shutdown::Both));
             }
 
             endpoint.addr = Some(addr);
@@ -112,7 +133,7 @@ impl Peer {
 
         let addr = endpoint
             .addr
-            .expect("Attempt to connect to undefined endpoint");
+            .ok_or_else(|| Error::Connect("No endpoint address set".to_owned()))?;
 
         let udp_conn =
             socket2::Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
@@ -137,7 +158,9 @@ impl Peer {
             endpoint=?endpoint.addr.unwrap()
         );
 
-        endpoint.conn = Some(udp_conn.try_clone().unwrap());
+        // `try_clone` is a `dup(2)`, which fails on fd exhaustion -- reachable
+        // on a server with many peers, and not a reason to abort.
+        endpoint.conn = Some(udp_conn.try_clone()?);
 
         Ok(udp_conn)
     }
@@ -174,5 +197,86 @@ impl Peer {
 
     pub fn index(&self) -> u32 {
         self.index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::noise::amnezia::AmneziaConfig;
+    use crate::noise::Tunn;
+    use crate::x25519;
+    use rand_core::OsRng;
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    fn test_peer() -> Peer {
+        let secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let peer_public = x25519::PublicKey::from(&x25519::StaticSecret::random_from_rng(OsRng));
+        let tunnel = Tunn::new_with_obfuscation(
+            secret,
+            peer_public,
+            None,
+            None,
+            1,
+            None,
+            Default::default(),
+            AmneziaConfig::default(),
+        )
+        .unwrap();
+        Peer::new(tunnel, 1, None, None)
+    }
+
+    /// An *unconnected* UDP socket, which is what makes this deterministic:
+    /// `shutdown(2)` on one returns ENOTCONN on every unix. That is the same
+    /// errno the kernel gives for a connected socket whose association it has
+    /// already torn down after an ICMP error -- the real-world trigger.
+    fn unconnected_socket() -> Socket {
+        Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap()
+    }
+
+    #[test]
+    fn a_roam_survives_a_failing_endpoint_shutdown() {
+        // `set_endpoint` fires whenever an authenticated peer changes source
+        // address, so the trigger is a remote datagram on the ingress path.
+        // This used to `unwrap` the shutdown and abort the whole daemon.
+        let peer = test_peer();
+        peer.endpoint_mut().conn = Some(unconnected_socket());
+        peer.endpoint_mut().addr = Some("192.0.2.1:51820".parse().unwrap());
+
+        assert!(
+            unconnected_socket().shutdown(Shutdown::Both).is_err(),
+            "precondition: shutdown on an unconnected UDP socket must fail, \
+             otherwise this test proves nothing"
+        );
+
+        peer.set_endpoint("192.0.2.2:51820".parse().unwrap());
+
+        assert_eq!(
+            peer.endpoint().addr,
+            Some("192.0.2.2:51820".parse().unwrap()),
+            "the roam must still be applied"
+        );
+        assert!(
+            peer.endpoint().conn.is_none(),
+            "the stale connected socket must be dropped either way"
+        );
+    }
+
+    #[test]
+    fn shutdown_endpoint_survives_a_failing_shutdown() {
+        // Same call, reached from the 250 ms timer tick for every peer.
+        let peer = test_peer();
+        peer.endpoint_mut().conn = Some(unconnected_socket());
+
+        peer.shutdown_endpoint();
+
+        assert!(peer.endpoint().conn.is_none());
+    }
+
+    #[test]
+    fn connecting_without_an_endpoint_address_is_an_error_not_a_panic() {
+        let peer = test_peer();
+        assert!(peer.endpoint().addr.is_none());
+        assert!(peer.connect_endpoint(51820, None).is_err());
     }
 }
