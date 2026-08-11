@@ -276,6 +276,30 @@ mod tests {
         assert_eq!(wire, original);
     }
 
+    /// A datagram shorter than the nonce must be refused, not sliced.
+    ///
+    /// Separate from the offset guard below: this one is about the *datagram*,
+    /// and it is the guard a remote peer reaches. `type_mask` runs on every
+    /// inbound datagram at the device ingress before anything has validated its
+    /// length, so weakening this check turns a 6-byte packet from anywhere on
+    /// the internet into a slice panic inside a UDP worker.
+    #[test]
+    fn a_datagram_too_short_to_nonce_is_refused_not_sliced() {
+        let k = key();
+        for len in [0usize, 1, 4, NONCE_SIZE - 1] {
+            let datagram = vec![0u8; len];
+            assert_eq!(
+                k.type_mask(&datagram),
+                None,
+                "a {}-byte datagram cannot supply a {}-byte nonce",
+                len,
+                NONCE_SIZE
+            );
+        }
+        // Exactly the nonce length is enough, and is the boundary.
+        assert!(k.type_mask(&vec![0u8; NONCE_SIZE]).is_some());
+    }
+
     /// A prefix shorter than the nonce cannot produce one. Config validation
     /// should stop this, so the check here is the backstop -- and it must
     /// refuse rather than silently mask with a truncated nonce.

@@ -788,8 +788,14 @@ impl AmneziaConfig {
     fn masked_len(kind: PacketKind, message_len: usize) -> usize {
         /// Type, receiver index and counter -- the same 16 bytes as
         /// `session::DATA_OFFSET`, spelled again here because that one is
-        /// private to the session module. Pinned by
-        /// `the_masked_transport_length_is_the_transport_header`.
+        /// private to the session module.
+        ///
+        /// NOT pinned by a unit test, and it cannot be: every in-crate test
+        /// round-trips this value against itself, so any wrong constant stays
+        /// self-consistent and the suite stays green while the wire format
+        /// diverges from amneziawg-go. The external oracle is
+        /// `scripts/hp-interop.py`, which runs our masking against a real
+        /// amneziawg-go v3 peer -- that is what catches a change here.
         const TRANSPORT_HEADER_SZ: usize = 16;
         match kind {
             PacketKind::TransportData => TRANSPORT_HEADER_SZ,
@@ -821,15 +827,17 @@ impl AmneziaConfig {
         let message_len = packet.len() - junk;
         let masked = Self::masked_len(kind, message_len);
 
-        // The type field first, with the mask already computed for it, then the
-        // body from keystream offset 4. Doing the type field here rather than
-        // inside `unmask_inbound` keeps the classification and the unmasking
-        // reading from one derivation of the mask.
-        for i in 0..TYPE_MASK_SIZE {
-            packet[junk + i] ^= mask[i];
-        }
+        // Body first, then the type field. The order matters only on the
+        // failure path: unmasking the type field is an in-place XOR that cannot
+        // report failure, so doing it first would leave the caller holding a
+        // datagram with four corrupted bytes when `unmask_inbound` then refuses
+        // -- and the caller's contract is that a rejected datagram is unchanged,
+        // because it goes on to probe classification.
         if !self.header_protection.unmask_inbound(packet, junk, masked) {
             return None;
+        }
+        for i in 0..TYPE_MASK_SIZE {
+            packet[junk + i] ^= mask[i];
         }
         Some(junk)
     }

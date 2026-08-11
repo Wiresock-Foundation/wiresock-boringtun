@@ -49,7 +49,7 @@ use allowed_ips::AllowedIps;
 use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
-use probe_reply::ProbeResponder;
+use probe_reply::{HeaderProtectionVerdict, ProbeResponder};
 use rand_chacha::ChaCha8Rng;
 use rand_core::{OsRng, RngCore, SeedableRng};
 use socket2::{Domain, Protocol, Type};
@@ -1133,26 +1133,31 @@ impl Device {
                     // message type, and this is the outermost point that owns a
                     // mutable buffer -- the connected-socket path below reaches
                     // `Tunn::decapsulate`, which does its own, but this one
-                    // classifies and finds the peer before any `Tunn` is
-                    // involved.
+                    // classifies and finds the peer before any `Tunn` exists.
                     //
-                    // The result is deliberately ignored. Unmasking only mutates
-                    // after a successful classification, so a datagram that is
-                    // not ours is left exactly as it arrived and still reaches
-                    // probe detection below -- which is the whole reason this is
-                    // not an early `continue`.
-                    if d.config.amnezia.header_protection_enabled() {
-                        let _ = d
-                            .config
-                            .amnezia
-                            .unmask_and_classify_inbound(obf, &mut t.src_buf[..packet_len]);
-                    }
+                    // Its verdict is then AUTHORITATIVE, and that is the whole
+                    // point: `classify`'s own `strip_inbound` range-tests the
+                    // tag with an all-zero mask, so letting it have a second
+                    // opinion would both reject our own peers (whose tags are
+                    // masked) and accept datagrams that were never masked at
+                    // all -- header protection would be enforced on send and
+                    // nowhere on receive. An earlier version of this discarded
+                    // the verdict and did exactly that.
+                    let verdict = if d.config.amnezia.header_protection_enabled() {
+                        HeaderProtectionVerdict::Masked(
+                            d.config
+                                .amnezia
+                                .unmask_and_classify_inbound(obf, &mut t.src_buf[..packet_len]),
+                        )
+                    } else {
+                        HeaderProtectionVerdict::NotConfigured
+                    };
 
                     // AmneziaWG framing first, probe detection only if that
                     // fails. The order lives inside `classify` rather than here
                     // so it can be tested; see its doc for why getting it
                     // backwards makes the server answer its own clients.
-                    let packet = match probe_reply::classify(
+                    let packet = match verdict.classify(
                         &t.src_buf[..packet_len],
                         &d.config.amnezia,
                         obf,

@@ -150,8 +150,76 @@ pub(crate) fn classify<'a>(
     responder: Option<&ProbeResponder>,
     rng: &mut impl RngCore,
 ) -> Ingress<'a> {
-    if let Some(packet) = amnezia.strip_inbound(obf, datagram) {
-        return Ingress::Wireguard(packet);
+    classify_with_verdict(
+        datagram,
+        amnezia
+            .strip_inbound(obf, datagram)
+            .map(|p| datagram.len() - p.len()),
+        amnezia,
+        from,
+        responder,
+        rng,
+    )
+}
+
+/// Which classifier is authoritative for one inbound datagram.
+///
+/// A two-state enum rather than an `Option<Option<usize>>` because the outer
+/// and inner `None`s mean opposite things -- "no key configured, ask
+/// `strip_inbound`" versus "a key is configured and this datagram is not ours".
+/// Conflating them is exactly the bug this type was introduced to prevent.
+pub(crate) enum HeaderProtectionVerdict {
+    /// No key set: the ordinary path, byte-identical to before.
+    NotConfigured,
+    /// A key is set and the unmasking classifier has already ruled.
+    Masked(Option<usize>),
+}
+
+impl HeaderProtectionVerdict {
+    pub(crate) fn classify<'a>(
+        &self,
+        datagram: &'a [u8],
+        amnezia: &AmneziaConfig,
+        obf: ObfuscationRanges,
+        from: SocketAddr,
+        responder: Option<&ProbeResponder>,
+        rng: &mut impl RngCore,
+    ) -> Ingress<'a> {
+        match self {
+            Self::NotConfigured => classify(datagram, amnezia, obf, from, responder, rng),
+            Self::Masked(verdict) => {
+                classify_with_verdict(datagram, *verdict, amnezia, from, responder, rng)
+            }
+        }
+    }
+}
+
+/// [`classify`], but with the AmneziaWG verdict already decided by the caller.
+///
+/// Exists for header protection. When a key is set, the message type is masked,
+/// so [`AmneziaConfig::strip_inbound`] -- which range-tests the tag with an
+/// all-zero mask -- would reject our own peers' datagrams and *accept* datagrams
+/// that were never masked at all. The unmasking classifier is then the only
+/// authority, and this entry point is how its verdict is carried in without
+/// giving `strip_inbound` a second opinion.
+///
+/// `verdict` is `Some(junk_offset)` when the datagram is ours, `None` when it is
+/// not and probe detection should have it.
+///
+/// Kept here rather than exposing a probe-only helper: the module doc's rule is
+/// that AmneziaWG classification happens before probe classification, and that
+/// rule is enforced by [`reply_to`] having exactly one caller. This preserves
+/// that -- it moves *where* the verdict comes from, not the order.
+pub(crate) fn classify_with_verdict<'a>(
+    datagram: &'a [u8],
+    verdict: Option<usize>,
+    amnezia: &AmneziaConfig,
+    from: SocketAddr,
+    responder: Option<&ProbeResponder>,
+    rng: &mut impl RngCore,
+) -> Ingress<'a> {
+    if let Some(junk) = verdict {
+        return Ingress::Wireguard(&datagram[junk..]);
     }
     match responder.and_then(|r| reply_to(datagram, from, amnezia.imitation.protocol, r, rng)) {
         Some(reply) => Ingress::Reply(reply),
@@ -235,8 +303,56 @@ fn reply_to(
 mod tests {
     use super::*;
     use crate::noise::amnezia::conforming_initiation;
+    use crate::noise::amnezia::AmneziaConfig;
     use crate::noise::quic::version_negotiation::{MAX_LEN as VN_MAX_LEN, MIN_INITIAL_DATAGRAM};
     use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
+
+    /// An UNMASKED AmneziaWG datagram must not reach the tunnel path on a device
+    /// that has a header-protection key set.
+    ///
+    /// This is the hole [`HeaderProtectionVerdict`] exists to close. The first
+    /// version of the ingress ran the unmasking classifier, threw its verdict
+    /// away, and then called [`classify`] -- whose `strip_inbound` range-tests
+    /// the tag with an all-zero mask and therefore *accepts* a datagram nobody
+    /// masked. Header protection was enforced on send and nowhere on receive,
+    /// and a prober holding only the server's public key and the S/H values
+    /// could still get a cookie reply out of it.
+    ///
+    /// The precondition assert is the load-bearing part: it states that the
+    /// zero-mask classifier does accept this datagram, so the test cannot pass
+    /// by accident on input that was never dangerous.
+    #[test]
+    fn an_unmasked_datagram_is_not_accepted_when_a_key_is_set() {
+        let obf = ObfuscationRanges::default();
+        let cfg = AmneziaConfig::new(120, 130, 110, 80).with_header_protection([0x5a; 32]);
+        let from: SocketAddr = "192.0.2.9:1234".parse().unwrap();
+
+        // A well-formed but UNMASKED initiation: S1 junk, then a raw H1 tag.
+        let mut wire = vec![0xab; 120 + crate::noise::packet_sizes::HANDSHAKE_INIT_SZ];
+        wire[120..124].copy_from_slice(&1u32.to_le_bytes());
+
+        assert!(
+            cfg.strip_inbound(obf, &wire).is_some(),
+            "precondition: the zero-mask classifier must accept this, or the test proves nothing"
+        );
+
+        let mut buf = wire.clone();
+        let verdict =
+            HeaderProtectionVerdict::Masked(cfg.unmask_and_classify_inbound(obf, &mut buf));
+        match verdict.classify(
+            &buf,
+            &cfg,
+            obf,
+            from,
+            None,
+            &mut ChaCha8Rng::seed_from_u64(1),
+        ) {
+            Ingress::Wireguard(_) => {
+                panic!("an unmasked datagram reached the tunnel path with a key set")
+            }
+            Ingress::Reply(_) | Ingress::Drop => {}
+        }
+    }
 
     /// Large enough that no test hits the ceiling by accident; the tests that
     /// mean to exercise it build their own.

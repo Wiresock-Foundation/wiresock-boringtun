@@ -1929,24 +1929,65 @@ mod tests {
         }
     }
 
-    /// A peer with the wrong key must fail, not silently succeed. Without this
-    /// the test above could pass with the masking a no-op at both ends.
+    /// The non-vacuity control for the round-trip test above: it proves the
+    /// bytes on the wire are actually masked.
+    ///
+    /// Asserted at the classifier seam rather than through a handshake. The
+    /// first version of this test built its two tunnels from two independent
+    /// keypair generations and asserted only `TunnResult::Err(_)`, so mac1
+    /// failed on the receiver whatever the masking did -- it passed with
+    /// `masked_len` forced to 0, i.e. with masking a complete no-op, which is
+    /// the one thing it existed to rule out.
     #[test]
     fn a_mismatched_header_protection_key_does_not_interoperate() {
-        let mut protected = create_two_tuns_with_amnezia(
-            AmneziaConfig::new(120, 130, 110, 80).with_header_protection([0x5a; 32]),
-        );
-        let mut unprotected = create_two_tuns_with_amnezia(AmneziaConfig::new(120, 130, 110, 80));
+        let protected = AmneziaConfig::new(120, 130, 110, 80).with_header_protection([0x5a; 32]);
+        let unprotected = AmneziaConfig::new(120, 130, 110, 80);
+        let wrong_key = AmneziaConfig::new(120, 130, 110, 80).with_header_protection([0xa5; 32]);
 
-        let init = create_handshake_init(&mut protected.0);
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(protected.clone());
         let mut dst = vec![0u8; 2048];
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        let obf = my_tun.handshake.obf;
+
+        // A receiver with no key range-tests the tag raw. If it matches, the
+        // initiation went out unmasked and the feature did nothing.
         assert!(
-            matches!(
-                unprotected.1.decapsulate(None, &init, &mut dst),
-                TunnResult::Err(_)
-            ),
-            "a responder without the key must reject a protected initiation"
+            unprotected.strip_inbound(obf, &init).is_none(),
+            "an unprotected receiver classified a protected initiation, so nothing was masked"
         );
+
+        // The wrong key derives the wrong keystream, so the tag still misses.
+        let mut buf = init.clone();
+        assert!(
+            wrong_key
+                .unmask_and_classify_inbound(obf, &mut buf)
+                .is_none(),
+            "the wrong key must not unmask"
+        );
+
+        // ... and the matching key recovers it, at the S1 offset.
+        let mut buf = init.clone();
+        assert_eq!(
+            protected.unmask_and_classify_inbound(obf, &mut buf),
+            Some(120),
+            "the matching key must unmask and report the S1 junk offset"
+        );
+    }
+
+    /// A datagram the header-protection classifier rejects must be handed back
+    /// byte-for-byte unchanged, because the caller passes it on to probe
+    /// detection. The type-field XOR happens in place, so doing it before the
+    /// body unmask can fail would corrupt four bytes of someone else's traffic.
+    #[test]
+    fn a_rejected_datagram_is_not_modified() {
+        let cfg = AmneziaConfig::new(120, 130, 110, 80).with_header_protection([0x5a; 32]);
+        let obf = ObfuscationRanges::default();
+
+        // Not ours: right length for nothing, tag matches no range once unmasked.
+        let original: Vec<u8> = (0..200u32).map(|i| (i * 7 + 1) as u8).collect();
+        let mut buf = original.clone();
+        assert_eq!(cfg.unmask_and_classify_inbound(obf, &mut buf), None);
+        assert_eq!(buf, original, "a rejected datagram must be left untouched");
     }
 
     /// Header protection needs 12 bytes of prefix for its nonce, so a
@@ -1992,17 +2033,35 @@ mod tests {
         let ok = AmneziaConfig::new(12, 12, 12, 12).with_header_protection([1u8; 32]);
         assert!(ok.validate().is_ok(), "12 bytes is exactly enough");
 
-        // S3 stays small so the cookie-reply amplification rule -- which is a
-        // different check with a different reason -- cannot be what fails here.
-        let too_small = AmneziaConfig::new(11, 130, 11, 80).with_header_protection([1u8; 32]);
-        let err = too_small
-            .validate()
-            .expect_err("11 bytes cannot nonce a datagram");
-        assert!(
-            err.contains("S1") && err.contains("header protection"),
-            "the error must name the offending size and the reason: {}",
-            err
-        );
+        // Every position, not just S1: the name says "every S", and pinning one
+        // of them let a narrowing to S1-only pass. An S4 under the nonce length
+        // is the nastiest of the four -- the handshake completes and then every
+        // transport packet fails to send, so the tunnel is "up" and carries
+        // nothing.
+        //
+        // S3 stays small in each case so the cookie-reply amplification rule --
+        // a different check with a different reason -- cannot be what fails.
+        // Exactly one size is under the nonce length in each case, and it is the
+        // first one `validate` reaches -- otherwise the error would name an
+        // earlier position and the assertion would pass for the wrong reason.
+        for (label, sizes) in [
+            ("S1", (11u16, 130u16, 12u16, 80u16)),
+            ("S2", (120, 11, 12, 80)),
+            ("S3", (120, 130, 11, 80)),
+            ("S4", (120, 130, 12, 11)),
+        ] {
+            let too_small = AmneziaConfig::new(sizes.0, sizes.1, sizes.2, sizes.3)
+                .with_header_protection([1u8; 32]);
+            let err = too_small
+                .validate()
+                .expect_err("11 bytes cannot nonce a datagram");
+            assert!(
+                err.contains(label) && err.contains("header protection"),
+                "the error must name {} and the reason: {}",
+                label,
+                err
+            );
+        }
 
         // ... and without a key the same sizes are fine, since nothing needs a
         // nonce. This is what keeps the rule scoped to header protection.
