@@ -14,7 +14,10 @@ pub mod rate_limiter;
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
 pub(crate) mod quic;
 mod session;
-mod timers;
+// `pub(crate)` so `device::api` can compare an AmneziaWG 3.0 tunable-timer value
+// against the constant this build actually uses, and warn on a mismatch rather
+// than ignore it silently.
+pub(crate) mod timers;
 
 use amnezia::AmneziaConfig;
 use handshake::ObfuscationRanges;
@@ -883,6 +886,18 @@ impl Tunn {
     fn validate_decapsulated_packet<'a>(&mut self, packet: &'a mut [u8]) -> TunnResult<'a> {
         let (computed_len, src_ip_address) = match packet.len() {
             0 => return TunnResult::Done, // This is keepalive, and not an error
+            // A keepalive whose plaintext was padded is not zero-length, it is a
+            // run of zero bytes. AmneziaWG's `content_padding_addition` produces
+            // exactly that, and amneziawg-go accepts it with the same test
+            // (device/receive.go:513, `len(elem.packet) == 0 || elem.packet[0] == 0`).
+            //
+            // Without this arm the padded keepalive falls through to the
+            // catch-all below and is rejected as InvalidPacket, so peer liveness
+            // silently degrades while data traffic still flows -- a tunnel that
+            // looks healthy and then dies. No valid IP packet begins with a zero
+            // byte (the version nibble would have to be 0), so this cannot
+            // swallow real traffic.
+            _ if packet[0] == 0 => return TunnResult::Done,
             _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
                 let len_bytes: [u8; IP_LEN_SZ] = packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ]
                     .try_into()
@@ -1566,6 +1581,42 @@ mod tests {
             // single-argument `panic!` is not a format string and would print
             // the braces verbatim.
             other => panic!("expected the retry to be accepted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_padded_keepalive_is_a_keepalive_not_an_invalid_packet() {
+        // AmneziaWG's `content_padding_addition` pads the plaintext with zeros,
+        // so a keepalive from such a peer arrives as a run of zero bytes rather
+        // than as a zero-length payload. amneziawg-go accepts it
+        // (device/receive.go:513); we used to reject it as InvalidPacket, which
+        // degrades peer liveness while data traffic still flows -- the failure
+        // presents as a tunnel that looks healthy and then dies.
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut dst = vec![0u8; 2048];
+
+        for pad in [1usize, 16, 100] {
+            let padded_keepalive = vec![0u8; pad];
+            let sent = unwrap_network_packet(my_tun.encapsulate(&padded_keepalive, &mut dst));
+
+            let mut their_dst = vec![0u8; 2048];
+            match their_tun.decapsulate(None, &sent, &mut their_dst) {
+                TunnResult::Done => {}
+                other => panic!(
+                    "a {pad}-byte padded keepalive must be Done, got {:?}",
+                    other
+                ),
+            }
+        }
+
+        // The unpadded form still works, and real traffic is unaffected -- the
+        // new arm must not have swallowed anything that decodes as IP.
+        let packet = create_ipv4_udp_packet();
+        let sent = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        let mut their_dst = vec![0u8; 2048];
+        match their_tun.decapsulate(None, &sent, &mut their_dst) {
+            TunnResult::WriteToTunnelV4(recv, _) => assert_eq!(&packet[..], recv),
+            other => panic!("a real IPv4 packet must still arrive, got {:?}", other),
         }
     }
 
