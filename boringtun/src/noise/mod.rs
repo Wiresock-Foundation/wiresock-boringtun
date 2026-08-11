@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
+// Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
 pub mod amnezia;
@@ -14,9 +14,9 @@ pub mod rate_limiter;
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
 pub(crate) mod quic;
 mod session;
-// `pub(crate)` so `device::api` can compare an AmneziaWG 3.0 tunable-timer value
-// against the constant this build actually uses, and warn on a mismatch rather
-// than ignore it silently.
+// Widened ahead of the AmneziaWG 3.0 tunable-timer comparison in `device::api`;
+// no consumer outside `noise` on this branch yet. Present tense would be a claim
+// this tree does not support -- this PR is mergeable to master on its own.
 pub(crate) mod timers;
 
 use amnezia::AmneziaConfig;
@@ -1641,6 +1641,25 @@ mod tests {
                 ),
             }
         }
+
+        // The actual new semantic: acceptance keys on the FIRST BYTE, not on the
+        // plaintext being all zeros. amneziawg-go does the same
+        // (`len(packet) == 0 || packet[0] == 0`), and matching it is the point --
+        // narrowing this to `iter().all(|b| b == 0)` would reject a padded
+        // keepalive from any implementation whose padding is not zero-filled,
+        // restoring the roaming-endpoint bug this PR exists to fix. Nothing
+        // pinned that until now: the narrowing left the whole suite green.
+        let mut zero_prefixed = vec![0u8; 1];
+        zero_prefixed.extend_from_slice(&[0x45, 0x00, 0x14]);
+        let sent = unwrap_network_packet(my_tun.encapsulate(&zero_prefixed, &mut dst));
+        assert!(
+            matches!(
+                their_tun.decapsulate(None, &sent, &mut their_dst),
+                TunnResult::Done
+            ),
+            "a plaintext whose first byte is zero must be a keepalive even when \
+             later bytes are not"
+        );
 
         // The shape padding actually produces for *data*: a real packet with the
         // zeros appended. The IPv4 total-length field, not the plaintext length,
