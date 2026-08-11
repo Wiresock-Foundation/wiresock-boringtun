@@ -261,6 +261,14 @@ impl<H: Sync + Send> EventPoll<H> {
         self.insert_at(trigger as _, ev);
         // Add the event to epoll
         if unsafe { epoll_ctl(self.epoll, EPOLL_CTL_ADD, trigger, &mut event_desc) } == -1 {
+            // Undo the insert above. The vector is keyed by file descriptor, so
+            // leaving a handler for an fd epoll never accepted keeps whatever it
+            // captured alive -- an `Arc<Peer>`, for the connected-socket handler
+            // -- and parks a stale entry at an index the kernel will hand out
+            // again as soon as that fd is closed and reused. `insert_at` would
+            // then drop it as a "previous event", so the damage is bounded, but
+            // only by luck and only later.
+            self.events.lock()[trigger as usize].take();
             return Err(Error::EventQueue(io::Error::last_os_error()));
         }
 

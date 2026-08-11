@@ -1172,19 +1172,30 @@ impl Device {
                         if let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark) {
                             // Not `unwrap`: this is `epoll_ctl(EPOLL_CTL_ADD)`,
                             // which fails with ENOSPC once the process hits
-                            // `max_user_watches` -- a reachable state on a
-                            // server with many peers, and one an unauthenticated
-                            // flood of new source addresses can drive. The
-                            // connected socket is an optimisation, so falling
-                            // back to the anonymous path costs throughput, not
-                            // correctness. Note the sibling `Result` one line
+                            // `max_user_watches` -- reachable on a server with
+                            // many peers, and drivable by an *authenticated*
+                            // peer roaming rapidly, since every new source
+                            // address arrives here. Not by an unauthenticated
+                            // flood: this runs only after `verify_packet`, peer
+                            // lookup and `handle_verified_packet` have all
+                            // succeeded. Note the sibling `Result` one line
                             // above is already handled this way.
                             if let Err(e) = d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
                             {
                                 tracing::warn!(
-                                    message = "Failed to register connected socket for peer",
+                                    message = "Failed to register connected socket for peer; \
+                                               reverting to the shared socket",
                                     error = ?e
                                 );
+                                // Roll the connection back, or this is a
+                                // blackhole rather than a fallback:
+                                // `connect_endpoint` has already stored a clone
+                                // in `endpoint.conn`, so the send path would go
+                                // on using a socket that now has no receive
+                                // handler registered. Dropping it puts both
+                                // directions back on the shared socket, which is
+                                // what "falling back" has to mean.
+                                p.shutdown_endpoint();
                             }
                         }
                     }

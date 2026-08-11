@@ -18,11 +18,17 @@ pub struct Endpoint {
 
 /// Report a failed endpoint shutdown without taking the process with it.
 ///
-/// Both callers are dropping the socket regardless, so there is nothing to
-/// recover; the only question is whether the failure is visible. It is logged
-/// at debug rather than warn because ENOTCONN here is ordinary -- the kernel
-/// drops the association on an ICMP error, and the next datagram from that
-/// peer re-establishes it.
+/// Both callers are dropping the socket regardless, so there is nothing here to
+/// recover: the only question is whether the failure is visible. Unwrapping a
+/// syscall whose result is going to be discarded converts any unexpected errno
+/// into a process abort, and these run on the 250 ms timer tick for every peer
+/// and again on every roam -- the two highest-frequency paths in the daemon.
+///
+/// Deliberately not claiming a specific trigger. An earlier version of this
+/// comment blamed ICMP, which was wrong: an ICMP error sets `sk_err` on a
+/// connected UDP socket and is reported to the next send or receive, it does
+/// not tear the association down, so it cannot make a later `shutdown` return
+/// ENOTCONN. Logged at debug because a failure here is not actionable.
 fn log_shutdown_error(result: std::io::Result<()>) {
     if let Err(e) = result {
         tracing::debug!(message = "Endpoint shutdown failed", error = ?e);
@@ -96,11 +102,10 @@ impl Peer {
     pub fn shutdown_endpoint(&self) {
         if let Some(conn) = self.endpoint.write().conn.take() {
             tracing::info!("Disconnecting from endpoint");
-            // Best-effort: the socket is being dropped either way. `shutdown(2)`
-            // on a connected UDP socket returns ENOTCONN once the kernel has
-            // torn the association down -- after an ICMP error, for instance --
-            // and this runs from the 250 ms timer tick for every peer, so an
-            // unwrap here is a remote-triggerable way to abort the daemon.
+            // Best-effort: the socket is being dropped either way, so the result
+            // is discarded. This runs from the 250 ms timer tick for every peer,
+            // and unwrapping a discarded result turns any unexpected errno into
+            // a process abort. See `log_shutdown_error`.
             log_shutdown_error(conn.shutdown(Shutdown::Both));
         }
     }
@@ -227,9 +232,12 @@ mod tests {
     }
 
     /// An *unconnected* UDP socket, which is what makes this deterministic:
-    /// `shutdown(2)` on one returns ENOTCONN on every unix. That is the same
-    /// errno the kernel gives for a connected socket whose association it has
-    /// already torn down after an ICMP error -- the real-world trigger.
+    /// `shutdown(2)` on one returns ENOTCONN on every unix.
+    ///
+    /// This is a stand-in for "shutdown failed", not a claim that production
+    /// reaches ENOTCONN by this route -- the production socket is connected. The
+    /// property under test is that a failed shutdown does not abort the process,
+    /// and any errno demonstrates it.
     fn unconnected_socket() -> Socket {
         Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap()
     }
