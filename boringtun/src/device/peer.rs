@@ -18,11 +18,20 @@ pub struct Endpoint {
 
 /// Report a failed endpoint shutdown without taking the process with it.
 ///
-/// Both callers are dropping the socket regardless, so there is nothing here to
-/// recover: the only question is whether the failure is visible. Unwrapping a
-/// syscall whose result is going to be discarded converts any unexpected errno
-/// into a process abort, and these run on the 250 ms timer tick for every peer
-/// and again on every roam -- the two highest-frequency paths in the daemon.
+/// `endpoint.conn` is a `dup(2)`, so closing it does NOT close the descriptor
+/// the registered connected-socket handler owns. The `shutdown` is what raises
+/// EPOLLHUP on that descriptor, which is how the event loop reaches
+/// `handler.cancel()` and frees the handler, its socket and its `Arc<Peer>` --
+/// see the `p.shutdown_endpoint(); // close open udp socket and free the
+/// closure` call in `device::mod`. So a failure here is not free; it retains a
+/// handler.
+///
+/// There is still no cheaper recovery available at this point, and no errno has
+/// been identified that makes `shutdown` fail on a genuinely connected UDP
+/// socket, so the result is discarded rather than propagated. What must not
+/// happen is an abort: unwrapping a discarded result converts any unexpected
+/// errno into a dead daemon, and these run on the 250 ms timer tick for every
+/// peer and again on every roam -- the two highest-frequency paths here.
 ///
 /// Deliberately not claiming a specific trigger. An earlier version of this
 /// comment blamed ICMP, which was wrong: an ICMP error sets `sk_err` on a

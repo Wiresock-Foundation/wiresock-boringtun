@@ -930,6 +930,14 @@ impl Device {
         // the whole signal: the operator needs to know traffic arrived before
         // the key, not how much of it did.
         let warned_keyless = AtomicBool::new(false);
+        // Also at most once, and for the same reason as `warned_keyless`. Once
+        // the process is out of epoll watches or descriptors it stays out, and
+        // the rollback below clears `endpoint.conn`, so `connect_endpoint` no
+        // longer short-circuits -- every subsequent datagram from that peer
+        // retries the whole socket/bind/connect/dup/epoll_ctl dance and would
+        // log again. The retry itself is upstream behaviour this fork did not
+        // introduce; the unlatched line would be ours.
+        let warned_conn_register = AtomicBool::new(false);
         // Also at most once, and for a sharper reason than volume. Whether a
         // cookie reply amplifies is fixed by S1/S2/S3, so once it is true it is
         // true for every datagram of that kind until the operator changes the
@@ -1182,20 +1190,30 @@ impl Device {
                             // above is already handled this way.
                             if let Err(e) = d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
                             {
-                                tracing::warn!(
-                                    message = "Failed to register connected socket for peer; \
-                                               reverting to the shared socket",
-                                    error = ?e
-                                );
+                                if !warned_conn_register.swap(true, Ordering::Relaxed) {
+                                    tracing::warn!(
+                                        message = "Failed to register connected socket for peer; \
+                                                   reverting to the shared socket",
+                                        error = ?e
+                                    );
+                                }
                                 // Roll the connection back, or this is a
                                 // blackhole rather than a fallback:
                                 // `connect_endpoint` has already stored a clone
                                 // in `endpoint.conn`, so the send path would go
                                 // on using a socket that now has no receive
-                                // handler registered. Dropping it puts both
+                                // handler registered. Clearing it puts both
                                 // directions back on the shared socket, which is
                                 // what "falling back" has to mean.
-                                p.shutdown_endpoint();
+                                //
+                                // Cleared rather than `shutdown_endpoint()`:
+                                // that exists to raise EPOLLHUP so the event
+                                // loop frees a *registered* handler, and on this
+                                // path registration is precisely what failed --
+                                // `register_event` already dropped the handler
+                                // box. All the shutdown would add here is an
+                                // `info!` per datagram from the retry above.
+                                p.endpoint_mut().conn = None;
                             }
                         }
                     }

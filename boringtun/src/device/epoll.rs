@@ -54,6 +54,57 @@ impl<H> Drop for EventPoll<H> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::Arc;
+
+    type H = Box<dyn Fn() + Send + Sync>;
+
+    /// A handler epoll refused must not stay in the events vector.
+    ///
+    /// `register_event` inserts before calling `epoll_ctl`, so a failure used to
+    /// strand the box -- and because the box owns its trigger fd, that fd never
+    /// closes, its number is never re-issued, and nothing ever revisits the
+    /// index. The leak is permanent, not merely delayed.
+    ///
+    /// `epoll_ctl(EPOLL_CTL_ADD)` on a regular file fails with EPERM on every
+    /// Linux, because regular files are always ready, so this needs no sysctl
+    /// tuning and no privileges to reach the failure path.
+    #[test]
+    fn a_handler_epoll_refused_is_not_left_in_the_events_vector() {
+        let poll: EventPoll<H> = EventPoll::new().unwrap();
+        let path = std::env::temp_dir().join(format!("bt-epoll-probe-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+
+        // The Arc is the observable: if the handler is stranded, so is whatever
+        // it captured -- in production that is an `Arc<Peer>`.
+        let canary = Arc::new(());
+        let held = Arc::clone(&canary);
+        let handler: H = Box::new(move || {
+            let _ = &held;
+        });
+
+        assert!(
+            poll.new_event(file.as_raw_fd(), handler).is_err(),
+            "precondition: epoll_ctl on a regular file must fail, or this proves nothing"
+        );
+        assert_eq!(
+            Arc::strong_count(&canary),
+            1,
+            "a handler epoll never accepted is still holding its captured state"
+        );
+        assert_eq!(
+            poll.registered_count(),
+            0,
+            "a handler epoll never accepted is still in the events vector"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 impl<H: Sync + Send> EventPoll<H> {
     /// Create a new event registry
     pub fn new() -> Result<EventPoll<H>, Error> {
@@ -261,18 +312,29 @@ impl<H: Sync + Send> EventPoll<H> {
         self.insert_at(trigger as _, ev);
         // Add the event to epoll
         if unsafe { epoll_ctl(self.epoll, EPOLL_CTL_ADD, trigger, &mut event_desc) } == -1 {
-            // Undo the insert above. The vector is keyed by file descriptor, so
-            // leaving a handler for an fd epoll never accepted keeps whatever it
-            // captured alive -- an `Arc<Peer>`, for the connected-socket handler
-            // -- and parks a stale entry at an index the kernel will hand out
-            // again as soon as that fd is closed and reused. `insert_at` would
-            // then drop it as a "previous event", so the damage is bounded, but
-            // only by luck and only later.
+            // Undo the insert above, or the handler is stranded permanently.
+            //
+            // The vector is keyed by file descriptor, and for every handler that
+            // OWNS its trigger -- the connected socket, the listen socket, the
+            // API socket -- the stranded box is that descriptor's only owner. So
+            // the fd never closes, the kernel never re-issues the number,
+            // `register_event` is never called with it again, and `insert_at`
+            // never revisits the index to reclaim it. Whatever the handler
+            // captured stays alive with it, including an `Arc<Peer>`.
+            //
+            // Only a handler that *borrows* its fd (`register_iface_handler`'s
+            // `Arc<TunSocket>`) could ever be cleaned up by a later insert at the
+            // same index, which is why "it self-heals on reuse" is not a defence.
             self.events.lock()[trigger as usize].take();
             return Err(Error::EventQueue(io::Error::last_os_error()));
         }
 
         Ok(EventRef { trigger })
+    }
+
+    #[cfg(test)]
+    fn registered_count(&self) -> usize {
+        self.events.lock().iter().filter(|e| e.is_some()).count()
     }
 
     // Insert an event into the events vector
