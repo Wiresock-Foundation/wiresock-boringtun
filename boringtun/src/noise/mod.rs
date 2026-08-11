@@ -12,6 +12,7 @@ pub(crate) mod imitation;
 pub mod rate_limiter;
 
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
+pub mod header_protection;
 pub(crate) mod quic;
 mod session;
 // Widened ahead of the AmneziaWG 3.0 tunable-timer comparison in `device::api`;
@@ -559,12 +560,39 @@ impl Tunn {
             return self.send_queued_packet(dst);
         }
 
-        // A datagram that matches no configured shape is rejected here rather
-        // than re-parsed at offset 0. With a junk prefix configured this is the
-        // S-prefix doing its job as an input filter.
-        let datagram = match self.amnezia.strip_inbound(self.handshake.obf, datagram) {
-            Some(d) => d,
-            None => return TunnResult::Err(WireGuardError::InvalidPacket),
+        // Header protection has to be undone before anything reads the message
+        // type, and undoing it mutates. The public signature takes `&[u8]`, and
+        // widening it would push a `&mut` requirement through `device`, the C
+        // API and the JNI bindings -- and make `wireguard_read` scribble on a
+        // buffer its header describes as the received packet. So the protected
+        // path copies instead.
+        //
+        // The copy is one allocation per inbound datagram, and only when a key
+        // is set; the unprotected path below is untouched. A buffer owned by
+        // `Tunn` would avoid it, but it cannot be borrowed across the `&mut
+        // self` calls further down, so that wants `mem::take` and a restore on
+        // every early return -- worth doing, not worth doing first.
+        let unmasked;
+        let datagram = if self.amnezia.header_protection_enabled() {
+            let mut buf = datagram.to_vec();
+            match self
+                .amnezia
+                .unmask_and_classify_inbound(self.handshake.obf, &mut buf)
+            {
+                Some(junk) => {
+                    unmasked = buf;
+                    &unmasked[junk..]
+                }
+                None => return TunnResult::Err(WireGuardError::InvalidPacket),
+            }
+        } else {
+            // A datagram that matches no configured shape is rejected here
+            // rather than re-parsed at offset 0. With a junk prefix configured
+            // this is the S-prefix doing its job as an input filter.
+            match self.amnezia.strip_inbound(self.handshake.obf, datagram) {
+                Some(d) => d,
+                None => return TunnResult::Err(WireGuardError::InvalidPacket),
+            }
         };
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
         let packet = match self.rate_limiter.verify_packet(
@@ -1865,6 +1893,86 @@ mod tests {
             1,
             "the packet must be queued for retry, not dropped"
         );
+    }
+
+    /// Header protection, end to end through the real state machine.
+    ///
+    /// The unit tests in `header_protection` prove the cipher round-trips a
+    /// buffer. This proves the whole path lines up: masked at the right offset
+    /// for the right length on four packet kinds, unmasked before the H1-H4
+    /// range test, and the keystream consumed contiguously across the type
+    /// field and the body. Any of those wrong and the handshake never completes.
+    #[test]
+    fn header_protection_round_trips_a_handshake_and_data() {
+        const KEY: [u8; 32] = [0x5a; 32];
+        // Every S at or above the 12-byte nonce minimum.
+        let amnezia = AmneziaConfig::new(120, 130, 110, 80).with_header_protection(KEY);
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake_with_amnezia(amnezia);
+
+        let packet = create_ipv4_udp_packet();
+        let mut dst = vec![0u8; 2048];
+        let sent = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+
+        // The tag on the wire must NOT be in the H4 range -- if it were, the
+        // masking would not have happened and this test would pass vacuously.
+        let obf = my_tun.handshake.obf;
+        let wire_tag = u32::from_le_bytes(sent[80..84].try_into().unwrap());
+        assert!(
+            !obf.matches_h4(wire_tag),
+            "the transport tag is still range-matchable on the wire, so nothing was masked"
+        );
+
+        let mut their_dst = vec![0u8; 2048];
+        match their_tun.decapsulate(None, &sent, &mut their_dst) {
+            TunnResult::WriteToTunnelV4(recv, _) => assert_eq!(&packet[..], recv),
+            other => panic!("expected the packet to arrive, got {:?}", other),
+        }
+    }
+
+    /// A peer with the wrong key must fail, not silently succeed. Without this
+    /// the test above could pass with the masking a no-op at both ends.
+    #[test]
+    fn a_mismatched_header_protection_key_does_not_interoperate() {
+        let mut protected = create_two_tuns_with_amnezia(
+            AmneziaConfig::new(120, 130, 110, 80).with_header_protection([0x5a; 32]),
+        );
+        let mut unprotected = create_two_tuns_with_amnezia(AmneziaConfig::new(120, 130, 110, 80));
+
+        let init = create_handshake_init(&mut protected.0);
+        let mut dst = vec![0u8; 2048];
+        assert!(
+            matches!(
+                unprotected.1.decapsulate(None, &init, &mut dst),
+                TunnResult::Err(_)
+            ),
+            "a responder without the key must reject a protected initiation"
+        );
+    }
+
+    /// Header protection needs 12 bytes of prefix for its nonce, so a
+    /// configuration that cannot supply one is refused rather than run
+    /// unprotected -- an operator who set a key and got no masking would have
+    /// no way to notice.
+    #[test]
+    fn header_protection_requires_every_s_to_hold_a_nonce() {
+        let ok = AmneziaConfig::new(12, 12, 12, 12).with_header_protection([1u8; 32]);
+        assert!(ok.validate().is_ok(), "12 bytes is exactly enough");
+
+        // S3 stays small so the cookie-reply amplification rule -- which is a
+        // different check with a different reason -- cannot be what fails here.
+        let too_small = AmneziaConfig::new(11, 130, 11, 80).with_header_protection([1u8; 32]);
+        let err = too_small
+            .validate()
+            .expect_err("11 bytes cannot nonce a datagram");
+        assert!(
+            err.contains("S1") && err.contains("header protection"),
+            "the error must name the offending size and the reason: {}",
+            err
+        );
+
+        // ... and without a key the same sizes are fine, since nothing needs a
+        // nonce. This is what keeps the rule scoped to header protection.
+        assert!(AmneziaConfig::new(11, 130, 11, 80).validate().is_ok());
     }
 
     #[test]

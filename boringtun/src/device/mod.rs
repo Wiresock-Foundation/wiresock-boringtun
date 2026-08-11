@@ -1129,6 +1129,25 @@ impl Device {
                         continue;
                     };
 
+                    // Header protection comes off before anything reads the
+                    // message type, and this is the outermost point that owns a
+                    // mutable buffer -- the connected-socket path below reaches
+                    // `Tunn::decapsulate`, which does its own, but this one
+                    // classifies and finds the peer before any `Tunn` is
+                    // involved.
+                    //
+                    // The result is deliberately ignored. Unmasking only mutates
+                    // after a successful classification, so a datagram that is
+                    // not ours is left exactly as it arrived and still reaches
+                    // probe detection below -- which is the whole reason this is
+                    // not an early `continue`.
+                    if d.config.amnezia.header_protection_enabled() {
+                        let _ = d
+                            .config
+                            .amnezia
+                            .unmask_and_classify_inbound(obf, &mut t.src_buf[..packet_len]);
+                    }
+
                     // AmneziaWG framing first, probe detection only if that
                     // fails. The order lives inside `classify` rather than here
                     // so it can be tested; see its doc for why getting it

@@ -44,6 +44,7 @@ updates:
     # traits, and `new_from_slice` stops resolving (measured on #21).
     #
     #   chacha20poly1305 >=0.11.0-a  1.85 / 2024, brings aead 0.6
+    #   chacha20         >=0.10.0-a  1.85 / 2024, same generation
     #   hmac             >=0.13   1.85 / 2024, brings digest 0.11
     #   blake2           >=0.11   unpublished yet; will be this generation
     #   aes              >=0.9    0.9.2 is 1.85 / 2024
@@ -86,6 +87,8 @@ updates:
         versions: [">=5"]
       - dependency-name: "chacha20poly1305"
         versions: [">=0.11.0-a"]
+      - dependency-name: "chacha20"
+        versions: [">=0.10.0-a"]
       - dependency-name: "hmac"
         versions: [">=0.13"]
       - dependency-name: "blake2"
