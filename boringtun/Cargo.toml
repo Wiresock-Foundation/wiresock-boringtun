@@ -50,7 +50,7 @@ x25519-dalek = { version = "2.0.1", features = [
     "static_secrets",
 ] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
-rand_chacha = { version = "0.3", default-features = false }
+rand_chacha = { version = "0.9", default-features = false }
 # `aead` is not a direct dependency: its traits reach us through
 # `chacha20poly1305::aead`, so the two cannot drift into different major
 # versions of the same trait. Pinning it here separately is what made the
