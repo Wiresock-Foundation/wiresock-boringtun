@@ -904,12 +904,20 @@ impl Tunn {
         //
         // No valid IP packet starts with a zero byte -- the version nibble would
         // have to be 0 -- so this cannot swallow real traffic. It can still
-        // swallow a *malformed* plaintext that merely starts with one, which the
-        // catch-all below used to report, so say so rather than drop it silently.
+        // swallow a plaintext that merely starts with one and carries something
+        // else after it, which the catch-all below used to report, so note it
+        // rather than drop it silently.
+        //
+        // The note does not call that plaintext malformed, because nothing here
+        // establishes it is: this arm cannot tell padding from garbage, and a
+        // peer padding with something other than zeros would land in it. It says
+        // what was observed and nothing more. Accepting it either way is what
+        // matches amneziawg-go, whose rule at device/receive.go is the same
+        // first-byte test and which logs every keepalive it takes.
         if matches!(packet.first(), None | Some(&0)) {
             if packet.iter().any(|&b| b != 0) {
                 tracing::debug!(
-                    message = "Discarding a zero-prefixed plaintext that is not all padding",
+                    message = "Discarding a zero-prefixed plaintext with a non-zero tail",
                     len = packet.len()
                 );
             }
