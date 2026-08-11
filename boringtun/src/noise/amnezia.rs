@@ -577,6 +577,26 @@ impl AmneziaConfig {
         self.inbound_junk_size(kind)
     }
 
+    /// The S4 prefix a transport data packet will carry on the wire.
+    ///
+    /// Exists so `Tunn::encapsulate` can size `dst` for the whole frame before
+    /// formatting anything. It reads through [`Self::outbound_junk_size`], the
+    /// same accessor [`Self::prepend_outbound`] uses, so the prediction cannot
+    /// drift from the production by way of two spellings of one lookup -- the
+    /// same reasoning as [`Self::cookie_reply_len_on_wire`].
+    ///
+    /// Assuming the *kind* is safe here in a way it would not be in general:
+    /// `prepend_outbound` derives it from the tag on the wire, and
+    /// `format_packet_data` always writes `obf.random_h4(rng)`. Since
+    /// `ObfuscationRanges::new` rejects overlapping H ranges, that tag can
+    /// never match H1/H2/H3, so a self-emitted transport packet always
+    /// classifies as [`PacketKind::TransportData`] -- including at the lengths
+    /// that collide with `HANDSHAKE_INIT_SZ`, `HANDSHAKE_RESP_SZ` and
+    /// `COOKIE_REPLY_SZ`, where the match arms fall through on their tag guard.
+    pub(crate) fn transport_junk_size(&self) -> usize {
+        self.outbound_junk_size(PacketKind::TransportData)
+    }
+
     fn read_tag(packet: &[u8], offset: usize) -> Option<u32> {
         let tag = packet.get(offset..offset + 4)?;
         Some(u32::from_le_bytes(tag.try_into().ok()?))

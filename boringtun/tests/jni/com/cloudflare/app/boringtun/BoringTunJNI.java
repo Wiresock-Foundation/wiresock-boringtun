@@ -57,6 +57,9 @@ public class BoringTunJNI {
     private static final String KNOWN_B64 =
         "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=";
 
+    /** `DATA_OVERHEAD_SZ` in src/noise/mod.rs: 16 bytes of header plus a 16-byte AEAD tag. */
+    private static final int DATA_OVERHEAD_SZ = 32;
+
     /** `result_type` in src/ffi/mod.rs. */
     private static final byte WIREGUARD_DONE = 0;
     private static final byte WRITE_TO_NETWORK = 1;
@@ -117,8 +120,8 @@ public class BoringTunJNI {
     }
 
     public static void main(String[] args) {
-        if (args.length > 0 && "nullhandle".equals(args[0])) {
-            nullHandleChild();
+        if (args.length > 0 && "fatal-inputs".equals(args[0])) {
+            fatalInputChild();
             return;
         }
 
@@ -308,9 +311,9 @@ public class BoringTunJNI {
         }
         check(roundTripped, "a packet written by A arrives at B byte-for-byte identical");
 
-        System.out.println("== a zero tunnel handle must not kill the JVM ==");
-        check(nullHandleChildSurvives(),
-              "a zero tunnel handle throws instead of aborting the process");
+        System.out.println("== inputs that used to kill the JVM ==");
+        check(fatalInputChildSurvives(),
+              "a zero handle and a too-small dst are errors, not process death");
 
         System.out.println();
         if (failures == 0) {
@@ -336,23 +339,87 @@ public class BoringTunJNI {
      * dies, the parent sees a nonzero exit, and this reports FAIL like anything
      * else.
      */
-    private static void nullHandleChild() {
+    private static void fatalInputChild() {
         ByteBuffer dst = ByteBuffer.allocateDirect(2048);
         ByteBuffer op = ByteBuffer.allocateDirect(1);
         byte[] src = ipv4Packet(64);
 
-        int rejected = 0;
-        if (throwsIAE(() -> wireguard_write(0L, src, src.length, dst, 2048, op))) rejected++;
-        if (throwsIAE(() -> wireguard_read(0L, src, src.length, dst, 2048, op))) rejected++;
-        if (throwsIAE(() -> wireguard_tick(0L, dst, 2048, op))) rejected++;
+        int survived = 0;
+
+        // 1. A zero handle, rejected in jni.rs before the FFI call.
+        if (throwsIAE(() -> wireguard_write(0L, src, src.length, dst, 2048, op))) survived++;
+        if (throwsIAE(() -> wireguard_read(0L, src, src.length, dst, 2048, op))) survived++;
+        if (throwsIAE(() -> wireguard_tick(0L, dst, 2048, op))) survived++;
+
+        // 2. A dst too small for the packet the tunnel wants to write. These
+        //    reach noise::session, which used to panic! -- and a panic inside
+        //    an extern "C" callee aborts instead of unwinding, so these were
+        //    process kills rather than errors. They must come back as
+        //    WIREGUARD_ERROR now.
+        //
+        //    The update_timers keepalive case from the same family is covered
+        //    in noise/mod.rs instead: reaching it needs a persistent keepalive
+        //    to fall due, which is deterministic under mock-instant and a real
+        //    1s sleep here.
+        ByteBuffer netA = ByteBuffer.allocateDirect(2048);
+        ByteBuffer netB = ByteBuffer.allocateDirect(2048);
+        ByteBuffer opA = ByteBuffer.allocateDirect(1);
+        ByteBuffer tiny = ByteBuffer.allocateDirect(64);
+
+        // A handshake response into a dst one byte short of the 32-byte
+        // keepalive the response path emits. A fresh pair, because this leaves
+        // the initiator without a stored session.
+        long[] pair = peerPair(30);
+        int n = wireguard_write(pair[0], src, src.length, netA, netA.capacity(), opA);
+        int n2 = wireguard_read(pair[1], taken(netA, n), n, netB, netB.capacity(), opA);
+        armOp(opA);
+        wireguard_read(pair[0], taken(netB, n2), n2, tiny, DATA_OVERHEAD_SZ - 1, opA);
+        if (opOf(opA) == WIREGUARD_ERROR) survived++;
+
+        // Now a completed handshake, and the two established-session cases.
+        pair = peerPair(32);
+        n = wireguard_write(pair[0], src, src.length, netA, netA.capacity(), opA);
+        n2 = wireguard_read(pair[1], taken(netA, n), n, netB, netB.capacity(), opA);
+        wireguard_read(pair[0], taken(netB, n2), n2, netA, netA.capacity(), opA);
+
+        // Sending at the tunnel MTU: 1420 bytes of payload needs 1452.
+        ByteBuffer mtu = ByteBuffer.allocateDirect(1420);
+        armOp(opA);
+        wireguard_write(pair[0], new byte[1420], 1420, mtu, 1420, opA);
+        if (opOf(opA) == WIREGUARD_ERROR) survived++;
+
+        // Receiving into a dst sized for the plaintext rather than the frame.
+        armOp(opA);
+        int m = wireguard_write(pair[0], src, src.length, netA, netA.capacity(), opA);
+        if (opOf(opA) == WRITE_TO_NETWORK && m > 0) {
+            armOp(opA);
+            wireguard_read(pair[1], taken(netA, m), m, tiny, src.length, opA);
+            if (opOf(opA) == WIREGUARD_ERROR) survived++;
+        }
 
         // Reaching this line at all is most of the point.
-        if (rejected == 3) {
-            System.out.println("NULL_HANDLE_REJECTED");
+        if (survived == 6) {
+            System.out.println("FATAL_INPUTS_SURVIVED");
+        } else {
+            System.out.println("only " + survived + " of 6 survived");
         }
     }
 
-    private static boolean nullHandleChildSurvives() {
+    /** A pair of tunnels configured as each other's peer, as raw handles. */
+    private static long[] peerPair(int baseIndex) {
+        byte[] sa = x25519_secret_key();
+        byte[] sb = x25519_secret_key();
+        return new long[] {
+            new_tunnel(x25519_key_to_base64(sa),
+                       x25519_key_to_base64(x25519_public_key(sb)),
+                       null, (short) 0, baseIndex),
+            new_tunnel(x25519_key_to_base64(sb),
+                       x25519_key_to_base64(x25519_public_key(sa)),
+                       null, (short) 0, baseIndex + 1),
+        };
+    }
+
+    private static boolean fatalInputChildSurvives() {
         try {
             String java = System.getProperty("java.home")
                 + File.separator + "bin" + File.separator + "java";
@@ -361,12 +428,12 @@ public class BoringTunJNI {
                 "-Djava.library.path=" + System.getProperty("java.library.path"),
                 "-cp", System.getProperty("java.class.path"),
                 BoringTunJNI.class.getName(),
-                "nullhandle");
+                "fatal-inputs");
             pb.redirectErrorStream(true);
             Process p = pb.start();
             String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
             int code = p.waitFor();
-            if (code == 0 && out.contains("NULL_HANDLE_REJECTED")) {
+            if (code == 0 && out.contains("FATAL_INPUTS_SURVIVED")) {
                 return true;
             }
             System.out.println("        (child exited " + code + "; output: "

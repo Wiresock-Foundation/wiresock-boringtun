@@ -193,18 +193,31 @@ impl Session {
 
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
-    /// returns the size of the formatted packet
+    /// returns the formatted packet
+    ///
+    /// `dst` must hold `src.len() + DATA_OVERHEAD_SZ`; otherwise this returns
+    /// [`WireGuardError::DestinationBufferTooSmall`]. It used to panic instead,
+    /// which was not survivable: every caller reaches this through
+    /// `ffi::wireguard_write` and friends, and those are `extern "C"`, so the
+    /// panic hit rustc's nounwind shim and aborted the process rather than
+    /// unwinding. Sizing `dst` to the tunnel MTU -- which needs
+    /// `MTU + DATA_OVERHEAD_SZ` -- was enough to do it.
     pub(super) fn format_packet_data<'a>(
         &self,
         obf: ObfuscationRanges,
         rng: &mut impl RngCore,
         src: &[u8],
         dst: &'a mut [u8],
-    ) -> &'a mut [u8] {
+    ) -> Result<&'a mut [u8], WireGuardError> {
         if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
-            panic!("The destination buffer is too small");
+            return Err(WireGuardError::DestinationBufferTooSmall);
         }
 
+        // Checked first, deliberately: this counter must not advance for a
+        // packet that was never formatted, or the rejected call would burn a
+        // nonce. Note this bound covers the base frame only -- the Amnezia S4
+        // prefix is added later, by `write_to_network` -- so `Tunn::encapsulate`
+        // preflights the full wire size before calling this.
         let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed);
 
         let (message_type, rest) = dst.split_at_mut(4);
@@ -233,13 +246,13 @@ impl Session {
                 .unwrap()
         };
 
-        &mut dst[..DATA_OFFSET + n]
+        Ok(&mut dst[..DATA_OFFSET + n])
     }
 
     /// packet - a data packet we received from the network
     /// dst - pre-allocated space to hold the encapsulated IP packet, to send to the interface
     ///       dst will always take less space than src
-    /// return the size of the encapsulated packet on success
+    /// return the encapsulated packet on success
     pub(super) fn receive_packet_data<'a>(
         &self,
         packet: PacketData,
@@ -247,8 +260,12 @@ impl Session {
     ) -> Result<&'a mut [u8], WireGuardError> {
         let ct_len = packet.encrypted_encapsulated_packet.len();
         if dst.len() < ct_len {
-            // This is a very incorrect use of the library, therefore panic and not error
-            panic!("The destination buffer is too small");
+            // Was a panic, on the grounds that it is "a very incorrect use of
+            // the library". It is incorrect, but it is not the library's to
+            // punish that way: this runs inside `extern "C"` FFI callees, where
+            // a panic aborts rather than unwinds, so a caller who sized `dst`
+            // for the plaintext rather than the frame lost the whole process.
+            return Err(WireGuardError::DestinationBufferTooSmall);
         }
         if packet.receiver_idx != self.receiving_index {
             return Err(WireGuardError::WrongIndex);
