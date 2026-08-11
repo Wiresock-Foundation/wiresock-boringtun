@@ -671,6 +671,19 @@ fn handle_awg3_device_key(key: &str, val: &str) -> Result<(), i32> {
             // multiple like vanilla WireGuard rather than by a random addition
             // -- not "the peer is not padding", which is what an earlier version
             // of this comment claimed.
+            //
+            // Silent even so, and the reason is on the other side's get path:
+            // amneziawg-go's UAPI only emits this key when the value is
+            // non-zero, so `=0` never appears in a config it generated. It can
+            // only be hand-typed, which makes a warning here a warning about
+            // whether someone spelled "unset" out loud.
+            //
+            // We do not pad to a 16-byte multiple either (`format_packet_data`
+            // seals `src` at its own length), so 0 is a real difference in
+            // length distribution. But that difference is a property of this
+            // build -- it is there on every tunnel we make, including plain
+            // WireGuard with no AWG keys at all -- so it is not caused by this
+            // config line and does not belong in a diagnostic keyed to it.
             Some((0, 0)) => {}
             Some((lo, hi)) => tracing::warn!(
                 message = "content_padding_addition is not implemented; \
@@ -718,14 +731,29 @@ fn handle_awg3_device_key(key: &str, val: &str) -> Result<(), i32> {
         // theirs -- the tunnel is mutually unreachable, not degraded. Accepting
         // the key and ignoring it would turn that into an unexplained dead port;
         // failing here at least names the reason.
-        "header_protection_key" => {
-            tracing::error!(
-                "header_protection_key is not implemented: a peer using it cannot \
-                 interoperate with this build, so the configuration is refused \
-                 rather than applied without protection"
-            );
-            return Err(EINVAL);
-        }
+        //
+        // The all-zero key is the exception, and it is not a special case we
+        // invented: amneziawg-go accepts it -- `FromHex` is a plain length-checked
+        // hex decode with no zero test -- and its `HeaderProtectionCipher` then
+        // returns no cipher at all when the key is zero, which also lifts the
+        // S1..S4 >= 12 requirement its UAPI otherwise imposes. A zero key means
+        // protection is *off*, which is exactly what this build does, so that
+        // peer interoperates and aborting the whole transaction over it would
+        // refuse a configuration that asks nothing of us. It is also the only
+        // way to turn header protection off over UAPI: `set=1` is seeded from
+        // the live device, so omitting the key preserves whatever was there.
+        "header_protection_key" => match val.parse::<KeyBytes>() {
+            Ok(KeyBytes(key)) if key == [0u8; 32] => {}
+            Ok(_) => {
+                tracing::error!(
+                    "header_protection_key is not implemented: a peer using it cannot \
+                     interoperate with this build, so the configuration is refused \
+                     rather than applied without protection"
+                );
+                return Err(EINVAL);
+            }
+            Err(_) => return Err(EINVAL),
+        },
         _ => return Err(EINVAL),
     }
     Ok(())
@@ -1107,14 +1135,58 @@ mod tests {
             "inverted range"
         );
         // And the catch-all this function replaced still rejects everything it
-        // does not list. `header_protection_key` is one of those on this branch;
-        // the stacked header-protection PR gives it an arm in `api_set` above,
-        // and this assertion is what makes removing that arm surface as EINVAL
-        // rather than as silent tolerance.
+        // does not list.
         assert_eq!(handle_awg3_device_key("not_a_real_key", "1"), Err(EINVAL));
+        // A live `header_protection_key` is refused rather than tolerated. "0"
+        // is a separate case and is refused for a different reason -- it is one
+        // hex character, not a key at all. See the test below for the
+        // distinction, which is why this assertion does not cover the all-zero
+        // key despite looking like it might.
         assert_eq!(
             handle_awg3_device_key("header_protection_key", "0"),
             Err(EINVAL)
+        );
+    }
+
+    /// An all-zero header-protection key means "off", which is what we do.
+    ///
+    /// This is the one AWG-3 key we refuse outright, because a peer that masks
+    /// the message-type field is mutually unreachable rather than degraded. The
+    /// zero key is not that peer: amneziawg-go accepts it and then builds no
+    /// cipher from it, so header protection is off on both ends and the tunnel
+    /// works. Refusing it would abort the whole `set=1` transaction over a line
+    /// that asks nothing of us -- the exact failure mode this function exists to
+    /// remove.
+    #[test]
+    fn a_zeroed_header_protection_key_means_off_and_is_tolerated() {
+        assert_eq!(
+            handle_awg3_device_key("header_protection_key", &"0".repeat(64)),
+            Ok(()),
+            "an all-zero key is amneziawg-go's 'off'"
+        );
+        // The same 32 zero bytes in base64; `KeyBytes` takes both spellings and
+        // so does the UAPI.
+        assert_eq!(
+            handle_awg3_device_key(
+                "header_protection_key",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            ),
+            Ok(()),
+            "base64 spells the same 32 zero bytes"
+        );
+        // A live key still aborts the transaction.
+        assert_eq!(
+            handle_awg3_device_key("header_protection_key", &"ab".repeat(32)),
+            Err(EINVAL),
+            "a live key is still refused"
+        );
+        // And a value that is not a key at all is still refused. "0" is one hex
+        // character, not 32 zero bytes -- which is why the assertion above that
+        // uses it never reached this case.
+        assert_eq!(
+            handle_awg3_device_key("header_protection_key", "0"),
+            Err(EINVAL),
+            "one hex char is not a key"
         );
     }
 
