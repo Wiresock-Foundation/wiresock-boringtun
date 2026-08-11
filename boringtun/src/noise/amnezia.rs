@@ -393,6 +393,15 @@ impl AmneziaConfig {
         self.header_protection.is_set()
     }
 
+    /// The header-protection key as lowercase hex, or `None` when unset.
+    ///
+    /// Deliberately the only way out of [`HeaderProtectionKey`]: it exists so
+    /// `get=1` can round-trip the configuration, and nothing else needs the
+    /// bytes. `Debug` on the key still refuses to render them.
+    pub(crate) fn header_protection_key_hex(&self) -> Option<String> {
+        self.header_protection.to_hex()
+    }
+
     pub fn with_protocol_imitation(
         mut self,
         protocol: AmneziaImitationProtocol,
@@ -956,7 +965,14 @@ impl AmneziaConfig {
         };
 
         let junk_size = self.outbound_junk_size(kind);
-        if junk_size == 0 {
+        // With header protection off, no prefix means nothing to do. With it on,
+        // no prefix also means no nonce -- and returning here would emit the
+        // packet in the clear, which is the one outcome setting a key is meant
+        // to prevent. `validate` rejects that configuration, but
+        // `Tunn::new_with_obfuscation` does not call `validate`, so the public
+        // constructors reach it. Falling through instead routes it into the
+        // masking backstop below, which refuses.
+        if junk_size == 0 && !self.header_protection_enabled() {
             return Ok(&mut buffer[..packet_size]);
         }
 

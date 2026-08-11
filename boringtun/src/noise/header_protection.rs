@@ -31,6 +31,17 @@
 //! [`AmneziaConfig::validate`](super::amnezia::AmneziaConfig::validate), which
 //! warns about the combination rather than refusing it.
 //!
+//! # What can turn this on
+//!
+//! Rust callers, via [`AmneziaConfig::with_header_protection`](super::amnezia::AmneziaConfig::with_header_protection),
+//! and the device UAPI, via `header_protection_key`. **Not** the C or JNI
+//! bindings: `ffi::new_tunnel_with_amnezia` and its siblings take S1-S4, H1-H4
+//! and the junk parameters but no key, and `jni.rs` exposes no AmneziaWG
+//! configuration at all. The unmasking below is reachable from those paths --
+//! `Tunn::decapsulate` is where it happens for them -- but nothing there can
+//! set a key, so in practice they run unprotected. Exposing it means a new
+//! constructor, which is an API change rather than part of this one.
+//!
 //! # Wire compatibility
 //!
 //! Byte-compatible with amneziawg-go v3 (`device/noise-protocol.go`
@@ -82,6 +93,18 @@ impl HeaderProtectionKey {
 
     pub fn is_set(&self) -> bool {
         self.0 != [0u8; 32]
+    }
+
+    /// Lowercase hex, or `None` when unset.
+    ///
+    /// The single deliberate way to get the bytes back out, so that `get=1` can
+    /// round-trip a configuration. Everything else about this type is built to
+    /// keep the key in — see the `Debug` impl.
+    pub(crate) fn to_hex(self) -> Option<String> {
+        if !self.is_set() {
+            return None;
+        }
+        Some(self.0.iter().map(|b| format!("{:02x}", b)).collect())
     }
 
     /// A cipher for one datagram, keyed by this key and nonced by `nonce`.
@@ -264,6 +287,30 @@ mod tests {
         assert!(!k.unmask_inbound(&mut wire, NONCE_SIZE - 1, 20));
         // Exactly the nonce size is legal.
         assert!(k.mask_outbound(&mut wire, NONCE_SIZE, 20));
+    }
+
+    /// `get=1` has to round-trip the key, or `awg showconf` produces a config
+    /// that reapplies with protection silently off.
+    #[test]
+    fn the_key_round_trips_through_hex() {
+        let k = key();
+        let hex = k.to_hex().expect("a set key renders");
+        assert_eq!(hex.len(), 64, "32 bytes, two hex digits each");
+        assert_eq!(&hex[..6], "010203", "lowercase, big-endian byte order");
+        let mut back = [0u8; 32];
+        for (i, b) in back.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        assert_eq!(
+            HeaderProtectionKey::new(back),
+            k,
+            "parsing our own output must give the same key back"
+        );
+        assert_eq!(
+            HeaderProtectionKey::default().to_hex(),
+            None,
+            "an unset key must not be emitted, or a vanilla device's get=1 changes"
+        );
     }
 
     #[test]

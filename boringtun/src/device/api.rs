@@ -418,6 +418,21 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
             }
         }
 
+        // Emitted so a configuration round-trips: `awg showconf` reads this to
+        // produce a file that `awg setconf` reapplies, and a key dropped here
+        // would come back as a device with header protection silently off --
+        // mutually unreachable with every peer that still has it. amneziawg-go
+        // emits it the same way. Unset stays absent, keeping a vanilla device's
+        // output byte-identical.
+        //
+        // Yes, this writes a secret to the UAPI socket. That socket is
+        // root-only and already carries `private_key` upstream; this fork does
+        // not emit the private key, but that is a deliberate divergence about
+        // the *static* key, not a rule that no shared secret may round-trip.
+        if let Some(key) = d.config.amnezia.header_protection_key_hex() {
+            writeln!(writer, "header_protection_key={}", key);
+        }
+
         let obf = d.config.obf;
         let default = ObfuscationRanges::default();
         for (key, range, def) in [

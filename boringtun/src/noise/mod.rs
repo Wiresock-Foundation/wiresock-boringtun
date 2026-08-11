@@ -1953,6 +1953,40 @@ mod tests {
     /// configuration that cannot supply one is refused rather than run
     /// unprotected -- an operator who set a key and got no masking would have
     /// no way to notice.
+    /// A zero S size with header protection on must not emit in the clear.
+    ///
+    /// `validate()` rejects the configuration, but the public constructors do
+    /// not call it, so this is reachable through `Tunn::new_with_amnezia` alone.
+    /// Refusing to send is the only safe answer: emitting unmasked is precisely
+    /// what setting a key is meant to prevent, and the caller cannot tell it
+    /// happened.
+    #[test]
+    fn a_zero_prefix_with_header_protection_refuses_rather_than_emitting_cleartext() {
+        // S1 = 0, so the very first packet -- the handshake initiation -- has no
+        // prefix and therefore no nonce. Using S4 instead would be a worse test:
+        // it makes the tunnel unusable before a session exists, so the handshake
+        // helper cannot even reach the assertion.
+        let amnezia = AmneziaConfig::new(0, 130, 110, 80).with_header_protection([0x5a; 32]);
+        assert!(
+            amnezia.validate().is_err(),
+            "precondition: validate must reject this, or the test proves nothing \
+             about the path that bypasses it"
+        );
+
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let packet = create_ipv4_udp_packet();
+        let mut dst = vec![0u8; 2048];
+
+        match my_tun.encapsulate(&packet, &mut dst) {
+            TunnResult::Err(_) => {}
+            TunnResult::WriteToNetwork(sent) => panic!(
+                "emitted {} bytes with header protection on and no prefix to nonce it",
+                sent.len()
+            ),
+            other => panic!("expected an error, got {:?}", other),
+        }
+    }
+
     #[test]
     fn header_protection_requires_every_s_to_hold_a_nonce() {
         let ok = AmneziaConfig::new(12, 12, 12, 12).with_header_protection([1u8; 32]);
