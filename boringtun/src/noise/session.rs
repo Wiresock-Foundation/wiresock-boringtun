@@ -215,7 +215,9 @@ impl Session {
 
         // Checked first, deliberately: this counter must not advance for a
         // packet that was never formatted, or the rejected call would burn a
-        // nonce.
+        // nonce. Note this bound covers the base frame only -- the Amnezia S4
+        // prefix is added later, by `write_to_network` -- so `Tunn::encapsulate`
+        // preflights the full wire size before calling this.
         let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed);
 
         let (message_type, rest) = dst.split_at_mut(4);

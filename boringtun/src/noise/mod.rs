@@ -496,7 +496,24 @@ impl Tunn {
     /// unwinding, that inconsistency cost the caller their process.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let current = self.current;
+        let transport_junk = self.amnezia.transport_junk_size();
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
+            // The whole wire size, not just the base frame. `format_packet_data`
+            // checks only `src.len() + DATA_OVERHEAD_SZ` and then advances the
+            // sending counter, while the S4 prefix is added afterwards by
+            // `write_to_network` -- so a dst falling between those two sizes
+            // used to burn a nonce on every rejected call.
+            //
+            // This has to stay inside the established-session branch. The
+            // no-session branch below emits a handshake initiation, or a
+            // standalone pre-handshake junk datagram, and neither size has
+            // anything to do with `src.len()` or S4. Gating those on a
+            // transport-shaped bound would stop the tunnel coming up at all,
+            // and would drop the packet instead of queueing it for retry.
+            if dst.len() < src.len() + DATA_OVERHEAD_SZ + transport_junk {
+                return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+            }
+
             // Send the packet using an established session
             let packet_size = match session.format_packet_data(
                 self.handshake.obf,
@@ -620,14 +637,14 @@ impl Tunn {
 
         // Checked before the response is consumed, not after. The keepalive
         // below is a data packet with an empty payload, so it needs exactly
-        // DATA_OVERHEAD_SZ -- a fixed requirement, knowable here.
+        // DATA_OVERHEAD_SZ plus whatever S4 prefix `write_to_network` will add
+        // -- a fixed requirement, knowable here.
         // `receive_handshake_response` clears the handshake state
-        // (handshake.rs:869-873) and the session is not stored until further
-        // down, so an error raised between those two points would discard a
+        // (handshake.rs:869-873), so an error raised after it would discard a
         // valid response and leave the retry -- with a correct buffer -- failing
         // as UnexpectedPacket. Unlike the data path, whose equivalent error is
-        // retryable, that would cost a whole handshake.
-        if dst.len() < DATA_OVERHEAD_SZ {
+        // retryable, that would cost the keepalive for good.
+        if dst.len() < DATA_OVERHEAD_SZ + self.amnezia.transport_junk_size() {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
 
@@ -1595,6 +1612,97 @@ mod tests {
             my_tun.update_timers(&mut small),
             TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
         ));
+    }
+
+    #[test]
+    fn a_rejected_amnezia_encapsulate_does_not_advance_the_nonce() {
+        // The S4 form of the same rule, and the reason the preflight lives in
+        // `encapsulate` rather than in `format_packet_data`: the formatter
+        // bounds only the base frame and then advances the counter, while the
+        // S4 prefix is added afterwards by `write_to_network`. A dst between
+        // those two sizes burned one nonce per rejected call.
+        const S4: usize = 600;
+        let (mut my_tun, _their_tun) =
+            create_two_tuns_and_handshake_with_amnezia(AmneziaConfig::new(0, 0, 0, S4 as u16));
+        let packet = create_ipv4_udp_packet();
+        let exact = packet.len() + DATA_OVERHEAD_SZ + S4;
+
+        let mut roomy = vec![0u8; 2048];
+        let first = unwrap_network_packet(my_tun.encapsulate(&packet, &mut roomy));
+        // The emitted datagram carries the S4 prefix, so the WireGuard frame --
+        // and the counter inside it -- begins S4 bytes in.
+        let before = counter_of(&first[S4..]);
+
+        let mut in_the_window = vec![0u8; exact - 1];
+        for _ in 0..8 {
+            assert!(matches!(
+                my_tun.encapsulate(&packet, &mut in_the_window),
+                TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+            ));
+        }
+
+        // The boundary pinned from below too: an off-by-one preflight would
+        // satisfy every assertion above while rejecting a valid send.
+        let mut at_the_boundary = vec![0u8; exact];
+        let next = unwrap_network_packet(my_tun.encapsulate(&packet, &mut at_the_boundary));
+        assert_eq!(next.len(), exact);
+        assert_eq!(
+            counter_of(&next[S4..]),
+            before + 1,
+            "eight rejected calls advanced the nonce"
+        );
+    }
+
+    #[test]
+    fn handshake_response_with_a_short_dst_stays_retryable_under_amnezia() {
+        // As the non-Amnezia case, but the requirement is DATA_OVERHEAD_SZ + S4.
+        // Preflighting only the base frame let a dst in between consume the
+        // response and then fail, losing the keepalive for good.
+        const S4: usize = 64;
+        let (mut my_tun, mut their_tun) =
+            create_two_tuns_with_amnezia(AmneziaConfig::new(0, 0, 0, S4 as u16));
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, &init);
+
+        let mut too_small = vec![0u8; DATA_OVERHEAD_SZ + S4 - 1];
+        assert!(matches!(
+            my_tun.decapsulate(None, &resp, &mut too_small),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+
+        // Exactly enough, and the same response: this asserts both that the
+        // preflight is not off by one and that the refusal did not consume it.
+        let mut exact = vec![0u8; DATA_OVERHEAD_SZ + S4];
+        let keepalive = unwrap_network_packet(my_tun.decapsulate(None, &resp, &mut exact));
+        assert_eq!(keepalive.len(), DATA_OVERHEAD_SZ + S4);
+    }
+
+    #[test]
+    fn encapsulate_without_a_session_is_not_gated_on_the_transport_size() {
+        // The preflight belongs to the established-session branch alone. With
+        // no session, `encapsulate` emits a 148-byte handshake initiation and
+        // queues the packet for retry -- neither of which has anything to do
+        // with src.len() or S4. Hoisting the preflight out of that branch would
+        // fail this call, leave the tunnel unable to come up at all, and drop
+        // the packet instead of queueing it.
+        //
+        // This is here because the rest of the suite does not notice that
+        // mistake: every other test passes with the preflight hoisted.
+        const S4: usize = 4000;
+        let (mut my_tun, _their_tun) =
+            create_two_tuns_with_amnezia(AmneziaConfig::new(0, 0, 0, S4 as u16));
+        let packet = create_ipv4_udp_packet();
+
+        // The buffer every other test here uses, and far short of the
+        // src.len() + DATA_OVERHEAD_SZ + S4 a transport packet would need.
+        let mut dst = vec![0u8; 2048];
+        let init = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        assert_eq!(init.len(), HANDSHAKE_INIT_SZ);
+        assert_eq!(
+            my_tun.packet_queue.len(),
+            1,
+            "the packet must be queued for retry, not dropped"
+        );
     }
 
     #[test]
