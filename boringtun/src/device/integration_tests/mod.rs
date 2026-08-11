@@ -543,6 +543,65 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore]
+    /// `update_only` must not create a peer that does not already exist.
+    ///
+    /// `Device::update_peer` has no existence check of its own, so a section
+    /// carrying `update_only=true` for an unknown key would otherwise create the
+    /// peer and install its allowed-IPs -- letting a stale block from a
+    /// management plane resurrect a peer that was deliberately revoked, and
+    /// reporting success while doing it. amneziawg-go/wireguard-go discard the
+    /// whole section instead, which is what this pins.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`; CI runs it via
+    /// `cargo test -- --ignored`.
+    fn test_update_only_does_not_create_a_missing_peer() {
+        let port = next_port();
+        let private_key = StaticSecret::random_from_rng(OsRng);
+
+        let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
+        assert_eq!(wg.wg_set_port(port), "errno=0\n\n");
+        assert_eq!(wg.wg_set_key(private_key), "errno=0\n\n");
+
+        let peer_key = StaticSecret::random_from_rng(OsRng);
+        let peer_pub_key = PublicKey::from(&peer_key);
+        let peer_hex = encode(peer_pub_key.as_bytes());
+
+        // The peer does not exist, so the whole section is discarded -- and the
+        // transaction still succeeds, which is the point of tolerating the key
+        // rather than returning EINVAL.
+        assert_eq!(
+            wg.wg_set(&format!(
+                "public_key={}\nupdate_only=true\nendpoint=172.0.0.1:50001\nallowed_ip=172.0.0.2/32",
+                peer_hex
+            )),
+            "errno=0\n\n"
+        );
+        assert!(
+            !wg.wg_get().contains(&peer_hex),
+            "update_only must not create a peer that does not exist"
+        );
+
+        // Once the peer does exist, the same section applies normally.
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 0, 0, 1)), 50001);
+        assert_eq!(wg.wg_set_peer(&peer_pub_key, &endpoint, &[]), "errno=0\n\n");
+        assert_eq!(
+            wg.wg_set(&format!(
+                "public_key={}\nupdate_only=true\nendpoint=172.0.0.1:50002",
+                peer_hex
+            )),
+            "errno=0\n\n"
+        );
+        let response = wg.wg_get();
+        assert!(response.contains(&peer_hex), "the peer must still be there");
+        assert!(
+            response.contains("endpoint=172.0.0.1:50002"),
+            "update_only must still update an existing peer, got {}",
+            response
+        );
+    }
+
     /// Test if wireguard can handle simple ipv4 connections, don't use a connected socket
     #[test]
     #[ignore]
