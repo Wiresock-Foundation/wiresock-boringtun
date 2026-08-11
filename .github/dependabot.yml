@@ -13,3 +13,41 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # This crate declares rust-version = "1.75", because WireSock supports
+    # Windows 7 and that is the last toolchain targeting it. The whole
+    # rand 0.10 generation, and the x25519/curve25519 releases that moved
+    # with it, declare rust-version 1.85 and edition 2024:
+    #
+    #   rand_chacha     0.10.0   1.85 / 2024
+    #   rand_core       0.10.0   1.85 / 2024
+    #   rand            0.10.0   1.85 / 2024
+    #   getrandom       0.4.0    1.85 / 2024
+    #   x25519-dalek    3.0.0    1.85 / 2024
+    #   curve25519-dalek 5.0.0   1.85 / 2024
+    #
+    # They also move as a set: rand_chacha 0.10 requires rand_core ^0.10,
+    # and the only x25519-dalek speaking rand_core 0.10 is 3.0. So there is
+    # no partial upgrade -- taking any one of them means taking 1.85, which
+    # means dropping Windows 7. That is a product decision, not a dependency
+    # bump, so Dependabot should stop proposing it weekly (it already did,
+    # in #12, which CI correctly failed on win7-msrv).
+    #
+    # These are scoped to the MSRV-raising majors on purpose. A patch or
+    # minor release inside the ranges we actually use -- including a
+    # security fix -- is NOT ignored and will still open a PR.
+    #
+    # Revisit when Windows 7 support ends: delete this block, and the whole
+    # set can be taken together in one change.
+    ignore:
+      - dependency-name: "rand_chacha"
+        versions: [">=0.10"]
+      - dependency-name: "rand_core"
+        versions: [">=0.10"]
+      - dependency-name: "rand"
+        versions: [">=0.10"]
+      - dependency-name: "getrandom"
+        versions: [">=0.4"]
+      - dependency-name: "x25519-dalek"
+        versions: [">=3"]
+      - dependency-name: "curve25519-dalek"
+        versions: [">=5"]
