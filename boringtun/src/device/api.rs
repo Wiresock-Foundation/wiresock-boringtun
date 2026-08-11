@@ -620,17 +620,26 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
 /// answer with it instead of leaving the daemon claiming agreement it no longer
 /// has.
 ///
-/// Panics on a key the caller did not match, rather than returning a plausible
-/// default: a silent 0 here would make `<unmapped_key>=0` look like agreement.
-fn awg3_our_timer(key: &str) -> u64 {
-    match key {
+/// `None` for a key with no built-in equivalent.
+///
+/// Returns an `Option` rather than panicking on the unmatched arm. The caller's
+/// key list and this one are two hand-maintained lists that have to agree, and
+/// this runs on the UAPI parse path: adding a sixth AWG-3 tunable to the caller
+/// and forgetting it here would turn `<newkey>=<anything>` into a panic in the
+/// API thread. amneziawg-go has already added five, so a sixth is the expected
+/// direction of travel. An unmapped key now degrades to the same "not
+/// implemented" warning as a value that merely disagrees, which is the outcome
+/// that arm is for. Not a silent `0`, which would make `<newkey>=0` look like
+/// agreement.
+fn awg3_our_timer(key: &str) -> Option<u64> {
+    Some(match key {
         "reject_after_time" => REJECT_AFTER_TIME.as_secs(),
         "rekey_after_time" => REKEY_AFTER_TIME.as_secs(),
         "rekey_timeout" => REKEY_TIMEOUT.as_secs(),
         "keepalive_timeout" => KEEPALIVE_TIMEOUT.as_secs(),
         "max_handshake_attempts" => REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs(),
-        _ => unreachable!("caller matched the key"),
-    }
+        _ => return None,
+    })
 }
 
 /// AmneziaWG 3.0 device keys this build does not implement.
@@ -658,7 +667,10 @@ fn handle_awg3_device_key(key: &str, val: &str) -> Result<(), i32> {
             // Sender-side only: it pads its own plaintext, and we already
             // tolerate the padded keepalive that results. Nothing breaks; our
             // own transport just keeps a different length distribution to
-            // theirs. 0 means the peer is not padding either.
+            // theirs. 0 is amneziawg-go's "unset", which pads to a 16-byte
+            // multiple like vanilla WireGuard rather than by a random addition
+            // -- not "the peer is not padding", which is what an earlier version
+            // of this comment claimed.
             Some((0, 0)) => {}
             Some((lo, hi)) => tracing::warn!(
                 message = "content_padding_addition is not implemented; \
@@ -688,14 +700,14 @@ fn handle_awg3_device_key(key: &str, val: &str) -> Result<(), i32> {
                 // -- so a mismatch has to say so. A range that merely *contains*
                 // our value is not equivalent to it: the peer re-picks, we do
                 // not.
-                Some((lo, hi)) if u64::from(lo) == ours && u64::from(hi) == ours => {}
+                Some((lo, hi)) if ours == Some(u64::from(lo)) && ours == Some(u64::from(hi)) => {}
                 Some((lo, hi)) => tracing::warn!(
                     message = "tunable timers are not implemented; \
                                using the built-in WireGuard constant",
                     key = key,
                     requested_low = lo,
                     requested_high = hi,
-                    ours = ours
+                    ours = ?ours
                 ),
                 None => return Err(EINVAL),
             }
@@ -992,20 +1004,48 @@ mod tests {
         // surfaces as one-way blackholing minutes later rather than as a
         // handshake failure. Silence there would be the wrong default -- so what
         // we report as "ours" has to be what the timer wheel really uses.
-        assert_eq!(awg3_our_timer("reject_after_time"), 180);
-        assert_eq!(awg3_our_timer("rekey_after_time"), 120);
-        assert_eq!(awg3_our_timer("rekey_timeout"), 5);
-        assert_eq!(awg3_our_timer("keepalive_timeout"), 10);
+        assert_eq!(awg3_our_timer("reject_after_time"), Some(180));
+        assert_eq!(awg3_our_timer("rekey_after_time"), Some(120));
+        assert_eq!(awg3_our_timer("rekey_timeout"), Some(5));
+        assert_eq!(awg3_our_timer("keepalive_timeout"), Some(10));
         // We have no attempt counter: the equivalent is REKEY_ATTEMPT_TIME /
         // REKEY_TIMEOUT = 90/5, which is how amneziawg-go defines its own
         // default (`MaxTimerHandshakes = 90 / 5`). Because `awg3_our_timer`
         // computes it, retuning either constant fails this assertion instead of
         // leaving the daemon claiming an agreement it no longer has -- which a
         // hardcoded 18 asserted against a literal 18 could never catch.
-        assert_eq!(awg3_our_timer("max_handshake_attempts"), 18);
+        assert_eq!(awg3_our_timer("max_handshake_attempts"), Some(18));
         assert_eq!(
             awg3_our_timer("max_handshake_attempts"),
-            REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs()
+            Some(REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs())
+        );
+
+        // Every key the caller routes into the timer arm must have an entry
+        // here. These are two hand-maintained lists on the UAPI parse path, and
+        // this assertion is what stops them drifting: with `unreachable!` in
+        // place of the `None`, adding a sixth tunable upstream and forgetting it
+        // here turned `<newkey>=<anything>` into a panic in the API thread.
+        for key in [
+            "reject_after_time",
+            "rekey_after_time",
+            "rekey_timeout",
+            "keepalive_timeout",
+            "max_handshake_attempts",
+        ] {
+            assert!(
+                awg3_our_timer(key).is_some(),
+                "{} is routed into the timer arm but has no built-in equivalent",
+                key
+            );
+        }
+
+        // An unmapped key degrades to the warning, not to a panic and not to a
+        // silent 0 that would make `<newkey>=0` look like agreement.
+        assert_eq!(awg3_our_timer("some_future_tunable"), None);
+        assert_eq!(
+            handle_awg3_device_key("reject_after_time", "60"),
+            Ok(()),
+            "a disagreeing value is tolerated with a warning, not refused"
         );
     }
 
@@ -1066,8 +1106,11 @@ mod tests {
             Err(EINVAL),
             "inverted range"
         );
-        // And the catch-all this function replaced still rejects everything else,
-        // including the keys that keep their own arms in `api_set`.
+        // And the catch-all this function replaced still rejects everything it
+        // does not list. `header_protection_key` is one of those on this branch;
+        // the stacked header-protection PR gives it an arm in `api_set` above,
+        // and this assertion is what makes removing that arm surface as EINVAL
+        // rather than as silent tolerance.
         assert_eq!(handle_awg3_device_key("not_a_real_key", "1"), Err(EINVAL));
         assert_eq!(
             handle_awg3_device_key("header_protection_key", "0"),
