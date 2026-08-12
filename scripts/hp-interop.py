@@ -27,9 +27,12 @@ python `cryptography` module, a built boringtun-cli, and amneziawg-go v3:
 
 The /v3 suffix is required, not cosmetic -- see the note in awg-go-interop.sh.
 
-SAFETY: everything lives in throwaway network namespaces prefixed `hpa-`/`hpb-`;
-the host's own interfaces, routes and WireGuard devices are never touched, and
-cleanup runs on every exit path.
+SAFETY: everything lives in throwaway network namespaces prefixed `hpa-`/`hpb-`,
+plus two UAPI sockets under /run/{amneziawg,wireguard} -- /run is not network
+namespaced, so those are the one piece of state outside them. Every name carries
+a suffix taken from an exclusive `mkdtemp` reservation, so nothing this script
+deletes can belong to anything else; the host's own interfaces, routes and
+WireGuard devices are never touched, and cleanup runs on every exit path.
 
 Usage: hp-interop.py <boringtun-cli> <amneziawg-go>
 Exit 0 if all four cases behave as expected, 1 otherwise.
@@ -45,8 +48,17 @@ import tempfile
 import time
 
 BT, GO = sys.argv[1], sys.argv[2]
-TOKEN = secrets.token_hex(3)
-WORK = tempfile.mkdtemp(prefix=f"hpi-{TOKEN}-")
+# TOKEN comes out of the mkdtemp reservation rather than a second random draw.
+# `teardown` deletes namespaces, links and sockets by name before setup, to
+# clear a crashed previous run -- so those names must be provably ours. mkdtemp
+# retries until the kernel accepts an exclusive create, which proves the suffix
+# unique against every concurrent run for as long as the directory lives;
+# `token_hex(3)` is 24 bits and proves nothing. Same argument as
+# awg-go-interop.sh. The suffix is [a-z0-9_]{8}, so it stays safe in the
+# unquoted interpolations below and `hva-<8>` is 12 chars, inside the kernel's
+# 15-character interface-name limit.
+WORK = tempfile.mkdtemp(prefix="hpi-")
+TOKEN = os.path.basename(WORK)[len("hpi-") :]
 
 # S sizes all >= 12: amneziawg-go refuses header protection below that, and so
 # do we. H ranges must not overlap or go rejects the whole set=.
@@ -159,7 +171,7 @@ def launch(cmd, log):
 # returncode check never sees it either -- only the missing-log check does.
 #
 # Quoted here and nowhere else on purpose: every other interpolation in this
-# file is a `secrets.token_hex` name or a module-level literal.
+# file is a TOKEN-derived name or a module-level literal.
 def start_go(ns, iface, logname):
     log = os.path.join(WORK, logname)
     return launch(
