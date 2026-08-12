@@ -1384,4 +1384,262 @@ mod tests {
         assert_eq!(parse_tag_range("1"), Some((1, 1)));
         assert_eq!(parse_tag_range("1-5"), Some((1, 5)));
     }
+
+    /// The acceptance policy for AmneziaWG 3.0 device keys, pinned end to end.
+    ///
+    /// One sentence carries this whole branch: a value that differs from what
+    /// this build does warns, and a value that agrees with us -- or that means
+    /// "unset" -- is silent. Both halves are load-bearing. Losing a warning
+    /// ships a daemon that ignores a timer the peer set and says nothing, which
+    /// surfaces as one-way blackholing minutes later rather than as a handshake
+    /// failure; gaining one on a silent row fires the new diagnostic on
+    /// configurations that agree with us, which is how a warning gets tuned out.
+    ///
+    /// Neither half was reachable from a test before this one: deleting either
+    /// `tracing::warn!` in `handle_awg3_device_key` left the suite green, and so
+    /// did making either silent arm noisy. The table below is the policy, and it
+    /// is checked against the code rather than against the comments above it.
+    #[test]
+    fn an_awg3_device_key_warns_exactly_when_its_value_differs_from_ours() {
+        const SILENT: &[tracing::Level] = &[];
+        const WARNS: &[tracing::Level] = &[tracing::Level::WARN];
+        const REFUSED_LOUDLY: &[tracing::Level] = &[tracing::Level::ERROR];
+
+        let cases: &[PolicyRow] = &[
+            // We never pad, so any addition the peer asked for is a real
+            // difference in our transport length distribution and says so.
+            ("content_padding_addition", "1", Ok(()), WARNS),
+            ("content_padding_addition", "64", Ok(()), WARNS),
+            ("content_padding_addition", "1-100", Ok(()), WARNS),
+            // amneziawg-go parses these as u32, so a value over u16::MAX is a
+            // legal config and must warn like any other, not abort.
+            ("content_padding_addition", "100000", Ok(()), WARNS),
+            // 0 is the exception, and not because it agrees with us -- it does
+            // not, we pad to nothing and it pads to a 16-byte multiple. It is
+            // silent because amneziawg-go's UAPI only emits this key when the
+            // value is non-zero, so `=0` can only be hand-typed, and warning
+            // about it is warning about someone spelling "unset" out loud.
+            ("content_padding_addition", "0", Ok(()), SILENT),
+            ("content_padding_addition", "0-0", Ok(()), SILENT),
+            // A range that merely starts at 0 is not "unset": the peer pads on
+            // almost every packet. It warns.
+            ("content_padding_addition", "0-100", Ok(()), WARNS),
+            // Refusal is not a warning: an unparseable value fails the
+            // transaction and the errno is the answer.
+            (
+                "content_padding_addition",
+                "notanumber",
+                Err(EINVAL),
+                SILENT,
+            ),
+            // Timers: exactly our own constant is agreement, and silent. These
+            // five numbers are the ones `awg3_our_timer` reports, so a retune
+            // that moves a constant moves the silent row with it.
+            ("reject_after_time", "180", Ok(()), SILENT),
+            ("rekey_after_time", "120", Ok(()), SILENT),
+            ("rekey_timeout", "5", Ok(()), SILENT),
+            ("keepalive_timeout", "10", Ok(()), SILENT),
+            ("max_handshake_attempts", "18", Ok(()), SILENT),
+            // The degenerate range spells the same agreement.
+            ("reject_after_time", "180-180", Ok(()), SILENT),
+            // 0 is amneziawg-go's "unset": it falls back to the same built-in
+            // we hardcode, so the peer is asking for exactly what we do.
+            ("reject_after_time", "0", Ok(()), SILENT),
+            ("rekey_after_time", "0", Ok(()), SILENT),
+            ("rekey_timeout", "0", Ok(()), SILENT),
+            ("keepalive_timeout", "0", Ok(()), SILENT),
+            ("max_handshake_attempts", "0", Ok(()), SILENT),
+            // Anything else is a difference we have to name.
+            ("reject_after_time", "60", Ok(()), WARNS),
+            ("rekey_after_time", "121", Ok(()), WARNS),
+            ("rekey_timeout", "1", Ok(()), WARNS),
+            ("keepalive_timeout", "25", Ok(()), WARNS),
+            ("max_handshake_attempts", "5", Ok(()), WARNS),
+            // Including a range that contains our value, starts at it, or ends
+            // at it: the peer re-picks inside the range and we do not, so one
+            // matching end is not an agreement.
+            ("reject_after_time", "120-200", Ok(()), WARNS),
+            ("reject_after_time", "180-200", Ok(()), WARNS),
+            ("reject_after_time", "0-180", Ok(()), WARNS),
+            // An inverted range is refused before any of that, and silently.
+            ("reject_after_time", "200-100", Err(EINVAL), SILENT),
+            // The one key we refuse outright -- a peer masking the message-type
+            // field is mutually unreachable, not degraded. The refusal is the
+            // loud case: an aborted `set=1` with nothing in the log naming the
+            // reason is the failure this function exists to remove.
+            (
+                "header_protection_key",
+                "abababababababababababababababababababababababababababababababab",
+                Err(EINVAL),
+                REFUSED_LOUDLY,
+            ),
+            // An all-zero key means protection is off, which is what we do, so
+            // it is agreement: tolerated and silent.
+            (
+                "header_protection_key",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                Ok(()),
+                SILENT,
+            ),
+            // A key from neither list is still refused, and silently.
+            ("not_a_real_key", "1", Err(EINVAL), SILENT),
+        ];
+
+        for &(key, val, expected_result, expected_levels) in cases {
+            let (result, events) = capture_awg3_key(key, val);
+            assert_eq!(
+                result, expected_result,
+                "{}={} was tolerated/refused against policy",
+                key, val
+            );
+            let levels: Vec<tracing::Level> = events.iter().map(|e| e.level).collect();
+            assert_eq!(
+                levels.as_slice(),
+                expected_levels,
+                "{}={} logged the wrong thing: {:?}",
+                key,
+                val,
+                events
+            );
+
+            if expected_levels != WARNS {
+                continue;
+            }
+            // A warning that fires is only half the contract; it also has to
+            // carry the numbers, because the operator's next question is which
+            // config line this was about and what we did instead.
+            let warning = &events[0];
+            let (lo, hi) = parse_uint_range(val).expect("a warning row parses as a range");
+            assert_eq!(
+                warning.requested_low,
+                Some(u64::from(lo)),
+                "{}={} must report the low end it was given",
+                key,
+                val
+            );
+            assert_eq!(
+                warning.requested_high,
+                Some(u64::from(hi)),
+                "{}={} must report the high end it was given",
+                key,
+                val
+            );
+            if key == "content_padding_addition" {
+                // The padding warning names the key in its message and carries
+                // no `key` field; the timer warning does the opposite. Pinning
+                // both shapes is what stops the two sites being confused for
+                // each other when one of them is deleted.
+                assert!(
+                    warning.message.contains("content_padding_addition"),
+                    "the padding warning must name its key: {}",
+                    warning.message
+                );
+                assert_eq!(warning.key, None, "the padding warning has no key field");
+            } else {
+                assert_eq!(
+                    warning.key,
+                    Some(key.to_owned()),
+                    "the timer warning must name the key it is about"
+                );
+                let ours = awg3_our_timer(key).expect("a timer key has a built-in equivalent");
+                // The constant we will actually use, not the one we were asked
+                // for. Reporting the request back would make the log agree with
+                // the config it is warning about.
+                assert_eq!(
+                    warning.ours,
+                    Some(format!("Some({})", ours)),
+                    "{}={} must report the built-in it falls back to",
+                    key,
+                    val
+                );
+                assert!(
+                    warning.message.contains("tunable timers"),
+                    "the timer warning must say which subsystem ignored the value: {}",
+                    warning.message
+                );
+            }
+        }
+    }
+
+    /// One row of the AWG-3 acceptance policy: the key and value as they arrive
+    /// over the UAPI, the answer the transaction gets, and the events the log
+    /// gets, in order.
+    type PolicyRow = (
+        &'static str,
+        &'static str,
+        Result<(), i32>,
+        &'static [tracing::Level],
+    );
+
+    /// One `tracing` event, reduced to the fields the AWG-3 acceptance policy is
+    /// stated in terms of.
+    #[derive(Debug)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        message: String,
+        key: Option<String>,
+        requested_low: Option<u64>,
+        requested_high: Option<u64>,
+        ours: Option<String>,
+    }
+
+    impl tracing::field::Visit for CapturedEvent {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "requested_low" => self.requested_low = Some(value),
+                "requested_high" => self.requested_high = Some(value),
+                _ => {}
+            }
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "key" => self.key = Some(value.to_owned()),
+                "message" => self.message = value.to_owned(),
+                _ => {}
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            match field.name() {
+                "message" => self.message = format!("{:?}", value),
+                "ours" => self.ours = Some(format!("{:?}", value)),
+                _ => {}
+            }
+        }
+    }
+
+    /// Every event `handle_awg3_device_key` emits for one key/value, in order.
+    ///
+    /// Silence is a claim about behaviour like any other, and a subscriber is
+    /// the only thing that can observe it. Same shape as
+    /// `the_keepalive_warning_reports_the_interval_it_applied`; the default is
+    /// thread-local, so this stays correct under the test harness's threads.
+    fn capture_awg3_key(key: &str, val: &str) -> (Result<(), i32>, Vec<CapturedEvent>) {
+        use std::sync::{Arc, Mutex};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        struct Capture(Arc<Mutex<Vec<CapturedEvent>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let mut captured = CapturedEvent {
+                    level: *event.metadata().level(),
+                    message: String::new(),
+                    key: None,
+                    requested_low: None,
+                    requested_high: None,
+                    ours: None,
+                };
+                event.record(&mut captured);
+                self.0.lock().unwrap().push(captured);
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+        let result =
+            tracing::subscriber::with_default(subscriber, || handle_awg3_device_key(key, val));
+        let captured = std::mem::take(&mut *events.lock().unwrap());
+        (result, captured)
+    }
 }
