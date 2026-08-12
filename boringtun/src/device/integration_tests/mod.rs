@@ -6,6 +6,7 @@
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use crate::device::{DeviceConfig, DeviceHandle};
+    #[cfg(target_os = "linux")]
     use crate::noise::{Packet, Tunn, TunnResult};
     use crate::x25519::{PublicKey, StaticSecret};
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -15,6 +16,7 @@ mod tests {
     use ring::rand::{SecureRandom, SystemRandom};
     use std::fmt::Write as _;
     use std::io::{BufRead, BufReader, Read, Write};
+    #[cfg(target_os = "linux")]
     use std::net::UdpSocket;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::os::unix::net::UnixStream;
@@ -22,6 +24,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
+    #[cfg(target_os = "linux")]
     use std::time::Duration;
 
     static NEXT_IFACE_IDX: AtomicUsize = AtomicUsize::new(100); // utun 100+ should be vacant during testing on CI
@@ -436,6 +439,11 @@ mod tests {
         }
 
         /// Arm this device's event queue so the next `EPOLL_CTL_ADD` fails.
+        ///
+        /// Linux-only: the hook lives on `epoll.rs`'s `EventPoll`, and the
+        /// module gate above excludes only macOS -- iOS and tvOS also reach
+        /// here and select `kqueue.rs`, which has no such hook.
+        #[cfg(target_os = "linux")]
         fn fail_next_event_registration(&self) {
             self._device.device.read().queue.fail_next_registration();
         }
@@ -883,6 +891,7 @@ mod tests {
     /// `cargo test -- --ignored`.
     #[test]
     #[ignore]
+    #[cfg(target_os = "linux")]
     fn a_refused_connected_socket_registration_returns_the_peer_to_the_shared_socket() {
         let port = next_port();
         let private_key = StaticSecret::random_from_rng(OsRng);

@@ -29,9 +29,11 @@ pub struct Endpoint {
 /// There is still no cheaper recovery available at this point, and no errno has
 /// been identified that makes `shutdown` fail on a genuinely connected UDP
 /// socket, so the result is discarded rather than propagated. What must not
-/// happen is an abort: unwrapping a discarded result converts any unexpected
-/// errno into a dead daemon, and these run on the 250 ms timer tick for every
-/// peer and again on every roam -- the two highest-frequency paths here.
+/// happen is a panic: unwrapping a discarded result turns any unexpected errno
+/// into a panicked worker thread, and `DeviceHandle::wait`'s `join().unwrap()`
+/// turns that into a dead daemon. Callers: connection expiry, peer removal,
+/// listen-port changes, and each source-address change of an authenticated
+/// peer -- that last one is the only caller a remote input paces.
 ///
 /// Deliberately not claiming a specific trigger. An earlier version of this
 /// comment blamed ICMP, which was wrong: an ICMP error sets `sk_err` on a
@@ -111,10 +113,10 @@ impl Peer {
     pub fn shutdown_endpoint(&self) {
         if let Some(conn) = self.endpoint.write().conn.take() {
             tracing::info!("Disconnecting from endpoint");
-            // Best-effort: the socket is being dropped either way, so the result
-            // is discarded. This runs from the 250 ms timer tick for every peer,
-            // and unwrapping a discarded result turns any unexpected errno into
-            // a process abort. See `log_shutdown_error`.
+            // Best-effort: the socket is being dropped either way, so the
+            // result is discarded. Reached on connection expiry, peer removal
+            // and listen-port changes -- at most once per connected socket, and
+            // even so, unwrapping it panics a worker. See `log_shutdown_error`.
             log_shutdown_error(conn.shutdown(Shutdown::Both));
         }
     }
@@ -124,9 +126,10 @@ impl Peer {
         if endpoint.addr != Some(addr) {
             // We only need to update the endpoint if it differs from the current one
             if let Some(conn) = endpoint.conn.take() {
-                // Same as `shutdown_endpoint`, and more exposed: this fires on
-                // every roam, so the trigger is an authenticated peer changing
-                // source address -- a remote input on the ingress path.
+                // Same as `shutdown_endpoint`, and more exposed: fires once
+                // per source-address change of an authenticated peer that has a
+                // connected socket open, so a peer alternating addresses drives
+                // one per datagram -- a remote input on the ingress path.
                 log_shutdown_error(conn.shutdown(Shutdown::Both));
             }
 
@@ -299,7 +302,7 @@ mod tests {
 
     #[test]
     fn shutdown_endpoint_survives_a_failing_shutdown() {
-        // Same call, reached from the 250 ms timer tick for every peer.
+        // Same call, reached from connection expiry, removal and port changes.
         let peer = test_peer();
         peer.endpoint_mut().conn = Some(unconnected_socket());
 
