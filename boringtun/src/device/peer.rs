@@ -160,18 +160,29 @@ impl Peer {
         } else {
             SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into()
         };
-        udp_conn.bind(&bind_addr)?;
-        udp_conn.connect(&addr.into())?;
-        udp_conn.set_nonblocking(true)?;
+
+        // `dup(2)` here rather than after the connect, because it is the one
+        // call in this function that fails on fd exhaustion. Once `connect`
+        // has run, this socket outranks the wildcard listener for the peer's
+        // 4-tuple, so a failure between there and the commit strands a socket
+        // that is taking the peer's datagrams and dropping them. Doing it
+        // first means fd exhaustion can no longer open that window.
+        //
+        // A `dup` shares the underlying `struct socket`, so the `bind` and
+        // `connect` below apply to both descriptors. `set_mark` is hoisted for
+        // the same reason -- SO_MARK is order-independent.
+        let conn_dup = udp_conn.try_clone()?;
 
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         if let Some(fwmark) = fwmark {
             udp_conn.set_mark(fwmark)?;
         }
 
-        // `try_clone` is a `dup(2)`, which fails on fd exhaustion -- reachable
-        // on a server with many peers, and not a reason to abort.
-        endpoint.conn = Some(udp_conn.try_clone()?);
+        udp_conn.bind(&bind_addr)?;
+        udp_conn.connect(&addr.into())?;
+        udp_conn.set_nonblocking(true)?;
+
+        endpoint.conn = Some(conn_dup);
 
         // Deliberately silent. An earlier revision of this function logged
         // "Connected endpoint" here, and an earlier revision of this comment

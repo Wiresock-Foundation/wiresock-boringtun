@@ -25,7 +25,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     #[cfg(target_os = "linux")]
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     static NEXT_IFACE_IDX: AtomicUsize = AtomicUsize::new(100); // utun 100+ should be vacant during testing on CI
     static NEXT_PORT: AtomicUsize = AtomicUsize::new(61111); // Use ports starting with 61111, hoping we don't run into a taken port 🤷
@@ -458,6 +458,37 @@ mod tests {
         #[cfg(target_os = "linux")]
         fn event_registration_attempts(&self) -> usize {
             self._device.device.read().queue.registration_attempts()
+        }
+
+        /// Block until this device has attempted at least `n` more
+        /// `EPOLL_CTL_ADD`s than `before`, or `timeout` elapses. Returns what
+        /// was actually observed, so the caller still asserts on it -- waiting
+        /// must never be able to stand in for the assertion.
+        ///
+        /// This is the synchronisation the connected-socket tests need. The
+        /// handshake response is written to the socket in the UDP handler
+        /// *before* the connected-socket block runs, so the client can be
+        /// holding the response while the worker has not yet reached the
+        /// registration. A fixed delay is a bet on the scheduler, and it is a
+        /// bet that loses: measured at 24 of 40 runs when the worker is starved.
+        #[cfg(target_os = "linux")]
+        fn wait_for_event_registrations(
+            &self,
+            before: usize,
+            n: usize,
+            timeout: Duration,
+        ) -> usize {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let seen = self.event_registration_attempts() - before;
+                if seen >= n || Instant::now() >= deadline {
+                    return seen;
+                }
+                // Sleeps rather than spins: the worker this waits on may be
+                // waiting for a core, and burning one here is exactly wrong
+                // under the load that makes the race visible.
+                thread::sleep(Duration::from_millis(1));
+            }
         }
 
         /// Assign a peer to the interface (with public_key, endpoint and a series of nallowed_ip)
@@ -996,19 +1027,18 @@ allowed_ip=10.66.66.2/32",
             "expected a handshake response to the first initiation"
         );
 
-        // The probe. Same source address, so nothing else clears the endpoint.
-        // `force_resend`, because `format_handshake_initiation` returns `Done`
-        // while a handshake is already in progress; the sleep keeps the second
-        // initiation's TAI64N strictly greater than the first's.
-        thread::sleep(Duration::from_millis(100));
+        // Waits for the upgrade attempt, not for an interval. The response is
+        // written strictly before the connected-socket block, so an elapsed-time
+        // bound only decides how often the worker loses the race, never whether
+        // it can. The assertion below is unchanged and still reads the counter
+        // itself: at 0 this times out and fails, and a second attempt that has
+        // already landed is still seen.
+        wg.wait_for_event_registrations(before, 1, Duration::from_secs(5));
 
-        // Read after the sleep, not the moment `recv_from` returns: the response
-        // is written strictly before the connected-socket block, so an immediate
-        // read races the worker still inside the handler. This pins that the
-        // armed one-shot was actually consumed -- without it, a device that
-        // never attempts the upgrade satisfies this whole test, because the
-        // second initiation is then answered by the shared listener for the
-        // trivial reason that no connected socket ever existed.
+        // This pins that the armed one-shot was actually consumed -- without
+        // it, a device that never attempts the upgrade satisfies this whole
+        // test, because the second initiation is then answered by the shared
+        // listener for the trivial reason that no connected socket ever existed.
         assert_eq!(
             wg.event_registration_attempts() - before,
             1,
@@ -1016,15 +1046,43 @@ allowed_ip=10.66.66.2/32",
              registration this test exercises never happened"
         );
 
-        let init2 = match client.format_handshake_initiation(&mut buf, true) {
-            TunnResult::WriteToNetwork(d) => d.to_vec(),
-            other => panic!("expected a second initiation, got {:?}", other),
+        // Retried until a deadline, not sent once. The counter above ticks at
+        // the top of `register_event`, but the rollback runs after it returns,
+        // so a single shot can still land on the rejected socket in the window
+        // between the two -- and such a datagram is silently swallowed, which is
+        // indistinguishable from the bug this test exists for.
+        //
+        // Retrying does not weaken the assertion. `conn` is cleared only by the
+        // rollback, by a roam, or by connection expiry (~3 min), none of which
+        // this loop reaches: delete the rollback and `conn` stays in place for
+        // the life of the endpoint, so every retry is swallowed, the deadline is
+        // hit, and the test fails exactly as before.
+        //
+        // `force_resend`, because `format_handshake_initiation` returns `Done`
+        // while a handshake is already in progress. Each call restamps, and
+        // `Tai64N` is nanosecond-resolution, so successive initiations are
+        // strictly increasing without help from a sleep -- which is what the
+        // fixed delay this replaced was also claimed to be for.
+        sock.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let n2 = loop {
+            let init2 = match client.format_handshake_initiation(&mut buf, true) {
+                TunnResult::WriteToNetwork(d) => d.to_vec(),
+                other => panic!("expected a second initiation, got {:?}", other),
+            };
+            sock.send_to(&init2, server).unwrap();
+            match sock.recv_from(&mut rx) {
+                Ok((n2, _)) => break n2,
+                Err(e) => assert!(
+                    Instant::now() < deadline,
+                    "the device never saw the second initiation: the rejected \
+                     connected socket is still taking the peer's datagrams off \
+                     the shared listener ({:?})",
+                    e
+                ),
+            }
         };
-        sock.send_to(&init2, server).unwrap();
-        let (n2, _) = sock.recv_from(&mut rx).expect(
-            "the device never saw the second initiation: the rejected connected \
-             socket is still taking the peer's datagrams off the shared listener",
-        );
         assert!(
             matches!(
                 Tunn::parse_incoming_packet(Default::default(), &rx[..n2]),
@@ -1040,7 +1098,7 @@ allowed_ip=10.66.66.2/32",
     /// `register_conn_handler` failing rolls `endpoint.conn` back to `None`, so
     /// `connect_endpoint` stops short-circuiting and the next authenticated
     /// datagram redoes the whole socket/bind/connect/dup/epoll_ctl sequence.
-    /// Once the process is out of `max_user_watches` that can never succeed, so
+    /// While this UID is out of `max_user_watches` that cannot succeed, so
     /// the retry is pure cost -- and worse than cost: each attempt binds a
     /// socket to the listen port and connects it to the peer's 4-tuple, which
     /// the kernel prefers over the wildcard listener, so datagrams arriving

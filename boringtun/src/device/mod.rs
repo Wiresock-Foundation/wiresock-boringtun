@@ -930,28 +930,60 @@ impl Device {
         // the whole signal: the operator needs to know traffic arrived before
         // the key, not how much of it did.
         let warned_keyless = AtomicBool::new(false);
-        // This one latches the *retry*, not just its log line. Once the
-        // process is out of epoll watches it stays out, and the rollback below
-        // clears `endpoint.conn`, so `connect_endpoint` stops short-circuiting
-        // -- every subsequent datagram from that peer would otherwise redo the
-        // whole socket/bind/connect/dup/epoll_ctl dance. Measured on the fault
-        // seam: 52 authenticated datagrams produced 52 `EPOLL_CTL_ADD`
-        // attempts without this gate, 1 with it.
+        // This one latches the *retry*, not just its log line, and it never
+        // clears. The flag lives in this closure, so only a fresh listener
+        // socket gets a fresh one. `register_udp_handler` is called once for
+        // udp4 and once for udp6, so there are two of these and a v4 failure
+        // does not gate v6.
         //
-        // The log volume was the least of it. Each retry binds a socket to the
-        // listen port and `connect`s it to the peer's 4-tuple, and the kernel
-        // prefers that socket over the wildcard listener -- so any datagram
-        // arriving between the `connect(2)` and the two `close(2)`s is
-        // delivered to a socket with no reader and dies with it. Under strace,
-        // which widens the window, 33 of 52 datagrams were lost that way.
-        // Retrying an upgrade that cannot succeed was costing the peer traffic
-        // it would otherwise have received on the shared socket.
+        // Not because the watch budget is permanently gone -- it is not.
+        // `max_user_watches` is counted per real UID, not per process, so
+        // another process under this UID can free some; and every connected
+        // handler this device releases gives one back, via `set_endpoint` on a
+        // roam, the `ConnectionExpired` arm in the timer above, and
+        // `remove_peer`. Capacity does come back. This listener stops asking.
+        //
+        // That is deliberate, because the two costs are not alike. Not asking
+        // costs throughput: the peer's traffic goes over the shared listener,
+        // which is how a `use_connected_socket=false` device runs all day.
+        // Asking again costs the peer's traffic outright: the rollback below
+        // clears `endpoint.conn`, so `connect_endpoint` stops short-circuiting
+        // and every subsequent datagram redoes the whole
+        // socket/bind/connect/epoll_ctl dance -- and the kernel prefers that
+        // half-built connected socket over the wildcard listener, so anything
+        // arriving between the `connect(2)` and the `close(2)` is delivered to
+        // a socket with no reader and dies with it. The attempt count is pinned
+        // by `a_peer_whose_upgrade_cannot_succeed_does_not_retry_it_per_datagram`:
+        // 52 authenticated datagrams, exactly one `EPOLL_CTL_ADD`. (The loss
+        // rate under that storm was observed once under strace, which widens
+        // the window; it is not pinned by a test.)
+        //
+        // So a periodic retry buys back an optimisation by re-buying that loss.
+        // A cooldown resumes the storm once per period, per peer, forever --
+        // and a failed `epoll_ctl` says nothing about when capacity returns, so
+        // no period is the right one. Clearing the flag when a handler is freed
+        // is worse: handlers are freed on every roam, and an authenticated peer
+        // roaming rapidly is the workload that exhausts the watches, so the
+        // gate would be cleared as fast as it is set, in exactly the case it
+        // exists for.
+        //
+        // Recovering the optimisation therefore means a new listener socket:
+        // in practice, a restart. A `listen_port=` rebind does rearm the flag
+        // when it succeeds, but `open_listen_socket` leaves `udp4`/`udp6` as
+        // `None` when it fails, and the iface handler's `expect("Not
+        // connected")` turns that into a panicked worker per thread -- and out
+        // of watches is exactly when that rebind fails. Do not treat it as the
+        // recovery until that is fixed.
+        //
+        // Not conditioned on the errno either. On the fresh UDP socket
+        // `Peer::connect_endpoint` hands to `register_conn_handler` below,
+        // `epoll_ctl(EPOLL_CTL_ADD)` can realistically only return ENOSPC or
+        // ENOMEM -- `register_event` explains why EMFILE cannot occur there,
+        // and `insert_at` deletes any prior registration at the index, so not
+        // EEXIST -- and both are exhaustion.
         //
         // The retry itself is upstream behaviour this fork did not introduce.
-        // Gating it is a change in behaviour, and a deliberate one: it is
-        // per-dispatch state, so it resets when the device restarts or the
-        // listen port is rebound, which is also when the watch budget might
-        // actually have changed.
+        // Gating it is a deliberate change.
         let conn_upgrade_disabled = AtomicBool::new(false);
         // Also at most once, and for a sharper reason than volume. Whether a
         // cookie reply amplifies is fixed by S1/S2/S3, so once it is true it is
@@ -1194,9 +1226,42 @@ impl Device {
                     if d.config.use_connected_socket
                         && !conn_upgrade_disabled.load(Ordering::Relaxed)
                     {
-                        if let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark) {
+                        // The gate below latches a failed `register_conn_handler`;
+                        // this latches a failed `connect_endpoint`, for the same
+                        // reason. That rollback and this `?` both leave
+                        // `endpoint.conn` at `None`, so `connect_endpoint` stops
+                        // short-circuiting and the peer's next datagram redoes
+                        // the whole socket/bind/connect sequence -- one per
+                        // datagram, with no log at all before this.
+                        //
+                        // `Error::Connect` is excluded, and that exclusion is
+                        // the point. `connect_endpoint` returns
+                        // `Connect("Connected")` for every datagram that reaches
+                        // the shared listener while `conn` is already committed,
+                        // which is what the tail of a roaming burst does: the
+                        // first packet upgrades and the rest land on it.
+                        // Latching there would take the connected socket away
+                        // from every healthy peer on this listener at the first
+                        // roam.
+                        //
+                        // Negated rather than matched positively, so a variant
+                        // added to `Error` later fails closed -- one attempt --
+                        // rather than open, one per datagram.
+                        let upgrade = p.connect_endpoint(d.listen_port, d.fwmark);
+                        if let Err(ref e) = upgrade {
+                            if !matches!(e, Error::Connect(_))
+                                && !conn_upgrade_disabled.swap(true, Ordering::Relaxed)
+                            {
+                                tracing::warn!(
+                                    message = "Failed to open a connected socket for peer; \
+                                               staying on the shared socket",
+                                    error = ?e
+                                );
+                            }
+                        }
+                        if let Ok(sock) = upgrade {
                             // Not `unwrap`: this is `epoll_ctl(EPOLL_CTL_ADD)`,
-                            // which fails with ENOSPC once the process hits
+                            // which fails with ENOSPC once this UID is out of
                             // `max_user_watches` -- reachable on a server with
                             // many peers, and drivable by an *authenticated*
                             // peer roaming rapidly, since every new source

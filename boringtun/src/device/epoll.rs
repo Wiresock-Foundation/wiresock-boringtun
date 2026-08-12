@@ -181,17 +181,12 @@ mod tests {
         // 0 = destructor never ran, 1 = ran with the lock HELD, 2 = ran with it FREE
         static OBSERVED: AtomicUsize = AtomicUsize::new(0);
 
-        struct ProbesTheLock(*const EventPoll<ProbesTheLock>);
-        // The pointer is only read inside `drop`, on the thread that owns the
-        // poll, and the poll outlives every handler registered in it.
-        unsafe impl Send for ProbesTheLock {}
-        unsafe impl Sync for ProbesTheLock {}
+        struct ProbesTheLock(&'static EventPoll<ProbesTheLock>);
 
         impl Drop for ProbesTheLock {
             fn drop(&mut self) {
-                let poll = unsafe { &*self.0 };
                 OBSERVED.store(
-                    if poll.events.try_lock().is_some() {
+                    if self.0.events.try_lock().is_some() {
                         2
                     } else {
                         1
@@ -201,17 +196,33 @@ mod tests {
             }
         }
 
-        let poll: EventPoll<ProbesTheLock> = EventPoll::new().unwrap();
+        // The poll is deliberately never dropped, and that is what makes the
+        // probe safe without `unsafe`: a handler can only hold a `&'static`
+        // back-reference to a poll that outlives the process, so the poll can
+        // never be dropped out from under a handler stranded inside it. With
+        // `poll` an ordinary local, deleting the rollback strands the probe in
+        // `poll.events`, the assertion fails, the panic unwinds the frame --
+        // and the probe's destructor then runs from `poll`'s own drop glue,
+        // after `EventPoll::drop` has been entered and the pointer to the poll
+        // invalidated. Miri rejects that under both Stacked Borrows and Tree
+        // Borrows, so the very run that proves this test can fail would be
+        // proving it through undefined behaviour.
+        //
+        // A `static` rather than `Box::leak`: the value stays reachable at
+        // exit, so `cargo miri test` does not abort on a leak diagnostic.
+        static POLL: std::sync::OnceLock<EventPoll<ProbesTheLock>> = std::sync::OnceLock::new();
+        let poll: &'static EventPoll<ProbesTheLock> =
+            POLL.get_or_init(|| EventPoll::new().unwrap());
         let path = std::env::temp_dir().join(format!("bt-epoll-reent-{}", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
 
-        poll.new_event(file.as_raw_fd(), ProbesTheLock(&poll as *const _))
+        poll.new_event(file.as_raw_fd(), ProbesTheLock(poll))
             .err()
             .expect("precondition: epoll_ctl on a regular file must fail, or this proves nothing");
 
-        // Read the observation while `poll` is still alive. Without the rollback
-        // the handler would instead be freed later by the poll's own drop glue,
-        // which takes no lock -- that would look free, and read as a pass.
+        // 0 rather than 2 is what a deleted rollback looks like: the probe is
+        // still sitting in `poll.events`, and since the poll is never dropped
+        // its destructor never runs at all.
         assert_eq!(
             OBSERVED.load(Ordering::SeqCst),
             2,
@@ -522,15 +533,17 @@ impl<H: Sync + Send> EventPoll<H> {
     }
 
     /// Make the next `register_event` on this poll fail, as `epoll_ctl` does
-    /// with ENOSPC once the process is out of `max_user_watches`.
+    /// with ENOSPC once this UID is out of `max_user_watches`.
     #[cfg(test)]
     pub(crate) fn fail_next_registration(&self) {
         self.fail_next_add
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Make every subsequent `register_event` fail, as a process that is out of
-    /// `max_user_watches` does until an operator raises the limit.
+    /// Make every subsequent `register_event` fail. Sticky, because a single
+    /// failure cannot express a device that keeps being refused -- not because
+    /// exhaustion is permanent: `max_user_watches` is per-UID and capacity
+    /// returns as watches are released.
     #[cfg(test)]
     pub(crate) fn fail_all_registrations(&self) {
         self.fail_all_adds
