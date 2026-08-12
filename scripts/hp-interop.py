@@ -25,6 +25,15 @@ python `cryptography` module, a built boringtun-cli, and amneziawg-go v3:
 
     go install github.com/amnezia-vpn/amneziawg-go/v3@latest   # needs Go >= 1.25
 
+`@latest` on purpose, not a pinned tag. This harness exists to notice the wire
+format moving under us; pinning would freeze the one external oracle we have
+into a second copy of our own constants, green forever for the same reason the
+in-crate tests are. The build actually tested is read out of the binary's Go
+module metadata and printed with the results, so every run names its oracle. To
+reproduce an older run, install that exact version and then go back to @latest:
+
+    go install github.com/amnezia-vpn/amneziawg-go/v3@v3.0.20260805
+
 The /v3 suffix is required, not cosmetic -- see the note in awg-go-interop.sh.
 
 SAFETY: everything lives in throwaway network namespaces prefixed `hpa-`/`hpb-`,
@@ -72,6 +81,22 @@ def bad(m): print(f"  FAIL {m}"); failed.append(m)
 
 def sh(cmd, **kw):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+
+def go_module_version(path):
+    """The module version amneziawg-go was built from.
+
+    NOT `--version`: upstream's version constant still reads 0.0.20250522 on the
+    v3 line, so the binary under-reports itself by more than a year. `go version
+    -m` reads the module metadata the linker embeds, which is the real answer.
+    Falls back to the raw path when the Go toolchain is absent -- naming the
+    oracle is worth having, not worth failing the run over.
+    """
+    r = sh(f"go version -m {shlex.quote(path)}")
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "mod" and "amneziawg-go" in parts[1]:
+            return f"{parts[1]} {parts[2]}"
+    return f"{path} (version unknown: `go version -m` said nothing)"
 
 def x25519_pub(priv_hex: str) -> str:
     from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
@@ -261,7 +286,8 @@ try:
     run_case("B go<->go WITHOUT key", "go", "go", None, None, True)
     run_case("C bt<->go WITH key",    "bt", "go", HP,   HP,   True)
     run_case("D bt<->go key one end", "bt", "go", HP,   None, False)
-    print(f"\nSUMMARY: {len(passed)} passed, {len(failed)} failed")
+    print(f"\nORACLE: {go_module_version(GO)}")
+    print(f"SUMMARY: {len(passed)} passed, {len(failed)} failed")
     sys.exit(1 if failed else 0)
 finally:
     teardown()

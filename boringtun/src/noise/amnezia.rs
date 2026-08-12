@@ -449,7 +449,45 @@ impl AmneziaConfig {
     /// this genuinely refuses a configuration the kernel module runs. It is
     /// intentional, and argued at the check rather than here, so that "every
     /// working kernel configuration is accepted" is not read as covering it.
+    /// The header-protection nonce rule on its own: every S size must be able to
+    /// supply the 12 nonce bytes once a key is set.
+    ///
+    /// Header protection nonces every datagram with its own first 12 bytes, so a
+    /// prefix shorter than that cannot supply one. Refused rather than silently
+    /// left unprotected: an operator who set a key and got no masking would have
+    /// no way to tell.
+    ///
+    /// Split out of [`Self::validate`] because it is the only rule the `Tunn`
+    /// constructors can enforce for themselves. It rejects exactly the
+    /// configurations that can *never* emit a datagram, whereas `validate`'s
+    /// cookie-amplification rule refuses configurations that do work -- weakly
+    /// reflecting -- which is a policy judgement belonging to the full check a
+    /// `set=1` runs, not to a constructor.
+    pub(crate) fn check_header_protection_nonce(&self) -> Result<(), String> {
+        if !self.header_protection_enabled() {
+            return Ok(());
+        }
+        for (label, junk) in [
+            ("S1", self.init_packet_junk_size),
+            ("S2", self.response_packet_junk_size),
+            ("S3", self.cookie_packet_junk_size),
+            ("S4", self.transport_packet_junk_size),
+        ] {
+            if (junk as usize) < NONCE_SIZE {
+                return Err(format!(
+                    "{} is {} bytes, but header protection needs at least {} \
+                     to nonce each datagram; raise {} or clear the key",
+                    label, junk, NONCE_SIZE, label
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        // First, and as its own pass rather than interleaved with the size rule
+        // below, because the `Tunn` constructors call it on their own.
+        self.check_header_protection_nonce()?;
         for (label, junk, base) in [
             ("S1", self.init_packet_junk_size, HANDSHAKE_INIT_SZ),
             ("S2", self.response_packet_junk_size, HANDSHAKE_RESP_SZ),
@@ -460,18 +498,6 @@ impl AmneziaConfig {
                 return Err(format!(
                     "{} is too large: {} junk bytes + {} packet bytes exceed the {}-byte maximum datagram",
                     label, junk, base, MAX_SENDABLE_DATAGRAM
-                ));
-            }
-
-            // Header protection nonces every datagram with its own first 12
-            // bytes, so a prefix shorter than that cannot supply one. Refused
-            // rather than silently left unprotected: an operator who set a key
-            // and got no masking would have no way to tell.
-            if self.header_protection_enabled() && (junk as usize) < NONCE_SIZE {
-                return Err(format!(
-                    "{} is {} bytes, but header protection needs at least {} \
-                     to nonce each datagram; raise {} or clear the key",
-                    label, junk, NONCE_SIZE, label
                 ));
             }
         }
@@ -1002,10 +1028,27 @@ impl AmneziaConfig {
             .header_protection
             .mask_outbound(&mut buffer[..new_size], junk_size, masked)
         {
-            // Only reachable with a junk size below the nonce length, which
-            // `validate` rejects -- so this is a backstop, and dropping the
-            // packet is right: emitting it unmasked would be readable by a
-            // classifier the operator asked to defeat.
+            // Only reachable with a junk size below the nonce length. The `Tunn`
+            // constructors now refuse that configuration outright, so the one
+            // door left is `Tunn::set_obfuscation`, which is public and
+            // infallible. Dropping the packet is right -- emitting it unmasked
+            // would be readable by the classifier the operator asked to defeat
+            // -- but `DestinationBufferTooSmall` is about the caller's buffer,
+            // and here the buffer is fine, so say so once.
+            //
+            // Process-wide rather than per-config: `AmneziaConfig` derives
+            // `Clone`/`PartialEq` and an interior-mutable latch would break
+            // both, and a tunnel in this state fails on every packet, so the
+            // second line would only be noise.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::error!(
+                    message = "header protection is on but the junk prefix for this \
+                               packet is shorter than the 12-byte nonce, so nothing \
+                               can be sent; raise S1-S4 or clear the key",
+                    junk_size = junk_size
+                )
+            });
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
         Ok(&mut buffer[..new_size])
