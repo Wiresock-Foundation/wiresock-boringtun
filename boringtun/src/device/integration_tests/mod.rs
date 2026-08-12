@@ -448,6 +448,18 @@ mod tests {
             self._device.device.read().queue.fail_next_registration();
         }
 
+        /// As above but sticky: a process out of watches stays out.
+        #[cfg(target_os = "linux")]
+        fn fail_all_event_registrations(&self) {
+            self._device.device.read().queue.fail_all_registrations();
+        }
+
+        /// How many `EPOLL_CTL_ADD` calls this device has attempted.
+        #[cfg(target_os = "linux")]
+        fn event_registration_attempts(&self) -> usize {
+            self._device.device.read().queue.registration_attempts()
+        }
+
         /// Assign a peer to the interface (with public_key, endpoint and a series of nallowed_ip)
         fn wg_set_peer(
             &self,
@@ -989,6 +1001,110 @@ allowed_ip=10.66.66.2/32",
                 Ok(Packet::HandshakeResponse(_))
             ),
             "expected a handshake response to the second initiation"
+        );
+    }
+
+    /// A peer whose connected-socket upgrade cannot succeed must not retry it
+    /// on every datagram.
+    ///
+    /// `register_conn_handler` failing rolls `endpoint.conn` back to `None`, so
+    /// `connect_endpoint` stops short-circuiting and the next authenticated
+    /// datagram redoes the whole socket/bind/connect/dup/epoll_ctl sequence.
+    /// Once the process is out of `max_user_watches` that can never succeed, so
+    /// the retry is pure cost -- and worse than cost: each attempt binds a
+    /// socket to the listen port and connects it to the peer's 4-tuple, which
+    /// the kernel prefers over the wildcard listener, so datagrams arriving
+    /// inside the window are delivered to a socket with no reader.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_peer_whose_upgrade_cannot_succeed_does_not_retry_it_per_datagram() {
+        let port = next_port();
+        let private_key = StaticSecret::random_from_rng(OsRng);
+        let public_key = PublicKey::from(&private_key);
+
+        let wg = WGHandle::init(next_ip(), next_ip_v6());
+        assert_eq!(
+            wg.wg_set_port(port),
+            "errno=0
+
+"
+        );
+        assert_eq!(
+            wg.wg_set_key(private_key),
+            "errno=0
+
+"
+        );
+
+        let peer_secret = StaticSecret::random_from_rng(OsRng);
+        let peer_public = PublicKey::from(&peer_secret);
+        assert_eq!(
+            wg.wg_set(&format!(
+                "public_key={}
+allowed_ip=10.66.66.2/32",
+                encode(peer_public.as_bytes())
+            )),
+            "errno=0
+
+"
+        );
+
+        let mut client = Tunn::new_with_obfuscation(
+            peer_secret,
+            public_key,
+            None,
+            None,
+            100,
+            None,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let mut rx = vec![0u8; 2048];
+
+        // Out of watches from here on, which is the state the gate exists for.
+        wg.fail_all_event_registrations();
+        let before = wg.event_registration_attempts();
+
+        // Every one of these is authenticated, so every one reaches the
+        // connected-socket block.
+        let datagrams = 52;
+        for i in 0..datagrams {
+            let init = match client.format_handshake_initiation(&mut buf, true) {
+                TunnResult::WriteToNetwork(d) => d.to_vec(),
+                other => panic!("expected an initiation, got {:?}", other),
+            };
+            sock.send_to(&init, server).unwrap();
+            let (n, _) = sock
+                .recv_from(&mut rx)
+                .unwrap_or_else(|e| panic!("no response to initiation {}: {:?}", i, e));
+            assert!(
+                matches!(
+                    Tunn::parse_incoming_packet(Default::default(), &rx[..n]),
+                    Ok(Packet::HandshakeResponse(_))
+                ),
+                "expected a handshake response to initiation {}",
+                i
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let attempts = wg.event_registration_attempts() - before;
+        assert!(
+            attempts <= 1,
+            "{} authenticated datagrams drove {} EPOLL_CTL_ADD attempts; a \
+             failed upgrade must be attempted once, not once per datagram",
+            datagrams,
+            attempts
         );
     }
 }

@@ -930,14 +930,29 @@ impl Device {
         // the whole signal: the operator needs to know traffic arrived before
         // the key, not how much of it did.
         let warned_keyless = AtomicBool::new(false);
-        // Also at most once, and for the same reason as `warned_keyless`. Once
-        // the process is out of epoll watches or descriptors it stays out, and
-        // the rollback below clears `endpoint.conn`, so `connect_endpoint` no
-        // longer short-circuits -- every subsequent datagram from that peer
-        // retries the whole socket/bind/connect/dup/epoll_ctl dance and would
-        // log again. The retry itself is upstream behaviour this fork did not
-        // introduce; the unlatched line would be ours.
-        let warned_conn_register = AtomicBool::new(false);
+        // This one latches the *retry*, not just its log line. Once the
+        // process is out of epoll watches it stays out, and the rollback below
+        // clears `endpoint.conn`, so `connect_endpoint` stops short-circuiting
+        // -- every subsequent datagram from that peer would otherwise redo the
+        // whole socket/bind/connect/dup/epoll_ctl dance. Measured on the fault
+        // seam: 52 authenticated datagrams produced 52 `EPOLL_CTL_ADD`
+        // attempts without this gate, 1 with it.
+        //
+        // The log volume was the least of it. Each retry binds a socket to the
+        // listen port and `connect`s it to the peer's 4-tuple, and the kernel
+        // prefers that socket over the wildcard listener -- so any datagram
+        // arriving between the `connect(2)` and the two `close(2)`s is
+        // delivered to a socket with no reader and dies with it. Under strace,
+        // which widens the window, 33 of 52 datagrams were lost that way.
+        // Retrying an upgrade that cannot succeed was costing the peer traffic
+        // it would otherwise have received on the shared socket.
+        //
+        // The retry itself is upstream behaviour this fork did not introduce.
+        // Gating it is a change in behaviour, and a deliberate one: it is
+        // per-dispatch state, so it resets when the device restarts or the
+        // listen port is rebound, which is also when the watch budget might
+        // actually have changed.
+        let conn_upgrade_disabled = AtomicBool::new(false);
         // Also at most once, and for a sharper reason than volume. Whether a
         // cookie reply amplifies is fixed by S1/S2/S3, so once it is true it is
         // true for every datagram of that kind until the operator changes the
@@ -1176,7 +1191,9 @@ impl Device {
                     // This packet was OK, that means we want to create a connected socket for this peer
                     let ip_addr = from.ip();
                     p.set_endpoint(from);
-                    if d.config.use_connected_socket {
+                    if d.config.use_connected_socket
+                        && !conn_upgrade_disabled.load(Ordering::Relaxed)
+                    {
                         if let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark) {
                             // Not `unwrap`: this is `epoll_ctl(EPOLL_CTL_ADD)`,
                             // which fails with ENOSPC once the process hits
@@ -1190,7 +1207,9 @@ impl Device {
                             // above is already handled this way.
                             if let Err(e) = d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
                             {
-                                if !warned_conn_register.swap(true, Ordering::Relaxed) {
+                                // `swap`, not `store`: four worker threads can
+                                // race into this block on different peers.
+                                if !conn_upgrade_disabled.swap(true, Ordering::Relaxed) {
                                     tracing::warn!(
                                         message = "Failed to register connected socket for peer; \
                                                    reverting to the shared socket",
@@ -1212,8 +1231,25 @@ impl Device {
                                 // path registration is precisely what failed --
                                 // `register_event` already dropped the handler
                                 // box. All the shutdown would add here is an
-                                // `info!` per datagram from the retry above.
+                                // `info!` on a socket that never entered
+                                // service.
                                 p.endpoint_mut().conn = None;
+                            } else {
+                                // Reported here, not in `connect_endpoint`:
+                                // this is the arm on which the connected socket
+                                // actually enters service. It runs at most once
+                                // per peer per source address, since the next
+                                // datagram short-circuits on `conn.is_some()`.
+                                //
+                                // Still under two locks -- the peer `Mutex`
+                                // this dispatch holds and the device read lock
+                                // -- but no longer under `Peer::endpoint`'s
+                                // write guard, which `connect_endpoint` held.
+                                tracing::info!(
+                                    message = "Connected endpoint",
+                                    port = d.listen_port,
+                                    endpoint = ?from
+                                );
                             }
                         }
                     }

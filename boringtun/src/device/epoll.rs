@@ -29,6 +29,14 @@ pub struct EventPoll<H: Sized> {
     /// disturb another test's device running concurrently.
     #[cfg(test)]
     fail_next_add: std::sync::atomic::AtomicBool,
+    /// As above but sticky, for the case a single failure cannot express: a
+    /// process that is out of watches and stays out.
+    #[cfg(test)]
+    fail_all_adds: std::sync::atomic::AtomicBool,
+    /// Counts `EPOLL_CTL_ADD` attempts, so a test can assert that a failed
+    /// upgrade is not retried per datagram.
+    #[cfg(test)]
+    add_attempts: std::sync::atomic::AtomicUsize,
 }
 
 /// A type that hold a reference to a triggered Event
@@ -117,7 +125,8 @@ mod tests {
     /// the caller supplied -- in this crate, `close(2)` on a `socket2::Socket`.
     /// The contract is that *nothing* runs in between, and the errno matters
     /// because `register_conn_handler`'s warning reports it to an operator as
-    /// the difference between `max_user_watches` and fd exhaustion.
+    /// the difference between `max_user_watches` (ENOSPC) and memory pressure
+    /// (ENOMEM).
     ///
     /// This pins the destructor half only. The lock half needs a contending
     /// thread to lose the futex race, which is not deterministic; it was
@@ -227,6 +236,10 @@ impl<H: Sync + Send> EventPoll<H> {
             epoll,
             #[cfg(test)]
             fail_next_add: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_all_adds: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            add_attempts: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -437,13 +450,20 @@ impl<H: Sync + Send> EventPoll<H> {
         // per-UID sysctl and cannot be forced from a shared test binary without
         // breaking every other epoll user on the host.
         #[cfg(test)]
-        let epoll_fd = if self
-            .fail_next_add
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            -1
-        } else {
-            self.epoll
+        let epoll_fd = {
+            self.add_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self
+                .fail_next_add
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+                || self
+                    .fail_all_adds
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                -1
+            } else {
+                self.epoll
+            }
         };
         #[cfg(not(test))]
         let epoll_fd = self.epoll;
@@ -469,7 +489,10 @@ impl<H: Sync + Send> EventPoll<H> {
             // and `EventPoll` makes no promise about what its `Drop` runs; in
             // this crate it closes a `socket2::Socket`. The errno is not
             // decorative here, it is what tells an operator whether they hit
-            // `max_user_watches` (ENOSPC) or ran out of descriptors (EMFILE).
+            // `max_user_watches` (ENOSPC) or ran out of memory (ENOMEM). Not
+            // EMFILE: `epoll_ctl` allocates no descriptor, so it cannot report
+            // it, and the socket and `dup` in `connect_endpoint` would have
+            // failed first anyway.
             let err = io::Error::last_os_error();
             // Bound to a local, not left as a temporary of this statement. As a
             // temporary the rejected handler would be destroyed *before* the
@@ -504,6 +527,20 @@ impl<H: Sync + Send> EventPoll<H> {
     pub(crate) fn fail_next_registration(&self) {
         self.fail_next_add
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make every subsequent `register_event` fail, as a process that is out of
+    /// `max_user_watches` does until an operator raises the limit.
+    #[cfg(test)]
+    pub(crate) fn fail_all_registrations(&self) {
+        self.fail_all_adds
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many `EPOLL_CTL_ADD` calls this poll has attempted.
+    #[cfg(test)]
+    pub(crate) fn registration_attempts(&self) -> usize {
+        self.add_attempts.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // Insert an event into the events vector
