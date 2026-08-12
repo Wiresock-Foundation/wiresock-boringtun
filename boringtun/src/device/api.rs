@@ -802,13 +802,20 @@ fn parse_keepalive_interval(val: &str) -> Option<u16> {
         return None;
     }
     if lo != hi {
+        // Report the value applied, not a description of how it was chosen.
+        // "Using the low end" was false for exactly the inputs where `lo == 0`:
+        // the clamp below sends 1, not 0, and 0 is the one low end an operator
+        // is likely to write. A field carrying the number cannot drift from the
+        // arithmetic the way a sentence about it can.
+        let fixed = lo.max(1) as u16;
         tracing::warn!(
             message = "randomised keepalive intervals are not implemented; \
-                       using the low end of the range",
+                       the range is narrowed to a single interval",
             requested_low = lo,
-            requested_high = hi
+            requested_high = hi,
+            fixed_interval = fixed
         );
-        return Some(lo.max(1) as u16);
+        return Some(fixed);
     }
     Some(lo as u16)
 }
@@ -1205,6 +1212,69 @@ mod tests {
             handle_awg3_device_key("header_protection_key", "0"),
             Err(EINVAL),
             "one hex char is not a key"
+        );
+    }
+
+    /// The warning must report the interval it applied, not describe it.
+    ///
+    /// It used to say "using the low end of the range", which is false for
+    /// exactly the inputs where `lo == 0` -- the clamp sends 1, and 0 is the
+    /// one low end an operator is likely to write. A sentence about the
+    /// arithmetic can drift from it; a field carrying the number cannot.
+    #[test]
+    fn the_keepalive_warning_reports_the_interval_it_applied() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Default)]
+        struct Captured {
+            message: String,
+            fixed_interval: Option<u64>,
+        }
+
+        impl Visit for Captured {
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                if field.name() == "fixed_interval" {
+                    self.fixed_interval = Some(value);
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.message = format!("{:?}", value);
+                }
+            }
+        }
+
+        struct Capture(Arc<Mutex<Vec<Captured>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let mut c = Captured::default();
+                event.record(&mut c);
+                self.0.lock().unwrap().push(c);
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(parse_keepalive_interval("0-30"), Some(1));
+        });
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "expected exactly one warning");
+        assert_eq!(
+            events[0].fixed_interval,
+            Some(1),
+            "the warning must carry the interval actually applied"
+        );
+        assert!(
+            !events[0].message.contains("low end"),
+            "the message claims the low end was used, but 0 was clamped to 1: {}",
+            events[0].message
         );
     }
 
