@@ -36,6 +36,7 @@ Exit 0 if all four cases behave as expected, 1 otherwise.
 """
 import os
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -149,17 +150,30 @@ def launch(cmd, log):
         print(f"      LAUNCH produced no log at {log} (WORK exists: {os.path.isdir(WORK)})")
     return log
 
+# `GO` and `BT` come from argv and `log` sits under `tempfile.mkdtemp()`, i.e.
+# under $TMPDIR -- none of the three is ours to trust, and `sh` runs as root.
+# Unquoted, a path with a space does not merely fail to launch: the shell splits
+# the redirect too, so `>` truncates at the *prefix*, creating a root-owned file
+# there or erasing whatever is already at that name, outside the namespaces this
+# script tears down. The trailing `&` makes the shell exit 0, so `launch`'s
+# returncode check never sees it either -- only the missing-log check does.
+#
+# Quoted here and nowhere else on purpose: every other interpolation in this
+# file is a `secrets.token_hex` name or a module-level literal.
 def start_go(ns, iface, logname):
     log = os.path.join(WORK, logname)
     return launch(
-        f"ip netns exec {ns} env LOG_LEVEL=verbose {GO} -f {iface} > {log} 2>&1 &", log
+        f"ip netns exec {ns} env LOG_LEVEL=verbose "
+        f"{shlex.quote(GO)} -f {iface} > {shlex.quote(log)} 2>&1 &",
+        log,
     )
 
 def start_bt(ns, iface, logname):
     log = os.path.join(WORK, logname)
     return launch(
         f"ip netns exec {ns} env WG_LOG_LEVEL=debug "
-        f"{BT} --foreground --disable-drop-privileges {iface} > {log} 2>&1 &",
+        f"{shlex.quote(BT)} --foreground --disable-drop-privileges {iface} "
+        f"> {shlex.quote(log)} 2>&1 &",
         log,
     )
 
