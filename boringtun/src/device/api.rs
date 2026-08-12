@@ -1578,20 +1578,23 @@ mod tests {
             ("reject_after_time", "200-100", Err(EINVAL), SILENT),
             // The one key we refuse outright -- a peer masking the message-type
             // field is mutually unreachable, not degraded. The refusal is the
-            // loud case: an aborted `set=1` with nothing in the log naming the
-            // reason is the failure this function exists to remove.
+            // loud case on the branch below this one, where the key is refused
+            // here. On THIS branch header protection is implemented, so
+            // `api_set` consumes the key before the fallback sees it and both
+            // spellings reach the catch-all: refused, and silently. That
+            // difference is the point of the rows -- if `api_set` ever stopped
+            // handling the key, these would start passing again while the
+            // feature was silently gone.
             (
                 "header_protection_key",
                 "abababababababababababababababababababababababababababababababab",
                 Err(EINVAL),
-                REFUSED_LOUDLY,
+                SILENT,
             ),
-            // An all-zero key means protection is off, which is what we do, so
-            // it is agreement: tolerated and silent.
             (
                 "header_protection_key",
                 "0000000000000000000000000000000000000000000000000000000000000000",
-                Ok(()),
+                Err(EINVAL),
                 SILENT,
             ),
             // A key from neither list is still refused, and silently.

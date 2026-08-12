@@ -422,6 +422,51 @@ impl AmneziaConfig {
         self
     }
 
+    /// The header-protection nonce rule on its own: every S size must be able to
+    /// supply the 12 nonce bytes once a key is set.
+    ///
+    /// Header protection nonces every datagram with its own first 12 bytes, so a
+    /// prefix shorter than that cannot supply one. Refused rather than silently
+    /// left unprotected: an operator who set a key and got no masking would have
+    /// no way to tell.
+    ///
+    /// What it catches is per-kind, not global: `prepend_outbound` refuses only
+    /// the kind whose own S is short. So this rejects a superset of the configs
+    /// that can never emit anything -- on a fresh tunnel S1 short is exactly
+    /// that, since no initiation means no session, while S2, S3 and S4 put
+    /// datagrams on the wire and lose the tunnel later. Every position is fatal,
+    /// by a different route; the table is on
+    /// [`Tunn::new_with_obfuscation`](crate::noise::Tunn::new_with_obfuscation).
+    ///
+    /// Split out of [`Self::validate`] because it is the only rule the `Tunn`
+    /// constructors can enforce for themselves. `validate`'s cookie-amplification
+    /// rule refuses configurations that do work -- weakly reflecting -- which is a
+    /// policy judgement belonging to the full check a `set=1` runs, not to a
+    /// constructor.
+    ///
+    /// Parity with amneziawg-go, which refuses the same four sizes in
+    /// `mergeWithDevice` against its own `HeaderCipherNonceSize = 12`.
+    pub(crate) fn check_header_protection_nonce(&self) -> Result<(), String> {
+        if !self.header_protection_enabled() {
+            return Ok(());
+        }
+        for (label, junk) in [
+            ("S1", self.init_packet_junk_size),
+            ("S2", self.response_packet_junk_size),
+            ("S3", self.cookie_packet_junk_size),
+            ("S4", self.transport_packet_junk_size),
+        ] {
+            if (junk as usize) < NONCE_SIZE {
+                return Err(format!(
+                    "{} is {} bytes, but header protection needs at least {} \
+                     to nonce each datagram; raise {} or clear the key",
+                    label, junk, NONCE_SIZE, label
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Check that every S-prefix can coexist with the packet it precedes.
     ///
     /// [`Self::new`] deliberately does not clamp, because the sizes are part of
@@ -449,41 +494,6 @@ impl AmneziaConfig {
     /// this genuinely refuses a configuration the kernel module runs. It is
     /// intentional, and argued at the check rather than here, so that "every
     /// working kernel configuration is accepted" is not read as covering it.
-    /// The header-protection nonce rule on its own: every S size must be able to
-    /// supply the 12 nonce bytes once a key is set.
-    ///
-    /// Header protection nonces every datagram with its own first 12 bytes, so a
-    /// prefix shorter than that cannot supply one. Refused rather than silently
-    /// left unprotected: an operator who set a key and got no masking would have
-    /// no way to tell.
-    ///
-    /// Split out of [`Self::validate`] because it is the only rule the `Tunn`
-    /// constructors can enforce for themselves. It rejects exactly the
-    /// configurations that can *never* emit a datagram, whereas `validate`'s
-    /// cookie-amplification rule refuses configurations that do work -- weakly
-    /// reflecting -- which is a policy judgement belonging to the full check a
-    /// `set=1` runs, not to a constructor.
-    pub(crate) fn check_header_protection_nonce(&self) -> Result<(), String> {
-        if !self.header_protection_enabled() {
-            return Ok(());
-        }
-        for (label, junk) in [
-            ("S1", self.init_packet_junk_size),
-            ("S2", self.response_packet_junk_size),
-            ("S3", self.cookie_packet_junk_size),
-            ("S4", self.transport_packet_junk_size),
-        ] {
-            if (junk as usize) < NONCE_SIZE {
-                return Err(format!(
-                    "{} is {} bytes, but header protection needs at least {} \
-                     to nonce each datagram; raise {} or clear the key",
-                    label, junk, NONCE_SIZE, label
-                ));
-            }
-        }
-        Ok(())
-    }
-
     pub fn validate(&self) -> Result<(), String> {
         // First, and as its own pass rather than interleaved with the size rule
         // below, because the `Tunn` constructors call it on their own.

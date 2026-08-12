@@ -349,8 +349,18 @@ impl Tunn {
     /// only fail on input the caller has by definition already rejected, so the
     /// error it returns is unreachable and tempts callers into `expect`.
     ///
-    /// The remaining failure is real but rare: seeding the per-tunnel RNG from
-    /// OS entropy.
+    /// # Errors
+    ///
+    /// Two. Seeding the per-tunnel RNG from OS entropy, which is real but rare.
+    /// And, when `amnezia` carries a header-protection key, any of S1..S4 below
+    /// `NONCE_SIZE`: header protection takes each datagram's nonce from its own
+    /// junk prefix, so a prefix shorter than that cannot supply one and the
+    /// packet kind it precedes can never be sent. Every position is fatal, by a
+    /// different route -- S1 short means no initiation, so an initiator never
+    /// forms a session at all; S2 means no response, so a responder never
+    /// completes one; S3 costs cookie replies under load; S4 means the
+    /// handshake completes and then no data crosses. The error names the
+    /// offending size. Configurations without a key are unaffected.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_obfuscation(
         static_private: x25519::StaticSecret,
@@ -362,12 +372,21 @@ impl Tunn {
         obf: ObfuscationRanges,
         amnezia: AmneziaConfig,
     ) -> Result<Self, String> {
-        // A junk prefix shorter than the header-protection nonce can never emit
-        // a datagram: `prepend_outbound` refuses every packet for the life of
-        // the tunnel. Refused here, where the constructor already returns
+        // A junk prefix shorter than the header-protection nonce cannot supply
+        // one, so `prepend_outbound` refuses that packet kind for the life of
+        // the tunnel. The refusal is per-kind, not global -- only the kind
+        // whose own S is short -- but every position is fatal by some route,
+        // and on a *fresh* tunnel S1 is fatal immediately: no initiation means
+        // no session, so nothing else is ever reached. See the constructor's
+        // rustdoc for the per-position table.
+        //
+        // Refused here, where the constructor already returns
         // `Result<_, String>` and can name the offending S size, rather than at
         // send time as a `DestinationBufferTooSmall` pointing the caller at a
         // buffer that was never the problem.
+        //
+        // Parity, not added strictness: amneziawg-go refuses the same four in
+        // `mergeWithDevice` against its own `HeaderCipherNonceSize = 12`.
         //
         // Only this rule, not the whole of `validate`: the cookie-amplification
         // rule refuses configurations that do work, which is a policy judgement
