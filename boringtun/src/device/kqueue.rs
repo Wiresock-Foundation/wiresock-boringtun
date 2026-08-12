@@ -255,12 +255,28 @@ impl<H: Send + Sync> EventPoll<H> {
                 return Err(Error::EventQueue(err));
             }
 
-            let mut displaced = events[index].take();
-            if let Some(event) = displaced.as_mut() {
-                // Properly remove any previous event first
-                event.event.flags = EV_DELETE;
-                unsafe { kevent(self.kqueue, &event.event, 1, null_mut(), 0, null()) };
-            }
+            // No `EV_DELETE` here, though upstream had one. `EV_ADD` above has
+            // already replaced this registration: kqueue(2) says "A kevent is
+            // identified by the (ident, filter) pair" and "Re-adding an existing
+            // event will modify the parameters of the original event, and not
+            // result in a duplicate entry". The displaced entry and the new one
+            // share both halves of that key -- `index == ident` for `FD` and
+            // `Signal`, `EVFILT_READ` for everything in `self.events`,
+            // `EVFILT_SIGNAL` for everything in `self.signals`, and
+            // `Timer`/`Notifier` cannot displace at all because their index is
+            // always `events.len()`. So the delete named the registration
+            // installed one statement earlier and stranded the new handler in
+            // the vector, unable to trigger.
+            //
+            // Not moved above the `EV_ADD` instead: there a failed add would
+            // leave the caller with neither registration. As it stands a failed
+            // add leaves the previous one intact.
+            //
+            // Defensive rather than live: this branch needs `events[fd]` to be
+            // occupied when a new socket is handed the same fd number, and
+            // every handler owns the trigger it is indexed by, so the number
+            // cannot be re-issued while the entry exists.
+            let displaced = events[index].take();
 
             if ev.kind == EventKind::Signal {
                 // Mask the signal if successfully added to kqueue

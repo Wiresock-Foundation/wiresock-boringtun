@@ -909,7 +909,21 @@ mod tests {
         let private_key = StaticSecret::random_from_rng(OsRng);
         let public_key = PublicKey::from(&private_key);
 
-        let wg = WGHandle::init(next_ip(), next_ip_v6());
+        // Single-queue, unlike `WGHandle::init`: with `use_multi_queue`, worker
+        // thread 1 registers a second TUN handler *asynchronously* from
+        // `event_loop`, and that is the one EPOLL_CTL_ADD that could land inside
+        // the window this test subtracts over.
+        let wg = WGHandle::init_with_config(
+            next_ip(),
+            next_ip_v6(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: true,
+                use_multi_queue: false,
+                uapi_fd: -1,
+                ..Default::default()
+            },
+        );
         assert_eq!(
             wg.wg_set_port(port),
             "errno=0
@@ -960,6 +974,7 @@ allowed_ip=10.66.66.2/32",
         // Armed after every other registration has happened -- the API socket,
         // the timers, the notifiers and both listeners are already in -- so the
         // next EPOLL_CTL_ADD is the connected socket for this peer.
+        let before = wg.event_registration_attempts();
         wg.fail_next_event_registration();
 
         let init = match client.format_handshake_initiation(&mut buf, false) {
@@ -986,6 +1001,21 @@ allowed_ip=10.66.66.2/32",
         // while a handshake is already in progress; the sleep keeps the second
         // initiation's TAI64N strictly greater than the first's.
         thread::sleep(Duration::from_millis(100));
+
+        // Read after the sleep, not the moment `recv_from` returns: the response
+        // is written strictly before the connected-socket block, so an immediate
+        // read races the worker still inside the handler. This pins that the
+        // armed one-shot was actually consumed -- without it, a device that
+        // never attempts the upgrade satisfies this whole test, because the
+        // second initiation is then answered by the shared listener for the
+        // trivial reason that no connected socket ever existed.
+        assert_eq!(
+            wg.event_registration_attempts() - before,
+            1,
+            "the device attempted no connected-socket upgrade, so the refused \
+             registration this test exercises never happened"
+        );
+
         let init2 = match client.format_handshake_initiation(&mut buf, true) {
             TunnResult::WriteToNetwork(d) => d.to_vec(),
             other => panic!("expected a second initiation, got {:?}", other),
@@ -1025,7 +1055,21 @@ allowed_ip=10.66.66.2/32",
         let private_key = StaticSecret::random_from_rng(OsRng);
         let public_key = PublicKey::from(&private_key);
 
-        let wg = WGHandle::init(next_ip(), next_ip_v6());
+        // Single-queue, unlike `WGHandle::init`: with `use_multi_queue`, worker
+        // thread 1 registers a second TUN handler *asynchronously* from
+        // `event_loop`, and that is the one EPOLL_CTL_ADD that could land inside
+        // the window this test subtracts over.
+        let wg = WGHandle::init_with_config(
+            next_ip(),
+            next_ip_v6(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: true,
+                use_multi_queue: false,
+                uapi_fd: -1,
+                ..Default::default()
+            },
+        );
         assert_eq!(
             wg.wg_set_port(port),
             "errno=0
@@ -1099,12 +1143,17 @@ allowed_ip=10.66.66.2/32",
         }
 
         let attempts = wg.event_registration_attempts() - before;
-        assert!(
-            attempts <= 1,
+        // Exactly one, not "at most one": zero would mean the upgrade was never
+        // attempted at all, which every one of these mutations produces --
+        // `use_connected_socket` forced off, the gate initialised true, the
+        // whole block deleted -- and each of those would have satisfied a
+        // `<= 1` bound while proving nothing.
+        assert_eq!(
+            attempts, 1,
             "{} authenticated datagrams drove {} EPOLL_CTL_ADD attempts; a \
-             failed upgrade must be attempted once, not once per datagram",
-            datagrams,
-            attempts
+             failed upgrade must be attempted exactly once -- 0 means it was \
+             never attempted, more than 1 means it was retried per datagram",
+            datagrams, attempts
         );
     }
 }
