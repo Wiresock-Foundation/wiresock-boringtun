@@ -82,6 +82,39 @@ def bad(m): print(f"  FAIL {m}"); failed.append(m)
 def sh(cmd, **kw):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
 
+class SetupError(Exception):
+    """The topology, not the wire format. Never a header-protection result."""
+
+def must(cmd):
+    """sh, but a nonzero exit ends the case instead of vanishing.
+
+    Setup ran through bare sh, whose CompletedProcess nobody read. That is
+    survivable for the three cases that expect the ping to SUCCEED -- a broken
+    topology fails them loudly. It is not survivable for D, which expects the
+    ping to FAIL: there, every setup command that quietly did nothing produced
+    exactly the result D was looking for. Measured on the unfixed script, six
+    separate sabotages -- no link address, link down, no tunnel address, a
+    misspelled ping binary, a bogus device name, and killing side B's daemon --
+    every one reported "PASS D ...: ping failed, as expected" and exit 0.
+    """
+    r = sh(cmd)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout).strip().splitlines()
+        raise SetupError(
+            "%s exited %d: %s" % (cmd, r.returncode, detail[0][:120] if detail else "")
+        )
+    return r
+
+def ping(ns, dst, count=3):
+    """One place that runs ping, so a ping that cannot RUN is never scored.
+
+    ping returns nonzero both for "no reply" and for "no such binary" or "no
+    such device". Sharing this between the preconditions and the test means a
+    broken invocation breaks a precondition instead of reading as the mismatch
+    case D is looking for.
+    """
+    return sh(f"ip netns exec {ns} ping -c {count} -W 2 -i 0.4 {dst}")
+
 def go_module_version(path):
     """The module version amneziawg-go was built from.
 
@@ -136,14 +169,14 @@ def underlay():
     teardown()
     time.sleep(0.3)
     for ns in (NS_A, NS_B):
-        sh(f"ip netns add {ns}")
-    sh(f"ip link add {VETH_A} type veth peer name {VETH_B}")
-    sh(f"ip link set {VETH_A} netns {NS_A} && ip link set {VETH_B} netns {NS_B}")
-    sh(f"ip netns exec {NS_A} ip addr add {LINK_A}/24 dev {VETH_A}")
-    sh(f"ip netns exec {NS_B} ip addr add {LINK_B}/24 dev {VETH_B}")
+        must(f"ip netns add {ns}")
+    must(f"ip link add {VETH_A} type veth peer name {VETH_B}")
+    must(f"ip link set {VETH_A} netns {NS_A} && ip link set {VETH_B} netns {NS_B}")
+    must(f"ip netns exec {NS_A} ip addr add {LINK_A}/24 dev {VETH_A}")
+    must(f"ip netns exec {NS_B} ip addr add {LINK_B}/24 dev {VETH_B}")
     for ns, dev in ((NS_A, VETH_A), (NS_B, VETH_B)):
-        sh(f"ip netns exec {ns} ip link set {dev} up")
-        sh(f"ip netns exec {ns} ip link set lo up")
+        must(f"ip netns exec {ns} ip link set {dev} up")
+        must(f"ip netns exec {ns} ip link set lo up")
 
 def sock_path(iface):
     for d in SOCK_DIRS:
@@ -236,11 +269,49 @@ def configure(iface, priv, peer_pub, endpoint, allowed, hp_key, keepalive=True):
     return uapi(iface, "\n".join(cfg) + "\n\n")
 
 def bring_up(ns, iface, addr):
-    sh(f"ip netns exec {ns} ip addr add {addr}/24 dev {iface}")
-    sh(f"ip netns exec {ns} ip link set {iface} up mtu 1420")
+    must(f"ip netns exec {ns} ip addr add {addr}/24 dev {iface}")
+    must(f"ip netns exec {ns} ip link set {iface} up mtu 1420")
+
+def assert_plumbing():
+    """Everything except the tunnel, proved working, right before the test.
+
+    Case D scores a FAILED ping as the expected header-protection mismatch, so
+    every other reason a ping can fail has to be excluded first. Otherwise D is
+    a test that cannot fail, which defeats the only thing it is for: showing
+    that C passing means something.
+
+    Three positive controls, none of which traverses the tunnel, so all must
+    hold identically in every case:
+      1. the underlay ping -- namespaces, veth, addresses, link state, and that
+         ping itself runs at all;
+      2. both namespaces still contain a live process -- a daemon that died
+         after set=1 would otherwise read as a mismatch;
+      3. each side answers on its OWN tunnel address -- local, so it does not
+         need the tunnel, and it catches a bring_up that never took, which the
+         underlay ping is blind to.
+
+    What this does NOT prove: that UDP reached the peer daemon (ICMP on the
+    veth and the daemon's socket are different paths), and it cannot tell a
+    header-protection mismatch from any other tunnel-layer disagreement -- only
+    from a broken topology, which is what D needs.
+    """
+    if ping(NS_A, LINK_B, count=2).returncode != 0:
+        raise SetupError(f"underlay {LINK_A} -> {LINK_B} is not reachable")
+    for ns, addr in ((NS_A, TUN_A), (NS_B, TUN_B)):
+        if not sh(f"ip netns pids {ns}").stdout.strip():
+            raise SetupError(f"no process left alive in {ns}")
+        if ping(ns, addr, count=1).returncode != 0:
+            raise SetupError(f"{addr} does not answer locally; bring_up did not take")
 
 def run_case(name, a_impl, b_impl, hp_a, hp_b, expect_pass):
+    """A broken setup is a FAIL, never a PASS -- see `assert_plumbing`."""
     print(f"==> {name}")
+    try:
+        _run_case(name, a_impl, b_impl, hp_a, hp_b, expect_pass)
+    except SetupError as e:
+        bad(f"{name}: setup failed, not an interop result -- {e}")
+
+def _run_case(name, a_impl, b_impl, hp_a, hp_b, expect_pass):
     # The log filename is a SLUG, not the display name: these go into an
     # unquoted shell redirect, and the case names contain spaces and `<->` --
     # which the shell reads as two more redirections, not as characters.
@@ -268,7 +339,11 @@ def run_case(name, a_impl, b_impl, hp_a, hp_b, expect_pass):
         bad(f"{name}: configuration refused (A={ra.strip()[:40]!r} B={rb.strip()[:40]!r})")
         return
 
-    r = sh(f"ip netns exec {NS_A} ping -c 3 -W 2 -i 0.4 {TUN_B}")
+    # Everything but the tunnel, proved working, before a failed ping is
+    # allowed to mean "header protection mismatched".
+    assert_plumbing()
+
+    r = ping(NS_A, TUN_B)
     got = r.returncode == 0
     if got == expect_pass:
         ok(f"{name}: ping {'succeeded' if got else 'failed'}, as expected")
