@@ -24,6 +24,11 @@ pub enum WaitResult<'a, H> {
 pub struct EventPoll<H: Sized> {
     events: Mutex<Vec<Option<Box<Event<H>>>>>,
     epoll: RawFd, // The OS epoll
+    /// Test-only fault injection for the next `EPOLL_CTL_ADD`. Scoped to this
+    /// poll instance rather than a global, so arming it in one test cannot
+    /// disturb another test's device running concurrently.
+    #[cfg(test)]
+    fail_next_add: std::sync::atomic::AtomicBool,
 }
 
 /// A type that hold a reference to a triggered Event
@@ -147,6 +152,66 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    /// The rollback must not destroy the handler while holding `events`.
+    ///
+    /// `H` is a type parameter, so `EventPoll` cannot know what `H::drop` runs.
+    /// One that reached back into this poll would take `self.events` a second
+    /// time on the same thread, and `parking_lot::Mutex` is not reentrant, so it
+    /// would hang the worker rather than fail. Nothing in this crate does today
+    /// -- the closest is `Arc<Peer>`, and `Peer` has no `Drop` at all -- which
+    /// makes this a contract about the function, not a reproduction of a bug.
+    ///
+    /// Probes with `try_lock` so a regression fails in microseconds instead of
+    /// deadlocking the suite, and distinguishes "ran with the lock held" from
+    /// "never ran", so deleting the rollback entirely cannot read as a pass.
+    #[test]
+    fn the_rollback_drops_the_handler_after_releasing_the_events_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // 0 = destructor never ran, 1 = ran with the lock HELD, 2 = ran with it FREE
+        static OBSERVED: AtomicUsize = AtomicUsize::new(0);
+
+        struct ProbesTheLock(*const EventPoll<ProbesTheLock>);
+        // The pointer is only read inside `drop`, on the thread that owns the
+        // poll, and the poll outlives every handler registered in it.
+        unsafe impl Send for ProbesTheLock {}
+        unsafe impl Sync for ProbesTheLock {}
+
+        impl Drop for ProbesTheLock {
+            fn drop(&mut self) {
+                let poll = unsafe { &*self.0 };
+                OBSERVED.store(
+                    if poll.events.try_lock().is_some() {
+                        2
+                    } else {
+                        1
+                    },
+                    Ordering::SeqCst,
+                );
+            }
+        }
+
+        let poll: EventPoll<ProbesTheLock> = EventPoll::new().unwrap();
+        let path = std::env::temp_dir().join(format!("bt-epoll-reent-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+
+        poll.new_event(file.as_raw_fd(), ProbesTheLock(&poll as *const _))
+            .err()
+            .expect("precondition: epoll_ctl on a regular file must fail, or this proves nothing");
+
+        // Read the observation while `poll` is still alive. Without the rollback
+        // the handler would instead be freed later by the poll's own drop glue,
+        // which takes no lock -- that would look free, and read as a pass.
+        assert_eq!(
+            OBSERVED.load(Ordering::SeqCst),
+            2,
+            "the rollback ran the handler's destructor while still holding \
+             self.events (0 = never ran, 1 = ran with the lock held, 2 = free)"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 impl<H: Sync + Send> EventPoll<H> {
@@ -160,6 +225,8 @@ impl<H: Sync + Send> EventPoll<H> {
         Ok(EventPoll {
             events: Mutex::new(vec![]),
             epoll,
+            #[cfg(test)]
+            fail_next_add: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -361,8 +428,26 @@ impl<H: Sync + Send> EventPoll<H> {
         let mut event_desc = ev.event;
         // Now add the pointer to the events vector, this is a place from which we can drop the event
         self.insert_at(trigger as _, ev);
-        // Add the event to epoll
-        if unsafe { epoll_ctl(self.epoll, EPOLL_CTL_ADD, trigger, &mut event_desc) } == -1 {
+        // Add the event to epoll. Under `cfg(test)` an armed fault swaps in an
+        // invalid epoll descriptor, so what follows is a real `epoll_ctl`
+        // failure with a real errno rather than a faked return value -- the
+        // rollback, the error type and the caller's handling are all exercised
+        // for real. The injected errno is EBADF, standing in for the ENOSPC that
+        // `max_user_watches` produces in the field; that one is a machine-wide
+        // per-UID sysctl and cannot be forced from a shared test binary without
+        // breaking every other epoll user on the host.
+        #[cfg(test)]
+        let epoll_fd = if self
+            .fail_next_add
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            -1
+        } else {
+            self.epoll
+        };
+        #[cfg(not(test))]
+        let epoll_fd = self.epoll;
+        if unsafe { epoll_ctl(epoll_fd, EPOLL_CTL_ADD, trigger, &mut event_desc) } == -1 {
             // Undo the insert above, or the handler is stranded permanently.
             //
             // The vector is keyed by file descriptor, and for every handler that
@@ -386,7 +471,22 @@ impl<H: Sync + Send> EventPoll<H> {
             // decorative here, it is what tells an operator whether they hit
             // `max_user_watches` (ENOSPC) or ran out of descriptors (EMFILE).
             let err = io::Error::last_os_error();
-            self.events.lock()[trigger as usize].take();
+            // Bound to a local, not left as a temporary of this statement. As a
+            // temporary the rejected handler would be destroyed *before* the
+            // `lock()` guard -- both are temporaries of the same statement, and
+            // they drop in reverse creation order -- so `H::drop` would run with
+            // `self.events` still held. `H` is a type parameter and `EventPoll`
+            // makes no promise about what that destructor does; one that reached
+            // back into this poll would hang the worker thread, because
+            // `parking_lot::Mutex` is not reentrant. Nothing in this crate does
+            // today: `Arc<Peer>` bottoms out at `close(2)`, and `Peer` has no
+            // `Drop` at all.
+            //
+            // `let _ = ...` would NOT work: `_` is a wildcard, not a binding, so
+            // the value still dies as a temporary. The explicit `drop` is
+            // documentation -- the binding is what releases the guard first.
+            let rejected = self.events.lock()[trigger as usize].take();
+            drop(rejected);
             return Err(Error::EventQueue(err));
         }
 
@@ -398,23 +498,46 @@ impl<H: Sync + Send> EventPoll<H> {
         self.events.lock().iter().filter(|e| e.is_some()).count()
     }
 
+    /// Make the next `register_event` on this poll fail, as `epoll_ctl` does
+    /// with ENOSPC once the process is out of `max_user_watches`.
+    #[cfg(test)]
+    pub(crate) fn fail_next_registration(&self) {
+        self.fail_next_add
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     // Insert an event into the events vector
     fn insert_at(&self, index: usize, data: Box<Event<H>>) {
-        let mut events = self.events.lock();
-        while events.len() <= index {
-            // Resize the vector to be able to fit the new index
-            // We trust the OS to allocate file descriptors in a sane order
-            events.push(None); // resize doesn't work because Clone is not satisfied
-        }
+        // The displaced handler leaves the lock scope before it is destroyed --
+        // see the note in `register_event`. Binding it inside the block would
+        // not be enough here: `events` is a *named* local, and locals drop in
+        // reverse declaration order, so anything declared after it dies while it
+        // is still held. Handing the box out of the block is what works.
+        //
+        // This also puts the handler's `close(2)` after the `EPOLL_CTL_DEL`
+        // rather than before it, which is the right order: deleting a descriptor
+        // epoll has already dropped on close is a harmless EBADF, but the
+        // reverse reads as if the fd number could be reissued in between.
+        let previous = {
+            let mut events = self.events.lock();
+            while events.len() <= index {
+                // Resize the vector to be able to fit the new index
+                // We trust the OS to allocate file descriptors in a sane order
+                events.push(None); // resize doesn't work because Clone is not satisfied
+            }
 
-        if events[index].take().is_some() {
-            // Properly remove the previous event first
-            unsafe {
-                epoll_ctl(self.epoll, EPOLL_CTL_DEL, index as _, null_mut());
-            };
-        }
+            let previous = events[index].take();
+            if previous.is_some() {
+                // Properly remove the previous event first
+                unsafe {
+                    epoll_ctl(self.epoll, EPOLL_CTL_DEL, index as _, null_mut());
+                };
+            }
 
-        events[index] = Some(data);
+            events[index] = Some(data);
+            previous
+        };
+        drop(previous);
     }
 
     /// Trigger a notification
@@ -469,11 +592,18 @@ impl<H> EventPoll<H> {
     /// This function is only safe to call when the event loop is not running,
     /// otherwise the memory of the handler may get freed while in use.
     pub unsafe fn clear_event_by_fd(&self, index: RawFd) {
-        let mut events = self.events.lock();
         assert!(index >= 0);
-        if events[index as usize].take().is_some() {
-            epoll_ctl(self.epoll, EPOLL_CTL_DEL, index, null_mut());
-        }
+        // Same shape as `insert_at`: the handler leaves the lock scope before it
+        // is destroyed. See the note in `register_event`.
+        let previous = {
+            let mut events = self.events.lock();
+            let previous = events[index as usize].take();
+            if previous.is_some() {
+                epoll_ctl(self.epoll, EPOLL_CTL_DEL, index, null_mut());
+            }
+            previous
+        };
+        drop(previous);
     }
 }
 

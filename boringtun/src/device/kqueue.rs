@@ -208,48 +208,70 @@ impl<H: Send + Sync> EventPoll<H> {
 
     // Register an event with this poll.
     fn register_event(&self, ev: Event<H>) -> Result<EventRef, Error> {
-        let mut events = match ev.kind {
-            EventKind::FD => self.events.lock(),
-            EventKind::Timer | EventKind::Notifier => self.custom.lock(),
-            EventKind::Signal => self.signals.lock(),
+        // Both handlers this can destroy -- the one being displaced, and on the
+        // error path the one being rejected -- leave the lock scope before they
+        // are dropped. `H` is a type parameter and `EventPoll` makes no promise
+        // about what its `Drop` runs; one that reached back into this poll would
+        // hang the worker, because `parking_lot::Mutex` is not reentrant.
+        // Binding inside the block is not enough: the guard is a *named* local
+        // declared first, and locals drop in reverse declaration order, so
+        // anything declared after it dies while it is still held. Handing the
+        // box out of the block is what works. Mirrors `epoll.rs`.
+        let (trigger, displaced) = {
+            let mut events = match ev.kind {
+                EventKind::FD => self.events.lock(),
+                EventKind::Timer | EventKind::Notifier => self.custom.lock(),
+                EventKind::Signal => self.signals.lock(),
+            };
+
+            let (trigger, index) = match ev.kind {
+                EventKind::FD | EventKind::Signal => {
+                    (ev.event.ident as RawFd, ev.event.ident as usize)
+                }
+                EventKind::Timer | EventKind::Notifier => {
+                    (-(events.len() as RawFd) - 1, events.len())
+                } // Custom events get negative identifiers, hopefully we will never have more than 2^31 events of each type
+            };
+
+            // Expand events vector if needed
+            while events.len() <= index {
+                // Resize the vector to be able to fit the new index
+                // We trust the OS to allocate file descriptors in a sane order
+                events.push(None); // resize doesn't work because Clone is not satisfied
+            }
+
+            let mut ev = Box::new(ev);
+            // The inner event points back to the wrapper
+            ev.event.ident = trigger as _;
+            ev.event.udata = ev.as_mut() as *mut Event<H> as _;
+
+            let mut kev = ev.event;
+            kev.flags |= EV_ADD;
+
+            if unsafe { kevent(self.kqueue, &kev, 1, null_mut(), 0, null()) } == -1 {
+                // errno before the unlock, and the unlock before `ev` drops.
+                let err = io::Error::last_os_error();
+                drop(events);
+                return Err(Error::EventQueue(err));
+            }
+
+            let mut displaced = events[index].take();
+            if let Some(event) = displaced.as_mut() {
+                // Properly remove any previous event first
+                event.event.flags = EV_DELETE;
+                unsafe { kevent(self.kqueue, &event.event, 1, null_mut(), 0, null()) };
+            }
+
+            if ev.kind == EventKind::Signal {
+                // Mask the signal if successfully added to kqueue
+                unsafe { signal(trigger, SIG_IGN) };
+            }
+
+            events[index] = Some(ev);
+
+            (trigger, displaced)
         };
-
-        let (trigger, index) = match ev.kind {
-            EventKind::FD | EventKind::Signal => (ev.event.ident as RawFd, ev.event.ident as usize),
-            EventKind::Timer | EventKind::Notifier => (-(events.len() as RawFd) - 1, events.len()), // Custom events get negative identifiers, hopefully we will never have more than 2^31 events of each type
-        };
-
-        // Expand events vector if needed
-        while events.len() <= index {
-            // Resize the vector to be able to fit the new index
-            // We trust the OS to allocate file descriptors in a sane order
-            events.push(None); // resize doesn't work because Clone is not satisfied
-        }
-
-        let mut ev = Box::new(ev);
-        // The inner event points back to the wrapper
-        ev.event.ident = trigger as _;
-        ev.event.udata = ev.as_mut() as *mut Event<H> as _;
-
-        let mut kev = ev.event;
-        kev.flags |= EV_ADD;
-
-        if unsafe { kevent(self.kqueue, &kev, 1, null_mut(), 0, null()) } == -1 {
-            return Err(Error::EventQueue(io::Error::last_os_error()));
-        }
-
-        if let Some(mut event) = events[index].take() {
-            // Properly remove any previous event first
-            event.event.flags = EV_DELETE;
-            unsafe { kevent(self.kqueue, &event.event, 1, null_mut(), 0, null()) };
-        }
-
-        if ev.kind == EventKind::Signal {
-            // Mask the signal if successfully added to kqueue
-            unsafe { signal(trigger, SIG_IGN) };
-        }
-
-        events[index] = Some(ev);
+        drop(displaced);
 
         Ok(EventRef { trigger })
     }
@@ -293,17 +315,24 @@ impl<H: Send + Sync> EventPoll<H> {
 impl<H> EventPoll<H> {
     // This function is only safe to call when the event loop is not running
     pub unsafe fn clear_event_by_fd(&self, index: RawFd) {
-        let (mut events, index) = if index >= 0 {
-            (self.events.lock(), index as usize)
-        } else {
-            (self.custom.lock(), (-index - 1) as usize)
-        };
+        // Same shape as `register_event`: the handler leaves the lock scope
+        // before it is destroyed. See the note there.
+        let cleared = {
+            let (mut events, index) = if index >= 0 {
+                (self.events.lock(), index as usize)
+            } else {
+                (self.custom.lock(), (-index - 1) as usize)
+            };
 
-        if let Some(mut event) = events[index].take() {
-            // Properly remove any previous event first
-            event.event.flags = EV_DELETE;
-            kevent(self.kqueue, &event.event, 1, null_mut(), 0, null());
-        }
+            let mut cleared = events[index].take();
+            if let Some(event) = cleared.as_mut() {
+                // Properly remove any previous event first
+                event.event.flags = EV_DELETE;
+                kevent(self.kqueue, &event.event, 1, null_mut(), 0, null());
+            }
+            cleared
+        };
+        drop(cleared);
     }
 }
 

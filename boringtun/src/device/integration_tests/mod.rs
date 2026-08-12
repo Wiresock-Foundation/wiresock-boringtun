@@ -6,6 +6,7 @@
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use crate::device::{DeviceConfig, DeviceHandle};
+    use crate::noise::{Packet, Tunn, TunnResult};
     use crate::x25519::{PublicKey, StaticSecret};
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
@@ -14,12 +15,14 @@ mod tests {
     use ring::rand::{SecureRandom, SystemRandom};
     use std::fmt::Write as _;
     use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::UdpSocket;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::os::unix::net::UnixStream;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
+    use std::time::Duration;
 
     static NEXT_IFACE_IDX: AtomicUsize = AtomicUsize::new(100); // utun 100+ should be vacant during testing on CI
     static NEXT_PORT: AtomicUsize = AtomicUsize::new(61111); // Use ports starting with 61111, hoping we don't run into a taken port 🤷
@@ -430,6 +433,11 @@ mod tests {
         /// Assign a private_key to the interface
         fn wg_set_key(&self, key: StaticSecret) -> String {
             self.wg_set(&format!("private_key={}", encode(key.to_bytes())))
+        }
+
+        /// Arm this device's event queue so the next `EPOLL_CTL_ADD` fails.
+        fn fail_next_event_registration(&self) {
+            self._device.device.read().queue.fail_next_registration();
         }
 
         /// Assign a peer to the interface (with public_key, endpoint and a series of nallowed_ip)
@@ -854,5 +862,124 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
+    }
+
+    /// A refused connected-socket registration must return the peer to the
+    /// shared listening socket, in *both* directions.
+    ///
+    /// `connect_endpoint` has already stored a `dup(2)` of the connected socket
+    /// in `endpoint.conn` by the time `register_conn_handler` runs, and the
+    /// kernel gives a connected UDP socket priority over the wildcard listener
+    /// for datagrams from that 4-tuple. So if registration fails and `conn` is
+    /// left in place, the peer's next datagram is taken off the listener by a
+    /// socket no handler reads: a blackhole, not a fallback. The direction that
+    /// dies is inbound, not outbound -- the surviving dup still sends.
+    ///
+    /// Asserts the observable consequence rather than `endpoint.conn.is_none()`,
+    /// so it cannot be satisfied by a rollback that clears the field while
+    /// leaving the socket in service.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`; CI runs it with
+    /// `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn a_refused_connected_socket_registration_returns_the_peer_to_the_shared_socket() {
+        let port = next_port();
+        let private_key = StaticSecret::random_from_rng(OsRng);
+        let public_key = PublicKey::from(&private_key);
+
+        let wg = WGHandle::init(next_ip(), next_ip_v6());
+        assert_eq!(
+            wg.wg_set_port(port),
+            "errno=0
+
+"
+        );
+        assert_eq!(
+            wg.wg_set_key(private_key),
+            "errno=0
+
+"
+        );
+
+        // No endpoint configured: it is learned from the datagram, which is what
+        // takes the device down the `connect_endpoint` path.
+        let peer_secret = StaticSecret::random_from_rng(OsRng);
+        let peer_public = PublicKey::from(&peer_secret);
+        assert_eq!(
+            wg.wg_set(&format!(
+                "public_key={}
+allowed_ip=10.66.66.2/32",
+                encode(peer_public.as_bytes())
+            )),
+            "errno=0
+
+"
+        );
+
+        let mut client = Tunn::new_with_obfuscation(
+            peer_secret,
+            public_key,
+            None,
+            None,
+            100,
+            None,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let mut rx = vec![0u8; 2048];
+
+        // Armed after every other registration has happened -- the API socket,
+        // the timers, the notifiers and both listeners are already in -- so the
+        // next EPOLL_CTL_ADD is the connected socket for this peer.
+        wg.fail_next_event_registration();
+
+        let init = match client.format_handshake_initiation(&mut buf, false) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+        sock.send_to(&init, server).unwrap();
+        // The response is written before the connected-socket block, so it
+        // arrives whether or not the rollback runs. This only establishes that
+        // the device authenticated the peer and therefore reached that block.
+        let (n, _) = sock
+            .recv_from(&mut rx)
+            .expect("the device must answer the first initiation");
+        assert!(
+            matches!(
+                Tunn::parse_incoming_packet(Default::default(), &rx[..n]),
+                Ok(Packet::HandshakeResponse(_))
+            ),
+            "expected a handshake response to the first initiation"
+        );
+
+        // The probe. Same source address, so nothing else clears the endpoint.
+        // `force_resend`, because `format_handshake_initiation` returns `Done`
+        // while a handshake is already in progress; the sleep keeps the second
+        // initiation's TAI64N strictly greater than the first's.
+        thread::sleep(Duration::from_millis(100));
+        let init2 = match client.format_handshake_initiation(&mut buf, true) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("expected a second initiation, got {:?}", other),
+        };
+        sock.send_to(&init2, server).unwrap();
+        let (n2, _) = sock.recv_from(&mut rx).expect(
+            "the device never saw the second initiation: the rejected connected \
+             socket is still taking the peer's datagrams off the shared listener",
+        );
+        assert!(
+            matches!(
+                Tunn::parse_incoming_packet(Default::default(), &rx[..n2]),
+                Ok(Packet::HandshakeResponse(_))
+            ),
+            "expected a handshake response to the second initiation"
+        );
     }
 }
