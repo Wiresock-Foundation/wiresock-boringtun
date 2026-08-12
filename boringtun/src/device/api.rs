@@ -747,8 +747,9 @@ fn handle_awg3_device_key(key: &str, val: &str) -> Result<(), i32> {
             Ok(_) => {
                 tracing::error!(
                     "header_protection_key is not implemented: a peer using it cannot \
-                     interoperate with this build, so the configuration is refused \
-                     rather than applied without protection"
+                     interoperate with this build, so this request fails here rather \
+                     than running unprotected; anything it already applied is not \
+                     rolled back"
                 );
                 return Err(EINVAL);
             }
@@ -776,12 +777,28 @@ fn handle_awg3_device_key(key: &str, val: &str) -> Result<(), i32> {
 ///
 /// A bare `0` still means off, as in vanilla WireGuard.
 ///
+/// Only the *low* end is bounded by the `u16` a peer stores, because only the
+/// low end is ever applied. A bare value out of that range is still refused --
+/// there the number is the datum we have to apply, and we cannot apply it.
+///
 /// Note this accepts surrounding whitespace where the previous `parse::<u16>()`
 /// did not; no tool emits it, and the shared range parser has to trim for the
 /// `min - max` form anyway.
 fn parse_keepalive_interval(val: &str) -> Option<u16> {
     let (lo, hi) = parse_uint_range(val)?;
-    if hi > u32::from(u16::MAX) {
+    // Bound the low end, not the high one. The low end is the value we apply and
+    // the value cast below, so this is what stops `lo as u16` truncating --
+    // `65536-70000` would otherwise become 0, switching the keepalive off for a
+    // peer that asked for one.
+    //
+    // The high end is discarded, so its magnitude cannot matter. amneziawg-go
+    // parses both ends as u32 (`UintRange::FromString` uses
+    // `ParseUint(_, 10, 32)`), hands out intervals above 65535 at runtime, and
+    // re-emits the range verbatim on `get=1` -- so `25-70000` is a config it can
+    // legitimately produce. Bounding `hi` refused it, and refusing it aborted the
+    // whole `set=1` mid-stream, after `replace_peers` had already cleared the
+    // peer table, over a number we never read.
+    if lo > u32::from(u16::MAX) {
         return None;
     }
     if lo != hi {
@@ -900,8 +917,9 @@ fn api_set_peer(
                 // is supported and does express a revocation.
                 "allowed_ip" if val.starts_with('-') => {
                     tracing::error!(
-                        message = "removing a single allowed_ip is not implemented; \
-                                   the prefix is unchanged and the transaction is refused",
+                        message = "removing a single allowed_ip is not implemented; the \
+                                   prefix is unchanged and the request fails here; \
+                                   anything this request already applied is not rolled back",
                         prefix = &val[1..]
                     );
                     return EINVAL;
@@ -1209,11 +1227,27 @@ mod tests {
         // amneziawg-go treats `0-30` as on.
         assert_eq!(parse_keepalive_interval("0-30"), Some(1));
         assert_eq!(parse_keepalive_interval("0-0"), Some(0), "0-0 is still off");
-        // The u16 bound the vanilla `parse::<u16>()` used to enforce still
-        // holds; without it these truncate to a plausible wrong interval
-        // (70000 as u16 == 4464).
+        // The u16 bound still holds for the value we actually apply: a bare
+        // 70000 is the interval, and without the bound it truncates to a
+        // plausible wrong one (70000 as u16 == 4464).
         assert_eq!(parse_keepalive_interval("70000"), None);
-        assert_eq!(parse_keepalive_interval("25-70000"), None);
+        // ...but the high end of a range is discarded, so it never has to fit.
+        // amneziawg-go parses both ends as u32 and re-emits them on `get=1`, so
+        // refusing these aborted a whole `set=1` over a number we do not read.
+        assert_eq!(parse_keepalive_interval("25-70000"), Some(25));
+        assert_eq!(parse_keepalive_interval("0-70000"), Some(1));
+        assert_eq!(
+            parse_keepalive_interval(&format!("65535-{}", u32::MAX)),
+            Some(65535)
+        );
+        // The bound moved to the low end, it did not go away. This is the value
+        // that gets cast, and 65536 as u16 is 0 -- the keepalive off for a peer
+        // that asked for one, which is what this test is named after.
+        assert_eq!(
+            parse_keepalive_interval("65536-70000"),
+            None,
+            "the low end is what we apply, so it must fit"
+        );
         assert_eq!(parse_keepalive_interval("35-25"), None, "inverted range");
         assert_eq!(parse_keepalive_interval("notanumber"), None);
     }
