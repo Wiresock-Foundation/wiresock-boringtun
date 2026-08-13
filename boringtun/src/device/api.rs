@@ -778,36 +778,48 @@ fn handle_awg3_device_key(key: &str, val: &str) -> Result<(), i32> {
 /// A bare `0` still means off, as in vanilla WireGuard.
 ///
 /// Only the *low* end is bounded by the `u16` a peer stores, because only the
-/// low end is ever applied. A bare value out of that range is still refused --
-/// there the number is the datum we have to apply, and we cannot apply it.
+/// low end is ever applied -- and it is bounded by capping, not by refusing.
+/// 65535 s is already 18 hours, an order of magnitude past any UDP NAT mapping
+/// lifetime, so the cap and every value above it are equally "as good as off"
+/// to every middlebox on the path; refusing instead aborts the whole
+/// transaction.
 ///
 /// Note this accepts surrounding whitespace where the previous `parse::<u16>()`
 /// did not; no tool emits it, and the shared range parser has to trim for the
 /// `min - max` form anyway.
 fn parse_keepalive_interval(val: &str) -> Option<u16> {
     let (lo, hi) = parse_uint_range(val)?;
-    // Bound the low end, not the high one. The low end is the value we apply and
-    // the value cast below, so this is what stops `lo as u16` truncating --
-    // `65536-70000` would otherwise become 0, switching the keepalive off for a
-    // peer that asked for one.
+    // Cap the low end. The low end is the value we apply, so this is what
+    // stops `lo as u16` truncating -- `65536-70000` would otherwise become 0,
+    // switching the keepalive off for a peer that asked for one. The high end
+    // is discarded, so its magnitude cannot matter at all.
     //
-    // The high end is discarded, so its magnitude cannot matter. amneziawg-go
-    // parses both ends as u32 (`UintRange::FromString` uses
-    // `ParseUint(_, 10, 32)`), hands out intervals above 65535 at runtime, and
-    // re-emits the range verbatim on `get=1` -- so `25-70000` is a config it can
-    // legitimately produce. Bounding `hi` refused it, and refusing it aborted the
-    // whole `set=1` mid-stream, after `replace_peers` had already cleared the
-    // peer table, over a number we never read.
-    if lo > u32::from(u16::MAX) {
-        return None;
-    }
+    // Capped and not refused, because refusing is the worse of the two errors.
+    // amneziawg-go parses both ends as u32 (`UintRange::FromString` uses
+    // `ParseUint(_, 10, 32)`), accepts a bare `70000`, re-emits it verbatim on
+    // `get=1`, and applies it as `time.Duration(PickOne()) * time.Second` --
+    // so `70000` is a config it can legitimately produce. Refusing it returns
+    // EINVAL from `api_set_peer`, which aborts the whole `set=1` mid-stream,
+    // after `replace_peers` may already have cleared the peer table. What that
+    // abort bought was the difference between 65535 s and 70000 s -- two
+    // intervals no NAT on the path can tell apart, both being far past any
+    // UDP mapping lifetime.
+    //
+    // The cap errs in the safe direction, the same one the `max(1)` below errs
+    // in: a keepalive sent more often than asked costs one 32-byte packet, one
+    // sent less often costs the NAT mapping this setting exists to hold open.
+    //
+    // The u32 ceiling above this is still a refusal rather than a cap, and it
+    // is the same refusal amneziawg-go makes (`strconv.ParseUint: value out of
+    // range`), so the two accept exactly the same set of configuration lines.
+    let capped = lo.min(u32::from(u16::MAX));
     if lo != hi {
         // Report the value applied, not a description of how it was chosen.
         // "Using the low end" was false for exactly the inputs where `lo == 0`:
         // the clamp below sends 1, not 0, and 0 is the one low end an operator
         // is likely to write. A field carrying the number cannot drift from the
         // arithmetic the way a sentence about it can.
-        let fixed = lo.max(1) as u16;
+        let fixed = capped.max(1) as u16;
         tracing::warn!(
             message = "randomised keepalive intervals are not implemented; \
                        the range is narrowed to a single interval",
@@ -817,7 +829,22 @@ fn parse_keepalive_interval(val: &str) -> Option<u16> {
         );
         return Some(fixed);
     }
-    Some(lo as u16)
+    if capped != lo {
+        // A bare value we cannot store. Silence would be the one outcome worse
+        // than either alternative: the operator's interval quietly replaced by
+        // a different one, invisible until someone diffs `get=1` against the
+        // config that produced it. Two warn sites rather than one merged one,
+        // because "range narrowed" and "value capped" are different diagnoses
+        // and a bare 70000 must not be told its range was narrowed.
+        tracing::warn!(
+            message = "the keepalive interval is above the maximum this build \
+                       stores; it is capped",
+            requested_low = lo,
+            requested_high = hi,
+            fixed_interval = capped
+        );
+    }
+    Some(capped as u16)
 }
 
 /// Apply one accumulated `[Peer]` section.
@@ -1257,25 +1284,73 @@ mod tests {
             }
         }
 
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+        let capture = |val: &str| {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+            let applied =
+                tracing::subscriber::with_default(subscriber, || parse_keepalive_interval(val));
+            let captured = std::mem::take(&mut *events.lock().unwrap());
+            (applied, captured)
+        };
 
-        tracing::subscriber::with_default(subscriber, || {
-            assert_eq!(parse_keepalive_interval("0-30"), Some(1));
-        });
+        // (the value as it arrives over the UAPI, the interval applied, the
+        // number of warnings the log gets, a word the diagnosis must contain --
+        // "narrowed" and "capped" are different statements and a bare 70000
+        // must not be told its range was narrowed)
+        let cases: &[(&str, Option<u16>, usize, &str)] = &[
+            // A range is narrowed, and the narrowed value is 1, not the 0 the
+            // low end literally is.
+            ("0-30", Some(1), 1, "narrowed"),
+            // Narrowing a range we *can* apply verbatim is still a difference
+            // from the peer -- it re-picks inside the range and we do not.
+            ("25-35", Some(25), 1, "narrowed"),
+            // A bare value we can store is applied verbatim and silently. A
+            // warning on the common case is a warning that gets tuned out.
+            ("25", Some(25), 0, ""),
+            ("0", Some(0), 0, ""),
+            ("65535", Some(65535), 0, ""),
+            // A bare value we cannot store is capped, and a cap is a change to
+            // the operator's number, so it says so.
+            ("65536", Some(65535), 1, "capped"),
+            ("70000", Some(65535), 1, "capped"),
+            // Both at once: one warning, carrying what survived.
+            ("70000-80000", Some(65535), 1, "narrowed"),
+        ];
 
-        let events = events.lock().unwrap();
-        assert_eq!(events.len(), 1, "expected exactly one warning");
-        assert_eq!(
-            events[0].fixed_interval,
-            Some(1),
-            "the warning must carry the interval actually applied"
-        );
-        assert!(
-            !events[0].message.contains("low end"),
-            "the message claims the low end was used, but 0 was clamped to 1: {}",
-            events[0].message
-        );
+        for &(val, expected, warnings, diagnosis) in cases {
+            let (applied, events) = capture(val);
+            assert_eq!(applied, expected, "{} applied the wrong interval", val);
+            let messages: Vec<&str> = events.iter().map(|e| e.message.as_str()).collect();
+            assert_eq!(
+                events.len(),
+                warnings,
+                "{} logged the wrong number of warnings: {:?}",
+                val,
+                messages
+            );
+            if warnings == 0 {
+                continue;
+            }
+            assert_eq!(
+                events[0].fixed_interval,
+                expected.map(u64::from),
+                "{}: the warning must carry the interval actually applied",
+                val
+            );
+            assert!(
+                events[0].message.contains(diagnosis),
+                "{}: the warning gives the wrong diagnosis, expected {:?}: {}",
+                val,
+                diagnosis,
+                events[0].message
+            );
+            assert!(
+                !events[0].message.contains("low end"),
+                "{}: the message claims the low end was used: {}",
+                val,
+                events[0].message
+            );
+        }
     }
 
     #[test]
@@ -1297,10 +1372,21 @@ mod tests {
         // amneziawg-go treats `0-30` as on.
         assert_eq!(parse_keepalive_interval("0-30"), Some(1));
         assert_eq!(parse_keepalive_interval("0-0"), Some(0), "0-0 is still off");
-        // The u16 bound still holds for the value we actually apply: a bare
-        // 70000 is the interval, and without the bound it truncates to a
-        // plausible wrong one (70000 as u16 == 4464).
-        assert_eq!(parse_keepalive_interval("70000"), None);
+        // A bare value above u16::MAX is capped to what we can store, not
+        // refused. amneziawg-go accepts it (`ParseUint(_, 10, 32)`), re-emits
+        // it verbatim on `get=1`, and applies it as ~19.4 h; refusing it
+        // returned EINVAL from `api_set_peer`, aborting a whole `set=1` over
+        // the difference between two intervals that are equally "off" as far
+        // as any NAT on the path is concerned.
+        assert_eq!(parse_keepalive_interval("70000"), Some(65535));
+        // Capped, not cast: `65536 as u16` is 0 -- the keepalive off for a
+        // peer that asked for one, which is what this test is named after.
+        assert_eq!(parse_keepalive_interval("65536"), Some(65535));
+        assert_eq!(parse_keepalive_interval(&u32::MAX.to_string()), Some(65535));
+        // The u32 ceiling is still a refusal, and it is the same one
+        // amneziawg-go makes, so the two accept the same set of lines.
+        assert_eq!(parse_keepalive_interval("4294967296"), None);
+        assert_eq!(parse_keepalive_interval("25-4294967296"), None);
         // ...but the high end of a range is discarded, so it never has to fit.
         // amneziawg-go parses both ends as u32 and re-emits them on `get=1`, so
         // refusing these aborted a whole `set=1` over a number we do not read.
@@ -1310,14 +1396,14 @@ mod tests {
             parse_keepalive_interval(&format!("65535-{}", u32::MAX)),
             Some(65535)
         );
-        // The bound moved to the low end, it did not go away. This is the value
-        // that gets cast, and 65536 as u16 is 0 -- the keepalive off for a peer
-        // that asked for one, which is what this test is named after.
+        // The low end of a range is capped for the same reason, and by the
+        // same expression.
         assert_eq!(
             parse_keepalive_interval("65536-70000"),
-            None,
-            "the low end is what we apply, so it must fit"
+            Some(65535),
+            "the low end is what we apply, so it is capped rather than cast"
         );
+        assert_eq!(parse_keepalive_interval("70000-80000"), Some(65535));
         assert_eq!(parse_keepalive_interval("35-25"), None, "inverted range");
         assert_eq!(parse_keepalive_interval("notanumber"), None);
     }
