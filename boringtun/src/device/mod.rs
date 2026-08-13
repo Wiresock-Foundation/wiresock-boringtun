@@ -100,6 +100,48 @@ pub enum Error {
     PeerSetup(String),
 }
 
+/// Whether a `Peer::connect_endpoint` failure says anything about *this
+/// listener's* capacity, or only about one peer's endpoint address.
+///
+/// Every fallible call in `connect_endpoint` -- `socket`, `setsockopt`, `dup`,
+/// `bind`, `connect`, `fcntl` -- reports through the same `Error::IoError`, so
+/// the call site cannot recover the distinction from the type. Only the errno
+/// separates "this process is out of descriptors", which every peer on the
+/// listener shares, from "the route to this one endpoint is `unreachable`",
+/// which none of them do.
+///
+/// Measured on Linux 6.6 with a UDP socket bound to `0.0.0.0:51820`: an
+/// `unreachable` route gives EHOSTUNREACH, a `prohibit` route EACCES, a
+/// `blackhole` route EINVAL, a scopeless IPv6 link-local destination EINVAL,
+/// an fwmark whose policy table holds `unreachable default` EHOSTUNREACH, and
+/// a missing default route -- a WAN flap, a DHCP renew -- ENETUNREACH. All
+/// six are per-destination, and the last is transient: latching the listener
+/// on it would cost every peer its connected socket over a one-second blip.
+///
+/// Deliberately a small allowlist rather than a denylist of those six: an
+/// errno nobody anticipated is far more likely to be destination-specific than
+/// process-wide, and the per-peer path is the safe default -- it still bounds
+/// the retry to one attempt per peer per endpoint address. That direction is
+/// kept even for `set_mark`'s EPERM, which genuinely is process-wide: EPERM=1
+/// and `connect`'s per-destination EACCES=13 are only an errno apart, and
+/// guessing wrong the other way costs every peer. The price is bounded -- a
+/// marked-but-unprivileged device pays one futile socket/setsockopt/close per
+/// peer per roam, with no `connect(2)`, so no half-built socket ever outranks
+/// the listener.
+fn is_upgrade_exhaustion(e: &Error) -> bool {
+    let raw = match e {
+        Error::IoError(e) => e.raw_os_error(),
+        _ => None,
+    };
+    matches!(
+        raw,
+        // socket(2)/dup(2): per-process and system-wide descriptor limits.
+        Some(libc::EMFILE) | Some(libc::ENFILE)
+        // socket(2)/bind(2)/connect(2): kernel memory and socket buffers.
+        | Some(libc::ENOMEM) | Some(libc::ENOBUFS)
+    )
+}
+
 // What the event loop should do after a handler returns
 enum Action {
     Continue, // Continue the loop
@@ -1225,9 +1267,10 @@ impl Device {
                     p.set_endpoint(from);
                     if d.config.use_connected_socket
                         && !conn_upgrade_disabled.load(Ordering::Relaxed)
+                        && !p.upgrade_suppressed()
                     {
                         // The gate below latches a failed `register_conn_handler`;
-                        // this latches a failed `connect_endpoint`, for the same
+                        // this handles a failed `connect_endpoint`, for the same
                         // reason. That rollback and this `?` both leave
                         // `endpoint.conn` at `None`, so `connect_endpoint` stops
                         // short-circuiting and the peer's next datagram redoes
@@ -1244,19 +1287,34 @@ impl Device {
                         // from every healthy peer on this listener at the first
                         // roam.
                         //
-                        // Negated rather than matched positively, so a variant
-                        // added to `Error` later fails closed -- one attempt --
-                        // rather than open, one per datagram.
+                        // Everything else is split by what the errno proves.
+                        // Only descriptor or memory exhaustion is a statement
+                        // about this process, and so about every peer on this
+                        // listener; a route lookup that fails for one endpoint
+                        // address -- `unreachable` route, missing default
+                        // during a WAN flap, fwmark policy -- says nothing
+                        // about any other peer's, and latching the listener
+                        // for it would cost all of them their connected socket
+                        // until the daemon restarts. Those suppress on the
+                        // *peer*, cleared when its endpoint address changes.
+                        // An errno the classifier does not recognise takes the
+                        // per-peer path too: still bounded at one attempt per
+                        // peer per address, never one per datagram.
                         let upgrade = p.connect_endpoint(d.listen_port, d.fwmark);
                         if let Err(ref e) = upgrade {
-                            if !matches!(e, Error::Connect(_))
-                                && !conn_upgrade_disabled.swap(true, Ordering::Relaxed)
-                            {
-                                tracing::warn!(
-                                    message = "Failed to open a connected socket for peer; \
-                                               staying on the shared socket",
-                                    error = ?e
-                                );
+                            if !matches!(e, Error::Connect(_)) {
+                                let first = if is_upgrade_exhaustion(e) {
+                                    !conn_upgrade_disabled.swap(true, Ordering::Relaxed)
+                                } else {
+                                    p.suppress_upgrade()
+                                };
+                                if first {
+                                    tracing::warn!(
+                                        message = "Failed to open a connected socket for peer; \
+                                                   staying on the shared socket",
+                                        error = ?e
+                                    );
+                                }
                             }
                         }
                         if let Ok(sock) = upgrade {
@@ -1513,6 +1571,80 @@ impl Default for IndexLfsr {
             lfsr: seed,
             mask: Self::random_index(),
         }
+    }
+}
+
+#[cfg(test)]
+mod upgrade_scope_tests {
+    //! Pins the split in `is_upgrade_exhaustion`: which `connect_endpoint`
+    //! failures latch the whole listener, and which stay with one peer.
+
+    use super::*;
+
+    fn io_err(errno: i32) -> Error {
+        Error::IoError(io::Error::from_raw_os_error(errno))
+    }
+
+    /// A destination-specific failure must not latch the listener.
+    ///
+    /// Latching costs every OTHER peer on the listener its connected socket
+    /// until the daemon restarts, and none of these errnos is evidence about
+    /// any of them.
+    #[test]
+    fn a_destination_specific_failure_must_not_latch_the_listener() {
+        let cases: &[(i32, &str)] = &[
+            (libc::EHOSTUNREACH, "`ip route add unreachable <peer>/32`"),
+            (
+                libc::ENETUNREACH,
+                "no default route: a WAN flap, a DHCP renew",
+            ),
+            (libc::EACCES, "a `prohibit` route"),
+            (
+                libc::EINVAL,
+                "a `blackhole` route, or a scopeless IPv6 link-local",
+            ),
+            (libc::EPERM, "SO_MARK without CAP_NET_ADMIN"),
+            (libc::EADDRNOTAVAIL, "no usable local address"),
+        ];
+        for &(errno, why) in cases {
+            assert!(
+                !is_upgrade_exhaustion(&io_err(errno)),
+                "errno {} ({}) is not listener-wide exhaustion; latching on it \
+                 takes every other peer's connected socket away",
+                errno,
+                why
+            );
+        }
+    }
+
+    /// Without this, the test above is satisfiable by `|_| false`, which
+    /// reintroduces the per-datagram storm the listener latch was added for.
+    #[test]
+    fn descriptor_and_memory_exhaustion_still_latches_the_listener() {
+        for &(errno, what) in &[
+            (libc::EMFILE, "per-process descriptor limit"),
+            (libc::ENFILE, "system-wide descriptor limit"),
+            (libc::ENOMEM, "kernel memory"),
+            (libc::ENOBUFS, "socket buffers"),
+        ] {
+            assert!(
+                is_upgrade_exhaustion(&io_err(errno)),
+                "errno {} ({}) is process-wide exhaustion and must latch the \
+                 listener, or every peer pays one doomed attempt each",
+                errno,
+                what
+            );
+        }
+    }
+
+    /// An error carrying no errno cannot prove exhaustion; fail closed to the
+    /// per-peer path, which is still bounded at one attempt per address.
+    #[test]
+    fn an_error_without_an_errno_is_not_exhaustion() {
+        assert!(!is_upgrade_exhaustion(&Error::Connect(
+            "Connected".to_owned()
+        )));
+        assert!(!is_upgrade_exhaustion(&Error::PeerSetup(String::new())));
     }
 }
 

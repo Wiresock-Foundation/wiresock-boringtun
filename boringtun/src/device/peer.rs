@@ -6,6 +6,7 @@ use socket2::{Domain, Protocol, Type};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::device::Error;
 use crate::noise::{Tunn, TunnResult};
@@ -53,6 +54,24 @@ pub struct Peer {
     index: u32,
     endpoint: RwLock<Endpoint>,
     preshared_key: Option<[u8; 32]>,
+    /// `connect_endpoint` failed for the endpoint address currently in
+    /// `endpoint.addr`, with an errno that says nothing about the listener's
+    /// capacity. Retrying it per datagram is the storm the listener-wide gate
+    /// in `device::mod` exists to stop, but latching the *listener* for a
+    /// per-destination failure takes the connected socket away from every
+    /// other peer, so the suppression is scoped here.
+    ///
+    /// Per endpoint *address*, not per peer: `set_endpoint` clears it when the
+    /// address actually changes, since the address is the whole reason the
+    /// connect failed and a roam to a routable one must be allowed to try
+    /// again. A peer alternating between two bad addresses therefore drives
+    /// one attempt per alternation -- the same bound the upgrade path already
+    /// had for a healthy alternating peer.
+    ///
+    /// Atomic rather than a plain `bool` only so `connect_endpoint`'s and
+    /// `set_endpoint`'s `&self` signatures stay put; every `Peer` is already
+    /// behind a `Mutex`, so there is no contention to speak of.
+    upgrade_suppressed: AtomicBool,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -95,6 +114,7 @@ impl Peer {
                 conn: None,
             }),
             preshared_key,
+            upgrade_suppressed: AtomicBool::new(false),
         }
     }
 
@@ -108,6 +128,18 @@ impl Peer {
 
     pub(crate) fn endpoint_mut(&self) -> parking_lot::RwLockWriteGuard<'_, Endpoint> {
         self.endpoint.write()
+    }
+
+    /// Whether a connected-socket upgrade for the current endpoint address has
+    /// already failed for a reason that will not change until the address does.
+    pub(crate) fn upgrade_suppressed(&self) -> bool {
+        self.upgrade_suppressed.load(Ordering::Relaxed)
+    }
+
+    /// Suppress further upgrade attempts for the current endpoint address.
+    /// Returns `true` if this is the first one, so the caller can log once.
+    pub(crate) fn suppress_upgrade(&self) -> bool {
+        !self.upgrade_suppressed.swap(true, Ordering::Relaxed)
     }
 
     pub fn shutdown_endpoint(&self) {
@@ -134,6 +166,13 @@ impl Peer {
             }
 
             endpoint.addr = Some(addr);
+            // The suppression describes the address we just left, not this
+            // peer. Held across a roam it would strand the peer on the shared
+            // listener for the life of the process after one bad endpoint --
+            // and cleared *outside* this guard it would rearm on every datagram
+            // from the same unroutable endpoint, which is the per-datagram
+            // storm again.
+            self.upgrade_suppressed.store(false, Ordering::Relaxed);
         }
     }
 
@@ -161,12 +200,15 @@ impl Peer {
             SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into()
         };
 
-        // `dup(2)` here rather than after the connect, because it is the one
-        // call in this function that fails on fd exhaustion. Once `connect`
-        // has run, this socket outranks the wildcard listener for the peer's
-        // 4-tuple, so a failure between there and the commit strands a socket
-        // that is taking the peer's datagrams and dropping them. Doing it
-        // first means fd exhaustion can no longer open that window.
+        // `dup(2)` here rather than after the connect. It is the one call
+        // *after* `Socket::new` that fails on fd exhaustion -- under blanket
+        // exhaustion `Socket::new` above fails first, so this line is reached
+        // only when a single descriptor remains, or when another thread takes
+        // the last one in between. Once `connect` has run, this socket
+        // outranks the wildcard listener for the peer's 4-tuple, and although
+        // a failing `?` closes it on the way out, every datagram arriving
+        // inside that window is delivered to it and dies with it. Doing the
+        // dup first means fd exhaustion can no longer open the window.
         //
         // A `dup` shares the underlying `struct socket`, so the `bind` and
         // `connect` below apply to both descriptors. `set_mark` is hoisted for
@@ -316,5 +358,184 @@ mod tests {
         let peer = test_peer();
         assert!(peer.endpoint().addr.is_none());
         assert!(peer.connect_endpoint(51820, None).is_err());
+    }
+
+    /// The upgrade suppression is per endpoint address, in both directions.
+    ///
+    /// A roam to a different address must rearm the upgrade -- the address is
+    /// the whole reason the connect failed. A datagram from the SAME address
+    /// must not, because rearming there is the per-datagram retry storm the
+    /// suppression exists to stop.
+    #[test]
+    fn suppression_is_cleared_when_the_endpoint_address_changes() {
+        let peer = test_peer();
+        peer.set_endpoint("192.0.2.7:51820".parse().unwrap());
+        assert!(!peer.upgrade_suppressed());
+
+        assert!(
+            peer.suppress_upgrade(),
+            "the first suppression reports itself"
+        );
+        assert!(!peer.suppress_upgrade(), "the second must not log again");
+
+        // Same address: `set_endpoint` runs on every datagram, and rearming
+        // here would retry the doomed connect once per datagram.
+        peer.set_endpoint("192.0.2.7:51820".parse().unwrap());
+        assert!(
+            peer.upgrade_suppressed(),
+            "a datagram from the same unroutable endpoint must not rearm the \
+             upgrade; that is the per-datagram retry storm"
+        );
+
+        // A roam: the failure described the old address, not the peer.
+        peer.set_endpoint("198.51.100.9:51820".parse().unwrap());
+        assert!(
+            !peer.upgrade_suppressed(),
+            "a roam to a different endpoint must rearm the upgrade"
+        );
+    }
+
+    /// Environment marker naming the child half of the descriptor-exhaustion
+    /// test below. Set by the parent, read by the same test function.
+    const DUP_EMFILE_CHILD: &str = "BORINGTUN_TEST_DUP_EMFILE_CHILD";
+
+    /// Test name for the re-exec, hoisted so the filter and the function cannot
+    /// drift apart silently -- a filter matching nothing exits 0.
+    const DUP_EMFILE_TEST: &str =
+        "device::peer::tests::a_failed_endpoint_dup_is_an_error_not_a_panic";
+
+    /// A failing `dup(2)` in `connect_endpoint` must return an error, not abort
+    /// the daemon.
+    ///
+    /// Runs the real failure in a *child process*. `RLIMIT_NOFILE` is
+    /// process-global and shared by every thread, so lowering it in this binary
+    /// would starve every other test's sockets. Unlike epoll's
+    /// `max_user_watches` -- machine-wide per-UID, which is why `EventPoll`
+    /// injects a fault instead -- this limit *is* forceable in a process of our
+    /// own, so nothing here is faked: a real `dup(2)` returns a real EMFILE.
+    ///
+    /// The child leaves *exactly one* descriptor free, which is the only state
+    /// in which the dup is reached at all: under blanket exhaustion the
+    /// `Socket::new` above it fails first and `try_clone` never runs. Both
+    /// halves of that arithmetic are asserted in the child, so drift fails the
+    /// test loudly instead of quietly retargeting it at `Socket::new`.
+    #[test]
+    fn a_failed_endpoint_dup_is_an_error_not_a_panic() {
+        if std::env::var_os(DUP_EMFILE_CHILD).is_some() {
+            dup_emfile_child();
+            return;
+        }
+
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                DUP_EMFILE_TEST,
+            ])
+            .env(DUP_EMFILE_CHILD, "1")
+            .output()
+            .expect("failed to re-run the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(
+            out.status.success(),
+            "the child aborted instead of returning an error: {:?}
+             --- child stdout ---
+{}--- child stderr ---
+{}",
+            out.status,
+            stdout,
+            stderr
+        );
+        // A filter matching nothing exits 0, so a successful child is not yet
+        // evidence that anything ran. Without this, the test turns into a no-op
+        // the moment the name in `DUP_EMFILE_TEST` drifts from the function.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran no test -- the filter matched nothing:
+{}",
+            stdout
+        );
+    }
+
+    fn dup_emfile_child() {
+        use std::os::unix::io::AsRawFd;
+
+        fn nofile(limit: libc::rlim_t) -> libc::rlim_t {
+            let mut rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) },
+                0,
+                "getrlimit"
+            );
+            let saved = rlim.rlim_cur;
+            rlim.rlim_cur = limit;
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) },
+                0,
+                "setrlimit"
+            );
+            saved
+        }
+        fn udp() -> std::io::Result<Socket> {
+            Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        }
+
+        // Built before the limit drops: key generation is allowed a descriptor.
+        let peer = test_peer();
+        peer.endpoint_mut().addr = Some("192.0.2.1:51820".parse().unwrap());
+
+        // A little headroom above the lowest free descriptor, so the fill below
+        // has something to do whatever this binary already has open.
+        let ceiling = udp().unwrap().as_raw_fd() as libc::rlim_t + 8;
+        let saved = nofile(ceiling);
+
+        let mut hogs = Vec::new();
+        while let Ok(s) = udp() {
+            hogs.push(s);
+        }
+        // Release exactly one. The `socket(2)` inside `connect_endpoint` takes
+        // it, and the `dup(2)` that follows has nothing left.
+        hogs.pop();
+
+        let first = udp();
+        let second = udp();
+        let one_free = first.is_ok();
+        let only_one = second.is_err();
+        drop((first, second));
+
+        let outcome = peer.connect_endpoint(0, None);
+        let committed = peer.endpoint().conn.is_some();
+
+        // Restore before asserting, or a failure cannot print itself.
+        drop(hogs);
+        nofile(saved);
+
+        assert!(
+            one_free,
+            "precondition: one descriptor must be free, or `Socket::new` fails              first and this test proves nothing about `try_clone`"
+        );
+        assert!(
+            only_one,
+            "precondition: only one descriptor may be free, or `try_clone`              succeeds and this test proves nothing"
+        );
+        match outcome {
+            Err(Error::IoError(e)) => assert_eq!(
+                e.raw_os_error(),
+                Some(libc::EMFILE),
+                "expected the dup to fail with EMFILE, got {:?}",
+                e
+            ),
+            other => panic!("expected an EMFILE i/o error, got {:?}", other),
+        }
+        assert!(
+            !committed,
+            "a failed upgrade must not leave a connected socket on the endpoint"
+        );
     }
 }
