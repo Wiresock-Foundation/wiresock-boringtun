@@ -38,10 +38,15 @@ The /v3 suffix is required, not cosmetic -- see the note in awg-go-interop.sh.
 
 SAFETY: everything lives in throwaway network namespaces prefixed `hpa-`/`hpb-`,
 plus two UAPI sockets under /run/{amneziawg,wireguard} -- /run is not network
-namespaced, so those are the one piece of state outside them. Every name carries
-a suffix taken from an exclusive `mkdtemp` reservation, so nothing this script
-deletes can belong to anything else; the host's own interfaces, routes and
-WireGuard devices are never touched, and cleanup runs on every exit path.
+namespaced, so those are the one piece of state outside them. Teardown deletes
+only names this run claimed: the namespaces and links whose create command
+reported success, and the two UAPI socket paths of a daemon this run launched.
+So nothing it deletes can belong to anything else; the host's own interfaces,
+routes and WireGuard devices are never touched, and cleanup runs on every exit
+path. The `mkdtemp` suffix keeps two concurrent runs off each other's names; it
+says nothing about the netns and link name spaces, which are separate and
+host-global, so ownership tracking and not the suffix is what makes teardown
+safe. A name that already exists is refused before anything is created.
 
 Usage: hp-interop.py <boringtun-cli> <amneziawg-go>
 Exit 0 if all four cases behave as expected, 1 otherwise.
@@ -58,14 +63,16 @@ import time
 
 BT, GO = sys.argv[1], sys.argv[2]
 # TOKEN comes out of the mkdtemp reservation rather than a second random draw.
-# `teardown` deletes namespaces, links and sockets by name before setup, to
-# clear a crashed previous run -- so those names must be provably ours. mkdtemp
-# retries until the kernel accepts an exclusive create, which proves the suffix
-# unique against every concurrent run for as long as the directory lives;
-# `token_hex(3)` is 24 bits and proves nothing. Same argument as
-# awg-go-interop.sh. The suffix is [a-z0-9_]{8}, so it stays safe in the
-# unquoted interpolations below and `hva-<8>` is 12 chars, inside the kernel's
-# 15-character interface-name limit.
+# mkdtemp retries until the kernel accepts an exclusive create, so two runs
+# sharing $TMPDIR cannot draw the same suffix and can therefore run at once;
+# `token_hex(3)` is 24 bits and would not reliably give even that. What mkdtemp
+# does NOT give is any claim on the `ip netns` or link name spaces: those are
+# separate, host-global, and a name matching ours there is improbable, not
+# impossible -- a crashed run whose /tmp was reaped can leave a stale netns for
+# a future run to re-draw. So the suffix is not what makes teardown safe;
+# `OWNED_*` is. Same split as awg-go-interop.sh. The suffix is [a-z0-9_]{8}, so
+# it stays safe in the unquoted interpolations below and `hva-<8>` is 12 chars,
+# inside the kernel's 15-character interface-name limit.
 WORK = tempfile.mkdtemp(prefix="hpi-")
 TOKEN = os.path.basename(WORK)[len("hpi-") :]
 
@@ -156,21 +163,40 @@ PORT = 51820
 LINK_A, LINK_B = "10.55.0.1", "10.55.0.2"
 TUN_A, TUN_B = "10.77.0.1", "10.77.0.2"
 
+# What this run has actually created, appended to only after the creating
+# command reported success. A name we did not create stays unclaimed and so is
+# unreachable from `teardown` -- including the one case that matters, an
+# `ip netns add` that failed *because the name was already taken*. Emptied at
+# the end of `teardown`, so each rebuild has to acquire its names again.
+OWNED_NS, OWNED_LINKS, OWNED_SOCKS = [], [], []
+
+def own_socks(iface):
+    """Claim a daemon's socket names at launch rather than on create: a daemon
+    that starts and then hangs still has to be cleaned up after, and
+    `wait_sock` giving up does not mean nothing was created."""
+    OWNED_SOCKS.extend(f"{d}/{iface}.sock" for d in SOCK_DIRS)
+
 def teardown():
-    for ns in (NS_A, NS_B):
+    for ns in OWNED_NS:
         sh(f"ip netns pids {ns} 2>/dev/null | xargs -r kill")
         sh(f"ip netns del {ns} 2>/dev/null")
-    sh(f"ip link del {VETH_A} 2>/dev/null")
-    for d in SOCK_DIRS:
-        for i in (IF_A, IF_B):
-            sh(f"rm -f {d}/{i}.sock")
+    for link in OWNED_LINKS:
+        sh(f"ip link del {link} 2>/dev/null")
+    for p in OWNED_SOCKS:
+        sh(f"rm -f {p}")
+    for owned in (OWNED_NS, OWNED_LINKS, OWNED_SOCKS):
+        owned.clear()
 
 def underlay():
     teardown()
     time.sleep(0.3)
     for ns in (NS_A, NS_B):
         must(f"ip netns add {ns}")
+        OWNED_NS.append(ns)
     must(f"ip link add {VETH_A} type veth peer name {VETH_B}")
+    # Deleting either end takes the pair; the peer is claimed as well so that a
+    # veth stranded by a failed `netns` move is still reachable.
+    OWNED_LINKS.extend((VETH_A, VETH_B))
     must(f"ip link set {VETH_A} netns {NS_A} && ip link set {VETH_B} netns {NS_B}")
     must(f"ip netns exec {NS_A} ip addr add {LINK_A}/24 dev {VETH_A}")
     must(f"ip netns exec {NS_B} ip addr add {LINK_B}/24 dev {VETH_B}")
@@ -232,6 +258,7 @@ def launch(cmd, log):
 # file is a TOKEN-derived name or a module-level literal.
 def start_go(ns, iface, logname):
     log = os.path.join(WORK, logname)
+    own_socks(iface)
     return launch(
         f"ip netns exec {ns} env LOG_LEVEL=verbose "
         f"{shlex.quote(GO)} -f {iface} > {shlex.quote(log)} 2>&1 &",
@@ -240,6 +267,7 @@ def start_go(ns, iface, logname):
 
 def start_bt(ns, iface, logname):
     log = os.path.join(WORK, logname)
+    own_socks(iface)
     return launch(
         f"ip netns exec {ns} env WG_LOG_LEVEL=debug "
         f"{shlex.quote(BT)} --foreground --disable-drop-privileges {iface} "
@@ -354,6 +382,32 @@ def _run_case(name, a_impl, b_impl, hp_a, hp_b, expect_pass):
                 tail = open(lg, errors="replace").read().strip().splitlines()[-4:]
                 for t in tail:
                     print(f"      {os.path.basename(lg)}: {t[:130]}")
+
+# Module level and BEFORE the `try:` below, on purpose: `sys.exit` here raises
+# SystemExit before that block is entered, so its `finally: teardown()` never
+# runs and the refusal cannot turn into the deletion it is refusing to make.
+# Nowhere inside works -- a `SetupError` raised from `_run_case` is caught by
+# `run_case`, scored a FAIL, and execution still reaches the `finally`.
+#
+# Every name carries this run's mkdtemp suffix, so a hit means a stale run that
+# drew the same suffix, or an unrelated workload; neither is ours to delete.
+# This is the clear diagnostic, not the safety mechanism -- `OWNED_*` is that,
+# and it also covers a name that appears after this check has passed.
+def refuse(what):
+    print(f"preflight: {what} already exists; refusing to touch it", file=sys.stderr)
+    shutil.rmtree(WORK, ignore_errors=True)
+    sys.exit(2)
+
+for _n in (NS_A, NS_B):
+    if sh(f"ip netns list | grep -qw {_n}").returncode == 0:
+        refuse(f"namespace {_n}")
+for _l in (VETH_A, VETH_B):
+    if sh(f"ip link show {_l} >/dev/null 2>&1").returncode == 0:
+        refuse(f"interface {_l}")
+for _d in SOCK_DIRS:
+    for _i in (IF_A, IF_B):
+        if os.path.exists(f"{_d}/{_i}.sock"):
+            refuse(f"{_d}/{_i}.sock")
 
 try:
     HP = secrets.token_bytes(32).hex()
