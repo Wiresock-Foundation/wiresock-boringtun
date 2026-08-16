@@ -406,7 +406,13 @@ for _l in (VETH_A, VETH_B):
         refuse(f"interface {_l}")
 for _d in SOCK_DIRS:
     for _i in (IF_A, IF_B):
-        if os.path.exists(f"{_d}/{_i}.sock"):
+        # lexists, not exists: this asks "is the NAME taken", and a dangling
+        # symlink takes the name (bind through it fails EADDRINUSE) while
+        # exists() follows it and reports absent. A dangler here is realistic:
+        # boringtun publishes /run/amneziawg/<i>.sock as a symlink and removes
+        # target before link at exit, so a kill inside that window leaves one.
+        # (`sock_path` keeps exists() -- it asks for a live socket, not a name.)
+        if os.path.lexists(f"{_d}/{_i}.sock"):
             refuse(f"{_d}/{_i}.sock")
 
 try:

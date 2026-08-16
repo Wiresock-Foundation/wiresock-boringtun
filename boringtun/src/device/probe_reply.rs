@@ -176,6 +176,28 @@ pub(crate) enum HeaderProtectionVerdict {
 }
 
 impl HeaderProtectionVerdict {
+    /// Build the authoritative verdict for one anonymous-ingress datagram,
+    /// unmasking `datagram` in place when a header-protection key is set.
+    ///
+    /// This is the step `register_udp_handler` performs before classifying,
+    /// extracted so `ingress_tests::demux_handshake` runs the same code the
+    /// production demux runs. While it lived inline in the handler it had no
+    /// automated coverage: deleting the branch, swapping the unmasking
+    /// classifier for the zero-mask one, and mis-slicing the buffer each left
+    /// the whole suite green -- on the exact branch that closes the
+    /// enforced-on-send-only hole.
+    pub(crate) fn for_ingress(
+        amnezia: &AmneziaConfig,
+        obf: ObfuscationRanges,
+        datagram: &mut [u8],
+    ) -> Self {
+        if amnezia.header_protection_enabled() {
+            Self::Masked(amnezia.unmask_and_classify_inbound(obf, datagram))
+        } else {
+            Self::NotConfigured
+        }
+    }
+
     pub(crate) fn classify<'a>(
         &self,
         datagram: &'a [u8],

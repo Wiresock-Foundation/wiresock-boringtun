@@ -11,8 +11,9 @@ pub mod handshake;
 pub(crate) mod imitation;
 pub mod rate_limiter;
 
-// QUIC Initial imitation generator (always compiled; pulls in `aes`).
+// AmneziaWG 3.0 header protection: ChaCha20 keystream mask, nonce from the junk prefix.
 pub mod header_protection;
+// QUIC Initial imitation generator (always compiled; pulls in `aes`).
 pub(crate) mod quic;
 mod session;
 // Widened ahead of the AmneziaWG 3.0 tunable-timer comparison in `device::api`;
