@@ -14,7 +14,10 @@ pub mod rate_limiter;
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
 pub(crate) mod quic;
 mod session;
-mod timers;
+// Widened ahead of the AmneziaWG 3.0 tunable-timer comparison in `device::api`;
+// no consumer outside `noise` on this branch yet. Present tense would be a claim
+// this tree does not support -- this PR is mergeable to master on its own.
+pub(crate) mod timers;
 
 use amnezia::AmneziaConfig;
 use handshake::ObfuscationRanges;
@@ -881,9 +884,48 @@ impl Tunn {
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
     /// Returns the truncated packet and the source IP as TunnResult
     fn validate_decapsulated_packet<'a>(&mut self, packet: &'a mut [u8]) -> TunnResult<'a> {
-        let (computed_len, src_ip_address) = match packet.len() {
-            0 => return TunnResult::Done, // This is keepalive, and not an error
-            _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
+        // A keepalive is empty -- or, from a peer using AmneziaWG's
+        // `content_padding_addition`, a run of zero bytes, since the padding is
+        // appended to an empty payload. amneziawg-go accepts both with a single
+        // test on the first byte (`len(packet) == 0 || packet[0] == 0` in
+        // device/receive.go), so we do too; rejecting the padded form strands
+        // every peer that pads.
+        //
+        // What rejecting it actually cost is narrower than "the tunnel dies":
+        // `handle_data` ticks `TimeLastPacketReceived` *before* calling this, so
+        // liveness was never at risk. But `TunnResult::Err` makes the device
+        // layer `continue` past `Peer::set_endpoint`, so a roaming peer whose
+        // only traffic is keepalives never moves its endpoint, and the
+        // connected-socket path logs one line per keepalive.
+        //
+        // `first()` rather than `packet[0]`: nothing but arm ordering kept the
+        // old index in bounds, and this runs under `extern "C"` FFI where an
+        // index panic aborts the caller's process instead of unwinding.
+        //
+        // No valid IP packet starts with a zero byte -- the version nibble would
+        // have to be 0 -- so this cannot swallow real traffic. It can still
+        // swallow a plaintext that merely starts with one and carries something
+        // else after it, which the catch-all below used to report, so note it
+        // rather than drop it silently.
+        //
+        // The note does not call that plaintext malformed, because nothing here
+        // establishes it is: this arm cannot tell padding from garbage, and a
+        // peer padding with something other than zeros would land in it. It says
+        // what was observed and nothing more. Accepting it either way is what
+        // matches amneziawg-go, whose rule at device/receive.go is the same
+        // first-byte test and which logs every keepalive it takes.
+        if matches!(packet.first(), None | Some(&0)) {
+            if packet.iter().any(|&b| b != 0) {
+                tracing::debug!(
+                    message = "Discarding a zero-prefixed plaintext with a non-zero tail",
+                    len = packet.len()
+                );
+            }
+            return TunnResult::Done;
+        }
+
+        let (computed_len, src_ip_address) =
+            if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE {
                 let len_bytes: [u8; IP_LEN_SZ] = packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ]
                     .try_into()
                     .unwrap();
@@ -891,12 +933,20 @@ impl Tunn {
                     [IPV4_SRC_IP_OFF..IPV4_SRC_IP_OFF + IPV4_IP_SZ]
                     .try_into()
                     .unwrap();
-                (
-                    u16::from_be_bytes(len_bytes) as usize,
-                    IpAddr::from(addr_bytes),
-                )
-            }
-            _ if packet[0] >> 4 == 6 && packet.len() >= IPV6_MIN_HEADER_SIZE => {
+                let computed_len = u16::from_be_bytes(len_bytes) as usize;
+                // The IPv4 total-length field covers the header too, so a value below
+                // the minimum header size describes a packet that cannot exist. The
+                // upper-bound check below does not catch it, and the truncation at the
+                // end would then hand the tun device a runt -- an empty write, for a
+                // total length of 0 -- while crediting `rx_bytes` with the field
+                // rather than the bytes received. wireguard-go rejects the same case
+                // (`int(length) < ipv4.HeaderLen`). The v6 branch needs no equivalent:
+                // it adds IPV6_MIN_HEADER_SIZE to the payload length.
+                if computed_len < IPV4_MIN_HEADER_SIZE {
+                    return TunnResult::Err(WireGuardError::InvalidPacket);
+                }
+                (computed_len, IpAddr::from(addr_bytes))
+            } else if packet[0] >> 4 == 6 && packet.len() >= IPV6_MIN_HEADER_SIZE {
                 let len_bytes: [u8; IP_LEN_SZ] = packet[IPV6_LEN_OFF..IPV6_LEN_OFF + IP_LEN_SZ]
                     .try_into()
                     .unwrap();
@@ -908,9 +958,9 @@ impl Tunn {
                     u16::from_be_bytes(len_bytes) as usize + IPV6_MIN_HEADER_SIZE,
                     IpAddr::from(addr_bytes),
                 )
-            }
-            _ => return TunnResult::Err(WireGuardError::InvalidPacket),
-        };
+            } else {
+                return TunnResult::Err(WireGuardError::InvalidPacket);
+            };
 
         if computed_len > packet.len() {
             return TunnResult::Err(WireGuardError::InvalidPacket);
@@ -1566,6 +1616,118 @@ mod tests {
             // single-argument `panic!` is not a format string and would print
             // the braces verbatim.
             other => panic!("expected the retry to be accepted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_padded_keepalive_is_a_keepalive_not_an_invalid_packet() {
+        // AmneziaWG's `content_padding_addition` appends zeros to the plaintext,
+        // so a keepalive from such a peer arrives as a run of zero bytes rather
+        // than as a zero-length payload. amneziawg-go accepts both forms; we used
+        // to reject the padded one as InvalidPacket, which makes the device layer
+        // skip the endpoint update for a roaming peer and log one line per
+        // keepalive.
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut dst = vec![0u8; 2048];
+        let mut their_dst = vec![0u8; 2048];
+
+        // 0 is the unpadded form: it pins the empty-plaintext case that the
+        // padded one now shares a branch with, so neither can be removed alone.
+        for pad in [0usize, 1, 16, 100] {
+            let padded_keepalive = vec![0u8; pad];
+            let sent = unwrap_network_packet(my_tun.encapsulate(&padded_keepalive, &mut dst));
+
+            match their_tun.decapsulate(None, &sent, &mut their_dst) {
+                TunnResult::Done => {}
+                // Positional, not `{pad}`/`{other:?}`: this crate is edition
+                // 2018, where the single-argument `panic!` next door would print
+                // the braces verbatim. Keeping every message in one style is what
+                // stops the broken arity from being reintroduced by copy-paste.
+                other => panic!(
+                    "a {}-byte padded keepalive must be Done, got {:?}",
+                    pad, other
+                ),
+            }
+        }
+
+        // The actual new semantic: acceptance keys on the FIRST BYTE, not on the
+        // plaintext being all zeros. amneziawg-go does the same
+        // (`len(packet) == 0 || packet[0] == 0`), and matching it is the point --
+        // narrowing this to `iter().all(|b| b == 0)` would reject a padded
+        // keepalive from any implementation whose padding is not zero-filled,
+        // restoring the roaming-endpoint bug this PR exists to fix. Nothing
+        // pinned that until now: the narrowing left the whole suite green.
+        let mut zero_prefixed = vec![0u8; 1];
+        zero_prefixed.extend_from_slice(&[0x45, 0x00, 0x14]);
+        let sent = unwrap_network_packet(my_tun.encapsulate(&zero_prefixed, &mut dst));
+        assert!(
+            matches!(
+                their_tun.decapsulate(None, &sent, &mut their_dst),
+                TunnResult::Done
+            ),
+            "a plaintext whose first byte is zero must be a keepalive even when \
+             later bytes are not"
+        );
+
+        // The shape padding actually produces for *data*: a real packet with the
+        // zeros appended. The IPv4 total-length field, not the plaintext length,
+        // decides what reaches the tunnel, so the padding has to be trimmed --
+        // neither delivered to the interface nor grounds for rejecting the
+        // packet. This is the half of padding tolerance that the keepalive cases
+        // above do not exercise, since a keepalive declares no length.
+        let packet = create_ipv4_udp_packet();
+        let mut padded = packet.clone();
+        padded.extend_from_slice(&[0u8; 16]);
+        let sent = unwrap_network_packet(my_tun.encapsulate(&padded, &mut dst));
+        match their_tun.decapsulate(None, &sent, &mut their_dst) {
+            TunnResult::WriteToTunnelV4(recv, _) => assert_eq!(&packet[..], recv),
+            other => panic!("a padded IPv4 packet must arrive trimmed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_ipv4_total_length_below_the_header_size_is_rejected_not_truncated() {
+        // The total-length field covers the header, so anything under 20 is not a
+        // packet. Only the upper bound was checked, so these truncated to
+        // `packet[..computed_len]` and were handed to the tun device as a runt --
+        // an empty write for a total length of 0 -- while `rx_bytes` was credited
+        // with the field rather than the bytes actually received. Reaching this
+        // needs a peer that completed the handshake, so it is a malicious- or
+        // buggy-peer case, not a remote one; wireguard-go rejects it too
+        // (`int(length) < ipv4.HeaderLen`).
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut dst = vec![0u8; 2048];
+        let mut their_dst = vec![0u8; 2048];
+
+        for bogus_total_len in [0u16, 1, IPV4_MIN_HEADER_SIZE as u16 - 1] {
+            let mut runt = create_ipv4_udp_packet();
+            runt[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ]
+                .copy_from_slice(&bogus_total_len.to_be_bytes());
+            let sent = unwrap_network_packet(my_tun.encapsulate(&runt, &mut dst));
+
+            match their_tun.decapsulate(None, &sent, &mut their_dst) {
+                TunnResult::Err(WireGuardError::InvalidPacket) => {}
+                other => panic!(
+                    "an IPv4 total length of {} must be InvalidPacket, got {:?}",
+                    bogus_total_len, other
+                ),
+            }
+        }
+
+        // The smallest total length that does describe a packet still works, so
+        // the new bound rejects only what it must.
+        let mut minimal = create_ipv4_udp_packet();
+        minimal[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ]
+            .copy_from_slice(&(IPV4_MIN_HEADER_SIZE as u16).to_be_bytes());
+        let sent = unwrap_network_packet(my_tun.encapsulate(&minimal, &mut dst));
+        match their_tun.decapsulate(None, &sent, &mut their_dst) {
+            TunnResult::WriteToTunnelV4(recv, _) => {
+                assert_eq!(recv.len(), IPV4_MIN_HEADER_SIZE)
+            }
+            other => panic!(
+                "a total length of exactly the header size must be accepted, got {:?}",
+                other
+            ),
         }
     }
 
