@@ -6,6 +6,8 @@
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use crate::device::{DeviceConfig, DeviceHandle};
+    #[cfg(target_os = "linux")]
+    use crate::noise::{Packet, Tunn, TunnResult};
     use crate::x25519::{PublicKey, StaticSecret};
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
@@ -14,12 +16,16 @@ mod tests {
     use ring::rand::{SecureRandom, SystemRandom};
     use std::fmt::Write as _;
     use std::io::{BufRead, BufReader, Read, Write};
+    #[cfg(target_os = "linux")]
+    use std::net::UdpSocket;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::os::unix::net::UnixStream;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
+    #[cfg(target_os = "linux")]
+    use std::time::{Duration, Instant};
 
     static NEXT_IFACE_IDX: AtomicUsize = AtomicUsize::new(100); // utun 100+ should be vacant during testing on CI
     static NEXT_PORT: AtomicUsize = AtomicUsize::new(61111); // Use ports starting with 61111, hoping we don't run into a taken port 🤷
@@ -430,6 +436,59 @@ mod tests {
         /// Assign a private_key to the interface
         fn wg_set_key(&self, key: StaticSecret) -> String {
             self.wg_set(&format!("private_key={}", encode(key.to_bytes())))
+        }
+
+        /// Arm this device's event queue so the next `EPOLL_CTL_ADD` fails.
+        ///
+        /// Linux-only: the hook lives on `epoll.rs`'s `EventPoll`, and the
+        /// module gate above excludes only macOS -- iOS and tvOS also reach
+        /// here and select `kqueue.rs`, which has no such hook.
+        #[cfg(target_os = "linux")]
+        fn fail_next_event_registration(&self) {
+            self._device.device.read().queue.fail_next_registration();
+        }
+
+        /// As above but sticky: a process out of watches stays out.
+        #[cfg(target_os = "linux")]
+        fn fail_all_event_registrations(&self) {
+            self._device.device.read().queue.fail_all_registrations();
+        }
+
+        /// How many `EPOLL_CTL_ADD` calls this device has attempted.
+        #[cfg(target_os = "linux")]
+        fn event_registration_attempts(&self) -> usize {
+            self._device.device.read().queue.registration_attempts()
+        }
+
+        /// Block until this device has attempted at least `n` more
+        /// `EPOLL_CTL_ADD`s than `before`, or `timeout` elapses. Returns what
+        /// was actually observed, so the caller still asserts on it -- waiting
+        /// must never be able to stand in for the assertion.
+        ///
+        /// This is the synchronisation the connected-socket tests need. The
+        /// handshake response is written to the socket in the UDP handler
+        /// *before* the connected-socket block runs, so the client can be
+        /// holding the response while the worker has not yet reached the
+        /// registration. A fixed delay is a bet on the scheduler, and it is a
+        /// bet that loses: measured at 24 of 40 runs when the worker is starved.
+        #[cfg(target_os = "linux")]
+        fn wait_for_event_registrations(
+            &self,
+            before: usize,
+            n: usize,
+            timeout: Duration,
+        ) -> usize {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let seen = self.event_registration_attempts() - before;
+                if seen >= n || Instant::now() >= deadline {
+                    return seen;
+                }
+                // Sleeps rather than spins: the worker this waits on may be
+                // waiting for a core, and burning one here is exactly wrong
+                // under the load that makes the race visible.
+                thread::sleep(Duration::from_millis(1));
+            }
         }
 
         /// Assign a peer to the interface (with public_key, endpoint and a series of nallowed_ip)
@@ -854,5 +913,305 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
+    }
+
+    /// A refused connected-socket registration must return the peer to the
+    /// shared listening socket, in *both* directions.
+    ///
+    /// `connect_endpoint` has already stored a `dup(2)` of the connected socket
+    /// in `endpoint.conn` by the time `register_conn_handler` runs, and the
+    /// kernel gives a connected UDP socket priority over the wildcard listener
+    /// for datagrams from that 4-tuple. So if registration fails and `conn` is
+    /// left in place, the peer's next datagram is taken off the listener by a
+    /// socket no handler reads: a blackhole, not a fallback. The direction that
+    /// dies is inbound, not outbound -- the surviving dup still sends.
+    ///
+    /// Asserts the observable consequence rather than `endpoint.conn.is_none()`,
+    /// so it cannot be satisfied by a rollback that clears the field while
+    /// leaving the socket in service.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`; CI runs it with
+    /// `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_refused_connected_socket_registration_returns_the_peer_to_the_shared_socket() {
+        let port = next_port();
+        let private_key = StaticSecret::random_from_rng(OsRng);
+        let public_key = PublicKey::from(&private_key);
+
+        // Single-queue, unlike `WGHandle::init`: with `use_multi_queue`, worker
+        // thread 1 registers a second TUN handler *asynchronously* from
+        // `event_loop`, and that is the one EPOLL_CTL_ADD that could land inside
+        // the window this test subtracts over.
+        let wg = WGHandle::init_with_config(
+            next_ip(),
+            next_ip_v6(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: true,
+                use_multi_queue: false,
+                uapi_fd: -1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            wg.wg_set_port(port),
+            "errno=0
+
+"
+        );
+        assert_eq!(
+            wg.wg_set_key(private_key),
+            "errno=0
+
+"
+        );
+
+        // No endpoint configured: it is learned from the datagram, which is what
+        // takes the device down the `connect_endpoint` path.
+        let peer_secret = StaticSecret::random_from_rng(OsRng);
+        let peer_public = PublicKey::from(&peer_secret);
+        assert_eq!(
+            wg.wg_set(&format!(
+                "public_key={}
+allowed_ip=10.66.66.2/32",
+                encode(peer_public.as_bytes())
+            )),
+            "errno=0
+
+"
+        );
+
+        let mut client = Tunn::new_with_obfuscation(
+            peer_secret,
+            public_key,
+            None,
+            None,
+            100,
+            None,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let mut rx = vec![0u8; 2048];
+
+        // Armed after every other registration has happened -- the API socket,
+        // the timers, the notifiers and both listeners are already in -- so the
+        // next EPOLL_CTL_ADD is the connected socket for this peer.
+        let before = wg.event_registration_attempts();
+        wg.fail_next_event_registration();
+
+        let init = match client.format_handshake_initiation(&mut buf, false) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+        sock.send_to(&init, server).unwrap();
+        // The response is written before the connected-socket block, so it
+        // arrives whether or not the rollback runs. This only establishes that
+        // the device authenticated the peer and therefore reached that block.
+        let (n, _) = sock
+            .recv_from(&mut rx)
+            .expect("the device must answer the first initiation");
+        assert!(
+            matches!(
+                Tunn::parse_incoming_packet(Default::default(), &rx[..n]),
+                Ok(Packet::HandshakeResponse(_))
+            ),
+            "expected a handshake response to the first initiation"
+        );
+
+        // Waits for the upgrade attempt, not for an interval. The response is
+        // written strictly before the connected-socket block, so an elapsed-time
+        // bound only decides how often the worker loses the race, never whether
+        // it can. The assertion below is unchanged and still reads the counter
+        // itself: at 0 this times out and fails, and a second attempt that has
+        // already landed is still seen.
+        wg.wait_for_event_registrations(before, 1, Duration::from_secs(5));
+
+        // This pins that the armed one-shot was actually consumed -- without
+        // it, a device that never attempts the upgrade satisfies this whole
+        // test, because the second initiation is then answered by the shared
+        // listener for the trivial reason that no connected socket ever existed.
+        assert_eq!(
+            wg.event_registration_attempts() - before,
+            1,
+            "the device attempted no connected-socket upgrade, so the refused \
+             registration this test exercises never happened"
+        );
+
+        // Retried until a deadline, not sent once. The counter above ticks at
+        // the top of `register_event`, but the rollback runs after it returns,
+        // so a single shot can still land on the rejected socket in the window
+        // between the two -- and such a datagram is silently swallowed, which is
+        // indistinguishable from the bug this test exists for.
+        //
+        // Retrying does not weaken the assertion. `conn` is cleared only by the
+        // rollback, by a roam, or by connection expiry (~3 min), none of which
+        // this loop reaches: delete the rollback and `conn` stays in place for
+        // the life of the endpoint, so every retry is swallowed, the deadline is
+        // hit, and the test fails exactly as before.
+        //
+        // `force_resend`, because `format_handshake_initiation` returns `Done`
+        // while a handshake is already in progress. Each call restamps, and
+        // `Tai64N` is nanosecond-resolution, so successive initiations are
+        // strictly increasing without help from a sleep -- which is what the
+        // fixed delay this replaced was also claimed to be for.
+        sock.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let n2 = loop {
+            let init2 = match client.format_handshake_initiation(&mut buf, true) {
+                TunnResult::WriteToNetwork(d) => d.to_vec(),
+                other => panic!("expected a second initiation, got {:?}", other),
+            };
+            sock.send_to(&init2, server).unwrap();
+            match sock.recv_from(&mut rx) {
+                Ok((n2, _)) => break n2,
+                Err(e) => assert!(
+                    Instant::now() < deadline,
+                    "the device never saw the second initiation: the rejected \
+                     connected socket is still taking the peer's datagrams off \
+                     the shared listener ({:?})",
+                    e
+                ),
+            }
+        };
+        assert!(
+            matches!(
+                Tunn::parse_incoming_packet(Default::default(), &rx[..n2]),
+                Ok(Packet::HandshakeResponse(_))
+            ),
+            "expected a handshake response to the second initiation"
+        );
+    }
+
+    /// A peer whose connected-socket upgrade cannot succeed must not retry it
+    /// on every datagram.
+    ///
+    /// `register_conn_handler` failing rolls `endpoint.conn` back to `None`, so
+    /// `connect_endpoint` stops short-circuiting and the next authenticated
+    /// datagram redoes the whole socket/bind/connect/dup/epoll_ctl sequence.
+    /// While this UID is out of `max_user_watches` that cannot succeed, so
+    /// the retry is pure cost -- and worse than cost: each attempt binds a
+    /// socket to the listen port and connects it to the peer's 4-tuple, which
+    /// the kernel prefers over the wildcard listener, so datagrams arriving
+    /// inside the window are delivered to a socket with no reader.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_peer_whose_upgrade_cannot_succeed_does_not_retry_it_per_datagram() {
+        let port = next_port();
+        let private_key = StaticSecret::random_from_rng(OsRng);
+        let public_key = PublicKey::from(&private_key);
+
+        // Single-queue, unlike `WGHandle::init`: with `use_multi_queue`, worker
+        // thread 1 registers a second TUN handler *asynchronously* from
+        // `event_loop`, and that is the one EPOLL_CTL_ADD that could land inside
+        // the window this test subtracts over.
+        let wg = WGHandle::init_with_config(
+            next_ip(),
+            next_ip_v6(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: true,
+                use_multi_queue: false,
+                uapi_fd: -1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            wg.wg_set_port(port),
+            "errno=0
+
+"
+        );
+        assert_eq!(
+            wg.wg_set_key(private_key),
+            "errno=0
+
+"
+        );
+
+        let peer_secret = StaticSecret::random_from_rng(OsRng);
+        let peer_public = PublicKey::from(&peer_secret);
+        assert_eq!(
+            wg.wg_set(&format!(
+                "public_key={}
+allowed_ip=10.66.66.2/32",
+                encode(peer_public.as_bytes())
+            )),
+            "errno=0
+
+"
+        );
+
+        let mut client = Tunn::new_with_obfuscation(
+            peer_secret,
+            public_key,
+            None,
+            None,
+            100,
+            None,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let mut rx = vec![0u8; 2048];
+
+        // Out of watches from here on, which is the state the gate exists for.
+        wg.fail_all_event_registrations();
+        let before = wg.event_registration_attempts();
+
+        // Every one of these is authenticated, so every one reaches the
+        // connected-socket block.
+        let datagrams = 52;
+        for i in 0..datagrams {
+            let init = match client.format_handshake_initiation(&mut buf, true) {
+                TunnResult::WriteToNetwork(d) => d.to_vec(),
+                other => panic!("expected an initiation, got {:?}", other),
+            };
+            sock.send_to(&init, server).unwrap();
+            let (n, _) = sock
+                .recv_from(&mut rx)
+                .unwrap_or_else(|e| panic!("no response to initiation {}: {:?}", i, e));
+            assert!(
+                matches!(
+                    Tunn::parse_incoming_packet(Default::default(), &rx[..n]),
+                    Ok(Packet::HandshakeResponse(_))
+                ),
+                "expected a handshake response to initiation {}",
+                i
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let attempts = wg.event_registration_attempts() - before;
+        // Exactly one, not "at most one": zero would mean the upgrade was never
+        // attempted at all, which every one of these mutations produces --
+        // `use_connected_socket` forced off, the gate initialised true, the
+        // whole block deleted -- and each of those would have satisfied a
+        // `<= 1` bound while proving nothing.
+        assert_eq!(
+            attempts, 1,
+            "{} authenticated datagrams drove {} EPOLL_CTL_ADD attempts; a \
+             failed upgrade must be attempted exactly once -- 0 means it was \
+             never attempted, more than 1 means it was retried per datagram",
+            datagrams, attempts
+        );
     }
 }

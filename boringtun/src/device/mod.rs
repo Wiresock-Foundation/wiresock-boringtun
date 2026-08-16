@@ -100,6 +100,48 @@ pub enum Error {
     PeerSetup(String),
 }
 
+/// Whether a `Peer::connect_endpoint` failure says anything about *this
+/// listener's* capacity, or only about one peer's endpoint address.
+///
+/// Every fallible call in `connect_endpoint` -- `socket`, `setsockopt`, `dup`,
+/// `bind`, `connect`, `fcntl` -- reports through the same `Error::IoError`, so
+/// the call site cannot recover the distinction from the type. Only the errno
+/// separates "this process is out of descriptors", which every peer on the
+/// listener shares, from "the route to this one endpoint is `unreachable`",
+/// which none of them do.
+///
+/// Measured on Linux 6.6 with a UDP socket bound to `0.0.0.0:51820`: an
+/// `unreachable` route gives EHOSTUNREACH, a `prohibit` route EACCES, a
+/// `blackhole` route EINVAL, a scopeless IPv6 link-local destination EINVAL,
+/// an fwmark whose policy table holds `unreachable default` EHOSTUNREACH, and
+/// a missing default route -- a WAN flap, a DHCP renew -- ENETUNREACH. All
+/// six are per-destination, and the last is transient: latching the listener
+/// on it would cost every peer its connected socket over a one-second blip.
+///
+/// Deliberately a small allowlist rather than a denylist of those six: an
+/// errno nobody anticipated is far more likely to be destination-specific than
+/// process-wide, and the per-peer path is the safe default -- it still bounds
+/// the retry to one attempt per peer per endpoint address. That direction is
+/// kept even for `set_mark`'s EPERM, which genuinely is process-wide: EPERM=1
+/// and `connect`'s per-destination EACCES=13 are only an errno apart, and
+/// guessing wrong the other way costs every peer. The price is bounded -- a
+/// marked-but-unprivileged device pays one futile socket/setsockopt/close per
+/// peer per roam, with no `connect(2)`, so no half-built socket ever outranks
+/// the listener.
+fn is_upgrade_exhaustion(e: &Error) -> bool {
+    let raw = match e {
+        Error::IoError(e) => e.raw_os_error(),
+        _ => None,
+    };
+    matches!(
+        raw,
+        // socket(2)/dup(2): per-process and system-wide descriptor limits.
+        Some(libc::EMFILE) | Some(libc::ENFILE)
+        // socket(2)/bind(2)/connect(2): kernel memory and socket buffers.
+        | Some(libc::ENOMEM) | Some(libc::ENOBUFS)
+    )
+}
+
 // What the event loop should do after a handler returns
 enum Action {
     Continue, // Continue the loop
@@ -930,6 +972,61 @@ impl Device {
         // the whole signal: the operator needs to know traffic arrived before
         // the key, not how much of it did.
         let warned_keyless = AtomicBool::new(false);
+        // This one latches the *retry*, not just its log line, and it never
+        // clears. The flag lives in this closure, so only a fresh listener
+        // socket gets a fresh one. `register_udp_handler` is called once for
+        // udp4 and once for udp6, so there are two of these and a v4 failure
+        // does not gate v6.
+        //
+        // Not because the watch budget is permanently gone -- it is not.
+        // `max_user_watches` is counted per real UID, not per process, so
+        // another process under this UID can free some; and every connected
+        // handler this device releases gives one back, via `set_endpoint` on a
+        // roam, the `ConnectionExpired` arm in the timer above, and
+        // `remove_peer`. Capacity does come back. This listener stops asking.
+        //
+        // That is deliberate, because the two costs are not alike. Not asking
+        // costs throughput: the peer's traffic goes over the shared listener,
+        // which is how a `use_connected_socket=false` device runs all day.
+        // Asking again costs the peer's traffic outright: the rollback below
+        // clears `endpoint.conn`, so `connect_endpoint` stops short-circuiting
+        // and every subsequent datagram redoes the whole
+        // socket/bind/connect/epoll_ctl dance -- and the kernel prefers that
+        // half-built connected socket over the wildcard listener, so anything
+        // arriving between the `connect(2)` and the `close(2)` is delivered to
+        // a socket with no reader and dies with it. The attempt count is pinned
+        // by `a_peer_whose_upgrade_cannot_succeed_does_not_retry_it_per_datagram`:
+        // 52 authenticated datagrams, exactly one `EPOLL_CTL_ADD`. (The loss
+        // rate under that storm was observed once under strace, which widens
+        // the window; it is not pinned by a test.)
+        //
+        // So a periodic retry buys back an optimisation by re-buying that loss.
+        // A cooldown resumes the storm once per period, per peer, forever --
+        // and a failed `epoll_ctl` says nothing about when capacity returns, so
+        // no period is the right one. Clearing the flag when a handler is freed
+        // is worse: handlers are freed on every roam, and an authenticated peer
+        // roaming rapidly is the workload that exhausts the watches, so the
+        // gate would be cleared as fast as it is set, in exactly the case it
+        // exists for.
+        //
+        // Recovering the optimisation therefore means a new listener socket:
+        // in practice, a restart. A `listen_port=` rebind does rearm the flag
+        // when it succeeds, but `open_listen_socket` leaves `udp4`/`udp6` as
+        // `None` when it fails, and the iface handler's `expect("Not
+        // connected")` turns that into a panicked worker per thread -- and out
+        // of watches is exactly when that rebind fails. Do not treat it as the
+        // recovery until that is fixed.
+        //
+        // Not conditioned on the errno either. On the fresh UDP socket
+        // `Peer::connect_endpoint` hands to `register_conn_handler` below,
+        // `epoll_ctl(EPOLL_CTL_ADD)` can realistically only return ENOSPC or
+        // ENOMEM -- `register_event` explains why EMFILE cannot occur there,
+        // and `insert_at` deletes any prior registration at the index, so not
+        // EEXIST -- and both are exhaustion.
+        //
+        // The retry itself is upstream behaviour this fork did not introduce.
+        // Gating it is a deliberate change.
+        let conn_upgrade_disabled = AtomicBool::new(false);
         // Also at most once, and for a sharper reason than volume. Whether a
         // cookie reply amplifies is fixed by S1/S2/S3, so once it is true it is
         // true for every datagram of that kind until the operator changes the
@@ -1168,10 +1265,115 @@ impl Device {
                     // This packet was OK, that means we want to create a connected socket for this peer
                     let ip_addr = from.ip();
                     p.set_endpoint(from);
-                    if d.config.use_connected_socket {
-                        if let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark) {
-                            d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
-                                .unwrap();
+                    if d.config.use_connected_socket
+                        && !conn_upgrade_disabled.load(Ordering::Relaxed)
+                        && !p.upgrade_suppressed()
+                    {
+                        // The gate below latches a failed `register_conn_handler`;
+                        // this handles a failed `connect_endpoint`, for the same
+                        // reason. That rollback and this `?` both leave
+                        // `endpoint.conn` at `None`, so `connect_endpoint` stops
+                        // short-circuiting and the peer's next datagram redoes
+                        // the whole socket/bind/connect sequence -- one per
+                        // datagram, with no log at all before this.
+                        //
+                        // `Error::Connect` is excluded, and that exclusion is
+                        // the point. `connect_endpoint` returns
+                        // `Connect("Connected")` for every datagram that reaches
+                        // the shared listener while `conn` is already committed,
+                        // which is what the tail of a roaming burst does: the
+                        // first packet upgrades and the rest land on it.
+                        // Latching there would take the connected socket away
+                        // from every healthy peer on this listener at the first
+                        // roam.
+                        //
+                        // Everything else is split by what the errno proves.
+                        // Only descriptor or memory exhaustion is a statement
+                        // about this process, and so about every peer on this
+                        // listener; a route lookup that fails for one endpoint
+                        // address -- `unreachable` route, missing default
+                        // during a WAN flap, fwmark policy -- says nothing
+                        // about any other peer's, and latching the listener
+                        // for it would cost all of them their connected socket
+                        // until the daemon restarts. Those suppress on the
+                        // *peer*, cleared when its endpoint address changes.
+                        // An errno the classifier does not recognise takes the
+                        // per-peer path too: still bounded at one attempt per
+                        // peer per address, never one per datagram.
+                        let upgrade = p.connect_endpoint(d.listen_port, d.fwmark);
+                        if let Err(ref e) = upgrade {
+                            if !matches!(e, Error::Connect(_)) {
+                                let first = if is_upgrade_exhaustion(e) {
+                                    !conn_upgrade_disabled.swap(true, Ordering::Relaxed)
+                                } else {
+                                    p.suppress_upgrade()
+                                };
+                                if first {
+                                    tracing::warn!(
+                                        message = "Failed to open a connected socket for peer; \
+                                                   staying on the shared socket",
+                                        error = ?e
+                                    );
+                                }
+                            }
+                        }
+                        if let Ok(sock) = upgrade {
+                            // Not `unwrap`: this is `epoll_ctl(EPOLL_CTL_ADD)`,
+                            // which fails with ENOSPC once this UID is out of
+                            // `max_user_watches` -- reachable on a server with
+                            // many peers, and drivable by an *authenticated*
+                            // peer roaming rapidly, since every new source
+                            // address arrives here. Not by an unauthenticated
+                            // flood: this runs only after `verify_packet`, peer
+                            // lookup and `handle_verified_packet` have all
+                            // succeeded. Note the sibling `Result` one line
+                            // above is already handled this way.
+                            if let Err(e) = d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
+                            {
+                                // `swap`, not `store`: four worker threads can
+                                // race into this block on different peers.
+                                if !conn_upgrade_disabled.swap(true, Ordering::Relaxed) {
+                                    tracing::warn!(
+                                        message = "Failed to register connected socket for peer; \
+                                                   reverting to the shared socket",
+                                        error = ?e
+                                    );
+                                }
+                                // Roll the connection back, or this is a
+                                // blackhole rather than a fallback:
+                                // `connect_endpoint` has already stored a clone
+                                // in `endpoint.conn`, so the send path would go
+                                // on using a socket that now has no receive
+                                // handler registered. Clearing it puts both
+                                // directions back on the shared socket, which is
+                                // what "falling back" has to mean.
+                                //
+                                // Cleared rather than `shutdown_endpoint()`:
+                                // that exists to raise EPOLLHUP so the event
+                                // loop frees a *registered* handler, and on this
+                                // path registration is precisely what failed --
+                                // `register_event` already dropped the handler
+                                // box. All the shutdown would add here is an
+                                // `info!` on a socket that never entered
+                                // service.
+                                p.endpoint_mut().conn = None;
+                            } else {
+                                // Reported here, not in `connect_endpoint`:
+                                // this is the arm on which the connected socket
+                                // actually enters service. It runs at most once
+                                // per peer per source address, since the next
+                                // datagram short-circuits on `conn.is_some()`.
+                                //
+                                // Still under two locks -- the peer `Mutex`
+                                // this dispatch holds and the device read lock
+                                // -- but no longer under `Peer::endpoint`'s
+                                // write guard, which `connect_endpoint` held.
+                                tracing::info!(
+                                    message = "Connected endpoint",
+                                    port = d.listen_port,
+                                    endpoint = ?from
+                                );
+                            }
                         }
                     }
                 }
@@ -1369,6 +1571,80 @@ impl Default for IndexLfsr {
             lfsr: seed,
             mask: Self::random_index(),
         }
+    }
+}
+
+#[cfg(test)]
+mod upgrade_scope_tests {
+    //! Pins the split in `is_upgrade_exhaustion`: which `connect_endpoint`
+    //! failures latch the whole listener, and which stay with one peer.
+
+    use super::*;
+
+    fn io_err(errno: i32) -> Error {
+        Error::IoError(io::Error::from_raw_os_error(errno))
+    }
+
+    /// A destination-specific failure must not latch the listener.
+    ///
+    /// Latching costs every OTHER peer on the listener its connected socket
+    /// until the daemon restarts, and none of these errnos is evidence about
+    /// any of them.
+    #[test]
+    fn a_destination_specific_failure_must_not_latch_the_listener() {
+        let cases: &[(i32, &str)] = &[
+            (libc::EHOSTUNREACH, "`ip route add unreachable <peer>/32`"),
+            (
+                libc::ENETUNREACH,
+                "no default route: a WAN flap, a DHCP renew",
+            ),
+            (libc::EACCES, "a `prohibit` route"),
+            (
+                libc::EINVAL,
+                "a `blackhole` route, or a scopeless IPv6 link-local",
+            ),
+            (libc::EPERM, "SO_MARK without CAP_NET_ADMIN"),
+            (libc::EADDRNOTAVAIL, "no usable local address"),
+        ];
+        for &(errno, why) in cases {
+            assert!(
+                !is_upgrade_exhaustion(&io_err(errno)),
+                "errno {} ({}) is not listener-wide exhaustion; latching on it \
+                 takes every other peer's connected socket away",
+                errno,
+                why
+            );
+        }
+    }
+
+    /// Without this, the test above is satisfiable by `|_| false`, which
+    /// reintroduces the per-datagram storm the listener latch was added for.
+    #[test]
+    fn descriptor_and_memory_exhaustion_still_latches_the_listener() {
+        for &(errno, what) in &[
+            (libc::EMFILE, "per-process descriptor limit"),
+            (libc::ENFILE, "system-wide descriptor limit"),
+            (libc::ENOMEM, "kernel memory"),
+            (libc::ENOBUFS, "socket buffers"),
+        ] {
+            assert!(
+                is_upgrade_exhaustion(&io_err(errno)),
+                "errno {} ({}) is process-wide exhaustion and must latch the \
+                 listener, or every peer pays one doomed attempt each",
+                errno,
+                what
+            );
+        }
+    }
+
+    /// An error carrying no errno cannot prove exhaustion; fail closed to the
+    /// per-peer path, which is still bounded at one attempt per address.
+    #[test]
+    fn an_error_without_an_errno_is_not_exhaustion() {
+        assert!(!is_upgrade_exhaustion(&Error::Connect(
+            "Connected".to_owned()
+        )));
+        assert!(!is_upgrade_exhaustion(&Error::PeerSetup(String::new())));
     }
 }
 
