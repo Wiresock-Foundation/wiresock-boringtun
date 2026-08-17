@@ -7,6 +7,7 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 const TUNSETIFF: u64 = 0x4004_54ca;
+const TUNGETIFF: u64 = 0x8004_54d2;
 
 #[repr(C)]
 union IfrIfru {
@@ -112,19 +113,55 @@ impl TunSocket {
         Ok(self.name.clone())
     }
 
+    /// The name of the interface the TUN fd is attached to, from TUNGETIFF.
+    ///
+    /// Needed when the socket was built around an embedder-provided fd:
+    /// `self.name` is then that fd in decimal, not an interface name that
+    /// SIOCGIFMTU could resolve. Kept out of `name()`, which must keep
+    /// returning the fd string -- the multi-queue path clones the socket by
+    /// re-parsing it, and embedders that cannot open `/dev/net/tun` (the
+    /// reason to hand over an fd at all) cannot TUNSETIFF a fresh one either.
+    fn attached_interface_name(&self) -> Result<String, Error> {
+        let mut ifr = ifreq {
+            ifr_name: [0; IFNAMSIZ],
+            ifr_ifru: IfrIfru { ifru_flags: 0 },
+        };
+
+        if unsafe { ioctl(self.fd, TUNGETIFF as _, &mut ifr) } < 0 {
+            return Err(Error::IOCtl(io::Error::last_os_error()));
+        }
+
+        let len = ifr
+            .ifr_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(IFNAMSIZ);
+        Ok(String::from_utf8_lossy(&ifr.ifr_name[..len]).to_string())
+    }
+
     /// Get the current MTU value
     pub fn mtu(&self) -> Result<usize, Error> {
-        let provided_fd = self.name.parse::<i32>();
-        if provided_fd.is_ok() {
-            return Ok(1500);
-        }
+        let name = if self.name.parse::<i32>().is_ok() {
+            // An embedder-provided fd. This MTU sizes the read buffer and
+            // clamps AmneziaWG content padding, and the monitor re-reads it
+            // every second, so a fabricated value would never self-correct;
+            // ask the kernel which interface the fd is attached to instead.
+            // A TUNGETIFF failure means the fd is not a TUN at all, so no
+            // interface can be asked: keep the pre-recovery answer of 1500
+            // rather than turning such a device's construction into an error.
+            match self.attached_interface_name() {
+                Ok(name) => name,
+                Err(_) => return Ok(1500),
+            }
+        } else {
+            self.name.clone()
+        };
 
         let fd = match unsafe { socket(AF_INET, SOCK_STREAM, IPPROTO_IP) } {
             -1 => return Err(Error::Socket(io::Error::last_os_error())),
             fd => fd,
         };
 
-        let name = self.name()?;
         let iface_name: &[u8] = name.as_ref();
         let mut ifr = ifreq {
             ifr_name: [0; IF_NAMESIZE],
@@ -155,5 +192,64 @@ impl TunSocket {
             -1 => Err(Error::IfaceRead(io::Error::last_os_error())),
             n => Ok(&mut dst[..n as usize]),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::io::IntoRawFd;
+    use std::os::unix::net::UnixStream;
+
+    /// Moves the interface MTU away from 1500, because a fresh TUN starts at
+    /// exactly the value the fd path used to fabricate -- left at the default,
+    /// the test below would pass with the hardcode still in place.
+    fn set_mtu(name: &str, mtu: c_int) {
+        let sock = unsafe { socket(AF_INET, SOCK_STREAM, IPPROTO_IP) };
+        assert!(sock >= 0, "socket: {}", io::Error::last_os_error());
+
+        let mut ifr = ifreq {
+            ifr_name: [0; IFNAMSIZ],
+            ifr_ifru: IfrIfru { ifru_mtu: mtu },
+        };
+        ifr.ifr_name[..name.len()].copy_from_slice(name.as_bytes());
+
+        let ret = unsafe { ioctl(sock, SIOCSIFMTU as _, &ifr) };
+        unsafe { close(sock) };
+        assert!(ret >= 0, "SIOCSIFMTU: {}", io::Error::last_os_error());
+    }
+
+    /// An fd-provided TUN must report the interface's real MTU, not a
+    /// fabricated 1500: the value sizes the read buffer and clamps AmneziaWG
+    /// content padding, and the MTU monitor re-stores it every second, so a
+    /// wrong answer here never self-corrects.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`; CI runs it via
+    /// `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn an_fd_provided_tun_reports_the_real_interface_mtu() {
+        let tun = TunSocket::new("utun86").unwrap();
+        set_mtu("utun86", 1280);
+
+        let fd = unsafe { dup(tun.as_raw_fd()) };
+        assert!(fd >= 0, "dup: {}", io::Error::last_os_error());
+        let by_fd = TunSocket::new(&fd.to_string()).unwrap();
+
+        // The recovered name must not leak into `name()`: the multi-queue
+        // clone path and the API-socket path both key off the fd string.
+        assert_eq!(by_fd.name().unwrap(), fd.to_string());
+
+        assert_eq!(by_fd.mtu().unwrap(), 1280);
+    }
+
+    /// A non-TUN fd has no attached interface to ask, and such a device
+    /// constructed fine before name recovery existed, so `mtu()` keeps the
+    /// historical 1500 fallback instead of erroring out of `Device::new`.
+    #[test]
+    fn a_non_tun_fd_falls_back_to_the_default_mtu() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let sock = TunSocket::new(&a.into_raw_fd().to_string()).unwrap();
+        assert_eq!(sock.mtu().unwrap(), 1500);
     }
 }
