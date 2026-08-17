@@ -10,6 +10,7 @@ use super::{
     HANDSHAKE_RESP_SZ,
 };
 use crate::noise::errors::WireGuardError;
+use crate::noise::header_protection::{HeaderProtectionKey, NONCE_SIZE, TYPE_MASK_SIZE};
 use rand_core::RngCore;
 use std::convert::{TryFrom, TryInto};
 use std::time::Duration;
@@ -272,6 +273,12 @@ pub struct AmneziaConfig {
     /// protocol imitation sequence) while keeping every other AmneziaWG
     /// behaviour. See [`AmneziaConfig::as_responder`].
     pub(crate) suppress_pre_handshake: bool,
+    /// AmneziaWG 3.0 header protection. Unset by default, and unset means off.
+    ///
+    /// Both ends must carry the same key: it is not negotiated and there is no
+    /// in-band signal, so a mismatch is a tunnel that never forms rather than
+    /// one that degrades.
+    pub(crate) header_protection: HeaderProtectionKey,
 }
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
@@ -357,6 +364,7 @@ impl AmneziaConfig {
             pre_handshake_junk: AmneziaPreHandshakeJunk::default(),
             imitation: AmneziaImitation::default(),
             suppress_pre_handshake: false,
+            header_protection: HeaderProtectionKey::default(),
         }
     }
 
@@ -370,6 +378,28 @@ impl AmneziaConfig {
         self.pre_handshake_junk =
             AmneziaPreHandshakeJunk::new(packet_count, packet_size_min, packet_size_max, delay_ms);
         self
+    }
+
+    /// Enable AmneziaWG 3.0 header protection with a shared key.
+    ///
+    /// An all-zero key means off, matching amneziawg-go, so this is also how it
+    /// is disabled again.
+    pub fn with_header_protection(mut self, key: [u8; 32]) -> Self {
+        self.header_protection = HeaderProtectionKey::new(key);
+        self
+    }
+
+    pub(crate) fn header_protection_enabled(&self) -> bool {
+        self.header_protection.is_set()
+    }
+
+    /// The header-protection key as lowercase hex, or `None` when unset.
+    ///
+    /// Deliberately the only way out of [`HeaderProtectionKey`]: it exists so
+    /// `get=1` can round-trip the configuration, and nothing else needs the
+    /// bytes. `Debug` on the key still refuses to render them.
+    pub(crate) fn header_protection_key_hex(&self) -> Option<String> {
+        self.header_protection.to_hex()
     }
 
     pub fn with_protocol_imitation(
@@ -390,6 +420,51 @@ impl AmneziaConfig {
     ) -> Self {
         self.imitation = AmneziaImitation::new(protocol, domain, browser);
         self
+    }
+
+    /// The header-protection nonce rule on its own: every S size must be able to
+    /// supply the 12 nonce bytes once a key is set.
+    ///
+    /// Header protection nonces every datagram with its own first 12 bytes, so a
+    /// prefix shorter than that cannot supply one. Refused rather than silently
+    /// left unprotected: an operator who set a key and got no masking would have
+    /// no way to tell.
+    ///
+    /// What it catches is per-kind, not global: `prepend_outbound` refuses only
+    /// the kind whose own S is short. So this rejects a superset of the configs
+    /// that can never emit anything -- on a fresh tunnel S1 short is exactly
+    /// that, since no initiation means no session, while S2, S3 and S4 put
+    /// datagrams on the wire and lose the tunnel later. Every position is fatal,
+    /// by a different route; the table is on
+    /// [`Tunn::new_with_obfuscation`](crate::noise::Tunn::new_with_obfuscation).
+    ///
+    /// Split out of [`Self::validate`] because it is the only rule the `Tunn`
+    /// constructors can enforce for themselves. `validate`'s cookie-amplification
+    /// rule refuses configurations that do work -- weakly reflecting -- which is a
+    /// policy judgement belonging to the full check a `set=1` runs, not to a
+    /// constructor.
+    ///
+    /// Parity with amneziawg-go, which refuses the same four sizes in
+    /// `mergeWithDevice` against its own `HeaderCipherNonceSize = 12`.
+    pub(crate) fn check_header_protection_nonce(&self) -> Result<(), String> {
+        if !self.header_protection_enabled() {
+            return Ok(());
+        }
+        for (label, junk) in [
+            ("S1", self.init_packet_junk_size),
+            ("S2", self.response_packet_junk_size),
+            ("S3", self.cookie_packet_junk_size),
+            ("S4", self.transport_packet_junk_size),
+        ] {
+            if (junk as usize) < NONCE_SIZE {
+                return Err(format!(
+                    "{} is {} bytes, but header protection needs at least {} \
+                     to nonce each datagram; raise {} or clear the key",
+                    label, junk, NONCE_SIZE, label
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Check that every S-prefix can coexist with the packet it precedes.
@@ -420,6 +495,9 @@ impl AmneziaConfig {
     /// intentional, and argued at the check rather than here, so that "every
     /// working kernel configuration is accepted" is not read as covering it.
     pub fn validate(&self) -> Result<(), String> {
+        // First, and as its own pass rather than interleaved with the size rule
+        // below, because the `Tunn` constructors call it on their own.
+        self.check_header_protection_nonce()?;
         for (label, junk, base) in [
             ("S1", self.init_packet_junk_size, HANDSHAKE_INIT_SZ),
             ("S2", self.response_packet_junk_size, HANDSHAKE_RESP_SZ),
@@ -432,6 +510,33 @@ impl AmneziaConfig {
                     label, junk, base, MAX_SENDABLE_DATAGRAM
                 ));
             }
+        }
+
+        // Header protection and protocol imitation both want the first bytes of
+        // the datagram, for incompatible reasons: the first wants them random
+        // because it uses them as a nonce, the second wants them protocol-shaped
+        // because that is the disguise. Imitation wins on the wire, so the nonce
+        // repeats -- a DNS header varies only in its transaction id, and a SIP
+        // request line hardly at all.
+        //
+        // Warned, not refused, and the distinction is the point. Nothing under
+        // the keystream is secret: a handshake carries the message type, sender
+        // index, the unencrypted ephemeral key and two AEAD ciphertexts, all of
+        // which vanilla WireGuard sends in the clear, so a repeated nonce leaks
+        // no plaintext and no key material. What it loses is unmasking
+        // resistance -- and under imitation the datagram already presents as
+        // DNS or SIP, so that was doing little of the work anyway. An operator
+        // with a reason to run both should be allowed to.
+        if self.header_protection_enabled()
+            && self.imitation.protocol != AmneziaImitationProtocol::None
+        {
+            tracing::warn!(
+                message = "header protection and protocol imitation are both enabled; \
+                           the imitation prefix is the header-protection nonce, so it \
+                           repeats and the masking can be undone by an observer who \
+                           collects two datagrams. Traffic is unaffected.",
+                protocol = ?self.imitation.protocol
+            );
         }
 
         // A cookie reply that is larger than the packet provoking it makes this
@@ -597,9 +702,23 @@ impl AmneziaConfig {
         self.outbound_junk_size(PacketKind::TransportData)
     }
 
-    fn read_tag(packet: &[u8], offset: usize) -> Option<u32> {
+    /// The message-type tag at `offset`, with `mask` XORed off it.
+    ///
+    /// `mask` is the header-protection keystream when a key is set and all
+    /// zeroes otherwise, so the unprotected path stays bit-for-bit what it was
+    /// -- XOR with zero is the identity, and there is no second code path to
+    /// drift out of step with this one.
+    fn read_tag_masked(packet: &[u8], offset: usize, mask: [u8; TYPE_MASK_SIZE]) -> Option<u32> {
         let tag = packet.get(offset..offset + 4)?;
-        Some(u32::from_le_bytes(tag.try_into().ok()?))
+        let mut bytes: [u8; 4] = tag.try_into().ok()?;
+        for (b, m) in bytes.iter_mut().zip(mask.iter()) {
+            *b ^= m;
+        }
+        Some(u32::from_le_bytes(bytes))
+    }
+
+    fn read_tag(packet: &[u8], offset: usize) -> Option<u32> {
+        Self::read_tag_masked(packet, offset, [0u8; TYPE_MASK_SIZE])
     }
 
     fn tag_matches(obf: ObfuscationRanges, kind: PacketKind, tag: u32) -> bool {
@@ -617,12 +736,13 @@ impl AmneziaConfig {
         packet: &[u8],
         kind: PacketKind,
         base_size: usize,
+        mask: [u8; TYPE_MASK_SIZE],
     ) -> bool {
         let junk_size = self.inbound_junk_size(kind);
         if packet.len() != junk_size + base_size {
             return false;
         }
-        Self::read_tag(packet, junk_size)
+        Self::read_tag_masked(packet, junk_size, mask)
             .map(|tag| Self::tag_matches(obf, kind, tag))
             .unwrap_or(false)
     }
@@ -653,13 +773,31 @@ impl AmneziaConfig {
         obf: ObfuscationRanges,
         packet: &'a [u8],
     ) -> Option<&'a [u8]> {
+        self.classify_inbound(obf, packet, [0u8; TYPE_MASK_SIZE])
+            .map(|(_, junk)| &packet[junk..])
+    }
+
+    /// Classify an inbound datagram, returning its kind and junk offset.
+    ///
+    /// `mask` unmasks the candidate type field as it is tested, which is what
+    /// lets header protection be undone *before* the H1-H4 range test rather
+    /// than after: the tag on the wire is XORed, so range-testing it raw would
+    /// reject every packet. The same four bytes apply at every candidate
+    /// offset, because the sender always starts its keystream at the message,
+    /// whatever the padding in front of it.
+    fn classify_inbound(
+        &self,
+        obf: ObfuscationRanges,
+        packet: &[u8],
+        mask: [u8; TYPE_MASK_SIZE],
+    ) -> Option<(PacketKind, usize)> {
         for (kind, base) in [
             (PacketKind::HandshakeInit, HANDSHAKE_INIT_SZ),
             (PacketKind::HandshakeResponse, HANDSHAKE_RESP_SZ),
             (PacketKind::CookieReply, COOKIE_REPLY_SZ),
         ] {
-            if self.inbound_kind_at_offset(obf, packet, kind, base) {
-                return Some(&packet[self.inbound_junk_size(kind)..]);
+            if self.inbound_kind_at_offset(obf, packet, kind, base, mask) {
+                return Some((kind, self.inbound_junk_size(kind)));
             }
         }
 
@@ -668,14 +806,76 @@ impl AmneziaConfig {
         // vanilla check.
         let junk = self.inbound_junk_size(PacketKind::TransportData);
         if packet.len() >= junk + DATA_OVERHEAD_SZ
-            && Self::read_tag(packet, junk)
+            && Self::read_tag_masked(packet, junk, mask)
                 .map(|tag| Self::tag_matches(obf, PacketKind::TransportData, tag))
                 .unwrap_or(false)
         {
-            return Some(&packet[junk..]);
+            return Some((PacketKind::TransportData, junk));
         }
 
         None
+    }
+
+    /// How many bytes of a message of `kind` the sender masked.
+    ///
+    /// The whole message for the handshake kinds; only the 16-byte header for
+    /// transport data, whose payload is already sealed. Matches amneziawg-go's
+    /// four send sites.
+    fn masked_len(kind: PacketKind, message_len: usize) -> usize {
+        /// Type, receiver index and counter -- the same 16 bytes as
+        /// `session::DATA_OFFSET`, spelled again here because that one is
+        /// private to the session module.
+        ///
+        /// NOT pinned by a unit test, and it cannot be: every in-crate test
+        /// round-trips this value against itself, so any wrong constant stays
+        /// self-consistent and the suite stays green while the wire format
+        /// diverges from amneziawg-go. The external oracle is
+        /// `scripts/hp-interop.py`, which runs our masking against a real
+        /// amneziawg-go v3 peer -- that is what catches a change here.
+        const TRANSPORT_HEADER_SZ: usize = 16;
+        match kind {
+            PacketKind::TransportData => TRANSPORT_HEADER_SZ,
+            _ => message_len,
+        }
+    }
+
+    /// Undo header protection on a received datagram and strip its junk prefix.
+    ///
+    /// Combines what [`Self::strip_inbound`] does with the unmasking, because
+    /// the two cannot be separated: classification needs the type field
+    /// unmasked, and unmasking the body needs the padding that classification
+    /// determines.
+    /// Returns the junk-prefix length, so the caller slices its own buffer.
+    /// Returning a slice instead would borrow `packet` for the caller's whole
+    /// use of it, which conflicts with the `&mut` this needs.
+    pub(crate) fn unmask_and_classify_inbound(
+        &self,
+        obf: ObfuscationRanges,
+        packet: &mut [u8],
+    ) -> Option<usize> {
+        let Some(mask) = self.header_protection.type_mask(packet) else {
+            // No key: the ordinary path, byte-identical to before.
+            let (_, junk) = self.classify_inbound(obf, packet, [0u8; TYPE_MASK_SIZE])?;
+            return Some(junk);
+        };
+
+        let (kind, junk) = self.classify_inbound(obf, packet, mask)?;
+        let message_len = packet.len() - junk;
+        let masked = Self::masked_len(kind, message_len);
+
+        // Body first, then the type field. The order matters only on the
+        // failure path: unmasking the type field is an in-place XOR that cannot
+        // report failure, so doing it first would leave the caller holding a
+        // datagram with four corrupted bytes when `unmask_inbound` then refuses
+        // -- and the caller's contract is that a rejected datagram is unchanged,
+        // because it goes on to probe classification.
+        if !self.header_protection.unmask_inbound(packet, junk, masked) {
+            return None;
+        }
+        for i in 0..TYPE_MASK_SIZE {
+            packet[junk + i] ^= mask[i];
+        }
+        Some(junk)
     }
 
     fn classify_outbound(&self, obf: ObfuscationRanges, packet: &[u8]) -> Option<PacketKind> {
@@ -809,7 +1009,14 @@ impl AmneziaConfig {
         };
 
         let junk_size = self.outbound_junk_size(kind);
-        if junk_size == 0 {
+        // With header protection off, no prefix means nothing to do. With it on,
+        // no prefix also means no nonce -- and returning here would emit the
+        // packet in the clear, which is the one outcome setting a key is meant
+        // to prevent. `validate` rejects that configuration, but
+        // `Tunn::new_with_obfuscation` does not call `validate`, so the public
+        // constructors reach it. Falling through instead routes it into the
+        // masking backstop below, which refuses.
+        if junk_size == 0 && !self.header_protection_enabled() {
             return Ok(&mut buffer[..packet_size]);
         }
 
@@ -822,6 +1029,38 @@ impl AmneziaConfig {
 
         buffer.copy_within(0..packet_size, junk_size);
         self.fill_outbound_junk(&mut buffer[..junk_size], packet_size, rng);
+
+        // Masking comes last: the junk is the nonce, so it has to be final
+        // before any keystream is derived from it, and the message has to be
+        // sitting at its wire offset.
+        let masked = Self::masked_len(kind, packet_size);
+        if !self
+            .header_protection
+            .mask_outbound(&mut buffer[..new_size], junk_size, masked)
+        {
+            // Only reachable with a junk size below the nonce length. The `Tunn`
+            // constructors now refuse that configuration outright, so the one
+            // door left is `Tunn::set_obfuscation`, which is public and
+            // infallible. Dropping the packet is right -- emitting it unmasked
+            // would be readable by the classifier the operator asked to defeat
+            // -- but `DestinationBufferTooSmall` is about the caller's buffer,
+            // and here the buffer is fine, so say so once.
+            //
+            // Process-wide rather than per-config: `AmneziaConfig` derives
+            // `Clone`/`PartialEq` and an interior-mutable latch would break
+            // both, and a tunnel in this state fails on every packet, so the
+            // second line would only be noise.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::error!(
+                    message = "header protection is on but the junk prefix for this \
+                               packet is shorter than the 12-byte nonce, so nothing \
+                               can be sent; raise S1-S4 or clear the key",
+                    junk_size = junk_size
+                )
+            });
+            return Err(WireGuardError::DestinationBufferTooSmall);
+        }
         Ok(&mut buffer[..new_size])
     }
 

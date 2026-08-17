@@ -49,7 +49,7 @@ use allowed_ips::AllowedIps;
 use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
-use probe_reply::ProbeResponder;
+use probe_reply::{HeaderProtectionVerdict, ProbeResponder};
 use rand_chacha::ChaCha8Rng;
 use rand_core::{OsRng, RngCore, SeedableRng};
 use socket2::{Domain, Protocol, Type};
@@ -1129,11 +1129,31 @@ impl Device {
                         continue;
                     };
 
+                    // Header protection comes off before anything reads the
+                    // message type, and this is the outermost point that owns a
+                    // mutable buffer -- the connected-socket path below reaches
+                    // `Tunn::decapsulate`, which does its own, but this one
+                    // classifies and finds the peer before any `Tunn` exists.
+                    //
+                    // Its verdict is then AUTHORITATIVE, and that is the whole
+                    // point: `classify`'s own `strip_inbound` range-tests the
+                    // tag with an all-zero mask, so letting it have a second
+                    // opinion would both reject our own peers (whose tags are
+                    // masked) and accept datagrams that were never masked at
+                    // all -- header protection would be enforced on send and
+                    // nowhere on receive. An earlier version of this discarded
+                    // the verdict and did exactly that.
+                    let verdict = HeaderProtectionVerdict::for_ingress(
+                        &d.config.amnezia,
+                        obf,
+                        &mut t.src_buf[..packet_len],
+                    );
+
                     // AmneziaWG framing first, probe detection only if that
                     // fails. The order lives inside `classify` rather than here
                     // so it can be tested; see its doc for why getting it
                     // backwards makes the server answer its own clients.
-                    let packet = match probe_reply::classify(
+                    let packet = match verdict.classify(
                         &t.src_buf[..packet_len],
                         &d.config.amnezia,
                         obf,
@@ -1740,9 +1760,27 @@ mod ingress_tests {
         // RFC 5737 TEST-NET-3, so the value is obviously a fixture.
         let src_addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
 
-        // A datagram matching no configured shape is dropped, exactly as the
-        // real ingress path does.
-        let stripped = amnezia.strip_inbound(obf, datagram)?;
+        // The production sequence, not a shortcut. `for_ingress` builds the
+        // authoritative header-protection verdict -- unmasking in place when a
+        // key is set -- and `classify` consumes it. An earlier version of this
+        // helper called `strip_inbound` directly, which mirrors the production
+        // path as it was *before* header protection: with a key configured the
+        // helper and the daemon then disagreed about which datagrams exist,
+        // and the enforcement branch had no automated coverage at all --
+        // deleting it left the whole suite green.
+        let mut wire = datagram.to_vec();
+        let verdict = HeaderProtectionVerdict::for_ingress(amnezia, obf, &mut wire);
+        let stripped = match verdict.classify(
+            &wire,
+            amnezia,
+            obf,
+            SocketAddr::new(src_addr, 40000),
+            None,
+            &mut ChaCha8Rng::seed_from_u64(1),
+        ) {
+            probe_reply::Ingress::Wireguard(p) => p,
+            probe_reply::Ingress::Reply(_) | probe_reply::Ingress::Drop => return None,
+        };
         let parsed = limiter
             .verify_packet(obf, &mut OsRng, Some(src_addr), stripped, &mut scratch)
             .ok()?;
@@ -2217,5 +2255,67 @@ mod ingress_tests {
                 sender_idx >> 8,
             );
         }
+    }
+
+    /// The device demux enforces header protection in both directions.
+    ///
+    /// This drives `HeaderProtectionVerdict::for_ingress` -- the exact step the
+    /// production handler runs -- through `demux_handshake`. Before the helper
+    /// was rewritten to share that step, this branch had no automated coverage:
+    /// deleting it, swapping the unmasking classifier for the zero-mask one,
+    /// and mis-slicing the buffer all left the suite green, on the branch that
+    /// closes the enforced-on-send-only hole.
+    ///
+    /// The reject half is the enforcement property. A masked round trip alone
+    /// proves nothing -- a masking that is a no-op at both ends also round
+    /// trips -- so the test also requires that an UNMASKED initiation, which
+    /// the zero-mask classifier demonstrably accepts, does NOT demux on a
+    /// device with a key.
+    #[test]
+    fn the_device_demux_enforces_header_protection_in_both_directions() {
+        let server_secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let client_secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let client_public = x25519::PublicKey::from(&client_secret);
+        let obf = ObfuscationRanges::default();
+        let protected = AmneziaConfig::new(120, 130, 110, 80).with_header_protection([0x5a; 32]);
+        let unprotected = AmneziaConfig::new(120, 130, 110, 80);
+
+        let initiation = |secret: x25519::StaticSecret, amnezia: AmneziaConfig| {
+            let mut tun = Tunn::new_with_obfuscation(
+                secret,
+                server_public,
+                None,
+                None,
+                1,
+                None,
+                obf,
+                amnezia,
+            )
+            .unwrap();
+            let mut buf = vec![0u8; MAX_UDP_SIZE];
+            match tun.format_handshake_initiation(&mut buf, false) {
+                TunnResult::WriteToNetwork(d) => d.to_vec(),
+                other => panic!("expected an initiation, got {:?}", other),
+            }
+        };
+
+        let masked = initiation(client_secret.clone(), protected.clone());
+        assert_eq!(
+            demux_handshake(&server_secret, obf, &protected, &masked),
+            Some(*client_public.as_bytes()),
+            "a masked initiation from a configured peer must demux"
+        );
+
+        let unmasked = initiation(client_secret, unprotected);
+        assert!(
+            protected.strip_inbound(obf, &unmasked).is_some(),
+            "precondition: the zero-mask classifier must accept this datagram, \n             or the reject half proves nothing"
+        );
+        assert_eq!(
+            demux_handshake(&server_secret, obf, &protected, &unmasked),
+            None,
+            "an unmasked initiation must not demux on a device with a \n             header-protection key"
+        );
     }
 }

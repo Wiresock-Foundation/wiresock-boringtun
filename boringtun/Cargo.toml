@@ -64,6 +64,12 @@ rand_chacha = { version = "0.3", default-features = false }
 # blocked. The stable 0.10.1 in the lockfile satisfies both spellings,
 # so nothing re-resolves.
 chacha20poly1305 = "0.10"
+# Raw ChaCha20 for AmneziaWG 3.0 header protection, which XORs an
+# unauthenticated keystream over the WireGuard header. Already in the graph via
+# chacha20poly1305, so this is a new edge rather than a new crate; declared
+# directly because we use it directly. 0.10 is the edition-2024 generation and
+# is pinned out in .github/dependabot.yml alongside the rest of that wave.
+chacha20 = { version = "0.9", default-features = false }
 blake2 = "0.10"
 hmac = "0.12"
 # AES-128 block cipher for the QUIC Initial header protection (RFC 9001 §5.4) in

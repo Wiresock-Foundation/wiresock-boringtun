@@ -98,6 +98,7 @@ struct AwgParams {
     h2: Option<(u32, u32)>,
     h3: Option<(u32, u32)>,
     h4: Option<(u32, u32)>,
+    header_protection: Option<[u8; 32]>,
     seen: bool,
 }
 
@@ -113,6 +114,11 @@ impl AwgParams {
             "s4" => self.s4 = Some(val),
             _ => unreachable!("caller matched the key"),
         }
+        self.seen = true;
+    }
+
+    fn set_header_protection(&mut self, key: [u8; 32]) {
+        self.header_protection = Some(key);
         self.seen = true;
     }
 
@@ -178,12 +184,15 @@ impl AwgParams {
         amnezia.response_packet_junk_size = self.s2.unwrap_or(amnezia.response_packet_junk_size);
         amnezia.cookie_packet_junk_size = self.s3.unwrap_or(amnezia.cookie_packet_junk_size);
         amnezia.transport_packet_junk_size = self.s4.unwrap_or(amnezia.transport_packet_junk_size);
-        let amnezia = amnezia.with_pre_handshake_junk(
+        let mut amnezia = amnezia.with_pre_handshake_junk(
             self.jc.unwrap_or(cur_junk.packet_count),
             self.jmin.unwrap_or(cur_junk.packet_size_min),
             self.jmax.unwrap_or(cur_junk.packet_size_max),
             cur_junk.packet_delay_ms,
         );
+        if let Some(key) = self.header_protection {
+            amnezia = amnezia.with_header_protection(key);
+        }
 
         // Reject sizes that could never emit a valid datagram, before anything
         // is committed. Without this, an oversized S value is accepted here and
@@ -409,6 +418,21 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
             }
         }
 
+        // Emitted so a configuration round-trips: `awg showconf` reads this to
+        // produce a file that `awg setconf` reapplies, and a key dropped here
+        // would come back as a device with header protection silently off --
+        // mutually unreachable with every peer that still has it. amneziawg-go
+        // emits it the same way. Unset stays absent, keeping a vanilla device's
+        // output byte-identical.
+        //
+        // Yes, this writes a secret to the UAPI socket. That socket is
+        // root-only and already carries `private_key` upstream; this fork does
+        // not emit the private key, but that is a deliberate divergence about
+        // the *static* key, not a rule that no shared secret may round-trip.
+        if let Some(key) = d.config.amnezia.header_protection_key_hex() {
+            writeln!(writer, "header_protection_key={}", key);
+        }
+
         let obf = d.config.obf;
         let default = ObfuscationRanges::default();
         for (key, range, def) in [
@@ -589,11 +613,22 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                         // tolerate these; accept and ignore rather than failing
                         // the whole transaction on a config that carries them.
                         "i1" | "i2" | "i3" | "i4" | "i5" => {}
+                        // Both ends must carry the same key: it is not negotiated
+                        // and there is no in-band signal, so a mismatch is a
+                        // tunnel that never forms rather than one that degrades.
+                        // An all-zero key means off, matching amneziawg-go.
+                        //
+                        // This arm is what `handle_awg3_device_key` refuses when
+                        // header protection is not compiled in; here it is, so
+                        // the key is accepted before reaching that fallback.
+                        "header_protection_key" => match val.parse::<KeyBytes>() {
+                            Ok(key_bytes) => awg.set_header_protection(key_bytes.0),
+                            Err(_) => return EINVAL,
+                        },
                         // AmneziaWG 3.0 device keys: tolerated where ignoring
-                        // them is safe, refused where it is not. Everything else
-                        // still fails the transaction, because
-                        // `handle_awg3_device_key` ends in the same EINVAL this
-                        // arm used to be.
+                        // them is safe. Everything else still fails the
+                        // transaction, because `handle_awg3_device_key` ends in
+                        // the same EINVAL this arm used to be.
                         _ => {
                             if let Err(code) = handle_awg3_device_key(key, val) {
                                 return code;
@@ -725,36 +760,10 @@ fn handle_awg3_device_key(key: &str, val: &str) -> Result<(), i32> {
                 None => return Err(EINVAL),
             }
         }
-        // Deliberately NOT tolerated, unlike everything above it. Header
-        // protection masks the message-type field with a ChaCha20 keystream, so
-        // a peer that sets it cannot classify our packets and we cannot classify
-        // theirs -- the tunnel is mutually unreachable, not degraded. Accepting
-        // the key and ignoring it would turn that into an unexplained dead port;
-        // failing here at least names the reason.
-        //
-        // The all-zero key is the exception, and it is not a special case we
-        // invented: amneziawg-go accepts it -- `FromHex` is a plain length-checked
-        // hex decode with no zero test -- and its `HeaderProtectionCipher` then
-        // returns no cipher at all when the key is zero, which also lifts the
-        // S1..S4 >= 12 requirement its UAPI otherwise imposes. A zero key means
-        // protection is *off*, which is exactly what this build does, so that
-        // peer interoperates and aborting the whole transaction over it would
-        // refuse a configuration that asks nothing of us. It is also the only
-        // way to turn header protection off over UAPI: `set=1` is seeded from
-        // the live device, so omitting the key preserves whatever was there.
-        "header_protection_key" => match val.parse::<KeyBytes>() {
-            Ok(KeyBytes(key)) if key == [0u8; 32] => {}
-            Ok(_) => {
-                tracing::error!(
-                    "header_protection_key is not implemented: a peer using it cannot \
-                     interoperate with this build, so this request fails here rather \
-                     than running unprotected; anything it already applied is not \
-                     rolled back"
-                );
-                return Err(EINVAL);
-            }
-            Err(_) => return Err(EINVAL),
-        },
+        // `header_protection_key` deliberately does NOT appear here: `api_set`
+        // handles it above, because this build implements it. It stays out of
+        // this fallback so that removing the feature would surface as an
+        // unhandled key rather than as silent tolerance.
         _ => return Err(EINVAL),
     }
     Ok(())
@@ -1189,56 +1198,74 @@ mod tests {
         // And the catch-all this function replaced still rejects everything it
         // does not list.
         assert_eq!(handle_awg3_device_key("not_a_real_key", "1"), Err(EINVAL));
-        // A live `header_protection_key` is refused rather than tolerated. "0"
-        // is a separate case and is refused for a different reason -- it is one
-        // hex character, not a key at all. See the test below for the
-        // distinction, which is why this assertion does not cover the all-zero
-        // key despite looking like it might.
+        // `header_protection_key` reaches this fallback only if the `api_set`
+        // arm above stops handling it, which is what makes removing the feature
+        // surface as EINVAL rather than as silent tolerance. Any value does,
+        // including a well-formed one -- "0" is used here because it is also not
+        // a key (one hex character), so the assertion holds either way.
         assert_eq!(
             handle_awg3_device_key("header_protection_key", "0"),
             Err(EINVAL)
         );
     }
 
-    /// An all-zero header-protection key means "off", which is what we do.
+    /// An all-zero header-protection key means "off", not "reject".
     ///
-    /// This is the one AWG-3 key we refuse outright, because a peer that masks
-    /// the message-type field is mutually unreachable rather than degraded. The
-    /// zero key is not that peer: amneziawg-go accepts it and then builds no
-    /// cipher from it, so header protection is off on both ends and the tunnel
-    /// works. Refusing it would abort the whole `set=1` transaction over a line
-    /// that asks nothing of us -- the exact failure mode this function exists to
-    /// remove.
+    /// amneziawg-go accepts the key -- its `FromHex` is a length-checked hex
+    /// decode with no zero test -- and then builds no cipher from it, so a peer
+    /// sending 32 zero bytes has protection off and interoperates with a build
+    /// that has it off too. Refusing the line would abort the whole `set=1`
+    /// transaction mid-stream over a configuration that asks nothing of us.
+    ///
+    /// It is also the only way to turn protection off over UAPI, since `set=1`
+    /// is seeded from the live device and an omitted key preserves the old one.
+    /// So this pins two things at once: the zero key parses, and the merge that
+    /// applies it leaves protection disabled rather than storing a "key" that
+    /// masks with an all-zero keystream.
     #[test]
-    fn a_zeroed_header_protection_key_means_off_and_is_tolerated() {
-        assert_eq!(
-            handle_awg3_device_key("header_protection_key", &"0".repeat(64)),
-            Ok(()),
-            "an all-zero key is amneziawg-go's 'off'"
+    fn a_zeroed_header_protection_key_means_off_not_a_key() {
+        let current = AmneziaConfig::default();
+
+        // A live key needs every junk size at or above `NONCE_SIZE`, because
+        // the nonce is read out of the junk prefix. The default sizes are below
+        // it, so a live key must be configured together with them.
+        let mut live = AwgParams::default();
+        live.set_size("s1", 16);
+        live.set_size("s2", 16);
+        live.set_size("s3", 16);
+        live.set_size("s4", 16);
+        live.set_header_protection([0xab; 32]);
+        let (_, with_key) = live
+            .merged(ObfuscationRanges::default(), &current)
+            .expect("a live key with junk sizes >= NONCE_SIZE is valid");
+        assert!(
+            with_key.header_protection_enabled(),
+            "precondition: a live key must enable protection, or the zero case \
+             below proves nothing"
         );
-        // The same 32 zero bytes in base64; `KeyBytes` takes both spellings and
-        // so does the UAPI.
-        assert_eq!(
-            handle_awg3_device_key(
-                "header_protection_key",
-                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-            ),
-            Ok(()),
-            "base64 spells the same 32 zero bytes"
+
+        // The zero key carries no junk sizes at all, and is still accepted --
+        // the nonce requirement applies only when protection is on, which is
+        // also why amneziawg-go's UAPI skips that check for a zero key. If the
+        // zero key were treated as set, this would fail the merge with EINVAL.
+        let mut zeroed = AwgParams::default();
+        zeroed.set_header_protection([0u8; 32]);
+        let (_, merged) = zeroed
+            .merged(ObfuscationRanges::default(), &current)
+            .expect("an all-zero key does not require junk sizes");
+        assert!(
+            !merged.header_protection_enabled(),
+            "32 zero bytes is amneziawg-go's 'off', not a key"
         );
-        // A live key still aborts the transaction.
-        assert_eq!(
-            handle_awg3_device_key("header_protection_key", &"ab".repeat(32)),
-            Err(EINVAL),
-            "a live key is still refused"
-        );
-        // And a value that is not a key at all is still refused. "0" is one hex
-        // character, not 32 zero bytes -- which is why the assertion above that
-        // uses it never reached this case.
-        assert_eq!(
-            handle_awg3_device_key("header_protection_key", "0"),
-            Err(EINVAL),
-            "one hex char is not a key"
+
+        // And it clears a key the device already had -- the UAPI's only way to
+        // turn protection off, since an omitted key preserves the old value.
+        let (_, cleared) = zeroed
+            .merged(ObfuscationRanges::default(), &with_key)
+            .expect("an all-zero key does not require junk sizes");
+        assert!(
+            !cleared.header_protection_enabled(),
+            "an all-zero key must clear a live one, not be ignored as 'unset'"
         );
     }
 
@@ -1551,20 +1578,23 @@ mod tests {
             ("reject_after_time", "200-100", Err(EINVAL), SILENT),
             // The one key we refuse outright -- a peer masking the message-type
             // field is mutually unreachable, not degraded. The refusal is the
-            // loud case: an aborted `set=1` with nothing in the log naming the
-            // reason is the failure this function exists to remove.
+            // loud case on the branch below this one, where the key is refused
+            // here. On THIS branch header protection is implemented, so
+            // `api_set` consumes the key before the fallback sees it and both
+            // spellings reach the catch-all: refused, and silently. That
+            // difference is the point of the rows -- if `api_set` ever stopped
+            // handling the key, these would start passing again while the
+            // feature was silently gone.
             (
                 "header_protection_key",
                 "abababababababababababababababababababababababababababababababab",
                 Err(EINVAL),
-                REFUSED_LOUDLY,
+                SILENT,
             ),
-            // An all-zero key means protection is off, which is what we do, so
-            // it is agreement: tolerated and silent.
             (
                 "header_protection_key",
                 "0000000000000000000000000000000000000000000000000000000000000000",
-                Ok(()),
+                Err(EINVAL),
                 SILENT,
             ),
             // A key from neither list is still refused, and silently.
