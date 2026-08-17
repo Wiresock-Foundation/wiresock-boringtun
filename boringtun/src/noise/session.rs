@@ -195,7 +195,8 @@ impl Session {
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the formatted packet
     ///
-    /// `dst` must hold `src.len() + DATA_OVERHEAD_SZ`; otherwise this returns
+    /// `dst` must hold `src.len() + pad + DATA_OVERHEAD_SZ`; otherwise this
+    /// returns
     /// [`WireGuardError::DestinationBufferTooSmall`]. It used to panic instead,
     /// which was not survivable: every caller reaches this through
     /// `ffi::wireguard_write` and friends, and those are `extern "C"`, so the
@@ -207,9 +208,16 @@ impl Session {
         obf: ObfuscationRanges,
         rng: &mut impl RngCore,
         src: &[u8],
+        pad: usize,
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
-        if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
+        // The sealed plaintext is `src` followed by `pad` zero bytes -- AmneziaWG
+        // 3.0 `content_padding_addition`. Every caller draws `pad` from
+        // `AmneziaConfig::content_padding_for_frame`, the one place the budget is
+        // computed, so the padded length already fits both `dst` and
+        // `MAX_SENDABLE_DATAGRAM`; this bound is the same check the base frame
+        // always had, widened by `pad`.
+        if dst.len() < src.len() + pad + super::DATA_OVERHEAD_SZ {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
 
@@ -228,20 +236,25 @@ impl Session {
         receiver_index.copy_from_slice(&self.sending_index.to_le_bytes());
         counter.copy_from_slice(&sending_key_counter.to_le_bytes());
 
-        // TODO: spec requires padding to 16 bytes, but actually works fine without it
+        let plaintext_len = src.len() + pad;
         let n = {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
             data[..src.len()].copy_from_slice(src);
+            // Zero the padding explicitly. The receiver relies on it: a
+            // zero-first-byte plaintext is a keepalive, and a data packet is
+            // trimmed by its IP length field, so the trailer must be zeros and
+            // not whatever the buffer held.
+            data[src.len()..plaintext_len].fill(0);
             self.sender
                 .seal_in_place_separate_tag(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut data[..src.len()],
+                    &mut data[..plaintext_len],
                 )
                 .map(|tag| {
-                    data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
-                    src.len() + AEAD_SIZE
+                    data[plaintext_len..plaintext_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
+                    plaintext_len + AEAD_SIZE
                 })
                 .unwrap()
         };

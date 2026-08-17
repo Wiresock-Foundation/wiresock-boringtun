@@ -99,6 +99,7 @@ struct AwgParams {
     h3: Option<(u32, u32)>,
     h4: Option<(u32, u32)>,
     header_protection: Option<[u8; 32]>,
+    content_padding: Option<(u32, u32)>,
     seen: bool,
 }
 
@@ -122,6 +123,11 @@ impl AwgParams {
         self.seen = true;
     }
 
+    fn set_content_padding(&mut self, range: (u32, u32)) {
+        self.content_padding = Some(range);
+        self.seen = true;
+    }
+
     fn set_header(&mut self, key: &str, range: (u32, u32)) {
         match key {
             "h1" => self.h1 = Some(range),
@@ -140,7 +146,16 @@ impl AwgParams {
         if !self.seen {
             return Ok(());
         }
-        let (obf, amnezia) = self.merged(device.config.obf, &device.config.amnezia)?;
+        // The padding is clamped against the interface MTU. This snapshot is
+        // one of three writers keeping it fresh: `Device::new` seeds it at
+        // startup, `register_mtu_monitor` pushes a changed MTU once a second
+        // (wg-quick sets the MTU *after* `wg setconf`, so a set=1-only
+        // snapshot would be stale from the start), and every `set=1` lands
+        // here. Saturated rather than truncated: `65536 as u16` is 0, which
+        // `content_padding` reads as "no clamp at all" -- fail-open in the one
+        // place that must fail closed.
+        let mtu = device.mtu.load(Ordering::Relaxed).min(u16::MAX as usize) as u16;
+        let (obf, amnezia) = self.merged(device.config.obf, &device.config.amnezia, mtu)?;
         if device.set_obfuscation(obf, amnezia) {
             tracing::info!(message = "AmneziaWG parameters updated");
         }
@@ -158,6 +173,7 @@ impl AwgParams {
         &self,
         cur_obf: ObfuscationRanges,
         cur_amnezia: &AmneziaConfig,
+        mtu: u16,
     ) -> Result<(ObfuscationRanges, AmneziaConfig), i32> {
         let cur_junk = cur_amnezia.pre_handshake_junk;
         let (h1, h2, h3, h4) = (
@@ -193,6 +209,13 @@ impl AwgParams {
         if let Some(key) = self.header_protection {
             amnezia = amnezia.with_header_protection(key);
         }
+        // The range this transaction carried, else whatever is already set, so
+        // a later `set=1` that does not mention padding keeps it. The MTU is
+        // always refreshed from the interface -- it is not a UAPI value.
+        let (pad_lo, pad_hi) = self
+            .content_padding
+            .unwrap_or(amnezia.content_padding_addition);
+        amnezia = amnezia.with_content_padding_addition(pad_lo, pad_hi, mtu);
 
         // Reject sizes that could never emit a valid datagram, before anything
         // is committed. Without this, an oversized S value is accepted here and
@@ -359,9 +382,56 @@ impl Device {
                     return Action::Exit;
                 }
 
-                // Periodically read the mtu of the interface in case it changes
+                Action::Continue
+            }),
+            std::time::Duration::from_millis(1000),
+        )?;
+
+        Ok(())
+    }
+
+    /// Refresh the interface MTU once a second, on every API path.
+    ///
+    /// Registered from `Device::new` rather than from `register_api_handler`,
+    /// because the `--uapi-fd` path never registers the socket watchdog above
+    /// -- parking the MTU refresh inside it froze `device.mtu` (and with it
+    /// the content-padding clamp) at the startup snapshot for fd-activated
+    /// daemons.
+    ///
+    /// The content-padding clamp is a *snapshot* in each peer's config
+    /// (`content_padding_mtu`), while amneziawg-go reads the live MTU per
+    /// packet (`device.tun.mtu.Load()` in RoutineEncryption) -- and wg-quick
+    /// sets the MTU *after* `wg setconf`, so the snapshot a `set=1` takes is
+    /// stale from the first second in the most common bring-up order. Push the
+    /// refreshed value into the configs here. Not via `set_obfuscation`: the
+    /// MTU is plumbing, not configuration -- that path drops every peer's
+    /// queued pre-handshake junk and logs "parameters updated", both wrong for
+    /// a value the operator did not change. Gated on inequality so the steady
+    /// state stays read-only and the write-lock upgrade is paid only when the
+    /// MTU actually moved.
+    pub(crate) fn register_mtu_monitor(&self) -> Result<(), Error> {
+        self.queue.new_periodic_event(
+            Box::new(|d, _| {
                 if let Ok(mtu) = d.iface.mtu() {
                     d.mtu.store(mtu, Ordering::Relaxed);
+
+                    // Saturate rather than truncate: `65536 as u16` is 0, and
+                    // 0 means "no clamp at all" to `content_padding` -- the
+                    // one value whose job is bounding the padding must not
+                    // fail open on a large reading.
+                    let mtu = mtu.min(u16::MAX as usize) as u16;
+                    if d.config.amnezia.content_padding_mtu != mtu {
+                        d.try_writeable(
+                            |device| device.trigger_yield(),
+                            |device| {
+                                device.cancel_yield();
+                                device.config.amnezia.content_padding_mtu = mtu;
+                                for peer in device.peers.values_mut() {
+                                    peer.lock().tunnel.set_content_padding_mtu(mtu);
+                                }
+                            },
+                        );
+                    }
                 }
 
                 Action::Continue
@@ -383,6 +453,80 @@ impl Device {
     }
 }
 
+/// The AmneziaWG interface parameters `get=1` emits, in order.
+///
+/// Emitted only when they differ from plain WireGuard, so a vanilla device's
+/// output is byte-identical to upstream's -- amneziawg-go's `IpcGetOperation`
+/// guards every 3.0 tunable on `!IsZero()` the same way. (The kernel
+/// amneziawg-tools differ: `awg showconf` prints `ContentPaddingAddition = 0`
+/// and the five timers unconditionally, which is why the *set* side reads a
+/// `=0` from a reapplied config dump as "unset" rather than as a request.)
+/// Sizes are `%u`; magic headers and the padding range use the kernel's
+/// `mh_genspec` convention -- a bare value when the range is degenerate,
+/// `start-end` otherwise. The padding MTU is a runtime clamp, not a UAPI
+/// value, so it is never emitted.
+///
+/// The header-protection key is emitted so a configuration round-trips: `awg
+/// showconf` reads this to produce a file that `awg setconf` reapplies, and a
+/// key dropped here would come back as a device with header protection
+/// silently off -- mutually unreachable with every peer that still has it.
+/// Yes, that writes a secret to the UAPI socket. That socket is root-only and
+/// already carries `private_key` upstream; this fork does not emit the private
+/// key, but that is a deliberate divergence about the *static* key, not a rule
+/// that no shared secret may round-trip.
+///
+/// Split from `api_get` so the emit grammar is reachable from a test --
+/// `api_get` itself wants a live `Device`, which wants root and a TUN.
+#[allow(unused_must_use)]
+fn write_awg_interface_params(
+    writer: &mut impl std::io::Write,
+    obf: &ObfuscationRanges,
+    a: &AmneziaConfig,
+) {
+    for (key, val) in [
+        ("jc", a.pre_handshake_junk.packet_count),
+        ("jmin", a.pre_handshake_junk.packet_size_min),
+        ("jmax", a.pre_handshake_junk.packet_size_max),
+        ("s1", a.init_packet_junk_size),
+        ("s2", a.response_packet_junk_size),
+        ("s3", a.cookie_packet_junk_size),
+        ("s4", a.transport_packet_junk_size),
+    ] {
+        if val != 0 {
+            writeln!(writer, "{}={}", key, val);
+        }
+    }
+
+    if let Some(key) = a.header_protection_key_hex() {
+        writeln!(writer, "header_protection_key={}", key);
+    }
+
+    let default = ObfuscationRanges::default();
+    for (key, range, def) in [
+        ("h1", obf.h1_init, default.h1_init),
+        ("h2", obf.h2_resp, default.h2_resp),
+        ("h3", obf.h3_cookie, default.h3_cookie),
+        ("h4", obf.h4_data, default.h4_data),
+    ] {
+        if range != def {
+            if range.start == range.end {
+                writeln!(writer, "{}={}", key, range.start);
+            } else {
+                writeln!(writer, "{}={}-{}", key, range.start, range.end);
+            }
+        }
+    }
+
+    let (lo, hi) = a.content_padding_addition;
+    if lo != 0 || hi != 0 {
+        if lo == hi {
+            writeln!(writer, "content_padding_addition={}", lo);
+        } else {
+            writeln!(writer, "content_padding_addition={}-{}", lo, hi);
+        }
+    }
+}
+
 #[allow(unused_must_use)]
 fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
     // get command requires an empty line, but there is no reason to be religious about it
@@ -398,58 +542,7 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
         writeln!(writer, "fwmark={}", fwmark);
     }
 
-    // AmneziaWG interface parameters, emitted only when they differ from plain
-    // WireGuard so a vanilla device's output is byte-identical to before.
-    // Sizes are `%u`; magic headers use the kernel's `mh_genspec` convention --
-    // a bare value when the range is degenerate, `start-end` otherwise.
-    {
-        let a = &d.config.amnezia;
-        for (key, val) in [
-            ("jc", a.pre_handshake_junk.packet_count),
-            ("jmin", a.pre_handshake_junk.packet_size_min),
-            ("jmax", a.pre_handshake_junk.packet_size_max),
-            ("s1", a.init_packet_junk_size),
-            ("s2", a.response_packet_junk_size),
-            ("s3", a.cookie_packet_junk_size),
-            ("s4", a.transport_packet_junk_size),
-        ] {
-            if val != 0 {
-                writeln!(writer, "{}={}", key, val);
-            }
-        }
-
-        // Emitted so a configuration round-trips: `awg showconf` reads this to
-        // produce a file that `awg setconf` reapplies, and a key dropped here
-        // would come back as a device with header protection silently off --
-        // mutually unreachable with every peer that still has it. amneziawg-go
-        // emits it the same way. Unset stays absent, keeping a vanilla device's
-        // output byte-identical.
-        //
-        // Yes, this writes a secret to the UAPI socket. That socket is
-        // root-only and already carries `private_key` upstream; this fork does
-        // not emit the private key, but that is a deliberate divergence about
-        // the *static* key, not a rule that no shared secret may round-trip.
-        if let Some(key) = d.config.amnezia.header_protection_key_hex() {
-            writeln!(writer, "header_protection_key={}", key);
-        }
-
-        let obf = d.config.obf;
-        let default = ObfuscationRanges::default();
-        for (key, range, def) in [
-            ("h1", obf.h1_init, default.h1_init),
-            ("h2", obf.h2_resp, default.h2_resp),
-            ("h3", obf.h3_cookie, default.h3_cookie),
-            ("h4", obf.h4_data, default.h4_data),
-        ] {
-            if range != def {
-                if range.start == range.end {
-                    writeln!(writer, "{}={}", key, range.start);
-                } else {
-                    writeln!(writer, "{}={}-{}", key, range.start, range.end);
-                }
-            }
-        }
-    }
+    write_awg_interface_params(writer, &d.config.obf, &d.config.amnezia);
 
     // Walk the trie once and group by owner. `peers_by_ip` remains the only
     // place prefixes live, but `AllowedIps::iter` materialises the whole
@@ -609,6 +702,13 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                             Some(range) => awg.set_header(key, range),
                             None => return EINVAL,
                         },
+                        // AmneziaWG 3.0 content padding: a `(lo, hi)` range of
+                        // zero bytes appended per transport packet. Implemented,
+                        // so it is applied rather than warned about.
+                        "content_padding_addition" => match parse_uint_range(val) {
+                            Some(range) => awg.set_content_padding(range),
+                            None => return EINVAL,
+                        },
                         // AWG 2.0 signature packets. A responder only has to
                         // tolerate these; accept and ignore rather than failing
                         // the whole transaction on a config that carries them.
@@ -698,36 +798,6 @@ fn awg3_our_timer(key: &str) -> Option<u64> {
 /// `api_set` itself needs a `Device`, which needs root and a TUN interface.
 fn handle_awg3_device_key(key: &str, val: &str) -> Result<(), i32> {
     match key {
-        "content_padding_addition" => match parse_uint_range(val) {
-            // Sender-side only: it pads its own plaintext, and we already
-            // tolerate the padded keepalive that results. Nothing breaks; our
-            // own transport just keeps a different length distribution to
-            // theirs. 0 is amneziawg-go's "unset", which pads to a 16-byte
-            // multiple like vanilla WireGuard rather than by a random addition
-            // -- not "the peer is not padding", which is what an earlier version
-            // of this comment claimed.
-            //
-            // Silent even so, and the reason is on the other side's get path:
-            // amneziawg-go's UAPI only emits this key when the value is
-            // non-zero, so `=0` never appears in a config it generated. It can
-            // only be hand-typed, which makes a warning here a warning about
-            // whether someone spelled "unset" out loud.
-            //
-            // We do not pad to a 16-byte multiple either (`format_packet_data`
-            // seals `src` at its own length), so 0 is a real difference in
-            // length distribution. But that difference is a property of this
-            // build -- it is there on every tunnel we make, including plain
-            // WireGuard with no AWG keys at all -- so it is not caused by this
-            // config line and does not belong in a diagnostic keyed to it.
-            Some((0, 0)) => {}
-            Some((lo, hi)) => tracing::warn!(
-                message = "content_padding_addition is not implemented; \
-                           our transport packets will not be padded",
-                requested_low = lo,
-                requested_high = hi
-            ),
-            None => return Err(EINVAL),
-        },
         "reject_after_time"
         | "rekey_after_time"
         | "rekey_timeout"
@@ -1050,7 +1120,7 @@ mod tests {
         params.set_size("s2", 130);
 
         let (_, merged) = params
-            .merged(ObfuscationRanges::default(), &current)
+            .merged(ObfuscationRanges::default(), &current, 1420)
             .expect("valid parameters");
 
         assert_eq!(
@@ -1141,32 +1211,8 @@ mod tests {
     #[test]
     fn an_awg3_device_key_is_tolerated_in_every_form_its_tools_emit() {
         // The whole point of the arm: a key we ignore must not abort the
-        // transaction. amneziawg-go stores content_padding_addition as a
-        // UintRange and re-picks per packet, and amneziawg-tools renders a
-        // non-degenerate range as `lo-hi`, so the range form is the *intended*
-        // spelling -- a bare u16 parse rejected it and killed the whole `set=1`,
-        // which is the failure this arm exists to prevent.
-        assert_eq!(
-            handle_awg3_device_key("content_padding_addition", "0"),
-            Ok(())
-        );
-        assert_eq!(
-            handle_awg3_device_key("content_padding_addition", "64"),
-            Ok(())
-        );
-        assert_eq!(
-            handle_awg3_device_key("content_padding_addition", "1-100"),
-            Ok(()),
-            "the randomised form amneziawg-tools emits"
-        );
-        assert_eq!(
-            handle_awg3_device_key("content_padding_addition", "100000"),
-            Ok(()),
-            "amneziawg-go parses these as u32, so a value over u16::MAX is legal"
-        );
-
-        // Timers: agreement and "unset" are silent, a real difference warns,
-        // and all three are tolerated.
+        // transaction. For the timers, agreement and "unset" are silent, a
+        // real difference warns, and every form is tolerated.
         for val in ["180", "0", "60", "120-200"] {
             assert_eq!(
                 handle_awg3_device_key("reject_after_time", val),
@@ -1184,12 +1230,6 @@ mod tests {
             assert_eq!(handle_awg3_device_key(key, "7"), Ok(()), "{}", key);
         }
 
-        // Malformed values are still refused -- tolerance is about keys we do
-        // not implement, not about input we cannot parse.
-        assert_eq!(
-            handle_awg3_device_key("content_padding_addition", "notanumber"),
-            Err(EINVAL)
-        );
         assert_eq!(
             handle_awg3_device_key("reject_after_time", "200-100"),
             Err(EINVAL),
@@ -1207,6 +1247,110 @@ mod tests {
             handle_awg3_device_key("header_protection_key", "0"),
             Err(EINVAL)
         );
+    }
+
+    /// `content_padding_addition` through a `set=1` merge applies the range and
+    /// the MTU, survives a merge that does not mention it, and clears on `(0,0)`.
+    ///
+    /// Pins the `set_content_padding` -> `merged` -> `content_padding_mtu`
+    /// path: the range reaches the config, the MTU passed to `merged` is
+    /// stored, and a later merge that does not mention padding keeps the range
+    /// while refreshing the MTU. The `get=1` emit side is pinned separately by
+    /// `the_get_emit_grammar_stays_byte_identical_for_a_vanilla_device`.
+    #[test]
+    fn content_padding_over_the_uapi_applies_and_round_trips() {
+        let current = AmneziaConfig::default();
+
+        // A range plus an MTU -> both land on the config.
+        let mut set = AwgParams::default();
+        set.set_content_padding((8, 24));
+        let (_, cfg) = set
+            .merged(ObfuscationRanges::default(), &current, 1280)
+            .expect("a padding range is valid");
+        assert_eq!(cfg.content_padding_addition, (8, 24));
+        assert_eq!(cfg.content_padding_mtu, 1280);
+
+        // A later transaction that does not mention padding keeps the range,
+        // and refreshes the MTU from whatever the interface now reports.
+        let mut untouched = AwgParams::default();
+        untouched.set_size("s1", 120);
+        let (_, kept) = untouched
+            .merged(ObfuscationRanges::default(), &cfg, 1400)
+            .expect("valid");
+        assert_eq!(kept.content_padding_addition, (8, 24), "range must survive");
+        assert_eq!(kept.content_padding_mtu, 1400, "MTU must refresh");
+
+        // (0, 0) clears it.
+        let mut cleared = AwgParams::default();
+        cleared.set_content_padding((0, 0));
+        let (_, off) = cleared
+            .merged(ObfuscationRanges::default(), &cfg, 1400)
+            .expect("valid");
+        assert_eq!(off.content_padding_addition, (0, 0), "must clear to unset");
+    }
+
+    /// The `get=1` emit grammar, pinned against a plain buffer.
+    ///
+    /// The emit half of the feature previously had no coverage at all -- the
+    /// merge test's doc admitted it. Two claims carry the interop story: a
+    /// vanilla device emits *nothing* (its `get=1` output stays byte-identical
+    /// to upstream boringtun, however much runtime state -- the learned MTU --
+    /// it carries), and a configured one emits each key in the one spelling
+    /// its tools reapply: bare value when the range is degenerate, `lo-hi`
+    /// otherwise, absent when unset (amneziawg-go's `IpcGetOperation` omits
+    /// every zero 3.0 tunable; the kernel tools print them at `=0` and our set
+    /// side reads that back as unset).
+    #[test]
+    fn the_get_emit_grammar_stays_byte_identical_for_a_vanilla_device() {
+        // Vanilla with a learned MTU: nothing at all.
+        let mut out = Vec::new();
+        let vanilla = AmneziaConfig::default().with_content_padding_addition(0, 0, 1420);
+        write_awg_interface_params(&mut out, &ObfuscationRanges::default(), &vanilla);
+        assert!(
+            out.is_empty(),
+            "a vanilla device's get=1 output grew: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+
+        // A configured device: sizes as %u, ranges in mh_genspec spelling.
+        let mut out = Vec::new();
+        let obf = ObfuscationRanges::new(
+            169887817, 269887816, 390382747, 890382746, 1033691040, 1033691040, 1526332224,
+            2026332223,
+        )
+        .expect("valid ranges");
+        let cfg = AmneziaConfig::new(120, 130, 110, 80)
+            .with_header_protection([0xab; 32])
+            .with_content_padding_addition(8, 24, 1420);
+        write_awg_interface_params(&mut out, &obf, &cfg);
+        let text = String::from_utf8(out).expect("utf8");
+        for line in [
+            "s1=120\n",
+            "s2=130\n",
+            "s3=110\n",
+            "s4=80\n",
+            &format!("header_protection_key={}\n", "ab".repeat(32)),
+            "h1=169887817-269887816\n",
+            // A degenerate range is a bare value, matching `mh_genspec` and
+            // amneziawg-go's `UintRange.ToString`.
+            "h3=1033691040\n",
+            "content_padding_addition=8-24\n",
+        ] {
+            assert!(text.contains(line), "missing {:?} in:\n{}", line, text);
+        }
+        assert!(
+            !text.contains("content_padding_mtu"),
+            "the MTU is a runtime clamp, not a UAPI value:\n{}",
+            text
+        );
+
+        // A degenerate padding range is a bare value too, never `16-16`.
+        let mut out = Vec::new();
+        let cfg = AmneziaConfig::default().with_content_padding_addition(16, 16, 0);
+        write_awg_interface_params(&mut out, &ObfuscationRanges::default(), &cfg);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("content_padding_addition=16\n"), "{}", text);
+        assert!(!text.contains("16-16"), "{}", text);
     }
 
     /// An all-zero header-protection key means "off", not "reject".
@@ -1236,7 +1380,7 @@ mod tests {
         live.set_size("s4", 16);
         live.set_header_protection([0xab; 32]);
         let (_, with_key) = live
-            .merged(ObfuscationRanges::default(), &current)
+            .merged(ObfuscationRanges::default(), &current, 1420)
             .expect("a live key with junk sizes >= NONCE_SIZE is valid");
         assert!(
             with_key.header_protection_enabled(),
@@ -1251,7 +1395,7 @@ mod tests {
         let mut zeroed = AwgParams::default();
         zeroed.set_header_protection([0u8; 32]);
         let (_, merged) = zeroed
-            .merged(ObfuscationRanges::default(), &current)
+            .merged(ObfuscationRanges::default(), &current, 1420)
             .expect("an all-zero key does not require junk sizes");
         assert!(
             !merged.header_protection_enabled(),
@@ -1261,7 +1405,7 @@ mod tests {
         // And it clears a key the device already had -- the UAPI's only way to
         // turn protection off, since an omitted key preserves the old value.
         let (_, cleared) = zeroed
-            .merged(ObfuscationRanges::default(), &with_key)
+            .merged(ObfuscationRanges::default(), &with_key, 1420)
             .expect("an all-zero key does not require junk sizes");
         assert!(
             !cleared.header_protection_enabled(),
@@ -1516,35 +1660,8 @@ mod tests {
     fn an_awg3_device_key_warns_exactly_when_its_value_differs_from_ours() {
         const SILENT: &[tracing::Level] = &[];
         const WARNS: &[tracing::Level] = &[tracing::Level::WARN];
-        const REFUSED_LOUDLY: &[tracing::Level] = &[tracing::Level::ERROR];
 
         let cases: &[PolicyRow] = &[
-            // We never pad, so any addition the peer asked for is a real
-            // difference in our transport length distribution and says so.
-            ("content_padding_addition", "1", Ok(()), WARNS),
-            ("content_padding_addition", "64", Ok(()), WARNS),
-            ("content_padding_addition", "1-100", Ok(()), WARNS),
-            // amneziawg-go parses these as u32, so a value over u16::MAX is a
-            // legal config and must warn like any other, not abort.
-            ("content_padding_addition", "100000", Ok(()), WARNS),
-            // 0 is the exception, and not because it agrees with us -- it does
-            // not, we pad to nothing and it pads to a 16-byte multiple. It is
-            // silent because amneziawg-go's UAPI only emits this key when the
-            // value is non-zero, so `=0` can only be hand-typed, and warning
-            // about it is warning about someone spelling "unset" out loud.
-            ("content_padding_addition", "0", Ok(()), SILENT),
-            ("content_padding_addition", "0-0", Ok(()), SILENT),
-            // A range that merely starts at 0 is not "unset": the peer pads on
-            // almost every packet. It warns.
-            ("content_padding_addition", "0-100", Ok(()), WARNS),
-            // Refusal is not a warning: an unparseable value fails the
-            // transaction and the errno is the answer.
-            (
-                "content_padding_addition",
-                "notanumber",
-                Err(EINVAL),
-                SILENT,
-            ),
             // Timers: exactly our own constant is agreement, and silent. These
             // five numbers are the ones `awg3_our_timer` reports, so a retune
             // that moves a constant moves the silent row with it.
@@ -1597,6 +1714,13 @@ mod tests {
                 Err(EINVAL),
                 SILENT,
             ),
+            // Same contract for content padding, which `api_set` also consumes
+            // before the fallback: implemented keys must not be quietly
+            // tolerated here. If the `api_set` arm were ever removed, these
+            // rows keep the fallback refusing the key -- the whole `set=1`
+            // fails instead of the feature silently vanishing.
+            ("content_padding_addition", "8-24", Err(EINVAL), SILENT),
+            ("content_padding_addition", "0", Err(EINVAL), SILENT),
             // A key from neither list is still refused, and silently.
             ("not_a_real_key", "1", Err(EINVAL), SILENT),
         ];
@@ -1640,40 +1764,30 @@ mod tests {
                 key,
                 val
             );
-            if key == "content_padding_addition" {
-                // The padding warning names the key in its message and carries
-                // no `key` field; the timer warning does the opposite. Pinning
-                // both shapes is what stops the two sites being confused for
-                // each other when one of them is deleted.
-                assert!(
-                    warning.message.contains("content_padding_addition"),
-                    "the padding warning must name its key: {}",
-                    warning.message
-                );
-                assert_eq!(warning.key, None, "the padding warning has no key field");
-            } else {
-                assert_eq!(
-                    warning.key,
-                    Some(key.to_owned()),
-                    "the timer warning must name the key it is about"
-                );
-                let ours = awg3_our_timer(key).expect("a timer key has a built-in equivalent");
-                // The constant we will actually use, not the one we were asked
-                // for. Reporting the request back would make the log agree with
-                // the config it is warning about.
-                assert_eq!(
-                    warning.ours,
-                    Some(format!("Some({})", ours)),
-                    "{}={} must report the built-in it falls back to",
-                    key,
-                    val
-                );
-                assert!(
-                    warning.message.contains("tunable timers"),
-                    "the timer warning must say which subsystem ignored the value: {}",
-                    warning.message
-                );
-            }
+            // Every warning row is a timer now that padding is applied rather
+            // than warned: it names the key in a `key` field, reports the
+            // built-in it fell back to, and says which subsystem ignored it.
+            assert_eq!(
+                warning.key,
+                Some(key.to_owned()),
+                "the timer warning must name the key it is about"
+            );
+            let ours = awg3_our_timer(key).expect("a timer key has a built-in equivalent");
+            // The constant we will actually use, not the one we were asked
+            // for. Reporting the request back would make the log agree with
+            // the config it is warning about.
+            assert_eq!(
+                warning.ours,
+                Some(format!("Some({})", ours)),
+                "{}={} must report the built-in it falls back to",
+                key,
+                val
+            );
+            assert!(
+                warning.message.contains("tunable timers"),
+                "the timer warning must say which subsystem ignored the value: {}",
+                warning.message
+            );
         }
     }
 

@@ -40,6 +40,9 @@ const MAX_JUNK_PACKET_DELAY_MS: u16 = 200;
 /// deliberate parity break — the kernel accepts those and runs them. The
 /// argument for it is at the check.
 const MAX_SENDABLE_DATAGRAM: usize = 65535 - 20 - 8;
+/// AmneziaWG rounds unpadded transport plaintext up to this multiple, matching
+/// amneziawg-go's `PaddingMultiple` and vanilla WireGuard's 16-byte boundary.
+const PADDING_MULTIPLE: usize = 16;
 const DNS_JUNK_SIZE_MIN: usize = 50;
 const DNS_JUNK_SIZE_MAX: usize = 200;
 const QUIC_JUNK_SIZE_MIN: usize = 1200;
@@ -279,6 +282,19 @@ pub struct AmneziaConfig {
     /// in-band signal, so a mismatch is a tunnel that never forms rather than
     /// one that degrades.
     pub(crate) header_protection: HeaderProtectionKey,
+    /// AmneziaWG 3.0 `content_padding_addition`, the inclusive `(lo, hi)` range
+    /// of zero bytes appended to each transport plaintext, inside the AEAD.
+    /// `(0, 0)` is the unset sentinel, matching amneziawg-go's `UintRange`.
+    ///
+    /// Send-only: the receiver trims a data packet by its IP length field and
+    /// treats a zero-first-byte plaintext as a keepalive, so a padded datagram
+    /// needs no cooperation on the far end.
+    pub(crate) content_padding_addition: (u32, u32),
+    /// The MTU the padding is clamped against, so a full-MTU packet grows by
+    /// zero and never turns a deliverable frame into `EMSGSIZE`. `0` means "no
+    /// MTU known" -- the raw `Tunn`/FFI path, where the caller's buffer is the
+    /// only bound; the device sets it from the interface MTU.
+    pub(crate) content_padding_mtu: u16,
 }
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
@@ -365,6 +381,8 @@ impl AmneziaConfig {
             imitation: AmneziaImitation::default(),
             suppress_pre_handshake: false,
             header_protection: HeaderProtectionKey::default(),
+            content_padding_addition: (0, 0),
+            content_padding_mtu: 0,
         }
     }
 
@@ -387,6 +405,133 @@ impl AmneziaConfig {
     pub fn with_header_protection(mut self, key: [u8; 32]) -> Self {
         self.header_protection = HeaderProtectionKey::new(key);
         self
+    }
+
+    /// Enable AmneziaWG 3.0 `content_padding_addition`.
+    ///
+    /// `lo`/`hi` are the inclusive range of zero bytes appended to each
+    /// transport plaintext; `mtu` clamps the result so a full-MTU packet is not
+    /// grown past what the link can carry (`0` = clamp only by the caller's
+    /// buffer). `(0, 0)` is the unset sentinel and falls back to the spec
+    /// 16-byte rounding.
+    ///
+    /// A transposed pair is normalized, not silently mapped to the unset
+    /// sentinel: `(0, 0)` does not mean "off", it means the 16-byte-rounding
+    /// fallback -- a third behaviour a caller who wrote `(hi, lo)` did not ask
+    /// for and would only discover in a packet capture. The UAPI never arrives
+    /// here inverted (`parse_uint_range` rejects `hi-lo`, as amneziawg-go's
+    /// `UintRange::FromString` does); this guards the public builder.
+    pub fn with_content_padding_addition(mut self, lo: u32, hi: u32, mtu: u16) -> Self {
+        self.content_padding_addition = (lo.min(hi), lo.max(hi));
+        self.content_padding_mtu = mtu;
+        self
+    }
+
+    /// The number of zero bytes to append to a `src_len`-byte transport
+    /// plaintext bound for a frame with `dst_len` bytes of buffer and a
+    /// `transport_junk`-byte S4 prefix.
+    ///
+    /// Owns the whole budget: the room padding may use is whatever the base
+    /// frame (`src_len + DATA_OVERHEAD_SZ + transport_junk`) does not, capped
+    /// so the padded datagram can cross neither the caller's buffer nor
+    /// `MAX_SENDABLE_DATAGRAM`. One function rather than a computation copied
+    /// into each call site, because the two sites that needed it (the data
+    /// path and the keepalive path) bound different frames and could drift:
+    /// a term added to one copy and missed in the other would over-pad the
+    /// keepalive, and `format_packet_data` then rejects it *after*
+    /// `receive_handshake_response` has cleared the handshake state -- the
+    /// keepalive lost for good, only on links near the MTU, only with padding
+    /// active.
+    pub(crate) fn content_padding_for_frame(
+        &self,
+        src_len: usize,
+        dst_len: usize,
+        transport_junk: usize,
+        rng: &mut impl RngCore,
+    ) -> usize {
+        let committed = src_len + DATA_OVERHEAD_SZ + transport_junk;
+        let space = dst_len
+            .saturating_sub(committed)
+            .min(MAX_SENDABLE_DATAGRAM.saturating_sub(committed));
+        self.content_padding(src_len, space, rng)
+    }
+
+    /// The number of zero bytes to append to a `src_len`-byte transport
+    /// plaintext, given the room actually available (`space`, already the
+    /// smaller of the caller's buffer and `MAX_SENDABLE_DATAGRAM`).
+    ///
+    /// Transcribes amneziawg-go's `randomPaddingAddition` (send.go) and its
+    /// `calculatePaddingSize` fallback: a value drawn from the configured range,
+    /// or -- when the range is unset and this is an AmneziaWG tunnel -- rounding
+    /// the plaintext up to a 16-byte multiple. In both, an over-MTU plaintext is
+    /// measured against one MTU *unit* (`% mtu`), and the amount is capped by the
+    /// MTU and then by `space`.
+    ///
+    /// A plain WireGuard tunnel with no range set gets nothing: the 16-byte rule
+    /// is a fingerprint match for AmneziaWG peers, and applying it to every
+    /// tunnel would change the wire format of ordinary WireGuard, which is a
+    /// separate decision. Amnezia tunnels get it because that is the population
+    /// amneziawg-go rounds.
+    pub(crate) fn content_padding(
+        &self,
+        src_len: usize,
+        space: usize,
+        rng: &mut impl RngCore,
+    ) -> usize {
+        let mtu = self.content_padding_mtu as usize;
+        // One MTU unit: an over-MTU plaintext (only reachable when `mtu == 0`
+        // does not clamp `space`) is measured against its remainder, matching
+        // upstream's `if packetSize > mtu { packetSize %= mtu }`.
+        let last_unit = if mtu != 0 && src_len > mtu {
+            src_len % mtu
+        } else {
+            src_len
+        };
+
+        let (lo, hi) = self.content_padding_addition;
+        let want = if lo != 0 || hi != 0 {
+            // An active range. `random_usize_inclusive` casts to u64 before the
+            // +1, so a full-width range does not overflow on a 32-bit target.
+            random_usize_inclusive(lo as usize, hi as usize, rng)
+        } else if self.is_amnezia_active() {
+            // Unset on an AmneziaWG tunnel: round the plaintext up to a 16-byte
+            // multiple, never past the MTU.
+            let padded = last_unit.next_multiple_of(PADDING_MULTIPLE);
+            let padded = if mtu != 0 { padded.min(mtu) } else { padded };
+            padded.saturating_sub(last_unit)
+        } else {
+            // Plain WireGuard, unset: unchanged.
+            return 0;
+        };
+
+        // Cap by the room left in one MTU unit, then by what the buffer holds.
+        let want = if mtu != 0 {
+            want.min(mtu.saturating_sub(last_unit))
+        } else {
+            want
+        };
+        want.min(space)
+    }
+
+    /// True when any AmneziaWG behaviour is actually configured.
+    ///
+    /// Masks `content_padding_mtu` out of the comparison: the MTU is runtime
+    /// link state -- the device writes it on every `set=1` and at startup, for
+    /// vanilla and AmneziaWG configurations alike -- not a feature the operator
+    /// enabled. Without the mask, any transaction carrying an AmneziaWG key
+    /// (including `content_padding_addition = 0`, which the kernel module's
+    /// `awg showconf` emits unconditionally) would leave an otherwise-vanilla
+    /// device "non-default" purely by its stored MTU, and flip the 16-byte
+    /// rounding on for plain WireGuard tunnels.
+    ///
+    /// A struct comparison rather than a field list so a future AmneziaWG knob
+    /// counts automatically; only plumbing fields belong in the mask.
+    fn is_amnezia_active(&self) -> bool {
+        let vanilla = Self {
+            content_padding_mtu: self.content_padding_mtu,
+            ..Self::default()
+        };
+        *self != vanilla
     }
 
     pub(crate) fn header_protection_enabled(&self) -> bool {
@@ -2717,6 +2862,116 @@ mod tests {
                     min
                 );
             }
+        }
+    }
+
+    /// The content-padding decision transcribes amneziawg-go, clamp and all.
+    ///
+    /// An active range draws inside `[lo, hi]` and produces more than one
+    /// distinct amount over many packets; a full-MTU packet grows by zero; an
+    /// over-MTU plaintext is measured against one MTU unit; and the amount never
+    /// exceeds the space the caller offers.
+    #[test]
+    fn content_padding_follows_the_range_and_the_mtu() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0xC0FFEE);
+        let cfg = AmneziaConfig::new(120, 130, 110, 80).with_content_padding_addition(8, 24, 1420);
+
+        // In band, and genuinely random -- a draw-once mutation collapses this.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let pad = cfg.content_padding(200, 4096, &mut rng);
+            assert!((8..=24).contains(&pad), "pad {} out of [8,24]", pad);
+            seen.insert(pad);
+        }
+        assert!(seen.len() > 1, "padding never varied: {:?}", seen);
+
+        // A full-MTU plaintext must grow by zero, or the datagram exceeds the
+        // link and stalls.
+        assert_eq!(cfg.content_padding(1420, 4096, &mut rng), 0);
+
+        // An over-MTU plaintext is measured against one MTU unit: src = mtu + 1
+        // has last_unit == 1, so the room is mtu - 1 = 1419 and the full [8, 24]
+        // draw fits. Asserting the band, not just an upper bound: measuring
+        // against `src_len` instead of `src_len % mtu` leaves room = 0 and pad =
+        // 0, which a bare `pad <= 24` would wave through.
+        let pad = cfg.content_padding(1421, 4096, &mut rng);
+        assert!(
+            (8..=24).contains(&pad),
+            "pad {} ignored the MTU-unit remainder (src measured whole?)",
+            pad
+        );
+
+        // Never exceeds the caller's space.
+        assert!(cfg.content_padding(200, 5, &mut rng) <= 5);
+    }
+
+    /// A transposed builder range is normalized, not silently unset.
+    ///
+    /// `(0, 0)` is not "off" -- it is the 16-byte-rounding fallback -- so
+    /// mapping an inverted pair onto it would hand a caller who wrote
+    /// `(hi, lo)` a third behaviour they never asked for, with no error and no
+    /// log. The UAPI cannot arrive here inverted (`parse_uint_range` rejects
+    /// it, pinned elsewhere); this pins the public builder.
+    #[test]
+    fn an_inverted_builder_range_is_normalized_not_unset() {
+        let cfg = AmneziaConfig::default().with_content_padding_addition(24, 8, 1420);
+        assert_eq!(cfg.content_padding_addition, (8, 24));
+        assert_eq!(cfg.content_padding_mtu, 1420);
+    }
+
+    /// An unset range on an AmneziaWG tunnel rounds the plaintext up to 16.
+    #[test]
+    fn unset_padding_rounds_an_amnezia_tunnel_to_16() {
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        // No content-padding range, but S-sizes set -> an AmneziaWG tunnel.
+        let cfg = AmneziaConfig::new(120, 130, 110, 80);
+        for (src, want) in [(33usize, 15usize), (32, 0), (1, 15), (16, 0), (17, 15)] {
+            assert_eq!(
+                cfg.content_padding(src, 4096, &mut rng),
+                want,
+                "src {} should round to a 16-byte multiple",
+                src
+            );
+        }
+    }
+
+    /// A plain WireGuard tunnel is never padded: its wire format is unchanged.
+    #[test]
+    fn a_vanilla_tunnel_is_never_padded() {
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let cfg = AmneziaConfig::default();
+        for src in [1usize, 15, 33, 200, 1420] {
+            assert_eq!(
+                cfg.content_padding(src, 4096, &mut rng),
+                0,
+                "a vanilla tunnel padded a {}-byte packet",
+                src
+            );
+        }
+    }
+
+    /// A vanilla config that has merely learned the interface MTU is still
+    /// vanilla.
+    ///
+    /// The device stores the MTU into `content_padding_mtu` on every `set=1`
+    /// and at startup, whether or not any AmneziaWG feature is on -- the kernel
+    /// module's `awg showconf` even prints `content_padding_addition = 0`
+    /// unconditionally, so a reapplied dump reaches `merged` and stores the MTU
+    /// on a device with everything else default. If the stored MTU alone made
+    /// the config count as AmneziaWG, that transaction would silently switch
+    /// 16-byte rounding on and change the wire format of a plain WireGuard
+    /// device.
+    #[test]
+    fn a_vanilla_tunnel_with_a_learned_mtu_is_still_not_padded() {
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let cfg = AmneziaConfig::default().with_content_padding_addition(0, 0, 1420);
+        for src in [1usize, 15, 33, 200, 1420] {
+            assert_eq!(
+                cfg.content_padding(src, 4096, &mut rng),
+                0,
+                "the stored MTU alone made a vanilla tunnel pad a {}-byte packet",
+                src
+            );
         }
     }
 }
