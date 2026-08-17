@@ -462,16 +462,21 @@ impl AmneziaConfig {
     ///
     /// Transcribes amneziawg-go's `randomPaddingAddition` (send.go) and its
     /// `calculatePaddingSize` fallback: a value drawn from the configured range,
-    /// or -- when the range is unset and this is an AmneziaWG tunnel -- rounding
-    /// the plaintext up to a 16-byte multiple. In both, an over-MTU plaintext is
-    /// measured against one MTU *unit* (`% mtu`), and the amount is capped by the
-    /// MTU and then by `space`.
+    /// or -- when the range is unset -- rounding the plaintext up to a 16-byte
+    /// multiple. In both, an over-MTU plaintext is measured against one MTU
+    /// *unit* (`% mtu`), and the amount is capped by the MTU and then by
+    /// `space`.
     ///
-    /// A plain WireGuard tunnel with no range set gets nothing: the 16-byte rule
-    /// is a fingerprint match for AmneziaWG peers, and applying it to every
-    /// tunnel would change the wire format of ordinary WireGuard, which is a
-    /// separate decision. Amnezia tunnels get it because that is the population
-    /// amneziawg-go rounds.
+    /// The rounding applies to every tunnel, vanilla WireGuard included. That
+    /// is the spec's own padding rule, and it is what the kernel
+    /// (`calculate_skb_padding`), wireguard-go and amneziawg-go
+    /// (`calculatePaddingSize`) all do unconditionally -- until this crate
+    /// rounded, a boringtun sender was the one implementation whose transport
+    /// lengths were not 16-multiples, itself a wire fingerprint. Interop is
+    /// unaffected: every receiver, this one included, trims a data packet by
+    /// its inner IP length. A keepalive stays zero-length -- rounding an empty
+    /// plaintext adds nothing -- so vanilla receivers, which classify a
+    /// keepalive by zero length, never see a difference.
     pub(crate) fn content_padding(
         &self,
         src_len: usize,
@@ -493,15 +498,13 @@ impl AmneziaConfig {
             // An active range. `random_usize_inclusive` casts to u64 before the
             // +1, so a full-width range does not overflow on a 32-bit target.
             random_usize_inclusive(lo as usize, hi as usize, rng)
-        } else if self.is_amnezia_active() {
-            // Unset on an AmneziaWG tunnel: round the plaintext up to a 16-byte
-            // multiple, never past the MTU.
+        } else {
+            // Unset: round the plaintext up to a 16-byte multiple, never past
+            // the MTU. Mirrors upstream `calculatePaddingSize`, which every
+            // implementation applies to every tunnel when no range is set.
             let padded = last_unit.next_multiple_of(PADDING_MULTIPLE);
             let padded = if mtu != 0 { padded.min(mtu) } else { padded };
             padded.saturating_sub(last_unit)
-        } else {
-            // Plain WireGuard, unset: unchanged.
-            return 0;
         };
 
         // Cap by the room left in one MTU unit, then by what the buffer holds.
@@ -511,27 +514,6 @@ impl AmneziaConfig {
             want
         };
         want.min(space)
-    }
-
-    /// True when any AmneziaWG behaviour is actually configured.
-    ///
-    /// Masks `content_padding_mtu` out of the comparison: the MTU is runtime
-    /// link state -- the device writes it on every `set=1` and at startup, for
-    /// vanilla and AmneziaWG configurations alike -- not a feature the operator
-    /// enabled. Without the mask, any transaction carrying an AmneziaWG key
-    /// (including `content_padding_addition = 0`, which the kernel module's
-    /// `awg showconf` emits unconditionally) would leave an otherwise-vanilla
-    /// device "non-default" purely by its stored MTU, and flip the 16-byte
-    /// rounding on for plain WireGuard tunnels.
-    ///
-    /// A struct comparison rather than a field list so a future AmneziaWG knob
-    /// counts automatically; only plumbing fields belong in the mask.
-    fn is_amnezia_active(&self) -> bool {
-        let vanilla = Self {
-            content_padding_mtu: self.content_padding_mtu,
-            ..Self::default()
-        };
-        *self != vanilla
     }
 
     pub(crate) fn header_protection_enabled(&self) -> bool {
@@ -2935,43 +2917,56 @@ mod tests {
         }
     }
 
-    /// A plain WireGuard tunnel is never padded: its wire format is unchanged.
-    #[test]
-    fn a_vanilla_tunnel_is_never_padded() {
-        let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let cfg = AmneziaConfig::default();
-        for src in [1usize, 15, 33, 200, 1420] {
-            assert_eq!(
-                cfg.content_padding(src, 4096, &mut rng),
-                0,
-                "a vanilla tunnel padded a {}-byte packet",
-                src
-            );
-        }
-    }
-
-    /// A vanilla config that has merely learned the interface MTU is still
-    /// vanilla.
+    /// A vanilla tunnel rounds to 16 like every other implementation.
     ///
-    /// The device stores the MTU into `content_padding_mtu` on every `set=1`
-    /// and at startup, whether or not any AmneziaWG feature is on -- the kernel
-    /// module's `awg showconf` even prints `content_padding_addition = 0`
-    /// unconditionally, so a reapplied dump reaches `merged` and stores the MTU
-    /// on a device with everything else default. If the stored MTU alone made
-    /// the config count as AmneziaWG, that transaction would silently switch
-    /// 16-byte rounding on and change the wire format of a plain WireGuard
-    /// device.
+    /// Kernel WireGuard (`calculate_skb_padding`), wireguard-go and
+    /// amneziawg-go (`calculatePaddingSize`) all round every outbound
+    /// transport plaintext up to a 16-byte multiple, clamped to the MTU --
+    /// unconditionally, vanilla tunnels included. Until this crate rounded, a
+    /// boringtun sender was the one implementation whose transport lengths
+    /// were not 16-multiples: a wire fingerprint. The keepalive rows are the
+    /// safety half of the claim -- `round16(0)` is 0, and vanilla receivers
+    /// classify a keepalive by zero length, so an empty plaintext must never
+    /// grow.
     #[test]
-    fn a_vanilla_tunnel_with_a_learned_mtu_is_still_not_padded() {
+    fn a_vanilla_tunnel_rounds_to_16_like_every_other_implementation() {
         let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let cfg = AmneziaConfig::default().with_content_padding_addition(0, 0, 1420);
-        for src in [1usize, 15, 33, 200, 1420] {
+
+        // No MTU learned (the raw `Tunn`/FFI path): pure rounding.
+        let cfg = AmneziaConfig::default();
+        for (src, want) in [(1usize, 15usize), (15, 1), (32, 0), (33, 15), (200, 8)] {
             assert_eq!(
                 cfg.content_padding(src, 4096, &mut rng),
-                0,
-                "the stored MTU alone made a vanilla tunnel pad a {}-byte packet",
+                want,
+                "src {} must round to a 16-byte multiple",
                 src
             );
         }
+        assert_eq!(
+            cfg.content_padding(0, 4096, &mut rng),
+            0,
+            "a keepalive must stay empty"
+        );
+
+        // With the interface MTU learned (every device tunnel): the clamp
+        // holds. A full-MTU packet grows by zero; a near-full one only up to
+        // the MTU, exactly as upstream clamps `paddedSize` to `mtu`.
+        let cfg = AmneziaConfig::default().with_content_padding_addition(0, 0, 1420);
+        assert_eq!(
+            cfg.content_padding(1420, 4096, &mut rng),
+            0,
+            "a full-MTU packet must not grow"
+        );
+        assert_eq!(
+            cfg.content_padding(1419, 4096, &mut rng),
+            1,
+            "rounding is clamped to the MTU, not to the next multiple"
+        );
+        assert_eq!(cfg.content_padding(200, 4096, &mut rng), 8);
+        assert_eq!(
+            cfg.content_padding(0, 4096, &mut rng),
+            0,
+            "a keepalive must stay empty whatever MTU is stored"
+        );
     }
 }
