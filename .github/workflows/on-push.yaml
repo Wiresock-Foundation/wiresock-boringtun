@@ -43,9 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -72,9 +70,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      # dtolnay installs the minimal profile; clippy must be asked for, and the
+      # `cargo +1.75.0` steps below beat the RUSTUP_TOOLCHAIN this action sets,
+      # so the 1.75 pin is untouched.
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          components: clippy
       - name: Deny MSRV-incompatible API use (all targets)
         run: cargo +stable clippy -p boringtun --all-targets --features=ffi-bindings -- -D clippy::incompatible_msrv
       - name: Install Rust 1.75
@@ -102,9 +103,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Check Windows
         run: cargo check -p boringtun
@@ -119,9 +118,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo hack check --each-feature
 
@@ -132,9 +129,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          components: clippy
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo hack clippy --each-feature
 
@@ -145,9 +142,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          components: rustfmt
       - run: cargo fmt --all --check
 
   tests:
@@ -157,9 +154,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo hack test --each-feature
 
@@ -170,7 +165,5 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+      - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -- --ignored
