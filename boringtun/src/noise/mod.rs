@@ -464,6 +464,19 @@ impl Tunn {
         self.pending_amnezia_junk = None;
     }
 
+    /// Update only the MTU the content padding is clamped against.
+    ///
+    /// The MTU is runtime link state, not obfuscation configuration, so this
+    /// deliberately does not go through [`Self::set_obfuscation`]: that path
+    /// drops any queued pre-handshake junk burst, which is right when the
+    /// operator changed the framing and wrong for a link property that moved
+    /// under us -- and it moves at every wg-quick bring-up, where the MTU is
+    /// set *after* `wg setconf`, exactly when the first handshake's burst is
+    /// most likely in flight.
+    pub fn set_content_padding_mtu(&mut self, mtu: u16) {
+        self.amnezia.content_padding_mtu = mtu;
+    }
+
     /// Update the persistent-keepalive interval.
     ///
     /// Purely a timer change, so live sessions are kept: the peer's keys are
@@ -550,11 +563,22 @@ impl Tunn {
                 return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
             }
 
+            // The padding budget lives in one place -- `content_padding_for_frame`
+            // owns the committed/space arithmetic for this site and the
+            // keepalive site both, so the two bounds cannot drift apart.
+            let pad = self.amnezia.content_padding_for_frame(
+                src.len(),
+                dst.len(),
+                transport_junk,
+                &mut self.handshake.rng,
+            );
+
             // Send the packet using an established session
             let packet_size = match session.format_packet_data(
                 self.handshake.obf,
                 &mut self.handshake.rng,
                 src,
+                pad,
                 dst,
             ) {
                 Ok(packet) => packet.len(),
@@ -707,14 +731,31 @@ impl Tunn {
         // valid response and leave the retry -- with a correct buffer -- failing
         // as UnexpectedPacket. Unlike the data path, whose equivalent error is
         // retryable, that would cost the keepalive for good.
-        if dst.len() < DATA_OVERHEAD_SZ + self.amnezia.transport_junk_size() {
+        let transport_junk = self.amnezia.transport_junk_size();
+        if dst.len() < DATA_OVERHEAD_SZ + transport_junk {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let keepalive_packet =
-            session.format_packet_data(self.handshake.obf, &mut self.handshake.rng, &[], dst)?;
+        // A keepalive is padded too -- upstream draws against an empty plaintext.
+        // The zero-fill in `format_packet_data` is what keeps it a keepalive: the
+        // peer classifies any zero-first-byte plaintext as one. Same budget
+        // helper as the data path, so the two frames' bounds cannot drift.
+        let pad = self.amnezia.content_padding_for_frame(
+            0,
+            dst.len(),
+            transport_junk,
+            &mut self.handshake.rng,
+        );
+
+        let keepalive_packet = session.format_packet_data(
+            self.handshake.obf,
+            &mut self.handshake.rng,
+            &[],
+            pad,
+            dst,
+        )?;
         let keepalive_packet_size = keepalive_packet.len();
         // Store new session in ring buffer
         let l_idx = session.local_index();
@@ -2898,5 +2939,133 @@ mod tests {
             h1_min, h1_max, h2_min, h2_max, h3_min, h3_max, h4_min, h4_max,
         );
         assert!(res.is_err());
+    }
+
+    /// A content-padded data packet grows on the wire and round-trips intact.
+    ///
+    /// The peer trims by the IP length field, so the original bytes come back
+    /// byte-for-byte across an untouched receive path. Padding is send-only.
+    #[test]
+    fn content_padding_grows_a_data_packet_and_round_trips() {
+        // A wide, deterministic range and no MTU clamp (0), so a small packet is
+        // always grown -- the packet is 32 bytes, far under any MTU.
+        let amnezia =
+            AmneziaConfig::new(120, 130, 110, 80).with_content_padding_addition(40, 80, 0);
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake_with_amnezia(amnezia);
+
+        let packet = create_ipv4_udp_packet();
+        let mut dst = vec![0u8; 2048];
+        let sent = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst)).to_vec();
+
+        // The wire datagram carries the padding: S4 + 16 header + plaintext(len +
+        // pad) + 16 tag. With no padding it would be S4 + 32 + len; the added
+        // 40..80 bytes must show.
+        let unpadded = 80 + 32 + packet.len(); // S4 = 80
+        assert!(
+            sent.len() >= unpadded + 40,
+            "wire len {} did not grow by the padding (unpadded {})",
+            sent.len(),
+            unpadded
+        );
+
+        let mut their_dst = vec![0u8; 2048];
+        match their_tun.decapsulate(None, &sent, &mut their_dst) {
+            TunnResult::WriteToTunnelV4(recv, _) => assert_eq!(&packet[..], recv),
+            other => panic!("expected the padded packet to arrive, got {:?}", other),
+        }
+    }
+
+    /// A padded keepalive is still classified as a keepalive by the peer.
+    ///
+    /// The zero-fill in `format_packet_data` is load-bearing: a non-zero trailer
+    /// would be `InvalidPacket` at the receiver, breaking session establishment.
+    #[test]
+    fn a_content_padded_keepalive_is_still_a_keepalive() {
+        let amnezia =
+            AmneziaConfig::new(120, 130, 110, 80).with_content_padding_addition(40, 80, 0);
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake_with_amnezia(amnezia);
+
+        // An empty encapsulate is a keepalive. The buffer is deliberately
+        // dirty: the padding region must be zeroed by `format_packet_data`
+        // itself, not inherited from a fresh allocation -- with a pre-zeroed
+        // buffer, deleting the zero-fill leaves this test green while every
+        // production caller that reuses buffers sends garbage trailers.
+        let mut dst = vec![0xAA_u8; 2048];
+        let sent = unwrap_network_packet(my_tun.encapsulate(&[], &mut dst)).to_vec();
+
+        let mut their_dst = vec![0xAA_u8; 2048];
+        match their_tun.decapsulate(None, &sent, &mut their_dst) {
+            // A keepalive decapsulates to Done -- no tunnel write, no error.
+            TunnResult::Done => {}
+            other => panic!("a padded keepalive was not a keepalive: {:?}", other),
+        }
+    }
+
+    /// Padding never eats the S4 headroom: with a dst that has no slack, the
+    /// pad clamps to zero and the send still succeeds at the exact size.
+    ///
+    /// This is the `space` budget in `encapsulate` doing its job. A budget
+    /// that forgets the junk prefix (`committed` without `transport_junk`)
+    /// pads into the room the S4 prefix needs, and `write_to_network` then
+    /// fails with `DestinationBufferTooSmall` *after* the sending counter
+    /// advanced -- the burned-nonce regression
+    /// `a_rejected_amnezia_encapsulate_does_not_advance_the_nonce` guards
+    /// against, reintroduced only when padding is active.
+    #[test]
+    fn content_padding_clamps_to_zero_when_dst_has_no_slack() {
+        const S4: usize = 64;
+        let amnezia =
+            AmneziaConfig::new(0, 0, 0, S4 as u16).with_content_padding_addition(40, 80, 0);
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake_with_amnezia(amnezia);
+
+        let packet = create_ipv4_udp_packet();
+        let exact = packet.len() + DATA_OVERHEAD_SZ + S4;
+        let mut dst = vec![0u8; exact];
+        let sent = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        assert_eq!(
+            sent.len(),
+            exact,
+            "no room means no padding, and the send must still succeed"
+        );
+    }
+
+    /// The targeted MTU update moves the clamp and nothing else.
+    ///
+    /// `set_content_padding_mtu` exists so the device's once-a-second MTU
+    /// refresh does not go through `set_obfuscation`, which discards any
+    /// queued pre-handshake junk burst -- right when the operator changed the
+    /// framing, wrong for a link property that moved under us. wg-quick sets
+    /// the MTU after `wg setconf`, so the refresh lands precisely when the
+    /// first handshake's burst is most likely in flight; this pins that the
+    /// burst survives it.
+    #[test]
+    fn set_content_padding_mtu_updates_the_clamp_and_keeps_a_queued_burst() {
+        let amnezia = AmneziaConfig::new(120, 130, 110, 80)
+            .with_pre_handshake_junk(4, 64, 128, 0)
+            .with_content_padding_addition(40, 80, 0);
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+
+        // Start a handshake so a junk burst is queued and partially sent.
+        let mut dst = vec![0u8; 2048];
+        assert!(matches!(
+            my_tun.format_handshake_initiation(&mut dst, false),
+            TunnResult::WriteToNetwork(_)
+        ));
+        assert!(
+            my_tun.pending_amnezia_junk.is_some(),
+            "precondition: a burst must be in flight, or this test proves nothing"
+        );
+
+        my_tun.set_content_padding_mtu(1280);
+        assert_eq!(my_tun.amnezia.content_padding_mtu, 1280);
+        assert_eq!(
+            my_tun.amnezia.content_padding_addition,
+            (40, 80),
+            "only the clamp may move"
+        );
+        assert!(
+            my_tun.pending_amnezia_junk.is_some(),
+            "an MTU refresh must not cost a mid-handshake peer its junk burst"
+        );
     }
 }

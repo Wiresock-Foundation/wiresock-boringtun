@@ -673,12 +673,23 @@ impl Device {
         Ok(())
     }
 
-    pub fn new(name: &str, config: DeviceConfig) -> Result<Device, Error> {
+    pub fn new(name: &str, mut config: DeviceConfig) -> Result<Device, Error> {
         let poll = EventPoll::<Handler>::new()?;
 
         // Create a tunnel device
         let iface = Arc::new(TunSocket::new(name)?.set_non_blocking()?);
         let mtu = iface.mtu()?;
+
+        // The content-padding clamp is runtime link state: a `DeviceConfig` is
+        // built before the TUN exists, so an embedder cannot know the interface
+        // MTU. Write it here, exactly as `AwgParams::apply` does on `set=1` --
+        // this is what keeps the field's contract ("the device sets it from the
+        // interface MTU") true for configurations that never see a UAPI
+        // transaction. Peers snapshot `config.amnezia` when they are created,
+        // so setting it before any peer exists covers all of them. Saturated,
+        // not truncated: `65536 as u16` is 0, which `content_padding` reads as
+        // "no clamp at all".
+        config.amnezia.content_padding_mtu = mtu.min(u16::MAX as usize) as u16;
 
         #[cfg(not(target_os = "linux"))]
         let uapi_fd = -1;
@@ -722,6 +733,10 @@ impl Device {
         } else {
             device.register_api_handler()?;
         }
+        // On both API paths: the fd path has no socket watchdog, and the MTU
+        // refresh used to live inside it -- freezing the padding clamp at the
+        // startup snapshot for fd-activated daemons.
+        device.register_mtu_monitor()?;
         device.register_iface_handler(Arc::clone(&device.iface))?;
         device.register_notifiers()?;
         device.register_timers()?;
