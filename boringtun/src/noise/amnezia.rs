@@ -456,7 +456,9 @@ impl AwgTimers {
         Self::hi(self.reject_after_time, REJECT_AFTER_TIME)
     }
 
-    /// How many handshake initiations one cycle may send before giving up.
+    /// How many handshake *retransmissions* one cycle may send. The cycle's
+    /// first initiation is not one of them, so the total number of initiations
+    /// is one more than this.
     ///
     /// Upstream *counts* attempts rather than measuring a window
     /// (`handshakeAttempts > maxHandshakeAttempts` in amneziawg-go's
@@ -468,30 +470,40 @@ impl AwgTimers {
     /// it would have to be sized from one fixed per-try cost while every retry
     /// draws its own. Sizing it from the low end -- the first shape of this
     /// code -- produced a give-up deadline shorter than a single
-    /// retransmission, so `rekey_timeout = 1-60` expired the peer 18 seconds
-    /// in having sent exactly one initiation, where every reference
-    /// implementation sends eighteen.
+    /// retransmission, so `rekey_timeout = 1-20` expired the peer after two or
+    /// three initiations, where every reference implementation sends eighteen.
     ///
-    /// Unset keeps the classic count, `REKEY_ATTEMPT_TIME / REKEY_TIMEOUT`,
-    /// which is how amneziawg-go defines its own `MaxTimerHandshakes` (`90 /
-    /// 5` in device/constants.go). Derived rather than written as `18` so
-    /// retuning either constant moves it -- and pinned to the literal 18 by a
-    /// test, so retuning cannot silently redefine what the classic count is.
+    /// The two regimes differ deliberately, because they answer to different
+    /// authorities:
     ///
-    /// One initiation is sent when the cycle starts, so a count of N means N
-    /// initiations in total. Vanilla is therefore unchanged: 18 initiations at
-    /// 5-second intervals, the last at t=85, expiring at t=90 -- the same
-    /// instant the old `REKEY_ATTEMPT_TIME` window fired.
-    pub(crate) fn max_attempts(&self, rng: &mut impl RngCore) -> u32 {
+    /// * **Configured**: `N + 1` retransmissions, i.e. `N + 2` initiations in
+    ///   total. That is what a peer running the same `max_handshake_attempts =
+    ///   N` gets from amneziawg-go, whose counter starts at zero, increments
+    ///   once per retransmission, and gives up only once it is *greater than*
+    ///   `N` -- its own log line reports the total as `maxAttempts + 2`. The
+    ///   knob has to mean the same number of packets on both ends, so the
+    ///   off-by-two is reproduced rather than corrected.
+    /// * **Unset**: the classic count, `REKEY_ATTEMPT_TIME / REKEY_TIMEOUT`
+    ///   initiations -- 17 retransmissions after the first. That is this
+    ///   crate's long-standing behaviour (the 90-second `REKEY_ATTEMPT_TIME`
+    ///   window at 5-second intervals) and it stays exactly as it was: an
+    ///   unconfigured tunnel must not change. It is derived rather than
+    ///   written as `18` so retuning either constant moves it, and pinned to
+    ///   the literal 18 by a test so retuning cannot silently redefine what
+    ///   the classic count is.
+    pub(crate) fn max_retransmissions(&self, rng: &mut impl RngCore) -> u32 {
         let classic = (REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs()) as u32;
         if self.max_handshake_attempts == (0, 0) {
-            return classic;
+            // 18 initiations total, the last at t=85, expiring at t=90 -- the
+            // same instant the old wall-clock window fired.
+            return classic.saturating_sub(1);
         }
-        random_usize_inclusive(
+        let n = random_usize_inclusive(
             self.max_handshake_attempts.0 as usize,
             self.max_handshake_attempts.1 as usize,
             rng,
-        ) as u32
+        ) as u32;
+        n.saturating_add(1)
     }
 }
 
@@ -3253,9 +3265,10 @@ mod tests {
         // would move code, comment and assertion together and quietly redefine
         // what "18 attempts, the same as amneziawg-go's MaxTimerHandshakes"
         // means.
-        assert_eq!(unset.max_attempts(&mut rng), 18);
+        // 17 retransmissions after the first initiation = 18 in total.
+        assert_eq!(unset.max_retransmissions(&mut rng) + 1, 18);
         assert_eq!(
-            unset.max_attempts(&mut rng),
+            unset.max_retransmissions(&mut rng) + 1,
             (REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs()) as u32
         );
         assert_eq!(REKEY_ATTEMPT_TIME, Duration::from_secs(90));
@@ -3292,8 +3305,10 @@ mod tests {
                 "refresh {} outside pick(100..=120)-5-2",
                 d
             );
-            let a = t.max_attempts(&mut rng);
-            assert!((3..=5).contains(&a), "attempts {} outside 3..=5", a);
+            // A configured N buys N+1 retransmissions, i.e. N+2 initiations,
+            // which is what the same N buys on amneziawg-go.
+            let a = t.max_retransmissions(&mut rng);
+            assert!((4..=6).contains(&a), "budget {} outside pick(3..=5)+1", a);
             let n = t.new_handshake_timeout(&mut rng).as_secs();
             assert!(
                 (9..=11).contains(&n),
@@ -3328,7 +3343,7 @@ mod tests {
             max_handshake_attempts: (u32::MAX, u32::MAX),
             ..AwgTimers::default()
         };
-        assert_eq!(t.max_attempts(&mut rng), u32::MAX);
+        assert_eq!(t.max_retransmissions(&mut rng), u32::MAX);
 
         // An inverted range cannot reach the accessors through the builder --
         // it is normalized on the way in, like the padding range beside it.

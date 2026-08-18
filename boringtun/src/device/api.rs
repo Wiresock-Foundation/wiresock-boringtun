@@ -573,11 +573,11 @@ fn write_awg_interface_params(
     // The padding range and the five tunable timers, when set. amneziawg-go
     // emits each of these only when non-zero (`!IsZero()` in
     // `IpcGetOperation`), so unset stays absent and a vanilla device's output
-    // is unchanged. The two bool keys go emits *unconditionally*
-    // (`random_trailers=0`, `disable_cookies=0`) are deliberately not
-    // reproduced: this build does not implement either feature, and inventing
-    // the keys would grow a vanilla device's `get=1` for nothing a peer can
-    // act on.
+    // is unchanged. The two bool keys amneziawg-go emits *unconditionally*
+    // from v3.1 on (`random_trailers=0`, `disable_cookies=0`) are deliberately
+    // not reproduced: this build does not implement either feature, and
+    // inventing the keys would grow a vanilla device's `get=1` for nothing a
+    // peer can act on.
     let t = &a.timers;
     for (key, range) in [
         ("content_padding_addition", a.content_padding_addition),
@@ -847,12 +847,16 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
 /// `api_set`, and it is the reason tolerating a key we can safely ignore is
 /// worth doing.)
 ///
-/// The two bool keys are here for a hard interop reason: amneziawg-go's
-/// `get=1` emits `random_trailers=0` and `disable_cookies=0`
-/// *unconditionally* -- its `boolf` has no is-set guard, unlike the five
-/// timers it emits only when set -- so every reapplied go dump carries both
-/// keys even for a configuration that never mentioned either. Refusing them
-/// would abort every such transaction.
+/// The two bool keys are here for a hard interop reason, and one that is
+/// version-specific: from **v3.1.20260812** on, amneziawg-go's `get=1` emits
+/// `random_trailers=0` and `disable_cookies=0` *unconditionally* -- its
+/// `boolf` has no is-set guard, unlike the five timers it emits only when set
+/// -- so every reapplied dump from such a peer carries both keys even for a
+/// configuration that never mentioned either. Refusing them would abort every
+/// such transaction. (Neither key exists at all in v3.0.20260805 and earlier:
+/// verified against `device/uapi.go` at both tags. A v3.0 dump cannot
+/// exercise this path, which is why the interop leg that does is labelled by
+/// the version that can.)
 ///
 /// A value that asks for nothing (off is what this build does) is silent; a
 /// value that turns the feature on warns, because silently ignoring it would
@@ -1380,10 +1384,11 @@ mod tests {
     #[test]
     fn an_awg3_device_key_is_tolerated_in_every_form_its_tools_emit() {
         // The two bool keys amneziawg-go's `get=1` emits *unconditionally*
-        // (`boolf` has no is-set guard): a reapplied go dump always carries
-        // `random_trailers=0` and `disable_cookies=0`, so refusing them would
-        // abort every such transaction. Off -- what this build does -- is
-        // silent agreement; on warns; junk is EINVAL.
+        // from v3.1.20260812 on (`boolf` has no is-set guard): a reapplied
+        // dump from such a peer always carries `random_trailers=0` and
+        // `disable_cookies=0`, so refusing them would abort every such
+        // transaction. Off -- what this build does -- is silent agreement; on
+        // warns; junk is EINVAL.
         //
         // Every spelling below is one amneziawg-go accepts, because it parses
         // both keys with `strconv.ParseBool`. Accepting a narrower set does not
@@ -1534,7 +1539,7 @@ mod tests {
         assert!(!text.contains("16-16"), "{}", text);
 
         // Set timers emit in the same grammar; unset ones stay absent, and the
-        // two bool keys amneziawg-go invents unconditionally are never
+        // two bool keys amneziawg-go v3.1 invents unconditionally are never
         // emitted -- this build does not implement them, and a vanilla
         // device's output must not grow.
         let mut out = Vec::new();

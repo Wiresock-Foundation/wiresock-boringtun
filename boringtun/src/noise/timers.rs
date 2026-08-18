@@ -77,12 +77,13 @@ pub struct Timers {
     ///
     /// Re-drawn per initiation send (upstream `timersHandshakeInitiated`):
     pub(super) retransmit_current: Duration,
-    /// Initiations sent in the current handshake cycle, and the count this
-    /// cycle may reach before giving up -- upstream's `handshakeAttempts` and
-    /// its per-cycle `maxHandshakeAttempts` snapshot. A count, not a window:
-    /// see [`AwgTimers::max_attempts`].
+    /// Retransmissions sent in the current handshake cycle, and the number
+    /// this cycle may send before giving up -- upstream's `handshakeAttempts`
+    /// and its per-cycle `maxHandshakeAttempts` snapshot. A count, not a
+    /// window: see [`AwgTimers::max_retransmissions`], which also explains why
+    /// the budget is one larger than the configured value.
     pub(super) handshake_attempts: u32,
-    pub(super) max_attempts_current: u32,
+    pub(super) max_retransmissions_current: u32,
     /// Re-drawn when the keepalive latch arms (upstream `timersDataReceived`):
     pub(super) keepalive_current: Duration,
     /// Re-drawn when the unanswered-data latch arms (upstream
@@ -108,7 +109,9 @@ impl Timers {
             should_reset_rr: reset_rr,
             retransmit_current: REKEY_TIMEOUT,
             handshake_attempts: 0,
-            max_attempts_current: (REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs()) as u32,
+            max_retransmissions_current: (REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs())
+                as u32
+                - 1,
             keepalive_current: KEEPALIVE_TIMEOUT,
             new_handshake_current: KEEPALIVE_TIMEOUT.saturating_add(REKEY_TIMEOUT),
             rekey_after_current: REKEY_AFTER_TIME,
@@ -231,10 +234,10 @@ impl Tunn {
         // The attempt *limit* is re-drawn; the attempts already spent in the
         // current cycle are not reset, or a peer could be kept retrying
         // forever by a periodic `awg syncconf`.
-        let max_attempts = t.max_attempts(&mut self.handshake.rng);
+        let max_retransmissions = t.max_retransmissions(&mut self.handshake.rng);
 
         self.timers.retransmit_current = retransmit;
-        self.timers.max_attempts_current = max_attempts;
+        self.timers.max_retransmissions_current = max_retransmissions;
         self.timers.keepalive_current = keepalive;
         self.timers.new_handshake_current = new_handshake;
         self.timers.rekey_after_current = rekey_after;
@@ -350,7 +353,7 @@ impl Tunn {
                     // cease and every packet queued up to be sent is cleared.
                     // If a packet is explicitly queued up to be sent, then this
                     // timer is reset.
-                    if self.timers.handshake_attempts >= self.timers.max_attempts_current {
+                    if self.timers.handshake_attempts >= self.timers.max_retransmissions_current {
                         tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
                         self.handshake.set_expired();
                         self.clear_all();
