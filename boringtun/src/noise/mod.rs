@@ -3246,6 +3246,68 @@ mod tests {
         ));
     }
 
+    /// An untuned tunnel keeps the classic absolute give-up bound, even when
+    /// the caller polls sparsely.
+    ///
+    /// Counting retransmissions measures nothing if `update_timers` is not
+    /// called: one poll 100 seconds after the initiation used to expire the
+    /// cycle, and under a count-only rule would instead send a retry and carry
+    /// on. The device's 250ms poll hides it; the FFI callers, which drive this
+    /// loop themselves, do not. A tunnel with no timer tunables set must
+    /// behave exactly as it did before they existed.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn an_untuned_tunnel_expires_on_the_classic_window_under_sparse_polling() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let mut dst = [0u8; 2048];
+
+        assert!(matches!(
+            my_tun.format_handshake_initiation(&mut dst, false),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        // A single poll, well past REKEY_ATTEMPT_TIME: expire, do not retry.
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(100));
+        assert!(
+            matches!(
+                my_tun.update_timers(&mut dst),
+                TunnResult::Err(WireGuardError::ConnectionExpired)
+            ),
+            "a 100-second gap must expire an untuned cycle, not retransmit"
+        );
+    }
+
+    /// A tuned tunnel is bounded by its count, not by the classic window.
+    ///
+    /// The mirror of the test above: with `max_handshake_attempts` set, the
+    /// same sparse poll must retry rather than expire, because the operator
+    /// asked for a budget rather than for 90 seconds.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_tuned_tunnel_is_bounded_by_its_count_not_the_classic_window() {
+        let amnezia = AmneziaConfig::default().with_tunable_timers(amnezia::AwgTimers {
+            max_handshake_attempts: (6, 6),
+            rekey_timeout: (2, 2),
+            ..amnezia::AwgTimers::default()
+        });
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let mut dst = [0u8; 2048];
+
+        assert!(matches!(
+            my_tun.format_handshake_initiation(&mut dst, false),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(100));
+        assert!(
+            matches!(
+                my_tun.update_timers(&mut dst),
+                TunnResult::WriteToNetwork(_)
+            ),
+            "a configured budget must survive a gap longer than REKEY_ATTEMPT_TIME"
+        );
+    }
+
     /// An unrelated AmneziaWG edit must not disturb the cached timer draws.
     ///
     /// `set_obfuscation` is called for any AWG change -- an `s1`, a magic

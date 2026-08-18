@@ -905,19 +905,22 @@ impl AmneziaConfig {
         // Refusing at `awg set`, naming the numbers, is the failure the
         // operator can act on.
         let t = &self.timers;
+        // The four *duration* ranges only. `max_handshake_attempts` is a
+        // count, and a drawn 0 is not degenerate there: it buys one
+        // retransmission (`N + 1`), so `0-3` is a perfectly ordinary "retry at
+        // least once" configuration that amneziawg-go runs the same way.
+        // Refusing it would refuse a working reference config for no gain.
         for (label, (lo, hi)) in [
             ("rekey_after_time", t.rekey_after_time),
             ("rekey_timeout", t.rekey_timeout),
             ("reject_after_time", t.reject_after_time),
             ("keepalive_timeout", t.keepalive_timeout),
-            ("max_handshake_attempts", t.max_handshake_attempts),
         ] {
             // A bare `0` parses to `(0, 0)` and means "use the built-in
             // default"; a zero *inside* a set range (`0-30`) is not unset, it
             // is a zero-second timer the draw can land on -- for rekey_timeout
-            // an unthrottled initiation storm, for max_handshake_attempts a
-            // handshake that gives up before its first retry. amneziawg-go
-            // draws and runs these.
+            // an unthrottled initiation storm, for keepalive_timeout a
+            // keepalive every poll. amneziawg-go draws and runs these.
             if (lo, hi) != (0, 0) && lo == 0 {
                 return Err(format!(
                     "{} = 0-{}: a set range must not contain 0 (a bare 0 means \
@@ -3375,13 +3378,26 @@ mod tests {
         })
         .is_ok());
 
-        // A zero inside a set range is refused, naming the key.
+        // A zero inside a set *duration* range is refused, naming the key.
         let err = check(AwgTimers {
             rekey_timeout: (0, 5),
             ..AwgTimers::default()
         })
         .unwrap_err();
         assert!(err.contains("rekey_timeout"), "{}", err);
+
+        // But `max_handshake_attempts` is a count, not a duration: a drawn 0
+        // buys one retransmission (`N + 1`), so `0-3` is an ordinary "retry at
+        // least once" config that amneziawg-go runs the same way. Refusing it
+        // would refuse a working reference configuration.
+        assert!(
+            check(AwgTimers {
+                max_handshake_attempts: (0, 3),
+                ..AwgTimers::default()
+            })
+            .is_ok(),
+            "a count range containing 0 must be accepted"
+        );
 
         // reject_after_time shorter than the (default) rekey_after_time +
         // rekey_timeout: keys would be rejected before the rekey replacing

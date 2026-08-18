@@ -332,6 +332,33 @@ impl Tunn {
             }
 
             if let Some(time_init_sent) = self.handshake.timer() {
+                // The classic absolute bound, kept for the untuned case only.
+                //
+                // Counting retransmissions is the right model once the
+                // intervals are drawn, but it measures nothing when polls are
+                // sparse: a caller that runs `update_timers` once, 100 seconds
+                // after the initiation, used to expire the cycle here and now
+                // sends a retry and carries on for the rest of its budget. The
+                // device polls at 250ms so it never notices, but the FFI
+                // callers drive this loop themselves, and an untuned tunnel
+                // must behave exactly as it did before the tunables existed.
+                //
+                // Only when neither relevant range is set, which is what makes
+                // it safe to check beside the retransmission deadline: the
+                // race that motivated the count model needs a drawn interval
+                // that can exceed the window, and with both unset the two are
+                // the fixed 5 and 90 seconds. A tuned tunnel is bounded by the
+                // count, and beyond that by `keychain_expire() * 3` above.
+                if self.amnezia.timers.max_handshake_attempts == (0, 0)
+                    && self.amnezia.timers.rekey_timeout == (0, 0)
+                    && now - self.timers[TimeLastHandshakeStarted] >= REKEY_ATTEMPT_TIME
+                {
+                    tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
+                    self.handshake.set_expired();
+                    self.clear_all();
+                    return TunnResult::Err(WireGuardError::ConnectionExpired);
+                }
+
                 // Handshake Initiation Retransmission.
                 //
                 // We avoid using `time` here, because it can be earlier than
