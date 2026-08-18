@@ -12,6 +12,20 @@ on:
   pull_request:
     branches: [ "master", "awg-2.0-extensions" ]
 
+# Third-party actions are pinned to commit SHAs; GitHub-owned ones (actions/*)
+# stay on major tags. Neither pin below may be "simplified" to the SHA its
+# moving ref happens to resolve to:
+#  - dtolnay/rust-toolchain: toolchain-named refs (`stable`) are synthetic
+#    commits *outside master's history*, garbage-collected when the branch is
+#    rewritten on release -- the README requires pinning a master SHA and
+#    naming the toolchain via the `toolchain:` input instead (at a master SHA
+#    that input is mandatory, and the ref name is never read by the action).
+#  - taiki-e/install-action: `@cargo-hack` is a tag re-pointed on every
+#    release, with the same dangling-commit hazard, so the pin is a release
+#    SHA with the tool named via `tool:`. That also freezes the *installed*
+#    cargo-hack at the release's embedded manifest -- reproducibility over
+#    freshness -- so bumping the SHA is what updates cargo-hack.
+
 jobs:
   # Depends on all actions that are required for a "successful" CI run.
   # Based on the ci here: https://github.com/tokio-rs/tokio/blob/master/.github/workflows/ci.yml
@@ -43,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (2026-08-05)
         with:
           toolchain: stable
       - uses: actions/setup-java@v5
@@ -72,9 +86,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      # dtolnay installs the minimal profile, so clippy must be asked for. The
+      # action activates its toolchain with `rustup default` -- the weakest
+      # level of rustup's precedence -- so the explicit `cargo +1.75.0` and
+      # `cargo +stable` below outrank it and the 1.75 pin is untouched.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (2026-08-05)
         with:
           toolchain: stable
+          components: clippy
       - name: Deny MSRV-incompatible API use (all targets)
         run: cargo +stable clippy -p boringtun --all-targets --features=ffi-bindings -- -D clippy::incompatible_msrv
       - name: Install Rust 1.75
@@ -102,7 +121,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (2026-08-05)
         with:
           toolchain: stable
 
@@ -119,10 +138,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (2026-08-05)
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@cargo-hack
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-hack
       - run: cargo hack check --each-feature
 
   clippy:
@@ -132,10 +153,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (2026-08-05)
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@cargo-hack
+          components: clippy
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-hack
       - run: cargo hack clippy --each-feature
 
   rustfmt:
@@ -145,9 +169,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (2026-08-05)
         with:
           toolchain: stable
+          components: rustfmt
       - run: cargo fmt --all --check
 
   tests:
@@ -157,10 +182,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (2026-08-05)
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@cargo-hack
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-hack
       - run: cargo hack test --each-feature
 
   integration-tests:
@@ -170,7 +197,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (2026-08-05)
         with:
           toolchain: stable
       - run: cargo test -- --ignored
