@@ -86,9 +86,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      # dtolnay installs the minimal profile; clippy must be asked for, and the
-      # `cargo +1.75.0` steps below beat the RUSTUP_TOOLCHAIN this action sets,
-      # so the 1.75 pin is untouched.
+      # dtolnay installs the minimal profile, so clippy must be asked for. The
+      # action activates its toolchain with `rustup default` -- the weakest
+      # level of rustup's precedence -- so the explicit `cargo +1.75.0` and
+      # `cargo +stable` below outrank it and the 1.75 pin is untouched.
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (2026-08-05)
         with:
           toolchain: stable
