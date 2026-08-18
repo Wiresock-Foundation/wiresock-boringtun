@@ -210,12 +210,15 @@ impl TunSocket {
         if let Some(err) = err {
             // A provided fd's interface may live in a netns this process
             // cannot resolve names in (a broker created the TUN elsewhere
-            // and passed only the fd over). The TUN itself still works
-            // through the fd, so answer what the pre-recovery code always
-            // did instead of failing a working device. The reverse
+            // and passed only the fd over), and that miss is exactly ENODEV.
+            // The TUN itself still works through the fd, so answer what the
+            // pre-recovery code always did instead of failing a working
+            // device -- but only for that errno: any other failure is a
+            // genuine query error, and masking it as a healthy 1500 would
+            // hide it for as long as the device retries. The reverse
             // confusion -- a same-named interface in *this* netns shadowing
             // the real one -- cannot be detected from the fd alone.
-            if provided_fd {
+            if provided_fd && err.raw_os_error() == Some(ENODEV) {
                 return Ok(1500);
             }
             return Err(Error::IOCtl(err));
