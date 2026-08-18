@@ -64,17 +64,25 @@ pub struct Timers {
     /// Should this timer call reset rr function (if not a shared rr instance)
     pub(super) should_reset_rr: bool,
     /// Per-arming draws from the AmneziaWG tunable timer ranges; the classic
-    /// constants when unset, and at construction. Each is re-drawn where
-    /// amneziawg-go re-arms the corresponding timer, so an armed deadline is
-    /// one uniform draw from its range -- a fresh draw per 250ms poll would
-    /// instead fire near the low end with high probability (first passage),
-    /// which is not the distribution a range configures.
+    /// constants when unset, and at construction. Each is re-drawn when its
+    /// deadline is armed, so an armed deadline is one uniform draw from its
+    /// range -- a fresh draw per 250ms poll would instead fire near the low
+    /// end with high probability (first passage), which is not the
+    /// distribution a range configures.
+    ///
+    /// Four of the six arm where amneziawg-go re-arms the matching timer. The
+    /// last two are a deliberate divergence, noted at their own field: upstream
+    /// re-draws those per *check*, which it can afford because it checks them
+    /// on the send and receive paths rather than on a poll.
     ///
     /// Re-drawn per initiation send (upstream `timersHandshakeInitiated`):
     pub(super) retransmit_current: Duration,
-    /// Re-drawn per handshake cycle (upstream's per-cycle
-    /// `maxHandshakeAttempts` snapshot, converted to a window):
-    pub(super) attempt_window_current: Duration,
+    /// Initiations sent in the current handshake cycle, and the count this
+    /// cycle may reach before giving up -- upstream's `handshakeAttempts` and
+    /// its per-cycle `maxHandshakeAttempts` snapshot. A count, not a window:
+    /// see [`AwgTimers::max_attempts`].
+    pub(super) handshake_attempts: u32,
+    pub(super) max_attempts_current: u32,
     /// Re-drawn when the keepalive latch arms (upstream `timersDataReceived`):
     pub(super) keepalive_current: Duration,
     /// Re-drawn when the unanswered-data latch arms (upstream
@@ -99,7 +107,8 @@ impl Timers {
             persistent_keepalive: usize::from(persistent_keepalive.unwrap_or(0)),
             should_reset_rr: reset_rr,
             retransmit_current: REKEY_TIMEOUT,
-            attempt_window_current: REKEY_ATTEMPT_TIME,
+            handshake_attempts: 0,
+            max_attempts_current: (REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs()) as u32,
             keepalive_current: KEEPALIVE_TIMEOUT,
             new_handshake_current: KEEPALIVE_TIMEOUT.saturating_add(REKEY_TIMEOUT),
             rekey_after_current: REKEY_AFTER_TIME,
@@ -196,6 +205,42 @@ impl Tunn {
             .key_refresh_receiving(&mut self.handshake.rng);
     }
 
+    /// Re-draw every cached tunable-timer deadline from the current config.
+    ///
+    /// Each `*_current` field is otherwise drawn only where amneziawg-go
+    /// re-arms the corresponding timer, so a live `set=1` that changes a range
+    /// would not reach an established session: [`Tunn::update_session_timers`]
+    /// reads `keychain_expire()` fresh on every poll, but the other five would
+    /// keep the draw made under the *previous* configuration until the next
+    /// handshake. That mix is worse than either half -- a session that expires
+    /// on the new `reject_after_time` while still rekeying on the old
+    /// `rekey_after_time` never rekeys before it is dropped, and the tunnel
+    /// stalls until traffic forces a fresh handshake.
+    ///
+    /// Drawn here rather than lazily at each check because the draw *is* the
+    /// arming: see the [`Timers`] field docs for why a fresh draw per 250ms
+    /// poll would not be the distribution a range configures.
+    pub(super) fn redraw_tunable_timers(&mut self) {
+        let t = self.amnezia.timers;
+        let retransmit = t.retransmit_timeout(&mut self.handshake.rng);
+        let keepalive = t.keepalive(&mut self.handshake.rng);
+        let new_handshake = t.new_handshake_timeout(&mut self.handshake.rng);
+        let rekey_after = t.key_refresh_sending(&mut self.handshake.rng);
+        let refresh_receive = t.key_refresh_receiving(&mut self.handshake.rng);
+
+        // The attempt *limit* is re-drawn; the attempts already spent in the
+        // current cycle are not reset, or a peer could be kept retrying
+        // forever by a periodic `awg syncconf`.
+        let max_attempts = t.max_attempts(&mut self.handshake.rng);
+
+        self.timers.retransmit_current = retransmit;
+        self.timers.max_attempts_current = max_attempts;
+        self.timers.keepalive_current = keepalive;
+        self.timers.new_handshake_current = new_handshake;
+        self.timers.rekey_after_current = rekey_after;
+        self.timers.refresh_receive_current = refresh_receive;
+    }
+
     // We don't really clear the timers, but we set them to the current time to
     // so the reference time frame is the same
     fn clear_all(&mut self) {
@@ -258,7 +303,6 @@ impl Tunn {
 
         // Load timers only once:
         let session_established = self.timers[TimeSessionEstablished];
-        let handshake_started = self.timers[TimeLastHandshakeStarted];
         let aut_packet_received = self.timers[TimeLastPacketReceived];
         let aut_packet_sent = self.timers[TimeLastPacketSent];
         let data_packet_received = self.timers[TimeLastDataPacketReceived];
@@ -285,27 +329,34 @@ impl Tunn {
             }
 
             if let Some(time_init_sent) = self.handshake.timer() {
-                // Handshake Initiation Retransmission
-                if now - handshake_started >= self.timers.attempt_window_current {
-                    // After REKEY_ATTEMPT_TIME ms of trying to initiate a new handshake,
-                    // the retries give up and cease, and clear all existing packets queued
-                    // up to be sent. If a packet is explicitly queued up to be sent, then
-                    // this timer is reset. With max_handshake_attempts configured, the
-                    // window is that cycle's drawn attempt count times the
-                    // retransmission minimum -- the same identity the classic
-                    // constants satisfy (90 = 18 x 5).
-                    tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
-                    self.handshake.set_expired();
-                    self.clear_all();
-                    return TunnResult::Err(WireGuardError::ConnectionExpired);
-                }
-
+                // Handshake Initiation Retransmission.
+                //
+                // We avoid using `time` here, because it can be earlier than
+                // `time_init_sent`. Once `checked_duration_since` is stable we
+                // can use that. A handshake initiation is retried after
+                // REKEY_TIMEOUT (or a draw from the configured rekey_timeout
+                // range, made at the previous send) if a response has not been
+                // received.
                 if time_init_sent.elapsed() >= self.timers.retransmit_current {
-                    // We avoid using `time` here, because it can be earlier than `time_init_sent`.
-                    // Once `checked_duration_since` is stable we can use that.
-                    // A handshake initiation is retried after REKEY_TIMEOUT (or a
-                    // draw from the configured rekey_timeout range, made at the
-                    // previous send) if a response has not been received.
+                    // Giving up is counted, not timed, and the count is checked
+                    // here rather than beside the wall clock: a separate
+                    // give-up deadline races the retransmission one, and with a
+                    // `rekey_timeout` range wide enough that a draw exceeds it,
+                    // the race is lost before the first retry is ever sent.
+                    // Upstream reaches its own limit the same way -- inside the
+                    // retransmit handler, never in parallel with it.
+                    //
+                    // After the cycle's attempt count is used up the retries
+                    // cease and every packet queued up to be sent is cleared.
+                    // If a packet is explicitly queued up to be sent, then this
+                    // timer is reset.
+                    if self.timers.handshake_attempts >= self.timers.max_attempts_current {
+                        tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
+                        self.handshake.set_expired();
+                        self.clear_all();
+                        return TunnResult::Err(WireGuardError::ConnectionExpired);
+                    }
+
                     tracing::warn!("HANDSHAKE(REKEY_TIMEOUT)");
                     handshake_initiation_required = true;
                 }

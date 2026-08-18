@@ -458,10 +458,17 @@ impl Tunn {
     /// forcing a re-handshake would drop traffic for no benefit. Any queued
     /// pre-handshake junk is dropped, since it was generated under the previous
     /// configuration.
+    ///
+    /// The tunable timers are re-drawn for the same reason the H/S values are
+    /// pushed at all: they are cached per-arming, so without this an
+    /// established session keeps running the *previous* configuration's
+    /// deadlines while `update_session_timers` already expires it on the new
+    /// `reject_after_time`.
     pub fn set_obfuscation(&mut self, obf: ObfuscationRanges, amnezia: AmneziaConfig) {
         self.handshake.set_obfuscation(obf);
         self.amnezia = amnezia;
         self.pending_amnezia_junk = None;
+        self.redraw_tunable_timers();
     }
 
     /// Update only the MTU the content padding is clamped against.
@@ -886,18 +893,23 @@ impl Tunn {
                 tracing::debug!("Sending handshake_initiation");
 
                 // One retransmission deadline per send, like upstream's
-                // `timersHandshakeInitiated`; one give-up window per cycle,
-                // like its per-cycle `maxHandshakeAttempts` snapshot. Unset
-                // ranges return the classic constants without touching the
-                // RNG.
+                // `timersHandshakeInitiated`; one attempt limit per cycle, like
+                // its per-cycle `maxHandshakeAttempts` snapshot. Unset ranges
+                // return the classic constants without touching the RNG.
                 self.timers.retransmit_current = self
                     .amnezia
                     .timers
                     .retransmit_timeout(&mut self.handshake.rng);
                 if starting_new_handshake {
-                    self.timers.attempt_window_current =
-                        self.amnezia.timers.attempt_window(&mut self.handshake.rng);
+                    // This send is the cycle's first attempt; the limit is
+                    // drawn once here and counted against by every retry.
+                    self.timers.handshake_attempts = 1;
+                    self.timers.max_attempts_current =
+                        self.amnezia.timers.max_attempts(&mut self.handshake.rng);
                     self.timer_tick(TimerName::TimeLastHandshakeStarted);
+                } else {
+                    self.timers.handshake_attempts =
+                        self.timers.handshake_attempts.saturating_add(1);
                 }
                 self.timer_tick(TimerName::TimeLastPacketSent);
                 self.write_to_network(dst, packet_size)
@@ -3170,9 +3182,11 @@ mod tests {
         ));
     }
 
-    /// A configured max_handshake_attempts shortens the give-up window via the
-    /// attempts x rekey_timeout identity the classic constants already satisfy
-    /// (90 = 18 x 5).
+    /// A configured max_handshake_attempts caps the number of initiations.
+    ///
+    /// Counted, not timed: exactly `max_handshake_attempts` initiations go out
+    /// (the cycle's first plus its retries) and the next retransmission
+    /// deadline expires the peer instead.
     #[test]
     #[cfg(feature = "mock-instant")]
     fn a_configured_attempt_count_gives_up_early() {
@@ -3184,7 +3198,7 @@ mod tests {
         let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
         let mut dst = [0u8; 2048];
 
-        // Start a cycle; its window is 3 attempts x 2 seconds = 6 seconds.
+        // Attempt 1 of 3 starts the cycle.
         assert!(matches!(
             my_tun.format_handshake_initiation(&mut dst, false),
             TunnResult::WriteToNetwork(_)
@@ -3192,23 +3206,77 @@ mod tests {
 
         // 3 seconds in: past the configured 2-second retransmission interval
         // -- a retry the constant REKEY_TIMEOUT (5s) would not yet send.
+        // Attempt 2 of 3.
         mock_instant::thread_local::MockClock::advance(Duration::from_secs(3));
         assert!(matches!(
             my_tun.update_timers(&mut dst),
             TunnResult::WriteToNetwork(_)
         ));
 
-        // 5 seconds: two past the retry, another retransmission, still inside
-        // the window.
+        // Attempt 3 of 3.
         mock_instant::thread_local::MockClock::advance(Duration::from_secs(2));
         assert!(matches!(
             my_tun.update_timers(&mut dst),
             TunnResult::WriteToNetwork(_)
         ));
 
-        // 7 seconds: past the 6-second window, 83 seconds before
-        // REKEY_ATTEMPT_TIME would have given up.
+        // The fourth retransmission deadline: the count is used up, so the
+        // cycle expires instead of sending a fourth initiation -- 83 seconds
+        // before the classic 18-attempt limit would have given up.
         mock_instant::thread_local::MockClock::advance(Duration::from_secs(2));
+        assert!(matches!(
+            my_tun.update_timers(&mut dst),
+            TunnResult::Err(WireGuardError::ConnectionExpired)
+        ));
+    }
+
+    /// A wide `rekey_timeout` range must not eat the attempt budget.
+    ///
+    /// The give-up rule used to be a wall-clock window sized as `attempts x
+    /// rekey_timeout.lo`, while each retransmission drew from the whole range.
+    /// With `rekey_timeout = 1-20` that window is 18 seconds, which two or
+    /// three draws exhaust, so the peer expired after a couple of initiations
+    /// where every reference implementation sends eighteen. Counting attempts
+    /// removes the race: retries are bounded by the count, whatever interval
+    /// each one happens to draw.
+    ///
+    /// The range's high end is kept modest on purpose. The whole cycle still
+    /// has to finish inside `keychain_expire() * 3` (540s at the default
+    /// `reject_after_time`), which zeroes key material on its own schedule
+    /// regardless of the handshake -- 17 retries of up to 21s stay under it.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_wide_retransmission_range_still_gets_its_full_attempt_budget() {
+        let amnezia = AmneziaConfig::default().with_tunable_timers(amnezia::AwgTimers {
+            rekey_timeout: (1, 20),
+            ..amnezia::AwgTimers::default()
+        });
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let mut dst = [0u8; 2048];
+
+        assert!(matches!(
+            my_tun.format_handshake_initiation(&mut dst, false),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        // The classic count is 18 initiations: the first plus 17 retries. Step
+        // past each drawn interval so every retry is actually due.
+        for attempt in 2..=18 {
+            let wait = my_tun.timers.retransmit_current;
+            mock_instant::thread_local::MockClock::advance(wait + Duration::from_secs(1));
+            assert!(
+                matches!(
+                    my_tun.update_timers(&mut dst),
+                    TunnResult::WriteToNetwork(_)
+                ),
+                "attempt {} was cut short by the give-up rule",
+                attempt
+            );
+        }
+
+        // Only now is the budget spent.
+        let wait = my_tun.timers.retransmit_current;
+        mock_instant::thread_local::MockClock::advance(wait + Duration::from_secs(1));
         assert!(matches!(
             my_tun.update_timers(&mut dst),
             TunnResult::Err(WireGuardError::ConnectionExpired)
@@ -3256,5 +3324,192 @@ mod tests {
             their_tun.update_timers(&mut their_dst),
             TunnResult::WriteToNetwork(_)
         ));
+    }
+
+    /// A live `set_obfuscation` reaches the cached timer draws.
+    ///
+    /// The five deadlines other than key expiry are drawn where their timer
+    /// arms, so a `set=1` on a running device would otherwise leave an
+    /// established session on the *previous* configuration until its next
+    /// handshake -- while `update_session_timers` already expires it on the
+    /// new `reject_after_time`. This is not a hypothetical ordering: the
+    /// assertion below failed before `set_obfuscation` re-drew, and the
+    /// counterfactual (the same sequence with the short config present from
+    /// construction) passed, so the stale draw was the whole difference.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_live_reconfiguration_reaches_the_cached_timer_draws() {
+        // Session established under a long rekey age.
+        let long = AmneziaConfig::default().with_tunable_timers(amnezia::AwgTimers {
+            rekey_after_time: (100, 100),
+            reject_after_time: (200, 200),
+            ..amnezia::AwgTimers::default()
+        });
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake_with_amnezia(long);
+        let mut my_dst = [0u8; 2048];
+        let mut their_dst = [0u8; 2048];
+
+        // A full round trip, so the on-send rekey trigger is armed and the
+        // unanswered-data trigger is not (see the sibling tests).
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(their_tun.update_timers(&mut []), TunnResult::Done));
+        assert!(matches!(
+            my_tun.update_timers(&mut my_dst),
+            TunnResult::Done
+        ));
+        let packet = create_ipv4_udp_packet();
+        let sent = unwrap_network_packet(my_tun.encapsulate(&packet, &mut my_dst)).to_vec();
+        assert!(matches!(
+            their_tun.decapsulate(None, &sent, &mut their_dst),
+            TunnResult::WriteToTunnelV4(..)
+        ));
+        let reply = unwrap_network_packet(their_tun.encapsulate(&packet, &mut their_dst)).to_vec();
+        assert!(matches!(
+            my_tun.decapsulate(None, &reply, &mut my_dst),
+            TunnResult::WriteToTunnelV4(..)
+        ));
+
+        // The operator shortens the rekey age on the live tunnel.
+        let short = AmneziaConfig::default().with_tunable_timers(amnezia::AwgTimers {
+            rekey_after_time: (10, 10),
+            reject_after_time: (200, 200),
+            ..amnezia::AwgTimers::default()
+        });
+        let obf = my_tun.handshake.obf;
+        my_tun.set_obfuscation(obf, short);
+
+        // 21 seconds into the session: twice the new rekey age, a fifth of the
+        // old one. It must be the handshake the new config asks for, not the
+        // keepalive that also comes due around here.
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(20));
+        let data = unwrap_network_packet(my_tun.update_timers(&mut my_dst));
+        let parsed = Tunn::parse_incoming_packet(obf, &data).expect("a well-formed packet");
+        assert!(
+            matches!(parsed, Packet::HandshakeInit(_)),
+            "a live reconfiguration must reach rekey_after_current, not leave \
+             the session on the draw made under the previous configuration"
+        );
+    }
+
+    /// Each armed deadline is ONE draw: the latch guards in `timer_tick` are
+    /// what make it so.
+    ///
+    /// Without them every packet re-draws, and a deadline re-drawn against a
+    /// 250ms poll fires near the low end of its range with high probability
+    /// (first passage) instead of uniformly across it -- which is not the
+    /// distribution a range configures, and puts the RNG on the per-packet
+    /// data path besides. Upstream guards the same way (`timersDataReceived`
+    /// mods `sendKeepalive` only `if !peer.timers.sendKeepalive.IsPending()`).
+    ///
+    /// Pinned from the observable side: a latched deadline must keep the value
+    /// drawn when it armed. Deleting either guard left the suite green before
+    /// this test existed.
+    ///
+    /// Both ranges are wide *and both are set*, which is what makes the second
+    /// half discriminating: `new_handshake_timeout` is
+    /// `keepalive.hi + pick(rekey_timeout)`, so with `rekey_timeout` left unset
+    /// it is a constant and a re-draw is indistinguishable from no re-draw.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_latched_deadline_keeps_the_draw_it_armed_with() {
+        let amnezia = AmneziaConfig::default().with_tunable_timers(amnezia::AwgTimers {
+            keepalive_timeout: (3, 9),
+            rekey_timeout: (2, 40),
+            ..amnezia::AwgTimers::default()
+        });
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake_with_amnezia(amnezia);
+        let mut my_dst = [0u8; 2048];
+        let mut their_dst = [0u8; 2048];
+
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(their_tun.update_timers(&mut []), TunnResult::Done));
+
+        // One data packet mine -> theirs: their side now owes a keepalive, and
+        // the deadline it will use was drawn at this instant.
+        let packet = create_ipv4_udp_packet();
+        let sent = unwrap_network_packet(my_tun.encapsulate(&packet, &mut my_dst)).to_vec();
+        assert!(matches!(
+            their_tun.decapsulate(None, &sent, &mut their_dst),
+            TunnResult::WriteToTunnelV4(..)
+        ));
+        let armed = their_tun.timers.keepalive_current;
+        assert!(
+            (3..=9).contains(&armed.as_secs()),
+            "the armed keepalive {:?} is outside the configured 3..=9",
+            armed
+        );
+
+        // Further inbound packets re-latch an ALREADY latched keepalive. The
+        // guard is what stops each of them re-drawing the deadline.
+        for _ in 0..8 {
+            let more = unwrap_network_packet(my_tun.encapsulate(&packet, &mut my_dst)).to_vec();
+            assert!(matches!(
+                their_tun.decapsulate(None, &more, &mut their_dst),
+                TunnResult::WriteToTunnelV4(..)
+            ));
+            assert_eq!(
+                their_tun.timers.keepalive_current, armed,
+                "a packet arriving on an already-armed keepalive must not re-draw \
+                 its deadline"
+            );
+        }
+
+        // And the same holds for the unanswered-data deadline on the sending
+        // side, whose latch `timer_tick(TimeLastPacketSent)` arms.
+        let armed_new_handshake = my_tun.timers.new_handshake_current;
+        for _ in 0..8 {
+            let _ = my_tun.encapsulate(&packet, &mut my_dst);
+            assert_eq!(
+                my_tun.timers.new_handshake_current, armed_new_handshake,
+                "a send on an already-armed new-handshake latch must not re-draw \
+                 its deadline"
+            );
+        }
+    }
+
+    /// Every initiation send re-draws the retransmission interval, including a
+    /// retransmission -- upstream's `timersHandshakeInitiated` runs on each
+    /// send, not once per cycle.
+    ///
+    /// One draw per cycle would make every retry in that cycle wait the
+    /// identical interval, which is the fixed inter-packet timing the tunable
+    /// exists to remove. Moving the draw under `starting_new_handshake` left
+    /// the suite green before this test existed.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn every_initiation_send_redraws_the_retransmission_interval() {
+        let amnezia = AmneziaConfig::default().with_tunable_timers(amnezia::AwgTimers {
+            rekey_timeout: (2, 30),
+            // More attempts than the loop below consumes, so the retries are
+            // never cut short by the cycle's attempt limit.
+            max_handshake_attempts: (5_000, 5_000),
+            ..amnezia::AwgTimers::default()
+        });
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let mut dst = [0u8; 2048];
+
+        assert!(matches!(
+            my_tun.format_handshake_initiation(&mut dst, false),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(my_tun.timers.retransmit_current);
+        for _ in 0..24 {
+            // Step past whatever this send drew, so the next poll retransmits.
+            let wait = my_tun.timers.retransmit_current;
+            mock_instant::thread_local::MockClock::advance(wait + Duration::from_secs(1));
+            assert!(matches!(
+                my_tun.update_timers(&mut dst),
+                TunnResult::WriteToNetwork(_)
+            ));
+            seen.insert(my_tun.timers.retransmit_current);
+        }
+        assert!(
+            seen.len() > 1,
+            "every retransmission reused the same {:?} interval: the draw is \
+             happening once per cycle, not once per send",
+            seen
+        );
     }
 }
