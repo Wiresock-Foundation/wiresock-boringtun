@@ -3,6 +3,9 @@
 
 // For `conforming_initiation` only, and gated exactly as it is: its caller is
 // `device::probe_reply`, which does not exist without the `device` feature.
+use super::timers::{
+    KEEPALIVE_TIMEOUT, REJECT_AFTER_TIME, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT,
+};
 #[cfg(all(test, feature = "device"))]
 use super::HANDSHAKE_INIT;
 use super::{
@@ -295,6 +298,9 @@ pub struct AmneziaConfig {
     /// MTU known" -- the raw `Tunn`/FFI path, where the caller's buffer is the
     /// only bound; the device sets it from the interface MTU.
     pub(crate) content_padding_mtu: u16,
+    /// AmneziaWG 3.0 tunable timers. All-default is vanilla WireGuard: every
+    /// accessor falls back to its classic constant.
+    pub(crate) timers: AwgTimers,
 }
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
@@ -354,6 +360,129 @@ impl AmneziaPreHandshakeJunk {
     }
 }
 
+/// AmneziaWG 3.0 tunable timers, each an inclusive `(lo, hi)` range --
+/// seconds, except `max_handshake_attempts`, which counts retries. `(0, 0)` is
+/// the unset sentinel, matching amneziawg-go's `UintRange`: the classic
+/// WireGuard constant governs, so an all-default struct is byte-identical
+/// vanilla behaviour and an unset accessor never touches the RNG.
+///
+/// Each accessor reproduces which *end* of the range its amneziawg-go
+/// namesake reads (device/timers.go, confirmed against the kernel module's
+/// src/timers.c): a fresh draw where upstream calls `PickOne()` per use, the
+/// low end where it wants the deterministic minimum (the receive-refresh
+/// subtraction), the high end where it wants the most permissive bound (key
+/// expiry, and the keepalive term of the new-handshake deadline).
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct AwgTimers {
+    pub rekey_after_time: (u32, u32),
+    pub rekey_timeout: (u32, u32),
+    pub reject_after_time: (u32, u32),
+    pub keepalive_timeout: (u32, u32),
+    pub max_handshake_attempts: (u32, u32),
+}
+
+impl AwgTimers {
+    /// A fresh draw from `range` in whole seconds, or `default` when unset.
+    fn pick(range: (u32, u32), default: Duration, rng: &mut impl RngCore) -> Duration {
+        if range == (0, 0) {
+            return default;
+        }
+        Duration::from_secs(random_usize_inclusive(range.0 as usize, range.1 as usize, rng) as u64)
+    }
+
+    fn lo(range: (u32, u32), default: Duration) -> Duration {
+        if range == (0, 0) {
+            default
+        } else {
+            Duration::from_secs(range.0 as u64)
+        }
+    }
+
+    fn hi(range: (u32, u32), default: Duration) -> Duration {
+        if range == (0, 0) {
+            default
+        } else {
+            Duration::from_secs(range.1 as u64)
+        }
+    }
+
+    /// The initiator's active-rekey age: a session older than this is rekeyed
+    /// on the next send. amneziawg-go's `keyRefreshTimeoutSending`.
+    pub(crate) fn key_refresh_sending(&self, rng: &mut impl RngCore) -> Duration {
+        Self::pick(self.rekey_after_time, REKEY_AFTER_TIME, rng)
+    }
+
+    /// The initiator's last-minute rekey age on receive:
+    /// `reject - keepalive - rekey_timeout`, with upstream's exact end choices
+    /// (draw, low, low) and its `max(0, ..)` clamp as saturating subtraction.
+    /// amneziawg-go's `keyRefreshTimeoutReceiving`.
+    ///
+    /// Saturating even though [`AmneziaConfig::validate`] refuses orderings
+    /// that could go negative: the raw `Tunn` builder path does not validate,
+    /// and a `Duration` underflow is a panic that crosses the FFI boundary as
+    /// a process abort.
+    pub(crate) fn key_refresh_receiving(&self, rng: &mut impl RngCore) -> Duration {
+        Self::pick(self.reject_after_time, REJECT_AFTER_TIME, rng)
+            .saturating_sub(Self::lo(self.keepalive_timeout, KEEPALIVE_TIMEOUT))
+            .saturating_sub(Self::lo(self.rekey_timeout, REKEY_TIMEOUT))
+    }
+
+    /// The initiation retransmission interval, drawn fresh per send.
+    /// amneziawg-go's `retransmitHandshakeTimeout`.
+    pub(crate) fn retransmit_timeout(&self, rng: &mut impl RngCore) -> Duration {
+        Self::pick(self.rekey_timeout, REKEY_TIMEOUT, rng)
+    }
+
+    /// The unanswered-data deadline after which a new handshake is forced:
+    /// keepalive high end plus a fresh rekey-timeout draw. amneziawg-go's
+    /// `newHandshakeTimeout`.
+    pub(crate) fn new_handshake_timeout(&self, rng: &mut impl RngCore) -> Duration {
+        Self::hi(self.keepalive_timeout, KEEPALIVE_TIMEOUT)
+            + Self::pick(self.rekey_timeout, REKEY_TIMEOUT, rng)
+    }
+
+    /// The passive-keepalive delay, drawn fresh per arming. amneziawg-go's
+    /// `sendKeepaliveTimeout`.
+    pub(crate) fn keepalive(&self, rng: &mut impl RngCore) -> Duration {
+        Self::pick(self.keepalive_timeout, KEEPALIVE_TIMEOUT, rng)
+    }
+
+    /// The key-expiry age: the high end, the most permissive draw a peer that
+    /// re-picks inside the same range could be running. amneziawg-go's
+    /// `keychainExpireTime`.
+    pub(crate) fn keychain_expire(&self) -> Duration {
+        Self::hi(self.reject_after_time, REJECT_AFTER_TIME)
+    }
+
+    /// The give-up window for one handshake cycle.
+    ///
+    /// Upstream counts attempts (`handshakeAttempts > maxHandshakeAttempts`);
+    /// this crate's polled timer model measures a window instead, so the
+    /// configured attempt count is converted through the identity the two
+    /// models already share: the classic window is `REKEY_ATTEMPT_TIME =
+    /// MaxTimerHandshakes x REKEY_TIMEOUT` (90 = 18 x 5). A drawn attempt
+    /// count times the retransmission minimum reproduces that, and an unset
+    /// count keeps the classic constant -- vanilla behaviour untouched.
+    /// Saturating multiply: both factors are honest u32s, and their product
+    /// can exceed u64 seconds only in configurations no one can wait out.
+    pub(crate) fn attempt_window(&self, rng: &mut impl RngCore) -> Duration {
+        if self.max_handshake_attempts == (0, 0) && self.rekey_timeout == (0, 0) {
+            return REKEY_ATTEMPT_TIME;
+        }
+        let attempts = if self.max_handshake_attempts == (0, 0) {
+            (REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs()) as usize
+        } else {
+            random_usize_inclusive(
+                self.max_handshake_attempts.0 as usize,
+                self.max_handshake_attempts.1 as usize,
+                rng,
+            )
+        };
+        let per_try = Self::lo(self.rekey_timeout, REKEY_TIMEOUT).as_secs();
+        Duration::from_secs((attempts as u64).saturating_mul(per_try))
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum PacketKind {
     HandshakeInit,
@@ -383,6 +512,7 @@ impl AmneziaConfig {
             header_protection: HeaderProtectionKey::default(),
             content_padding_addition: (0, 0),
             content_padding_mtu: 0,
+            timers: AwgTimers::default(),
         }
     }
 
@@ -424,6 +554,19 @@ impl AmneziaConfig {
     pub fn with_content_padding_addition(mut self, lo: u32, hi: u32, mtu: u16) -> Self {
         self.content_padding_addition = (lo.min(hi), lo.max(hi));
         self.content_padding_mtu = mtu;
+        self
+    }
+
+    /// Replace the AmneziaWG 3.0 tunable-timer ranges wholesale.
+    ///
+    /// `(0, 0)` ranges are unset -- the classic constant governs -- so the
+    /// default [`AwgTimers`] is a no-op. Like the S sizes, the builder stores
+    /// what it is given: the floors live in [`Self::validate`], which the
+    /// device path runs on every merge, and the timer arithmetic itself
+    /// saturates, so an unvalidated raw-`Tunn` configuration misbehaves
+    /// rather than panics.
+    pub fn with_tunable_timers(mut self, timers: AwgTimers) -> Self {
+        self.timers = timers;
         self
     }
 
@@ -705,6 +848,84 @@ impl AmneziaConfig {
                     },
                 request - COOKIE_REPLY_SZ,
                 raise
+            ));
+        }
+
+        // Timer floors. These are OURS, deliberately: neither amneziawg-go's
+        // UAPI nor the kernel module's netlink validates timer values at all,
+        // so a configuration refused here *loads* on the reference
+        // implementations -- it just runs badly (a zero-second retry storm, or
+        // keys rejected while the peer's state machine still considers them
+        // fresh, which surfaces as one-way blackholing minutes later).
+        // Refusing at `awg set`, naming the numbers, is the failure the
+        // operator can act on.
+        let t = &self.timers;
+        for (label, (lo, hi)) in [
+            ("rekey_after_time", t.rekey_after_time),
+            ("rekey_timeout", t.rekey_timeout),
+            ("reject_after_time", t.reject_after_time),
+            ("keepalive_timeout", t.keepalive_timeout),
+            ("max_handshake_attempts", t.max_handshake_attempts),
+        ] {
+            // A bare `0` parses to `(0, 0)` and means "use the built-in
+            // default"; a zero *inside* a set range (`0-30`) is not unset, it
+            // is a zero-second timer the draw can land on -- for rekey_timeout
+            // an unthrottled initiation storm, for max_handshake_attempts a
+            // handshake that gives up before its first retry. amneziawg-go
+            // draws and runs these.
+            if (lo, hi) != (0, 0) && lo == 0 {
+                return Err(format!(
+                    "{} = 0-{}: a set range must not contain 0 (a bare 0 means \
+                     \"use the built-in default\"; a 0 drawn from a range is a \
+                     zero-second timer)",
+                    label, hi
+                ));
+            }
+        }
+
+        // The orderings the timer state machine depends on, checked against
+        // the worst draw of every participating range; the classic constant
+        // stands in for an unset one, so a lone shortened key is still caught.
+        let eff = |range: (u32, u32), default: Duration| -> (u64, u64) {
+            if range == (0, 0) {
+                (default.as_secs(), default.as_secs())
+            } else {
+                (u64::from(range.0), u64::from(range.1))
+            }
+        };
+        let (reject_lo, _) = eff(t.reject_after_time, REJECT_AFTER_TIME);
+        let (_, rekey_after_hi) = eff(t.rekey_after_time, REKEY_AFTER_TIME);
+        let (_, rekey_timeout_hi) = eff(t.rekey_timeout, REKEY_TIMEOUT);
+        let (_, keepalive_hi) = eff(t.keepalive_timeout, KEEPALIVE_TIMEOUT);
+
+        // A key must be replaceable before it is rejectable: the rekey that
+        // replaces a session begins at rekey_after_time and needs a
+        // rekey_timeout to complete, so a reject_after_time draw shorter than
+        // that discards keys the peer still considers live.
+        if reject_lo < rekey_after_hi + rekey_timeout_hi {
+            return Err(format!(
+                "reject_after_time can draw {}s while rekey_after_time + rekey_timeout \
+                 can draw {}s: keys would be rejected before the rekey replacing them \
+                 completes. Raise reject_after_time to at least {}, or lower \
+                 rekey_after_time/rekey_timeout.",
+                reject_lo,
+                rekey_after_hi + rekey_timeout_hi,
+                rekey_after_hi + rekey_timeout_hi
+            ));
+        }
+
+        // The last-minute rekey window is reject - keepalive - rekey_timeout;
+        // a draw combination that zeroes it turns the receive-side refresh
+        // into "rekey immediately, always".
+        if reject_lo <= keepalive_hi + rekey_timeout_hi {
+            return Err(format!(
+                "reject_after_time can draw {}s while keepalive_timeout + rekey_timeout \
+                 can draw {}s: the last-minute rekey window (reject - keepalive - \
+                 rekey_timeout) would be zero or negative. Raise reject_after_time \
+                 above {}, or lower keepalive_timeout/rekey_timeout.",
+                reject_lo,
+                keepalive_hi + rekey_timeout_hi,
+                keepalive_hi + rekey_timeout_hi
             ));
         }
 
@@ -2968,5 +3189,150 @@ mod tests {
             0,
             "a keepalive must stay empty whatever MTU is stored"
         );
+    }
+
+    /// The tunable-timer accessors reproduce upstream's end choices, fall
+    /// back to the classic constants when unset, and never draw outside a
+    /// configured range.
+    #[test]
+    fn awg_timers_draw_inside_ranges_and_default_to_the_constants() {
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+
+        // Unset: every accessor is exactly its classic constant.
+        let unset = AwgTimers::default();
+        assert_eq!(unset.key_refresh_sending(&mut rng), REKEY_AFTER_TIME);
+        assert_eq!(unset.retransmit_timeout(&mut rng), REKEY_TIMEOUT);
+        assert_eq!(unset.keepalive(&mut rng), KEEPALIVE_TIMEOUT);
+        assert_eq!(unset.keychain_expire(), REJECT_AFTER_TIME);
+        assert_eq!(
+            unset.new_handshake_timeout(&mut rng),
+            KEEPALIVE_TIMEOUT + REKEY_TIMEOUT
+        );
+        assert_eq!(
+            unset.key_refresh_receiving(&mut rng),
+            REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT
+        );
+        assert_eq!(unset.attempt_window(&mut rng), REKEY_ATTEMPT_TIME);
+
+        // Set: draws stay inside the band and genuinely vary -- a draw-once
+        // mutation collapses the set below.
+        let t = AwgTimers {
+            rekey_after_time: (20, 40),
+            rekey_timeout: (2, 4),
+            reject_after_time: (100, 120),
+            keepalive_timeout: (5, 7),
+            max_handshake_attempts: (3, 5),
+        };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let d = t.key_refresh_sending(&mut rng).as_secs();
+            assert!((20..=40).contains(&d), "draw {} outside 20..=40", d);
+            seen.insert(d);
+        }
+        assert!(seen.len() > 1, "a range must draw more than one value");
+
+        // The deliberate end choices. Expiry honours the high end (the most
+        // permissive draw a re-picking peer could be running); the receive
+        // refresh subtracts the *low* ends from a reject draw; the
+        // new-handshake deadline adds the keepalive *high* end to a
+        // rekey_timeout draw; the give-up window multiplies an attempts draw
+        // by the rekey_timeout low end.
+        assert_eq!(t.keychain_expire(), Duration::from_secs(120));
+        for _ in 0..32 {
+            let d = t.key_refresh_receiving(&mut rng).as_secs();
+            assert!(
+                (93..=113).contains(&d),
+                "refresh {} outside pick(100..=120)-5-2",
+                d
+            );
+            let w = t.attempt_window(&mut rng).as_secs();
+            assert!(
+                [6, 8, 10].contains(&w),
+                "window {} not in pick(3..=5) x 2",
+                w
+            );
+            let n = t.new_handshake_timeout(&mut rng).as_secs();
+            assert!(
+                (9..=11).contains(&n),
+                "deadline {} outside 7+pick(2..=4)",
+                n
+            );
+        }
+    }
+
+    /// Pathological ranges saturate instead of panicking.
+    ///
+    /// The raw `Tunn` builder path does not run `validate`, and a `Duration`
+    /// underflow (or a wrapped multiply) is a panic that crosses the FFI
+    /// boundary as a process abort.
+    #[test]
+    fn awg_timer_arithmetic_saturates_on_unvalidated_configs() {
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let t = AwgTimers {
+            reject_after_time: (1, 1),
+            keepalive_timeout: (500, 500),
+            rekey_timeout: (500, 500),
+            ..AwgTimers::default()
+        };
+        assert_eq!(t.key_refresh_receiving(&mut rng), Duration::from_secs(0));
+
+        let t = AwgTimers {
+            max_handshake_attempts: (u32::MAX, u32::MAX),
+            rekey_timeout: (u32::MAX, u32::MAX),
+            ..AwgTimers::default()
+        };
+        // Must not panic; the exact saturated value is irrelevant.
+        let _ = t.attempt_window(&mut rng);
+    }
+
+    /// The timer floors refuse what the reference implementations would run
+    /// badly -- and only that.
+    ///
+    /// This is a deliberate divergence: amneziawg-go and the kernel module
+    /// accept any parseable value, so a configuration refused here loads
+    /// there and misbehaves (zero-second retry storms; keys rejected while
+    /// the peer still uses them). Each floor names the numbers and both ways
+    /// out.
+    #[test]
+    fn timer_floors_refuse_zero_draws_and_broken_orderings() {
+        let check = |t: AwgTimers| AmneziaConfig::default().with_tunable_timers(t).validate();
+
+        // All-default passes, and so does a coherent tuning.
+        assert!(check(AwgTimers::default()).is_ok());
+        assert!(check(AwgTimers {
+            rekey_after_time: (30, 40),
+            reject_after_time: (60, 80),
+            ..AwgTimers::default()
+        })
+        .is_ok());
+
+        // A zero inside a set range is refused, naming the key.
+        let err = check(AwgTimers {
+            rekey_timeout: (0, 5),
+            ..AwgTimers::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("rekey_timeout"), "{}", err);
+
+        // reject_after_time shorter than the (default) rekey_after_time +
+        // rekey_timeout: keys would be rejected before the rekey replacing
+        // them completes.
+        let err = check(AwgTimers {
+            reject_after_time: (60, 80),
+            ..AwgTimers::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("rekey_after_time + rekey_timeout"), "{}", err);
+
+        // Passing the first ordering is not enough: with rekey_after lowered,
+        // a reject_after_time at exactly keepalive + rekey_timeout still
+        // zeroes the last-minute-rekey window.
+        let err = check(AwgTimers {
+            rekey_after_time: (10, 10),
+            reject_after_time: (15, 15),
+            ..AwgTimers::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("keepalive_timeout + rekey_timeout"), "{}", err);
     }
 }
