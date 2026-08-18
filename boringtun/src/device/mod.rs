@@ -415,7 +415,14 @@ impl DeviceHandle {
             dst_buf: [0u8; MAX_UDP_SIZE],
             junk_rng: ChaCha8Rng::from_rng(OsRng).expect("OsRng must seed ChaCha8"),
             probe_rng: ChaCha8Rng::from_rng(OsRng).expect("OsRng must seed ChaCha8"),
-            iface: if _i == 0 || !device.read().config.use_multi_queue {
+            // `can_add_queue`: an embedder-provided fd cannot be cloned into
+            // a new queue -- `TunSocket::new` would re-parse the decimal name
+            // and alias the same fd, no second queue, with each alias's Drop
+            // closing the one descriptor.
+            iface: if _i == 0
+                || !device.read().config.use_multi_queue
+                || !device.read().iface.can_add_queue()
+            {
                 // For the first thread use the original iface
                 Arc::clone(&device.read().iface)
             } else {
