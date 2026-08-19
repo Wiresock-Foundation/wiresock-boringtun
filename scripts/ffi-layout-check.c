@@ -21,25 +21,60 @@
 //
 // Nothing here runs; every check is a static assertion.
 
-#include <stddef.h>
+// The header comes FIRST and pulls its own dependencies, which is half the
+// check: a client translation unit that includes wireguard_ffi.h before
+// anything else must compile. Including <stddef.h> ahead of it -- as this file
+// originally did -- silently supplied the size_t that the header itself was
+// failing to declare, so the one job that compiles the header was structurally
+// blind to whether the header stands alone.
 #include "../boringtun/src/wireguard_ffi.h"
 
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-#define WG_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
-#else
-// C99 fallback: a negative-width bit-field is a constraint violation, so this
-// fails the build with the message in the type name.
-#define WG_STATIC_ASSERT(cond, msg) \
-    typedef struct { int static_assertion_failed : ((cond) ? 1 : -1); } \
-        wg_static_assert_##__LINE__##_t
+#include <stddef.h>
+
+// C11 or newer only. There was a C99 fallback here that could not work: `##`
+// suppresses expansion of its operands, so `wg_static_assert_##__LINE__##_t`
+// pastes the literal identifier `wg_static_assert___LINE___t` for every
+// assertion rather than one per line, and the second typedef of that name is a
+// constraint violation. It also dropped `msg` entirely, so the message was not
+// "in the type name" as its comment claimed. Every one of the assertions below
+// would have failed, independently of whether the ABI was correct -- a check
+// that cries wolf is worse than no check. An explicit #error says what is
+// needed instead of pretending to cope.
+#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 201112L
+#error "ffi-layout-check.c requires C11 for _Static_assert; build with -std=c11 (MSVC: /std:c11)"
 #endif
 
+#define WG_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+
+// The nested range, inside and out. `sizeof == 8` alone does not pin it:
+// swapping `lo` and `hi` leaves the size, the alignment, and every offset and
+// width in the outer struct untouched, so this file passed clean against a
+// header in which every range in the ABI was inverted. For the timers and the
+// content padding the Rust side then re-sorts the transposed pair silently, so
+// nothing downstream complains either.
 WG_STATIC_ASSERT(sizeof(struct wireguard_awg_range) == 8,
                  "wireguard_awg_range must be two uint32_t and nothing else");
+WG_STATIC_ASSERT(offsetof(struct wireguard_awg_range, lo) == 0,
+                 "lo must lead wireguard_awg_range");
+WG_STATIC_ASSERT(offsetof(struct wireguard_awg_range, hi) == 4,
+                 "hi must follow lo in wireguard_awg_range");
+WG_STATIC_ASSERT(sizeof(((struct wireguard_awg_range *)0)->lo) == 4, "lo must be uint32_t");
+WG_STATIC_ASSERT(sizeof(((struct wireguard_awg_range *)0)->hi) == 4, "hi must be uint32_t");
 
 WG_STATIC_ASSERT(sizeof(struct wireguard_awg_params) == 160,
                  "wireguard_awg_params size is the ABI version anchor; it must "
                  "match AWG_PARAMS_SIZE_VER0 and be identical on 32- and 64-bit");
+
+// Alignment as well as size, matching what `ffi::tests::awg_params_layout_is_pinned`
+// pins with `align_of`. Neither side's offsets can see it: a `#pragma pack(1)`
+// over a struct that has no padding to begin with leaves every offset and the
+// total size exactly where they are, so only an explicit alignment assertion
+// notices that the C declaration now permits an object the Rust declaration
+// does not.
+WG_STATIC_ASSERT(_Alignof(struct wireguard_awg_range) == 4,
+                 "wireguard_awg_range must stay 4-byte aligned");
+WG_STATIC_ASSERT(_Alignof(struct wireguard_awg_params) == 4,
+                 "wireguard_awg_params must stay 4-byte aligned");
 
 // EVERY field offset, not a sample. Sampling is not enough: narrowing one
 // member to uint16_t only moves the two bytes after it into padding, leaving
@@ -109,11 +144,72 @@ WG_STATIC_ASSERT(WG_FIELD_SIZE(max_handshake_attempts) == 8,
 WG_STATIC_ASSERT(WG_FIELD_SIZE(header_protection_key) == 32,
                  "header_protection_key must be 32 bytes");
 
+// `wireguard_result` and `stats` -- the two structs in this header whose size
+// really does change with the word size (16/88 on LP64, 8/80 on ILP32, because
+// both hold `size_t`), and both crossed BY VALUE as return types, which is the
+// most ABI-sensitive crossing there is. The struct this file was written for
+// cannot differ between the two, so it was the only one checked; these two,
+// which can, had no pin anywhere in the tree. Expressed relative to
+// `sizeof(size_t)` so one set of assertions holds under -m32 and -m64.
+WG_STATIC_ASSERT(sizeof(struct wireguard_result) == 2 * sizeof(size_t),
+                 "wireguard_result must be an enum and a size_t with no tail padding");
+WG_STATIC_ASSERT(offsetof(struct wireguard_result, size) == sizeof(size_t),
+                 "wireguard_result::size moved");
+WG_STATIC_ASSERT(sizeof(((struct wireguard_result *)0)->size) == sizeof(size_t),
+                 "wireguard_result::size must be size_t");
+WG_STATIC_ASSERT(sizeof(((struct wireguard_result *)0)->op) == sizeof(int),
+                 "wireguard_result::op must be a plain enum");
+
+// The five published `stats` members, pinned where they are. `reserved` is
+// deliberately NOT pinned by offset: shrinking it to make room for a new field
+// is the documented, size-preserving way to extend this struct, and an
+// offsetof(reserved) assertion would fail on exactly that safe path.
+WG_STATIC_ASSERT(offsetof(struct stats, time_since_last_handshake) == 0, "stats layout changed");
+WG_STATIC_ASSERT(offsetof(struct stats, tx_bytes) == 8, "stats::tx_bytes moved");
+WG_STATIC_ASSERT(offsetof(struct stats, rx_bytes) == 8 + sizeof(size_t), "stats::rx_bytes moved");
+WG_STATIC_ASSERT(offsetof(struct stats, estimated_loss) == 8 + 2 * sizeof(size_t),
+                 "stats::estimated_loss moved");
+WG_STATIC_ASSERT(offsetof(struct stats, estimated_rtt) == 12 + 2 * sizeof(size_t),
+                 "stats::estimated_rtt moved");
+WG_STATIC_ASSERT(sizeof(((struct stats *)0)->time_since_last_handshake) == 8,
+                 "stats::time_since_last_handshake must be int64_t");
+WG_STATIC_ASSERT(sizeof(((struct stats *)0)->tx_bytes) == sizeof(size_t),
+                 "stats::tx_bytes must be size_t");
+WG_STATIC_ASSERT(sizeof(((struct stats *)0)->rx_bytes) == sizeof(size_t),
+                 "stats::rx_bytes must be size_t");
+WG_STATIC_ASSERT(sizeof(((struct stats *)0)->estimated_loss) == 4,
+                 "stats::estimated_loss must be float");
+WG_STATIC_ASSERT(sizeof(((struct stats *)0)->estimated_rtt) == 4,
+                 "stats::estimated_rtt must be int32_t");
+// `reserved`'s WIDTH, which the total below cannot see. `stats` has tail
+// padding on both word sizes, so shrinking `reserved` by up to seven bytes
+// leaves `sizeof(struct stats)` exactly where it was: `uint8_t reserved[55]`
+// compiles clean here under both -m32 and -m64. The Rust counterpart already
+// asserts this width, so without it a header-only edit passes CI while the
+// identical Rust edit fails -- the one-sided blindness this file exists to
+// remove, pointing the other way. (Found by mutating the header and watching
+// the check pass.)
+WG_STATIC_ASSERT(sizeof(((struct stats *)0)->reserved) == 56,
+                 "stats::reserved must be 56 bytes; tail padding hides a shrink from sizeof");
+// The rule `reserved`'s comment states -- "decrement appropriately when adding
+// new fields" -- made mechanical. The TOTAL is what must not move: 88 bytes on
+// LP64, 80 on ILP32. Adding a field and shrinking `reserved` to match keeps
+// this true, which is the whole point; adding one without shrinking `reserved`
+// grows a struct both sides hardcode the size of, and fails here. (The safe
+// path does still require editing the `reserved` width above, here and in the
+// Rust test -- deliberately, so the new field cannot land on one side only.)
+WG_STATIC_ASSERT(sizeof(struct stats) == 16 + 2 * sizeof(size_t) + 56,
+                 "stats total size must not change; decrement reserved when adding a field");
+
 // The declaration the client links against. Taking its address is enough to
 // require that it exists with exactly this signature.
 static struct wireguard_tunnel *(*const check_ctor)(
     const char *, const char *, const char *, uint16_t, uint32_t,
     const struct wireguard_awg_params *, const char *) = new_tunnel_with_awg_params;
 
-// Referenced so no compiler warns it is unused; never called.
-const void *wg_ffi_layout_check_anchor(void) { return (const void *)check_ctor; }
+// Referenced so no compiler warns it is unused; never called. Returns the
+// address OF the pointer, not the pointer cast to void*: converting a function
+// pointer to an object pointer is not conforming C (ISO C 6.3.2.3 covers only
+// object pointers), and -Wpedantic diagnoses it -- an odd thing to leave in the
+// one file whose job is to police conformance.
+const void *wg_ffi_layout_check_anchor(void) { return (const void *)&check_ctor; }

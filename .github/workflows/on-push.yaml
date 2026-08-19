@@ -85,10 +85,36 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install 32-bit C support
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib
-      - name: Check the C header against the pinned ABI layout (64-bit)
-        run: gcc -m64 -std=c11 -Wall -Wextra -Werror -c scripts/ffi-layout-check.c -o /dev/null
-      - name: Check the C header against the pinned ABI layout (32-bit)
-        run: gcc -m32 -std=c11 -Wall -Wextra -Werror -c scripts/ffi-layout-check.c -o /dev/null
+      # `-Wpedantic` because the file goes out of its way to be conforming --
+      # it takes the address OF the function pointer rather than casting the
+      # pointer itself, since function-to-object-pointer conversion is not
+      # conforming C -- and without the flag that care was a claim in a comment
+      # rather than something the job checks.
+      - name: Check the C header against the pinned ABI layout (64- and 32-bit)
+        run: |
+          gcc -m64 -std=c11 -Wall -Wextra -Wpedantic -Werror -c scripts/ffi-layout-check.c -o /dev/null
+          gcc -m32 -std=c11 -Wall -Wextra -Wpedantic -Werror -c scripts/ffi-layout-check.c -o /dev/null
+      # The consumer this header is written for is a C++ product, so "a client
+      # translation unit that includes wireguard_ffi.h must compile" has to
+      # mean C++ as well. Compiling is only half of it: without the header's
+      # `extern "C"` guard a C++ TU still compiles and then fails to link,
+      # because the names come out mangled and can never match the Rust
+      # `#[no_mangle]` exports. So the undefined symbols are inspected too --
+      # verified by removing the guard, which turns both references mangled.
+      - name: Check the header is usable from C++, with C linkage (64- and 32-bit)
+        run: |
+          for bits in 64 32; do
+            g++ -m$bits -std=c++17 -Wall -Wextra -Werror \
+              -c scripts/ffi-header-cpp-check.cpp -o "/tmp/cpp$bits.o"
+            if nm -u "/tmp/cpp$bits.o" | grep -qE '_Z[0-9]+new_tunnel'; then
+              echo "::error::wireguard_ffi.h declarations are C++-mangled at -m$bits;" \
+                   "the extern \"C\" guard is missing or unbalanced"
+              nm -u "/tmp/cpp$bits.o" | grep '_Z' || true
+              exit 1
+            fi
+            nm -u "/tmp/cpp$bits.o" | grep -q 'U new_tunnel_with_awg_params' || {
+              echo "::error::new_tunnel_with_awg_params is not referenced at -m$bits"; exit 1; }
+          done
 
   # The WireSock client builds the i686/x86_64 Windows targets with Rust 1.75,
   # the last toolchain that supports Windows 7 (declared as rust-version in

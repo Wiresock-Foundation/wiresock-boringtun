@@ -5,6 +5,18 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h> // size_t, used by wireguard_result and stats below
+
+// Every declaration here is `extern "C"` in the Rust library. Without this
+// guard a C++ translation unit that includes the header directly mangles the
+// names and fails to link -- and the consumer this header is written for is a
+// C++ product, so the only reason it has not bitten is that callers have been
+// wrapping the include themselves. A nested `extern "C"` is harmless, so doing
+// it here breaks nothing that already works.
+#ifdef __cplusplus
+extern "C"
+{
+#endif
 
 struct wireguard_tunnel; // This corresponds to the Rust type
 
@@ -382,6 +394,21 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_junk_imitation_browser(
 /// {0, 0} is the unset sentinel, exactly as it is in the AmneziaWG UAPI and on
 /// the wire: the built-in default governs and nothing is drawn. A degenerate
 /// range (lo == hi) is a fixed value.
+///
+/// {lo, 0} AND lo > hi MEAN DIFFERENT THINGS PER FIELD. One type, but the
+/// destination decides:
+///
+///   * h1_init..h4_data: {n, 0} with n != 0 is the FIXED tag n -- not "n and
+///     above", and not unset -- and lo > hi is a hard error naming the field.
+///   * everything else -- content_padding_addition and the five timers -- is
+///     normalised to (min, max), so lo > hi is silently accepted as the swapped
+///     range, and {n, 0} becomes (0, n), which is NOT the unset sentinel. For
+///     the four DURATION timers that is then rejected as "a set range must not
+///     contain 0", naming a range you never wrote. For max_handshake_attempts
+///     (a count) and content_padding_addition nothing complains at all: {9, 0}
+///     silently becomes a value drawn from 0..=9 where you meant a fixed 9.
+///
+/// Write lo <= hi, or {0, 0} for unset, and none of this applies.
 struct wireguard_awg_range
 {
     uint32_t lo;
@@ -403,7 +430,9 @@ struct wireguard_awg_range
 ///
 /// That is what lets this struct grow without another entry point. A struct
 /// SMALLER than the library knows is a caller built against an older header;
-/// the missing tail reads as unset. A LARGER one is accepted only if every byte
+/// the missing tail reads as unset -- but it must be a size this library
+/// actually published, not merely a smaller one, since a value landing inside a
+/// field would copy that field in half. A LARGER one is accepted only if every byte
 /// past what the library understands is zero -- i.e. the caller is not using
 /// the newer fields. If any is non-zero the call fails rather than silently
 /// dropping a parameter that was set: a discarded header-protection key would
@@ -429,6 +458,14 @@ struct wireguard_awg_params
 
     /// Jc/Jmin/Jmax/Jd: the pre-handshake junk burst -- packet count, size
     /// bounds, and the delay between packets in milliseconds.
+    ///
+    /// BOUNDED, and out of bounds is a refused constructor, not a clamp:
+    /// junk_packet_count <= 128, junk_packet_delay_ms <= 200, and a size pair
+    /// that is either {0, 0} (meaning "use the defaults") or satisfies
+    /// 1 <= min <= max <= 1280. Anything else would be silently rewritten --
+    /// a count of 200 becomes 0, switching the burst off entirely -- so
+    /// new_tunnel_with_awg_params refuses it instead. With junk_packet_count
+    /// == 0 there is no burst, so the sizes and the delay are unread.
     uint32_t junk_packet_count;
     uint32_t junk_packet_size_min;
     uint32_t junk_packet_size_max;
@@ -482,10 +519,25 @@ struct wireguard_awg_params
 /// protocols that do not carry a hostname.
 ///
 /// Unlike the constructors above, the whole configuration is validated before a
-/// tunnel exists: parameters that could never emit a valid datagram, or timers
-/// ordered so that keys would be rejected before the rekey replacing them
-/// completes, fail here rather than becoming a tunnel that silently never
-/// works.
+/// tunnel exists, and a failure is a NULL return rather than a tunnel that
+/// silently never works. Three classes are refused:
+///
+///   * parameters that could never emit a valid datagram, or that would be
+///     silently rewritten into a different configuration -- an out-of-range
+///     junk burst (Jc/Jmin/Jmax/Jd), or an imitation_domain that is not a valid
+///     hostname for the imitated protocol. This class is stricter here than
+///     elsewhere in the library: the UAPI set=1 path takes the silent rewrite,
+///     so a profile refused here can still load in boringtun-cli. Refusing is
+///     the point -- the rewrite is invisible until someone takes a capture;
+///   * timers ordered so that keys would be rejected before the rekey replacing
+///     them completes;
+///   * S-value combinations that make the cookie reply larger than the request
+///     it answers, i.e. an amplification reflector. THIS ONE IS POLICY, NOT
+///     IMPOSSIBILITY: the AmneziaWG kernel module runs those profiles, weakly
+///     reflecting, and so do the constructors above. It matches what the UAPI
+///     set=1 path applies, but a caller migrating a working profile off a
+///     legacy constructor can meet it. The binding constraint is
+///     s3_cookie_junk <= s2_response_junk + 28.
 ///
 /// Returns NULL on failure, with the reason in last_tunnel_error().
 struct wireguard_tunnel *new_tunnel_with_awg_params(
@@ -493,7 +545,7 @@ struct wireguard_tunnel *new_tunnel_with_awg_params(
                                     const char *server_static_public,
                                     const char *preshared_key,
                                     uint16_t keep_alive,
-                                    uint32_t index,
+                                    uint32_t index, // The 24bit index prefix for session indexes
                                     const struct wireguard_awg_params *params,
                                     const char *imitation_domain);
 
@@ -530,3 +582,7 @@ struct wireguard_result wireguard_force_handshake(const struct wireguard_tunnel 
                                                   uint32_t dst_size);
 
 struct stats wireguard_stats(const struct wireguard_tunnel *tunnel);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif

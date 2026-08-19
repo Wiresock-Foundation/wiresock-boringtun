@@ -332,7 +332,7 @@ pub unsafe extern "C" fn new_tunnel(
     )
 }
 
-// The shared body of the six `extern "C"` tunnel constructors below, which
+// The shared body of the seven `extern "C"` tunnel constructors below, which
 // take these values as scalars because a C caller cannot pass a Rust type.
 // Collapsing the list here would only move the widening one frame outward.
 #[allow(clippy::too_many_arguments)]
@@ -881,6 +881,28 @@ pub unsafe extern "C" fn new_tunnel_with_amnezia_junk_imitation_browser(
 /// on the wire: the built-in default governs and nothing is drawn. A degenerate
 /// range (`lo == hi`) is a fixed value.
 ///
+/// # `{lo, 0}` and `lo > hi` mean different things per field
+///
+/// One type, but the destination decides, and the difference is observable:
+///
+/// * **H1-H4** go to `ObfuscationRanges::new`, where `{n, 0}` with `n != 0` is
+///   the *fixed tag* `n` (not "n and above", and not unset), and `lo > hi` is a
+///   hard error naming the field.
+/// * **Everything else** -- `content_padding_addition` and the five timers --
+///   is normalised with `(lo.min(hi), lo.max(hi))`, so `lo > hi` is silently
+///   accepted as the swapped range and `{n, 0}` becomes `(0, n)`, which is
+///   *not* the unset sentinel. For the four *duration* timers `validate` then
+///   rejects it as "a set range must not contain 0", naming a range the caller
+///   never wrote. For `max_handshake_attempts` (a count, deliberately excluded
+///   from that rule) and for `content_padding_addition` (which `validate` never
+///   inspects) nothing complains at all: `{9, 0}` becomes a value drawn from
+///   `0..=9`, where the caller meant the fixed 9.
+///
+/// Write `{lo, hi}` with `lo <= hi`, or `{0, 0}` for unset, and none of this
+/// applies. The asymmetry is inherited from the two core types and is recorded
+/// here because a caller reading only the first paragraph would get `{n, 0}`
+/// wrong in every destination but H1-H4, and silently in two of them.
+///
 /// Deliberately not a packed scalar. amneziawg-tools packs its equivalents into
 /// a `uint32`/`uint64` (`u16_range_t`, `u32_range_t`), which saves nothing here
 /// and costs a caller the chance to get the halves the wrong way round.
@@ -914,7 +936,10 @@ impl From<wireguard_awg_range> for (u32, u32) {
 ///
 /// * A **smaller** struct than the library knows is a caller built against an
 ///   older header. The missing tail is read as zero, i.e. unset, which is the
-///   same thing that header's author asked for.
+///   same thing that header's author asked for. It must be a size this library
+///   has actually *published*, not merely a smaller one: a value landing inside
+///   a field would copy that field's leading bytes and zero the rest, which for
+///   a key is a tunnel mutually unreachable with its peer.
 /// * A **larger** struct is a caller built against a newer header. It is
 ///   accepted only if every byte past what this library understands is zero --
 ///   a caller that is not using the new fields. If any of them is non-zero the
@@ -932,7 +957,7 @@ impl From<wireguard_awg_range> for (u32, u32) {
 /// domain is a string and is passed as its own argument for that reason.
 #[allow(non_camel_case_types)]
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+#[derive(Default, Copy, Clone, PartialEq, Eq)]
 pub struct wireguard_awg_params {
     /// `sizeof(struct wireguard_awg_params)`. See the versioning note above.
     pub size: u32,
@@ -946,6 +971,16 @@ pub struct wireguard_awg_params {
 
     /// Jc/Jmin/Jmax/Jd: the pre-handshake junk burst -- packet count, size
     /// bounds, and the delay between packets in milliseconds.
+    ///
+    /// Bounded, and out of bounds is a *refused constructor*, not a clamp:
+    /// `junk_packet_count <= 128`, `junk_packet_delay_ms <= 200`, and a size
+    /// pair that is either `{0, 0}` (meaning "use the defaults") or satisfies
+    /// `1 <= min <= max <= 1280`. The underlying builder substitutes silently
+    /// for anything else -- a count of 200 becomes 0, switching the burst off
+    /// entirely -- which is the failure this entry point exists to turn into an
+    /// error. With `junk_packet_count == 0` there is no burst, so the sizes and
+    /// the delay are unread and unchecked. The limits are pinned by
+    /// `ffi::tests::awg_params_junk_bounds_are_where_the_docs_say`.
     pub junk_packet_count: u32,
     pub junk_packet_size_min: u32,
     pub junk_packet_size_max: u32,
@@ -990,6 +1025,82 @@ pub struct wireguard_awg_params {
     pub header_protection_key: [u8; 32],
 }
 
+impl std::fmt::Debug for wireguard_awg_params {
+    /// Never prints `header_protection_key`, only whether one is set.
+    ///
+    /// Hand-written for the same reason `HeaderProtectionKey`'s impl is: the key
+    /// is shared secret material, and this struct is `pub`, so a derived `Debug`
+    /// would put all 32 bytes into any log line that formats a caller's
+    /// parameters -- including the panic message of a failing `assert_eq!` on
+    /// two of these. `HeaderProtectionKey` exists to keep the key out of
+    /// `AmneziaConfig`'s derived `Debug`; deriving it here would have reopened
+    /// that hole one struct earlier in the pipeline.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured, not read field by field: a field added to the struct
+        // and not listed here is then a compile error rather than a field that
+        // silently stops appearing in diagnostics. Same idiom, and same reason,
+        // as the exhaustive `match` in `AmneziaImitationProtocol::as_str`.
+        let Self {
+            size: _,
+            s1_init_junk: _,
+            s2_response_junk: _,
+            s3_cookie_junk: _,
+            s4_transport_junk: _,
+            junk_packet_count: _,
+            junk_packet_size_min: _,
+            junk_packet_size_max: _,
+            junk_packet_delay_ms: _,
+            h1_init: _,
+            h2_resp: _,
+            h3_cookie: _,
+            h4_data: _,
+            imitation_protocol: _,
+            imitation_browser: _,
+            content_padding_addition: _,
+            content_padding_mtu: _,
+            rekey_after_time: _,
+            rekey_timeout: _,
+            reject_after_time: _,
+            keepalive_timeout: _,
+            max_handshake_attempts: _,
+            header_protection_key: _,
+        } = self;
+
+        f.debug_struct("wireguard_awg_params")
+            .field("size", &self.size)
+            .field("s1_init_junk", &self.s1_init_junk)
+            .field("s2_response_junk", &self.s2_response_junk)
+            .field("s3_cookie_junk", &self.s3_cookie_junk)
+            .field("s4_transport_junk", &self.s4_transport_junk)
+            .field("junk_packet_count", &self.junk_packet_count)
+            .field("junk_packet_size_min", &self.junk_packet_size_min)
+            .field("junk_packet_size_max", &self.junk_packet_size_max)
+            .field("junk_packet_delay_ms", &self.junk_packet_delay_ms)
+            .field("h1_init", &self.h1_init)
+            .field("h2_resp", &self.h2_resp)
+            .field("h3_cookie", &self.h3_cookie)
+            .field("h4_data", &self.h4_data)
+            .field("imitation_protocol", &self.imitation_protocol)
+            .field("imitation_browser", &self.imitation_browser)
+            .field("content_padding_addition", &self.content_padding_addition)
+            .field("content_padding_mtu", &self.content_padding_mtu)
+            .field("rekey_after_time", &self.rekey_after_time)
+            .field("rekey_timeout", &self.rekey_timeout)
+            .field("reject_after_time", &self.reject_after_time)
+            .field("keepalive_timeout", &self.keepalive_timeout)
+            .field("max_handshake_attempts", &self.max_handshake_attempts)
+            .field(
+                "header_protection_key",
+                &if self.header_protection_key.iter().any(|&b| b != 0) {
+                    "set"
+                } else {
+                    "unset"
+                },
+            )
+            .finish()
+    }
+}
+
 /// The size of the first published version of [`wireguard_awg_params`].
 ///
 /// A caller may pass a struct this small forever; the tail it does not have is
@@ -997,6 +1108,69 @@ pub struct wireguard_awg_params {
 /// cannot silently redefine what "the original struct" was and start rejecting
 /// callers built against it.
 const AWG_PARAMS_SIZE_VER0: usize = 160;
+
+/// Every size of [`wireguard_awg_params`] that has ever been published.
+///
+/// A caller's `size` must be one of these, or at least this build's own size (a
+/// newer header, governed by the zero-tail rule). An arbitrary value *between*
+/// two published sizes is refused, because the copy clamp would cut a member in
+/// half: once a field is appended, a `size` landing inside it copies that
+/// field's leading bytes and leaves the rest zero. For a key that is a tunnel
+/// mutually unreachable with its peer and no diagnostic anywhere -- exactly the
+/// outcome the zero-tail rule refuses in the other direction.
+const AWG_PARAMS_PUBLISHED_SIZES: [usize; 1] = [AWG_PARAMS_SIZE_VER0];
+
+/// The largest `size` this build will read.
+///
+/// `size` is four bytes of foreign memory, and it is the *only* bound the
+/// unknown-tail scan has. Without a ceiling, a caller who wrote
+/// `struct wireguard_awg_params p;` and forgot `p.size = sizeof(p)` hands over
+/// stack garbage, and `slice::from_raw_parts` is asked for up to 4 GiB past a
+/// 160-byte object: a segfault on x86_64, and above `isize::MAX` undefined
+/// behaviour outright on the i686 build this crate ships.
+///
+/// This bounds the damage rather than eliminating it: garbage that happens to
+/// land in `[AWG_PARAMS_SIZE_VER0, AWG_PARAMS_SIZE_MAX]` is still read past the
+/// caller's object, and the ABI's contract -- `params` points to `params->size`
+/// readable bytes -- is the only thing that can rule that out. What the ceiling
+/// buys is that the *unbounded* case, which no contract can survive, becomes
+/// the same named refusal every other malformed input gets. Kept close to the
+/// struct (6x today's size, room for many releases) so the window is a few
+/// hundred bytes rather than four gigabytes.
+const AWG_PARAMS_SIZE_MAX: usize = 1024;
+
+/// The ceiling has to stay above the struct it bounds, and nothing about the
+/// two numbers makes that automatic: one is a literal chosen for the size of
+/// the damage window, the other grows every time a field is appended. If the
+/// struct ever passed the ceiling, `read_awg_params` would reject *every*
+/// caller -- including one that did exactly what the header says, `p.size =
+/// sizeof(p)` -- with a message blaming them for an uninitialised field. A
+/// build failure at the moment the field is added is the only warning that
+/// arrives in time.
+const _: () = assert!(AWG_PARAMS_SIZE_MAX > std::mem::size_of::<wireguard_awg_params>());
+
+/// Likewise, this build's own size must be a size we have published, or the
+/// short-struct path refuses callers built against the current header. It
+/// holds trivially today (the table is `[AWG_PARAMS_SIZE_VER0]` and that is
+/// this build's size) and stops holding the moment a field is appended --
+/// which is exactly when the table needs the old size added to it, and the
+/// only repair that makes this compile again.
+const _: () = assert!(awg_params_size_is_published(std::mem::size_of::<
+    wireguard_awg_params,
+>()));
+
+/// `AWG_PARAMS_PUBLISHED_SIZES.contains`, as a `const fn` so the assertion
+/// above can run at compile time (`slice::contains` is not const on MSRV).
+const fn awg_params_size_is_published(size: usize) -> bool {
+    let mut i = 0;
+    while i < AWG_PARAMS_PUBLISHED_SIZES.len() {
+        if AWG_PARAMS_PUBLISHED_SIZES[i] == size {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
 
 /// How many of a caller's bytes to copy: never more than they passed, never
 /// more than this build understands.
@@ -1007,12 +1181,25 @@ const AWG_PARAMS_SIZE_VER0: usize = 160;
 /// exercised through [`read_awg_params`]. Extracting it makes the promise
 /// testable now rather than in the release that first depends on it -- when
 /// getting it wrong would read past a caller's allocation.
-const fn awg_params_copy_len(caller_size: usize, our_size: usize) -> usize {
-    if caller_size < our_size {
-        caller_size
-    } else {
-        our_size
-    }
+fn awg_params_copy_len(caller_size: usize, our_size: usize) -> usize {
+    caller_size.min(our_size)
+}
+
+/// May a caller's `size` be read at all, given what this build understands?
+///
+/// This build's own size and anything above it are fine -- the zero-tail rule
+/// governs those. A *shorter* size must be one this library actually published:
+/// [`awg_params_copy_len`] would otherwise copy a member in half, leaving its
+/// leading bytes set and the rest zero, which for a key is a tunnel mutually
+/// unreachable with its peer and no diagnostic anywhere.
+///
+/// Split out for the same reason `awg_params_copy_len` is, and it needs it
+/// more: while `AWG_PARAMS_SIZE_VER0 == our_size` no size is both valid and
+/// short, so [`read_awg_params`] cannot reach this rule and deleting it outright
+/// leaves every other test green. A pure function can be pinned now instead of
+/// in the release that first depends on it.
+fn awg_params_size_is_readable(caller_size: usize, our_size: usize) -> bool {
+    caller_size >= our_size || AWG_PARAMS_PUBLISHED_SIZES.contains(&caller_size)
 }
 
 /// Read a caller's [`wireguard_awg_params`] of any published size.
@@ -1037,6 +1224,34 @@ unsafe fn read_awg_params(params: *const wireguard_awg_params) -> Option<wiregua
             "Invalid AmneziaWG parameters: size is {}, which is smaller than the {}-byte \
              minimum; set params.size = sizeof(struct wireguard_awg_params)",
             caller_size, AWG_PARAMS_SIZE_VER0
+        ));
+        return None;
+    }
+
+    // Bound `size` from above before it is used as a length. See
+    // `AWG_PARAMS_SIZE_MAX`: an uninitialised `size` is the same caller mistake
+    // the floor above catches, and it must not be the one that reads 4 GiB.
+    if caller_size > AWG_PARAMS_SIZE_MAX {
+        set_last_error(&format!(
+            "Invalid AmneziaWG parameters: size is {}, which exceeds the {}-byte maximum this \
+             library will read -- the field is almost certainly uninitialised; set \
+             params.size = sizeof(struct wireguard_awg_params)",
+            caller_size, AWG_PARAMS_SIZE_MAX
+        ));
+        return None;
+    }
+
+    // A short struct must be a size we actually published, not merely a size
+    // above the floor: the clamp below copies `caller_size` bytes, and a size
+    // landing inside a field would copy that field in half. Unreachable while
+    // `AWG_PARAMS_SIZE_VER0 == our_size`; it becomes the load-bearing check the
+    // first time a field is appended.
+    if !awg_params_size_is_readable(caller_size, our_size) {
+        set_last_error(&format!(
+            "Invalid AmneziaWG parameters: size is {}, which is not a published size of struct \
+             wireguard_awg_params (this build understands {}); a size between two versions \
+             would copy a field in half",
+            caller_size, our_size
         ));
         return None;
     }
@@ -1132,24 +1347,138 @@ fn awg_params_to_config(
         AmneziaImitationBrowser::Default
     };
 
-    Some(
-        AmneziaConfig::new(s1, s2, s3, s4)
-            .with_pre_handshake_junk(jc, jmin, jmax, jd)
-            .with_protocol_imitation_browser(protocol, imitation_domain, browser)
-            .with_header_protection(p.header_protection_key)
-            .with_content_padding_addition(
-                p.content_padding_addition.lo,
-                p.content_padding_addition.hi,
-                mtu,
-            )
-            .with_tunable_timers(AwgTimers {
-                rekey_after_time: p.rekey_after_time.into(),
-                rekey_timeout: p.rekey_timeout.into(),
-                reject_after_time: p.reject_after_time.into(),
-                keepalive_timeout: p.keepalive_timeout.into(),
-                max_handshake_attempts: p.max_handshake_attempts.into(),
-            }),
-    )
+    // A transposed range is refused, not re-sorted.
+    //
+    // `with_content_padding_addition` and `with_tunable_timers` both normalize
+    // `lo > hi` on the way in, which is right for them: they are the crate's
+    // long-standing builders and an embedder relies on that leniency. It is
+    // wrong here. This entry point exists because a positional argument list
+    // long enough to transpose two same-typed values is a silent
+    // misconfiguration, and a struct whose halves can be typed the wrong way
+    // round reproduces exactly that hazard one level down -- `{40, 30}` for a
+    // timer is the same slip as passing `hi` before `lo`, and the crate's own
+    // UAPI refuses it (`parse_uint_range` returns None on `start > end`, as
+    // amneziawg-go's `UintRange::FromString` does). The adapter already
+    // refuses a transposed junk *size* pair a few lines above; these six were
+    // the inconsistency.
+    //
+    // A brand-new interface with no callers can afford the strict answer.
+    for (label, range) in [
+        ("content_padding_addition", p.content_padding_addition),
+        ("rekey_after_time", p.rekey_after_time),
+        ("rekey_timeout", p.rekey_timeout),
+        ("reject_after_time", p.reject_after_time),
+        ("keepalive_timeout", p.keepalive_timeout),
+        ("max_handshake_attempts", p.max_handshake_attempts),
+    ] {
+        if range.lo > range.hi {
+            set_last_error(&format!(
+                "Invalid AmneziaWG parameters: {} is {{{}, {}}}, whose lo exceeds its hi. Note \
+                 that unlike h1_init..h4_data, {{n, 0}} is not a fixed value here -- write \
+                 {{n, n}} for a fixed value, or {{0, 0}} to leave it unset",
+                label, range.lo, range.hi
+            ));
+            return None;
+        }
+    }
+
+    // Padding with no MTU is unbounded padding.
+    //
+    // `content_padding_mtu == 0` means "no MTU known", and `content_padding`
+    // then skips both of its clamps -- the drawn amount is limited only by the
+    // caller's `dst` buffer, which is `MAX_UDP_SIZE` in every real embedder.
+    // A full-size packet grows past the link and fragments or blackholes,
+    // which is precisely the `EMSGSIZE` the clamp exists to prevent. The
+    // device path never meets this because it always feeds the interface MTU;
+    // the FFI is the only path where an active range can meet a zero MTU, so
+    // the caller has to say what their link carries.
+    if p.content_padding_addition != wireguard_awg_range::default() && mtu == 0 {
+        set_last_error(
+            "Invalid AmneziaWG parameters: content_padding_addition is set but \
+             content_padding_mtu is 0, which disables the clamp that keeps a padded packet \
+             inside the link MTU -- set content_padding_mtu to the tunnel MTU",
+        );
+        return None;
+    }
+
+    let domain_supplied = imitation_domain.is_some();
+
+    let config = AmneziaConfig::new(s1, s2, s3, s4)
+        .with_pre_handshake_junk(jc, jmin, jmax, jd)
+        .with_protocol_imitation_browser(protocol, imitation_domain, browser)
+        .with_header_protection(p.header_protection_key)
+        .with_content_padding_addition(
+            p.content_padding_addition.lo,
+            p.content_padding_addition.hi,
+            mtu,
+        )
+        .with_tunable_timers(AwgTimers {
+            rekey_after_time: p.rekey_after_time.into(),
+            rekey_timeout: p.rekey_timeout.into(),
+            reject_after_time: p.reject_after_time.into(),
+            keepalive_timeout: p.keepalive_timeout.into(),
+            max_handshake_attempts: p.max_handshake_attempts.into(),
+        });
+
+    // `AmneziaPreHandshakeJunk::new` substitutes silently rather than failing:
+    // a Jc above its ceiling becomes 0 -- the burst switched off entirely --
+    // and an out-of-range or transposed size pair becomes the built-in default.
+    // `size16` above only rejects values past `u16::MAX`, so the API was louder
+    // about `junk_packet_count = 70000` than about the likelier and far more
+    // damaging `200`. The bounds are private to `noise::amnezia`, so the check
+    // is "did the value survive?" rather than a second copy of the constants.
+    //
+    // Two allowances, both matching what the burst actually reads:
+    //   * `(jmin, jmax) == (0, 0)` is a real request for the defaults, so only
+    //     a size pair the caller actually set is held to this;
+    //   * with `jc == 0` there is no burst, and neither the sizes nor the delay
+    //     are ever read, so an out-of-range value in them is inert rather than
+    //     a silently different configuration.
+    let junk = &config.pre_handshake_junk;
+    let burst = jc != 0;
+    let junk_substituted = junk.packet_count != jc
+        || (burst && junk.packet_delay_ms != jd)
+        || (burst
+            && (jmin, jmax) != (0, 0)
+            && (junk.packet_size_min, junk.packet_size_max) != (jmin, jmax));
+    if junk_substituted {
+        set_last_error(&format!(
+            "Invalid AmneziaWG parameters: the pre-handshake junk burst (junk_packet_count = \
+             {}, junk_packet_size_min = {}, junk_packet_size_max = {}, junk_packet_delay_ms = \
+             {}) is outside the supported bounds and would have been silently replaced by ({}, \
+             {}, {}, {})",
+            jc,
+            jmin,
+            jmax,
+            jd,
+            junk.packet_count,
+            junk.packet_size_min,
+            junk.packet_size_max,
+            junk.packet_delay_ms
+        ));
+        return None;
+    }
+
+    // The same rule for the imitation domain. Refusing only non-UTF-8 (in
+    // `new_tunnel_with_awg_params`) closed the rarest case and left the common
+    // one: a perfectly decodable hostname that fails the validator its protocol
+    // uses -- the strict LDH `is_valid_imitation_host` for DNS and SIP, the far
+    // looser `is_valid_quic_sni` for QUIC -- is dropped by
+    // `AmneziaImitation::new` and replaced with a randomly generated name at
+    // emit time. Asking the config what survived, rather than re-deciding here,
+    // is what keeps this correct for both: an underscore is fatal to a DNS
+    // QNAME and fine in a TLS SNI. `uses_domain` separates all of that from
+    // "this protocol carries no hostname, so the domain was never going to be
+    // used".
+    if domain_supplied && protocol.uses_domain() && config.imitation.domain().is_none() {
+        set_last_error(
+            "Invalid Amnezia imitation domain: not a valid hostname for this protocol -- it \
+             would have been replaced by a randomly generated one",
+        );
+        return None;
+    }
+
+    Some(config)
 }
 
 /// Allocate a new tunnel from a full set of AmneziaWG parameters.
@@ -1164,12 +1493,34 @@ fn awg_params_to_config(
 /// [`wireguard_awg_params`]. `imitation_domain` may be NULL, and is ignored by
 /// the protocols that do not carry a hostname.
 ///
+/// `index` is the **24-bit** prefix for session indexes, as it is in
+/// [`new_tunnel`]: it is shifted left by 8, so anything in the top byte is
+/// discarded silently. Two peers whose indexes differ only above bit 23
+/// collapse onto one prefix and the device demultiplexes their transport
+/// packets to the wrong tunnel.
+///
 /// Unlike the legacy constructors, the whole configuration is validated before
-/// a tunnel exists: a set of parameters that could never emit a valid datagram,
-/// or whose timers are ordered so that keys would be rejected before the rekey
-/// replacing them completes, fails here with a message from
-/// `last_tunnel_error()` rather than becoming a tunnel that silently never
-/// works.
+/// a tunnel exists, and a failure is a NULL return with the reason in
+/// `last_tunnel_error()` rather than a tunnel that silently never works. Three
+/// classes are refused:
+///
+/// * parameters that could never emit a valid datagram, or that would be
+///   silently rewritten into a different configuration (an out-of-range junk
+///   burst, a hostname that is not a valid host for the imitated protocol).
+///   This class is stricter here than anywhere else in the crate: the UAPI
+///   `set=1` path takes the silent rewrite, so a profile refused here can still
+///   load in `boringtun-cli`. Refusing is the point of this entry point -- the
+///   rewrite is invisible until someone takes a packet capture;
+/// * timers ordered so that keys would be rejected before the rekey replacing
+///   them completes;
+/// * S-value combinations that make the cookie reply larger than the request it
+///   answers, i.e. an amplification reflector. **This last one is policy, not
+///   impossibility**: the AmneziaWG kernel module runs those profiles, weakly
+///   reflecting, and so do the legacy `new_tunnel_with_amnezia*` constructors.
+///   The rule matches what the UAPI `set=1` path applies, so a profile refused
+///   here is refused by `boringtun-cli` too -- but a caller migrating a working
+///   profile off a legacy constructor can meet it. The binding constraint is
+///   `s3_cookie_junk <= s2_response_junk + 28`.
 ///
 /// Returns NULL on failure, with the reason in `last_tunnel_error()`.
 #[no_mangle]
@@ -1178,33 +1529,49 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
     server_static_public: *const c_char,
     preshared_key: *const c_char,
     keep_alive: u16,
+    // The 24bit index prefix for session indexes.
     index: u32,
     params: *const wireguard_awg_params,
     imitation_domain: *const c_char,
 ) -> *mut Mutex<Tunn> {
     clear_last_error();
 
-    let (amnezia, h1, h2, h3, h4) = if params.is_null() {
-        (
-            AmneziaConfig::default(),
-            wireguard_awg_range::default(),
-            wireguard_awg_range::default(),
-            wireguard_awg_range::default(),
-            wireguard_awg_range::default(),
-        )
-    } else {
-        let Some(p) = read_awg_params(params) else {
-            return ptr::null_mut();
+    // NULL parameters are a zeroed struct, not a separate path.
+    //
+    // Every field's unset encoding is already zero, so the two are the same
+    // configuration -- and going through one path means the argument checks
+    // apply to both. They did not before: with NULL params the domain was
+    // never even decoded, so a caller who passed a hostname but had not yet
+    // wired up the struct got a plain WireGuard tunnel with the hostname
+    // silently dropped, and a non-UTF-8 one was accepted where the other path
+    // refuses it. That is the silent substitution this constructor exists to
+    // refuse, reachable by reading "`params` may be NULL" as "params are
+    // optional".
+    let (amnezia, h1, h2, h3, h4) = {
+        let p = if params.is_null() {
+            wireguard_awg_params::default()
+        } else {
+            let Some(p) = read_awg_params(params) else {
+                return ptr::null_mut();
+            };
+            p
         };
         // A non-UTF-8 domain is refused rather than dropped. The legacy
         // constructors silently discard one (`parse_amnezia_imitation` maps the
         // error to `None`), which hands back a tunnel imitating the right
         // protocol with a randomly generated hostname -- a substitution the
         // caller can only discover in a packet capture.
+        //
+        // An EMPTY string is "no domain", not an invalid one. NULL and "" mean
+        // the same thing to every legacy constructor, and marshalling layers
+        // (C++/C#/Delphi/Go) routinely hand over "" for an absent string, so
+        // treating it as a rejected hostname would fail the commonest way of
+        // saying "I have nothing to pass here".
         let domain = if imitation_domain.is_null() {
             None
         } else {
             match CStr::from_ptr(imitation_domain).to_str() {
+                Ok("") => None,
                 Ok(domain) => Some(domain.to_owned()),
                 Err(_) => {
                     set_last_error("Invalid Amnezia imitation domain: not UTF-8");
@@ -1366,14 +1733,50 @@ mod tests {
     fn awg_params_layout_is_pinned() {
         use std::mem::{align_of, size_of};
 
+        // The nested range, inside and out. `sizeof == 8` alone does not pin
+        // it: swapping `lo` and `hi` in either declaration leaves the size, the
+        // alignment, and every offset and width in the outer struct untouched,
+        // so both guards passed while every range in the ABI arrived inverted.
+        // For the timers and the padding that is silent -- `with_tunable_timers`
+        // re-sorts a transposed pair -- so nothing downstream would complain.
         assert_eq!(size_of::<wireguard_awg_range>(), 8);
         assert_eq!(align_of::<wireguard_awg_range>(), 4);
+        let r = wireguard_awg_range::default();
+        let r_base = &r as *const _ as usize;
+        assert_eq!(
+            &r.lo as *const u32 as usize - r_base,
+            0,
+            "lo must lead wireguard_awg_range"
+        );
+        assert_eq!(
+            &r.hi as *const u32 as usize - r_base,
+            4,
+            "hi must follow lo in wireguard_awg_range"
+        );
+        assert_eq!(std::mem::size_of_val(&r.lo), 4);
+        assert_eq!(std::mem::size_of_val(&r.hi), 4);
+
         assert_eq!(size_of::<wireguard_awg_params>(), 160);
         assert_eq!(align_of::<wireguard_awg_params>(), 4);
-        assert_eq!(
-            AWG_PARAMS_SIZE_VER0,
+        // This build's size must be a *published* size -- not specifically
+        // version 0's.
+        //
+        // The earlier form asserted `AWG_PARAMS_SIZE_VER0 == size_of`, which
+        // fails on the first appended field and invites the obvious repair for
+        // a failing equality: bump `VER0`. That is the one edit that must never
+        // happen -- it lifts the floor in `read_awg_params` above 160 and
+        // refuses every client compiled against the shipped header, i.e. the
+        // mechanism turning on the callers it exists to protect. This form
+        // fails on the same day, and its only repair is to append the *old*
+        // size to the table, which is precisely the edit that must not be
+        // forgotten.
+        assert!(
+            AWG_PARAMS_PUBLISHED_SIZES.contains(&size_of::<wireguard_awg_params>()),
+            "this build's struct size {} is not in AWG_PARAMS_PUBLISHED_SIZES {:?}: append the \
+             previous size to the table rather than raising AWG_PARAMS_SIZE_VER0, which would \
+             refuse every caller built against the header that shipped it",
             size_of::<wireguard_awg_params>(),
-            "the published version-0 size must be this build's size until a field is added"
+            AWG_PARAMS_PUBLISHED_SIZES
         );
 
         // EVERY field offset, not a sample. Sampling is not enough: narrowing
@@ -1501,24 +1904,114 @@ mod tests {
         // every later offset stay put while the member reads fewer bytes. The
         // C guard missed exactly that until a mutation caught it, so both
         // sides check widths now.
+        // All twenty-three, matching `scripts/ffi-layout-check.c` one for one.
+        // This list used to hold fourteen while the comment above claimed
+        // "both sides check widths now" -- and the nine it omitted included
+        // `reject_after_time`, the field every rationale in this commit names
+        // as the disaster case.
         assert_eq!(std::mem::size_of_val(&p.size), 4);
         assert_eq!(std::mem::size_of_val(&p.s1_init_junk), 4);
+        assert_eq!(std::mem::size_of_val(&p.s2_response_junk), 4);
+        assert_eq!(std::mem::size_of_val(&p.s3_cookie_junk), 4);
         assert_eq!(std::mem::size_of_val(&p.s4_transport_junk), 4);
         assert_eq!(std::mem::size_of_val(&p.junk_packet_count), 4);
+        assert_eq!(std::mem::size_of_val(&p.junk_packet_size_min), 4);
+        assert_eq!(std::mem::size_of_val(&p.junk_packet_size_max), 4);
         assert_eq!(std::mem::size_of_val(&p.junk_packet_delay_ms), 4);
         assert_eq!(std::mem::size_of_val(&p.h1_init), 8);
+        assert_eq!(std::mem::size_of_val(&p.h2_resp), 8);
+        assert_eq!(std::mem::size_of_val(&p.h3_cookie), 8);
         assert_eq!(std::mem::size_of_val(&p.h4_data), 8);
         assert_eq!(std::mem::size_of_val(&p.imitation_protocol), 4);
         assert_eq!(std::mem::size_of_val(&p.imitation_browser), 4);
         assert_eq!(std::mem::size_of_val(&p.content_padding_addition), 8);
         assert_eq!(std::mem::size_of_val(&p.content_padding_mtu), 4);
         assert_eq!(std::mem::size_of_val(&p.rekey_after_time), 8);
+        assert_eq!(std::mem::size_of_val(&p.rekey_timeout), 8);
+        assert_eq!(std::mem::size_of_val(&p.reject_after_time), 8);
+        assert_eq!(std::mem::size_of_val(&p.keepalive_timeout), 8);
         assert_eq!(std::mem::size_of_val(&p.max_handshake_attempts), 8);
         assert_eq!(std::mem::size_of_val(&p.header_protection_key), 32);
     }
 
+    /// The two by-value return structs, pinned against the same answer
+    /// `scripts/ffi-layout-check.c` pins on the C side.
+    ///
+    /// `wireguard_result` and `stats` are the only structs in the header whose
+    /// layout really does change with the word size -- both hold `usize`, so
+    /// they are 16/88 bytes on LP64 and 8/80 on ILP32 -- and both are returned
+    /// *by value* across the ABI, the most layout-sensitive crossing there is.
+    /// The C guard was added without a Rust counterpart, which made it a
+    /// one-sided check: it caught a header edit and not the Rust edit on the
+    /// other side of the same boundary. Expressed relative to `size_of::<usize>`
+    /// so one set of literals holds on both targets.
+    #[test]
+    fn by_value_return_structs_are_pinned() {
+        use std::mem::size_of;
+        let word = size_of::<usize>();
+
+        assert_eq!(size_of::<wireguard_result>(), 2 * word);
+        let r = wireguard_result {
+            op: result_type::WIREGUARD_DONE,
+            size: 0,
+        };
+        let r_base = &r as *const _ as usize;
+        assert_eq!(&r.size as *const usize as usize - r_base, word);
+        assert_eq!(std::mem::size_of_val(&r.size), word);
+        // `op`'s WIDTH, which neither the total nor `size`'s offset can see:
+        // `#[repr(u8)]` on `result_type` shrinks it to one byte, and the seven
+        // bytes of padding that open up in front of `size` leave both the total
+        // and that offset exactly where they were. The C side already asserts
+        // `sizeof(op) == sizeof(int)`, so without this a Rust-only edit passes
+        // while the identical header edit fails -- and a C caller would read
+        // four bytes of which three are uninitialised padding, then dispatch on
+        // the result. (Found by mutating the enum and watching the test pass.)
+        assert_eq!(std::mem::size_of_val(&r.op), 4);
+
+        // `reserved`'s position is deliberately not pinned: shrinking it to
+        // make room for a new field is the documented, size-preserving way to
+        // extend this struct. The TOTAL is what must not move.
+        assert_eq!(size_of::<stats>(), 16 + 2 * word + 56);
+        let s = stats {
+            time_since_last_handshake: 0,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            estimated_loss: 0.0,
+            estimated_rtt: 0,
+            reserved: [0u8; 56],
+        };
+        let base = &s as *const _ as usize;
+        assert_eq!(
+            &s.time_since_last_handshake as *const i64 as usize - base,
+            0
+        );
+        assert_eq!(&s.tx_bytes as *const usize as usize - base, 8);
+        assert_eq!(&s.rx_bytes as *const usize as usize - base, 8 + word);
+        assert_eq!(
+            &s.estimated_loss as *const f32 as usize - base,
+            8 + 2 * word
+        );
+        assert_eq!(
+            &s.estimated_rtt as *const i32 as usize - base,
+            12 + 2 * word
+        );
+        assert_eq!(std::mem::size_of_val(&s.time_since_last_handshake), 8);
+        assert_eq!(std::mem::size_of_val(&s.tx_bytes), word);
+        assert_eq!(std::mem::size_of_val(&s.rx_bytes), word);
+        assert_eq!(std::mem::size_of_val(&s.estimated_loss), 4);
+        assert_eq!(std::mem::size_of_val(&s.estimated_rtt), 4);
+        assert_eq!(std::mem::size_of_val(&s.reserved), 56);
+    }
+
     /// A filled-in struct reaches every AmneziaWG feature, including the three
     /// 3.0 ones no other constructor can express.
+    ///
+    /// EVERY forwarded value is observed, with a distinct value per field. A
+    /// version of this test asserted eight of them, which let a transposition in
+    /// the adapter pass: swapping `s2`/`s3` in `AmneziaConfig::new`, or
+    /// `rekey_timeout`/`keepalive_timeout` in the `AwgTimers` literal, changed
+    /// nothing the test looked at. That is the exact hazard the struct exists to
+    /// remove, so the test has to be able to see it.
     #[test]
     fn awg_params_reach_every_feature() {
         last_tunnel_error_free();
@@ -1532,25 +2025,65 @@ mod tests {
             junk_packet_size_min: 50,
             junk_packet_size_max: 500,
             junk_packet_delay_ms: 10,
+            imitation_protocol: AmneziaImitationProtocol::Quic as u32,
+            imitation_browser: AmneziaImitationBrowser::Firefox as u32,
             content_padding_addition: wireguard_awg_range { lo: 8, hi: 24 },
             content_padding_mtu: 1420,
             rekey_after_time: wireguard_awg_range { lo: 30, hi: 40 },
+            rekey_timeout: wireguard_awg_range { lo: 5, hi: 7 },
             reject_after_time: wireguard_awg_range { lo: 300, hi: 400 },
-            header_protection_key: [0xab; 32],
+            keepalive_timeout: wireguard_awg_range { lo: 20, hi: 25 },
+            max_handshake_attempts: wireguard_awg_range { lo: 9, hi: 11 },
+            // Thirty-two DISTINCT bytes, not a uniform fill. A `[0xab; 32]` key
+            // is its own reverse, its own rotation and its own byte swap, so no
+            // ordering error in the key path could ever be seen -- and the key
+            // is the one parameter where order is the whole of the value: it is
+            // not negotiated, so a peer that receives it permuted has a tunnel
+            // that never forms.
+            header_protection_key: [
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+                0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b,
+                0x2c, 0x2d, 0x2e, 0x2f,
+            ],
             ..Default::default()
         };
-        let config = awg_params_to_config(&params, None).expect("valid parameters");
+        let config = awg_params_to_config(&params, Some("example.com".to_owned()))
+            .expect("valid parameters");
 
+        // S1-S4, each distinct, so a transposed pair is visible.
         assert_eq!(config.init_packet_junk_size, 120);
+        assert_eq!(config.response_packet_junk_size, 130);
+        assert_eq!(config.cookie_packet_junk_size, 110);
         assert_eq!(config.transport_packet_junk_size, 80);
+        // Jc/Jmin/Jmax/Jd.
         assert_eq!(config.pre_handshake_junk.packet_count, 4);
+        assert_eq!(config.pre_handshake_junk.packet_size_min, 50);
+        assert_eq!(config.pre_handshake_junk.packet_size_max, 500);
+        assert_eq!(config.pre_handshake_junk.packet_delay_ms, 10);
+        // Imitation, including the domain and the QUIC-only browser.
+        assert_eq!(config.imitation.protocol, AmneziaImitationProtocol::Quic);
+        assert_eq!(config.imitation.browser, AmneziaImitationBrowser::Firefox);
+        assert_eq!(config.imitation.domain(), Some("example.com"));
         // The three AWG 3.0 features, none of which any legacy constructor can
         // set at all.
+        // The key's BYTES, not just "a key is set". `header_protection_enabled`
+        // is a bool, so on its own it certifies only that the 32 bytes were not
+        // all zero: replacing them wholesale, reversing them, or copying half
+        // of them all leave it true. That is the failure this struct's rustdoc
+        // names three separate times as the one worth refusing a constructor
+        // over, so the test has to be able to see it.
+        assert_eq!(
+            config.header_protection_key_hex().as_deref(),
+            Some("101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f")
+        );
         assert!(config.header_protection_enabled());
         assert_eq!(config.content_padding_addition, (8, 24));
         assert_eq!(config.content_padding_mtu, 1420);
         assert_eq!(config.timers.rekey_after_time, (30, 40));
+        assert_eq!(config.timers.rekey_timeout, (5, 7));
         assert_eq!(config.timers.reject_after_time, (300, 400));
+        assert_eq!(config.timers.keepalive_timeout, (20, 25));
+        assert_eq!(config.timers.max_handshake_attempts, (9, 11));
 
         // An all-zero struct is a plain WireGuard tunnel: every AmneziaWG
         // field unset, so the ABI's "nothing configured" is the crate's.
@@ -1595,6 +2128,85 @@ mod tests {
         }
     }
 
+    /// The short-`size` acceptability rule, and the ceiling that bounds the
+    /// tail scan -- both checked directly, for the reason above.
+    ///
+    /// Neither is reachable through [`read_awg_params`] in a way any other test
+    /// observes: `AWG_PARAMS_SIZE_VER0` equals this build's size, so no size is
+    /// both valid and short, and disabling the published-size guard outright
+    /// left the whole suite green. The ceiling's *value* was equally unpinned --
+    /// raising it to four billion changed nothing any test looked at, which is
+    /// precisely the four-gigabyte read its own rustdoc says it exists to
+    /// prevent.
+    #[test]
+    fn awg_params_size_bounds_are_pinned() {
+        let our = std::mem::size_of::<wireguard_awg_params>();
+
+        // The ceiling has to stay above the struct it bounds, and this build's
+        // size has to be one we have published. Both are `const _` assertions
+        // at the definitions, and both are restated here on purpose: a
+        // compile-time guard for a state no current input can reach is
+        // invisible to mutation -- weakening `AWG_PARAMS_SIZE_MAX > size_of`
+        // to `> 0` keeps compiling, because both are true today. Asserting the
+        // relationship in two places is what makes weakening either one fail.
+        assert!(
+            AWG_PARAMS_SIZE_MAX > our,
+            "the ceiling {} must stay above the struct it bounds ({}), or every correct caller \
+             is refused for a mistake the library made",
+            AWG_PARAMS_SIZE_MAX,
+            our
+        );
+        assert!(
+            AWG_PARAMS_PUBLISHED_SIZES.contains(&our),
+            "this build's size {} must be a published size {:?}",
+            our,
+            AWG_PARAMS_PUBLISHED_SIZES
+        );
+
+        // This build's own size, and anything longer (where the zero-tail rule
+        // takes over), are readable.
+        assert!(awg_params_size_is_readable(our, our));
+        assert!(awg_params_size_is_readable(our + 8, our));
+
+        // A published shorter size stays readable once the struct grows -- the
+        // whole promise the `size` field makes to an older caller.
+        for &published in AWG_PARAMS_PUBLISHED_SIZES.iter() {
+            assert!(
+                awg_params_size_is_readable(published, published + 16),
+                "published size {} must stay readable after the struct grows",
+                published
+            );
+        }
+
+        // A size that is short but was never published would cut a member in
+        // half, so it is refused however plausible it looks.
+        let future = our + 16;
+        assert!(
+            !awg_params_size_is_readable(our + 4, future),
+            "an unpublished size between two versions must be refused"
+        );
+        assert!(!awg_params_size_is_readable(
+            AWG_PARAMS_SIZE_VER0 + 1,
+            future
+        ));
+
+        // The ceiling is a bound on how far past a 160-byte object the tail
+        // scan may read. Its rustdoc promises "a few hundred bytes rather than
+        // four gigabytes"; this is that promise, as an assertion.
+        assert!(
+            AWG_PARAMS_SIZE_MAX >= AWG_PARAMS_SIZE_VER0,
+            "the ceiling must not sit below the floor"
+        );
+        assert!(
+            AWG_PARAMS_SIZE_MAX <= 8 * AWG_PARAMS_SIZE_VER0,
+            "AWG_PARAMS_SIZE_MAX is {}, which is no longer close to the {}-byte struct it \
+             bounds: the window a garbage `size` can read past the caller's object is meant \
+             to be a few hundred bytes",
+            AWG_PARAMS_SIZE_MAX,
+            AWG_PARAMS_SIZE_VER0
+        );
+    }
+
     /// The size field's three cases: a short struct, a zero-padded long one,
     /// and a long one that is actually using something we do not implement.
     #[test]
@@ -1612,26 +2224,66 @@ mod tests {
         let read = unsafe { read_awg_params(&full) }.expect("our own size is valid");
         assert_eq!(read, full);
 
-        // A shorter struct -- a caller built against an older header. Its
-        // absent tail must read as unset, not as whatever was in memory, so
-        // the buffer beyond the truncation point is deliberately non-zero.
-        let mut buffer = [0xffu8; 256];
+        // A struct shorter than version 0 is refused outright. Note what this
+        // does NOT test: "a short struct's absent tail reads as unset" is
+        // unreachable today, because `AWG_PARAMS_SIZE_VER0` is this build's
+        // size, so no size is both valid and short. `awg_params_copy_len_*`
+        // pins the arithmetic; the copy that uses it has only ever run at
+        // `copy == our_size`. An earlier version of this test dressed the
+        // buffer up with a 0xff fill and a partial copy as though the tail were
+        // being observed -- setup that nothing could read, in front of an
+        // assertion about a different rule.
+        let mut buffer = [0u8; 256];
         let short_len = 40usize;
         unsafe {
-            ptr::copy_nonoverlapping(
-                &full as *const _ as *const u8,
-                buffer.as_mut_ptr(),
-                short_len,
-            );
             ptr::write_unaligned(buffer.as_mut_ptr() as *mut u32, short_len as u32);
         }
-        // A struct shorter than version 0 is refused outright.
         let short = unsafe { read_awg_params(buffer.as_ptr() as *const wireguard_awg_params) };
         assert!(short.is_none(), "a sub-version-0 size must be refused");
         assert!(
             last_error_string().contains("smaller than"),
             "{}",
             last_error_string()
+        );
+
+        // An absurd size is refused by name rather than being used as a length.
+        // Before the ceiling existed this asked `slice::from_raw_parts` for
+        // ~4 GiB starting just past a 160-byte object.
+        last_tunnel_error_free();
+        unsafe {
+            ptr::write_unaligned(buffer.as_mut_ptr() as *mut u32, u32::MAX);
+        }
+        let huge = unsafe { read_awg_params(buffer.as_ptr() as *const wireguard_awg_params) };
+        assert!(huge.is_none(), "an uninitialised size must be refused");
+        assert!(
+            last_error_string().contains("exceeds the"),
+            "{}",
+            last_error_string()
+        );
+
+        // Both sides of the ceiling, so `>` cannot become `>=` unnoticed. The
+        // allocation really is `AWG_PARAMS_SIZE_MAX` bytes, since the accepted
+        // case reads its whole zero tail.
+        last_tunnel_error_free();
+        let mut at_max = vec![0u8; AWG_PARAMS_SIZE_MAX];
+        unsafe {
+            ptr::write_unaligned(at_max.as_mut_ptr() as *mut u32, AWG_PARAMS_SIZE_MAX as u32);
+        }
+        assert!(
+            unsafe { read_awg_params(at_max.as_ptr() as *const wireguard_awg_params) }.is_some(),
+            "a size of exactly the ceiling is still accepted: {}",
+            last_error_string()
+        );
+        last_tunnel_error_free();
+        unsafe {
+            ptr::write_unaligned(
+                at_max.as_mut_ptr() as *mut u32,
+                AWG_PARAMS_SIZE_MAX as u32 + 1,
+            );
+        }
+        assert!(
+            unsafe { read_awg_params(at_max.as_ptr() as *const wireguard_awg_params) }.is_none(),
+            "one byte over the ceiling must be refused"
         );
 
         // A longer struct whose extra bytes are all zero: a newer caller that
@@ -1710,6 +2362,477 @@ mod tests {
         };
         assert!(!tunnel.is_null(), "NULL params must build a vanilla tunnel");
         unsafe { tunnel_free(tunnel) };
+    }
+
+    /// Each H range reaches the slot it is named for.
+    ///
+    /// The four ranges are the one part of the struct that bypasses
+    /// `awg_params_to_config`: `new_tunnel_with_awg_params` unpacks them back
+    /// into eight positional `u32`s for `new_tunnel_with_amnezia_config`. That
+    /// is the transposition hazard the struct exists to remove, reintroduced in
+    /// the one line the constructor still writes, and no test used to set an H
+    /// range to anything but zero -- so swapping two of the eight passed the
+    /// whole suite. An inverted range is refused by `ObfuscationRanges::new`
+    /// with the field's name in the message, which is what makes the routing
+    /// observable from out here.
+    #[test]
+    fn awg_params_route_each_h_range_to_its_own_slot() {
+        let private = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+        let public = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+
+        // An inverted range in one slot at a time; the error must name that
+        // slot and no other.
+        let inverted = wireguard_awg_range { lo: 400, hi: 300 };
+        for (name, params) in [
+            (
+                "H1",
+                wireguard_awg_params {
+                    h1_init: inverted,
+                    ..Default::default()
+                },
+            ),
+            (
+                "H2",
+                wireguard_awg_params {
+                    h2_resp: inverted,
+                    ..Default::default()
+                },
+            ),
+            (
+                "H3",
+                wireguard_awg_params {
+                    h3_cookie: inverted,
+                    ..Default::default()
+                },
+            ),
+            (
+                "H4",
+                wireguard_awg_params {
+                    h4_data: inverted,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            last_tunnel_error_free();
+            let params = wireguard_awg_params {
+                size: AWG_PARAMS_SIZE_VER0 as u32,
+                ..params
+            };
+            let tunnel = unsafe {
+                new_tunnel_with_awg_params(
+                    private.as_ptr(),
+                    public.as_ptr(),
+                    ptr::null(),
+                    0,
+                    0,
+                    &params,
+                    ptr::null(),
+                )
+            };
+            assert!(tunnel.is_null(), "{} inverted must not build", name);
+            let error = last_error_string();
+            assert!(
+                error.contains(name),
+                "{} was routed to another slot: {}",
+                name,
+                error
+            );
+            // ...and no OTHER slot is named, which is what makes this a routing
+            // check rather than a "something went wrong" check.
+            for other in ["H1", "H2", "H3", "H4"].iter().filter(|o| **o != name) {
+                assert!(
+                    !error.contains(other),
+                    "{} inverted, but the error names {}: {}",
+                    name,
+                    other,
+                    error
+                );
+            }
+        }
+
+        // And four valid, non-overlapping ranges build.
+        last_tunnel_error_free();
+        let params = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            h1_init: wireguard_awg_range { lo: 100, hi: 110 },
+            h2_resp: wireguard_awg_range { lo: 200, hi: 210 },
+            h3_cookie: wireguard_awg_range { lo: 300, hi: 310 },
+            h4_data: wireguard_awg_range { lo: 400, hi: 410 },
+            ..Default::default()
+        };
+        let tunnel = unsafe {
+            new_tunnel_with_awg_params(
+                private.as_ptr(),
+                public.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                &params,
+                ptr::null(),
+            )
+        };
+        assert!(
+            !tunnel.is_null(),
+            "four disjoint H ranges must build: {}",
+            last_error_string()
+        );
+        unsafe { tunnel_free(tunnel) };
+    }
+
+    /// A transposed range is refused, not silently re-sorted.
+    ///
+    /// `with_content_padding_addition` and `with_tunable_timers` normalize
+    /// `lo > hi` on the way in, which is right for the crate's long-standing
+    /// builders and wrong for this entry point: `{40, 30}` is the same slip as
+    /// passing `hi` before `lo`, which is the whole reason the positional
+    /// constructors were replaced. The UAPI refuses it too
+    /// (`parse_uint_range`), and the adapter already refused a transposed junk
+    /// size pair -- these six were the inconsistency.
+    #[test]
+    fn awg_params_refuse_a_transposed_range() {
+        for (label, mutate) in [
+            (
+                "content_padding_addition",
+                (|p: &mut wireguard_awg_params| {
+                    p.content_padding_addition = wireguard_awg_range { lo: 40, hi: 30 };
+                    p.content_padding_mtu = 1420;
+                }) as fn(&mut wireguard_awg_params),
+            ),
+            ("rekey_after_time", |p| {
+                p.rekey_after_time = wireguard_awg_range { lo: 40, hi: 30 }
+            }),
+            ("rekey_timeout", |p| {
+                p.rekey_timeout = wireguard_awg_range { lo: 9, hi: 2 }
+            }),
+            ("reject_after_time", |p| {
+                p.reject_after_time = wireguard_awg_range { lo: 400, hi: 300 }
+            }),
+            ("keepalive_timeout", |p| {
+                p.keepalive_timeout = wireguard_awg_range { lo: 20, hi: 10 }
+            }),
+            // The one the `{n, 0}` confusion actually reaches: `validate`
+            // exempts the count from the zero-in-a-range rule, so before this
+            // check `{9, 0}` became a draw from 0..=9 with no diagnostic.
+            ("max_handshake_attempts", |p| {
+                p.max_handshake_attempts = wireguard_awg_range { lo: 9, hi: 0 }
+            }),
+        ] {
+            last_tunnel_error_free();
+            let mut params = wireguard_awg_params {
+                size: AWG_PARAMS_SIZE_VER0 as u32,
+                ..Default::default()
+            };
+            mutate(&mut params);
+            assert!(
+                awg_params_to_config(&params, None).is_none(),
+                "{} accepted a transposed range",
+                label
+            );
+            let error = last_error_string();
+            assert!(error.contains(label), "{} not named in: {}", label, error);
+        }
+
+        // The same values the right way round are fine, so the check refuses
+        // transposition rather than the values.
+        last_tunnel_error_free();
+        let ok = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            rekey_after_time: wireguard_awg_range { lo: 30, hi: 40 },
+            reject_after_time: wireguard_awg_range { lo: 300, hi: 400 },
+            max_handshake_attempts: wireguard_awg_range { lo: 0, hi: 9 },
+            ..Default::default()
+        };
+        assert!(awg_params_to_config(&ok, None).is_some());
+    }
+
+    /// An active padding range with no MTU is refused.
+    ///
+    /// `content_padding_mtu == 0` means "no MTU known", and `content_padding`
+    /// then skips both clamps -- the draw is bounded only by the caller's
+    /// buffer, which is 64 KiB in a real embedder, so full-size packets grow
+    /// past the link and blackhole. The device path always feeds a real
+    /// interface MTU; the FFI is the only way to reach this combination.
+    #[test]
+    fn awg_params_refuse_padding_without_an_mtu() {
+        last_tunnel_error_free();
+        let no_mtu = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            content_padding_addition: wireguard_awg_range { lo: 100, hi: 200 },
+            ..Default::default()
+        };
+        assert!(awg_params_to_config(&no_mtu, None).is_none());
+        let error = last_error_string();
+        assert!(
+            error.contains("content_padding_mtu"),
+            "the error must name the field to set: {}",
+            error
+        );
+
+        // With an MTU it is accepted, and the range reaches the config.
+        last_tunnel_error_free();
+        let with_mtu = wireguard_awg_params {
+            content_padding_mtu: 1420,
+            ..no_mtu
+        };
+        let config = awg_params_to_config(&with_mtu, None).expect("valid with an MTU");
+        assert_eq!(config.content_padding_addition, (100, 200));
+        assert_eq!(config.content_padding_mtu, 1420);
+
+        // An unset range with no MTU stays fine: that is a vanilla tunnel, and
+        // the 16-byte rounding it does get is MTU-independent.
+        last_tunnel_error_free();
+        let unset = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            ..Default::default()
+        };
+        assert!(awg_params_to_config(&unset, None).is_some());
+    }
+
+    /// A parameter that would have been silently rewritten is refused instead.
+    ///
+    /// `AmneziaPreHandshakeJunk::new` substitutes rather than fails, and
+    /// `validate` never looks at the junk burst, so `junk_packet_count = 200`
+    /// used to build a tunnel with the burst switched off entirely and no error
+    /// -- while the harmless `70000` produced a clear message.
+    #[test]
+    fn awg_params_refuse_a_silently_rewritten_junk_burst() {
+        last_tunnel_error_free();
+        let over_ceiling = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            junk_packet_count: 200,
+            ..Default::default()
+        };
+        assert!(
+            awg_params_to_config(&over_ceiling, None).is_none(),
+            "a Jc that would be zeroed must be refused"
+        );
+        assert!(
+            last_error_string().contains("junk_packet_count"),
+            "{}",
+            last_error_string()
+        );
+
+        // The delay has its own ceiling, and its own silent zeroing.
+        last_tunnel_error_free();
+        let slow = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            junk_packet_count: 4,
+            junk_packet_delay_ms: 500,
+            ..Default::default()
+        };
+        assert!(
+            awg_params_to_config(&slow, None).is_none(),
+            "a Jd that would be zeroed must be refused"
+        );
+
+        // A transposed size pair would become the built-in default.
+        last_tunnel_error_free();
+        let transposed = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            junk_packet_count: 4,
+            junk_packet_size_min: 500,
+            junk_packet_size_max: 50,
+            ..Default::default()
+        };
+        assert!(
+            awg_params_to_config(&transposed, None).is_none(),
+            "a size pair that would be replaced must be refused"
+        );
+
+        // But leaving the size pair unset with a burst configured is a real
+        // request for the defaults, and must still work.
+        last_tunnel_error_free();
+        let defaults = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            junk_packet_count: 4,
+            ..Default::default()
+        };
+        let config = awg_params_to_config(&defaults, None)
+            .expect("an unset size pair means 'use the defaults'");
+        assert_eq!(config.pre_handshake_junk.packet_count, 4);
+        assert!(config.pre_handshake_junk.packet_size_max > 0);
+
+        // With no burst there is nothing to rewrite: the sizes and the delay
+        // are never read, so an out-of-range value in them is inert and must
+        // not be an error.
+        last_tunnel_error_free();
+        let no_burst = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            junk_packet_count: 0,
+            junk_packet_size_min: 5000,
+            junk_packet_size_max: 9000,
+            junk_packet_delay_ms: 5000,
+            ..Default::default()
+        };
+        assert!(
+            awg_params_to_config(&no_burst, None).is_some(),
+            "with Jc = 0 the unread fields must not be an error: {}",
+            last_error_string()
+        );
+    }
+
+    /// The junk-burst limits the header states are exactly where they are.
+    ///
+    /// The bounds live as private constants in `noise::amnezia`, so the numbers
+    /// in `wireguard_awg_params`'s rustdoc and in `wireguard_ffi.h` are a claim
+    /// about another module. This pins them: a caller cannot act on a bound
+    /// nobody checks, and the doc must not be the only thing asserting it.
+    #[test]
+    fn awg_params_junk_bounds_are_where_the_docs_say() {
+        let at = |jc: u32, jmin: u32, jmax: u32, jd: u32| {
+            last_tunnel_error_free();
+            let p = wireguard_awg_params {
+                size: AWG_PARAMS_SIZE_VER0 as u32,
+                junk_packet_count: jc,
+                junk_packet_size_min: jmin,
+                junk_packet_size_max: jmax,
+                junk_packet_delay_ms: jd,
+                ..Default::default()
+            };
+            awg_params_to_config(&p, None).is_some()
+        };
+
+        // junk_packet_count <= 128
+        assert!(at(128, 50, 500, 10), "Jc = 128 is the documented ceiling");
+        assert!(!at(129, 50, 500, 10), "Jc = 129 must be refused");
+        // junk_packet_delay_ms <= 200
+        assert!(at(4, 50, 500, 200), "Jd = 200 is the documented ceiling");
+        assert!(!at(4, 50, 500, 201), "Jd = 201 must be refused");
+        // 1 <= min <= max <= 1280
+        assert!(at(4, 1, 1280, 10), "the full documented size range");
+        assert!(!at(4, 1, 1281, 10), "Jmax = 1281 must be refused");
+        assert!(!at(4, 0, 500, 10), "Jmin = 0 with a burst must be refused");
+        assert!(!at(4, 500, 499, 10), "Jmin > Jmax must be refused");
+        // {0, 0} is "use the defaults", not a violation of `1 <= min`.
+        assert!(at(4, 0, 0, 10), "an unset size pair means the defaults");
+    }
+
+    /// A hostname that is valid UTF-8 but not a valid host is refused, not
+    /// swapped for a random one.
+    ///
+    /// The non-UTF-8 check covered the rarest case; `is_valid_imitation_host`
+    /// rejects the common ones (an underscore, a trailing dot, an over-long
+    /// label) and `AmneziaImitation::new` then drops the name and generates a
+    /// random one at emit time -- a substitution visible only in a capture.
+    ///
+    /// Both validators are exercised, because they disagree: QUIC's SNI goes
+    /// through the far looser `is_valid_quic_sni`, so the underscore that is
+    /// fatal to a DNS QNAME is perfectly good there. A test that only drove
+    /// DNS would leave the QUIC arm of this check unvisited while reading as
+    /// though it covered "the imitation domain".
+    #[test]
+    fn awg_params_refuse_a_domain_that_would_be_replaced() {
+        last_tunnel_error_free();
+        let params = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            imitation_protocol: AmneziaImitationProtocol::Dns as u32,
+            ..Default::default()
+        };
+        assert!(
+            awg_params_to_config(&params, Some("my_host.example.com".to_owned())).is_none(),
+            "an invalid hostname must be refused rather than replaced"
+        );
+        assert!(
+            last_error_string().contains("imitation domain"),
+            "{}",
+            last_error_string()
+        );
+
+        // A valid one survives, and is reported as kept.
+        last_tunnel_error_free();
+        let config = awg_params_to_config(&params, Some("example.com".to_owned()))
+            .expect("a valid hostname is accepted");
+        assert_eq!(config.imitation.domain(), Some("example.com"));
+
+        // QUIC, whose SNI goes through the other validator. The underscore
+        // that DNS refuses above is legal here, so this arm must ACCEPT it --
+        // and a control character, which no SNI may carry, must still be
+        // refused. Without both, the QUIC arm of `uses_domain` was untested and
+        // the check could have been hard-wired to the DNS rules unnoticed.
+        last_tunnel_error_free();
+        let quic = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            imitation_protocol: AmneziaImitationProtocol::Quic as u32,
+            ..Default::default()
+        };
+        let config = awg_params_to_config(&quic, Some("my_host.example.com".to_owned()))
+            .expect("an underscore is a legal SNI, whatever DNS thinks");
+        assert_eq!(config.imitation.domain(), Some("my_host.example.com"));
+        last_tunnel_error_free();
+        assert!(
+            awg_params_to_config(&quic, Some("bad\u{7f}host".to_owned())).is_none(),
+            "an SNI that would be replaced must still be refused for QUIC"
+        );
+
+        // A protocol that carries no hostname ignores the domain, as it always
+        // has -- that is not a substitution, so it is not an error.
+        last_tunnel_error_free();
+        let stun = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            imitation_protocol: AmneziaImitationProtocol::Stun as u32,
+            ..Default::default()
+        };
+        assert!(
+            awg_params_to_config(&stun, Some("example.com".to_owned())).is_some(),
+            "a hostname-free protocol must still accept a domain: {}",
+            last_error_string()
+        );
+
+        // An EMPTY domain is "none supplied", exactly as NULL is. Marshalling
+        // layers hand over "" for an absent string all the time, and the legacy
+        // constructors have always treated the two alike -- so the new refusal
+        // must not turn the commonest way of saying "nothing here" into a NULL
+        // return. Driven through the constructor, since that is where the
+        // C string is decoded.
+        let private = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+        let public = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+        let empty_domain = CString::new("").unwrap();
+        for (label, domain) in [
+            ("NULL", ptr::null()),
+            ("empty", empty_domain.as_ptr() as *const c_char),
+        ] {
+            last_tunnel_error_free();
+            let tunnel = unsafe {
+                new_tunnel_with_awg_params(
+                    private.as_ptr(),
+                    public.as_ptr(),
+                    ptr::null(),
+                    0,
+                    0,
+                    &params,
+                    domain,
+                )
+            };
+            assert!(
+                !tunnel.is_null(),
+                "a {} domain must build a tunnel, not fail: {}",
+                label,
+                last_error_string()
+            );
+            unsafe { tunnel_free(tunnel) };
+        }
+    }
+
+    /// The redacting `Debug` keeps the header-protection key out of logs.
+    #[test]
+    fn awg_params_debug_never_prints_the_header_protection_key() {
+        let params = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            s1_init_junk: 120,
+            header_protection_key: [0xab; 32],
+            ..Default::default()
+        };
+        let rendered = format!("{:?}", params);
+        assert!(
+            !rendered.contains("171") && !rendered.contains("ab, ab"),
+            "the key must not appear in Debug output: {}",
+            rendered
+        );
+        assert!(rendered.contains("\"set\""), "{}", rendered);
+        assert!(rendered.contains("s1_init_junk: 120"), "{}", rendered);
+
+        let unset = wireguard_awg_params::default();
+        assert!(format!("{:?}", unset).contains("\"unset\""));
     }
 
     #[test]
