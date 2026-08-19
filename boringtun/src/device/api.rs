@@ -5,11 +5,8 @@ use super::dev_lock::LockReadGuard;
 use super::drop_privileges::get_saved_ids;
 use super::{AllowedIP, Device, Error, SocketAddr};
 use crate::device::Action;
-use crate::noise::amnezia::AmneziaConfig;
+use crate::noise::amnezia::{AmneziaConfig, AwgTimers};
 use crate::noise::handshake::ObfuscationRanges;
-use crate::noise::timers::{
-    KEEPALIVE_TIMEOUT, REJECT_AFTER_TIME, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT,
-};
 use crate::serialization::KeyBytes;
 use crate::x25519;
 use hex::encode as encode_hex;
@@ -100,6 +97,11 @@ struct AwgParams {
     h4: Option<(u32, u32)>,
     header_protection: Option<[u8; 32]>,
     content_padding: Option<(u32, u32)>,
+    rekey_after_time: Option<(u32, u32)>,
+    rekey_timeout: Option<(u32, u32)>,
+    reject_after_time: Option<(u32, u32)>,
+    keepalive_timeout: Option<(u32, u32)>,
+    max_handshake_attempts: Option<(u32, u32)>,
     seen: bool,
 }
 
@@ -126,6 +128,29 @@ impl AwgParams {
     fn set_content_padding(&mut self, range: (u32, u32)) {
         self.content_padding = Some(range);
         self.seen = true;
+    }
+
+    /// Record one tunable-timer range. `false` for a key with no field here.
+    ///
+    /// Reports the miss rather than panicking on the unmatched arm, unlike its
+    /// `set_size`/`set_header` siblings whose key lists have been closed for
+    /// years. This list and the `api_set` match arm that routes into it are two
+    /// hand-maintained lists on the UAPI parse path, and amneziawg-go has
+    /// already added five tunables here, so a sixth is the expected direction
+    /// of travel: one added to the caller and forgotten here must fail the
+    /// transaction with the same EINVAL an unimplemented key gets, not panic
+    /// the API thread on `<newkey>=<anything>`.
+    fn set_timer(&mut self, key: &str, range: (u32, u32)) -> bool {
+        match key {
+            "rekey_after_time" => self.rekey_after_time = Some(range),
+            "rekey_timeout" => self.rekey_timeout = Some(range),
+            "reject_after_time" => self.reject_after_time = Some(range),
+            "keepalive_timeout" => self.keepalive_timeout = Some(range),
+            "max_handshake_attempts" => self.max_handshake_attempts = Some(range),
+            _ => return false,
+        }
+        self.seen = true;
+        true
     }
 
     fn set_header(&mut self, key: &str, range: (u32, u32)) {
@@ -216,6 +241,22 @@ impl AwgParams {
             .content_padding
             .unwrap_or(amnezia.content_padding_addition);
         amnezia = amnezia.with_content_padding_addition(pad_lo, pad_hi, mtu);
+
+        // Timers: each range this transaction carried, else whatever is
+        // already set. `(0, 0)` is amneziawg-go's "unset" -- the built-in
+        // constant governs again -- which is also what a reapplied kernel
+        // `awg showconf` dump sends, since it prints every unset timer as
+        // `=0`.
+        let cur = amnezia.timers;
+        amnezia = amnezia.with_tunable_timers(AwgTimers {
+            rekey_after_time: self.rekey_after_time.unwrap_or(cur.rekey_after_time),
+            rekey_timeout: self.rekey_timeout.unwrap_or(cur.rekey_timeout),
+            reject_after_time: self.reject_after_time.unwrap_or(cur.reject_after_time),
+            keepalive_timeout: self.keepalive_timeout.unwrap_or(cur.keepalive_timeout),
+            max_handshake_attempts: self
+                .max_handshake_attempts
+                .unwrap_or(cur.max_handshake_attempts),
+        });
 
         // Reject sizes that could never emit a valid datagram, before anything
         // is committed. Without this, an oversized S value is accepted here and
@@ -457,7 +498,10 @@ impl Device {
 ///
 /// Emitted only when they differ from plain WireGuard, so a vanilla device's
 /// output is byte-identical to upstream's -- amneziawg-go's `IpcGetOperation`
-/// guards every 3.0 tunable on `!IsZero()` the same way. (The kernel
+/// guards each of these on `!IsZero()` the same way. (Not *every* 3.0 key:
+/// `random_trailers` and `disable_cookies` go through its unguarded `boolf`
+/// and are always emitted. See `handle_awg3_device_key`, which is where that
+/// asymmetry is stated once and where the set side absorbs it.) (The kernel
 /// amneziawg-tools differ: `awg showconf` prints `ContentPaddingAddition = 0`
 /// and the five timers unconditionally, which is why the *set* side reads a
 /// `=0` from a reapplied config dump as "unset" rather than as a request.)
@@ -501,6 +545,19 @@ fn write_awg_interface_params(
         writeln!(writer, "header_protection_key={}", key);
     }
 
+    // One renderer for the `mh_genspec` spelling, so the keys sharing the
+    // grammar cannot drift apart the way two hand-copies of a parser once
+    // did (see `parse_uint_range`'s history). The enclosing function's
+    // `allow(unused_must_use)` covers the `writeln!`s here: lint levels are
+    // lexically scoped, so a nested item inherits them.
+    fn write_range(writer: &mut impl std::io::Write, key: &str, lo: u32, hi: u32) {
+        if lo == hi {
+            writeln!(writer, "{}={}", key, lo);
+        } else {
+            writeln!(writer, "{}={}-{}", key, lo, hi);
+        }
+    }
+
     let default = ObfuscationRanges::default();
     for (key, range, def) in [
         ("h1", obf.h1_init, default.h1_init),
@@ -509,20 +566,29 @@ fn write_awg_interface_params(
         ("h4", obf.h4_data, default.h4_data),
     ] {
         if range != def {
-            if range.start == range.end {
-                writeln!(writer, "{}={}", key, range.start);
-            } else {
-                writeln!(writer, "{}={}-{}", key, range.start, range.end);
-            }
+            write_range(writer, key, range.start, range.end);
         }
     }
 
-    let (lo, hi) = a.content_padding_addition;
-    if lo != 0 || hi != 0 {
-        if lo == hi {
-            writeln!(writer, "content_padding_addition={}", lo);
-        } else {
-            writeln!(writer, "content_padding_addition={}-{}", lo, hi);
+    // The padding range and the five tunable timers, when set. amneziawg-go
+    // emits each of these only when non-zero (`!IsZero()` in
+    // `IpcGetOperation`), so unset stays absent and a vanilla device's output
+    // is unchanged. The two bool keys amneziawg-go emits *unconditionally*
+    // from v3.1 on (`random_trailers=0`, `disable_cookies=0`) are deliberately
+    // not reproduced: this build does not implement either feature, and
+    // inventing the keys would grow a vanilla device's `get=1` for nothing a
+    // peer can act on.
+    let t = &a.timers;
+    for (key, range) in [
+        ("content_padding_addition", a.content_padding_addition),
+        ("rekey_after_time", t.rekey_after_time),
+        ("rekey_timeout", t.rekey_timeout),
+        ("reject_after_time", t.reject_after_time),
+        ("keepalive_timeout", t.keepalive_timeout),
+        ("max_handshake_attempts", t.max_handshake_attempts),
+    ] {
+        if range != (0, 0) {
+            write_range(writer, key, range.0, range.1);
         }
     }
 }
@@ -725,10 +791,34 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                             Ok(key_bytes) => awg.set_header_protection(key_bytes.0),
                             Err(_) => return EINVAL,
                         },
-                        // AmneziaWG 3.0 device keys: tolerated where ignoring
-                        // them is safe. Everything else still fails the
-                        // transaction, because `handle_awg3_device_key` ends in
-                        // the same EINVAL this arm used to be.
+                        // AmneziaWG 3.0 tunable timers, applied for real. The
+                        // kernel module's `awg showconf` prints every unset
+                        // timer as `=0`, so `(0, 0)` must mean -- and in
+                        // `merged` does mean -- "back to the built-in
+                        // constant". The floors live in
+                        // `AmneziaConfig::validate`, reached through `merged`,
+                        // so a violation fails the transaction with EINVAL and
+                        // a log line naming the numbers.
+                        "rekey_after_time"
+                        | "rekey_timeout"
+                        | "reject_after_time"
+                        | "keepalive_timeout"
+                        | "max_handshake_attempts" => match parse_uint_range(val) {
+                            // A key routed here that `set_timer` does not store
+                            // fails the transaction rather than panicking the
+                            // API thread -- see `set_timer`.
+                            Some(range) => {
+                                if !awg.set_timer(key, range) {
+                                    return EINVAL;
+                                }
+                            }
+                            None => return EINVAL,
+                        },
+                        // AmneziaWG device keys this build does not implement:
+                        // tolerated where ignoring them is safe. Everything
+                        // else still fails the transaction, because
+                        // `handle_awg3_device_key` ends in the same EINVAL
+                        // this arm used to be.
                         _ => {
                             if let Err(code) = handle_awg3_device_key(key, val) {
                                 return code;
@@ -745,42 +835,10 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
     .unwrap_or(EIO)
 }
 
-/// The constant this build actually uses for an AWG-3 tunable timer, in seconds.
-///
-/// `max_handshake_attempts` has no constant of its own: we bound handshake
-/// retries by wall clock instead of by a counter, so the equivalent count is
-/// REKEY_ATTEMPT_TIME / REKEY_TIMEOUT, which is what amneziawg-go's
-/// `MaxTimerHandshakes` is defined as too (`90 / 5` in device/constants.go).
-/// Computed rather than written as `18`, so retuning either constant moves this
-/// answer with it instead of leaving the daemon claiming agreement it no longer
-/// has.
-///
-/// `None` for a key with no built-in equivalent.
-///
-/// Returns an `Option` rather than panicking on the unmatched arm. The caller's
-/// key list and this one are two hand-maintained lists that have to agree, and
-/// this runs on the UAPI parse path: adding a sixth AWG-3 tunable to the caller
-/// and forgetting it here would turn `<newkey>=<anything>` into a panic in the
-/// API thread. amneziawg-go has already added five, so a sixth is the expected
-/// direction of travel. An unmapped key now degrades to the same "not
-/// implemented" warning as a value that merely disagrees, which is the outcome
-/// that arm is for. Not a silent `0`, which would make `<newkey>=0` look like
-/// agreement.
-fn awg3_our_timer(key: &str) -> Option<u64> {
-    Some(match key {
-        "reject_after_time" => REJECT_AFTER_TIME.as_secs(),
-        "rekey_after_time" => REKEY_AFTER_TIME.as_secs(),
-        "rekey_timeout" => REKEY_TIMEOUT.as_secs(),
-        "keepalive_timeout" => KEEPALIVE_TIMEOUT.as_secs(),
-        "max_handshake_attempts" => REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs(),
-        _ => return None,
-    })
-}
-
-/// AmneziaWG 3.0 device keys this build does not implement.
+/// AmneziaWG device keys this build does not implement.
 ///
 /// Tolerated rather than rejected because one unknown key aborts the rest of
-/// the `set=1`: an AWG-3 profile would otherwise lose every jc/s/h line it
+/// the `set=1`: an AWG profile would otherwise lose every jc/s/h line it
 /// carries, and every peer section after the offending one. (It does *not*
 /// leave the device untouched -- `private_key`, `listen_port`, `fwmark`,
 /// `replace_peers` and any peer already committed are applied as they are
@@ -789,51 +847,51 @@ fn awg3_our_timer(key: &str) -> Option<u64> {
 /// `api_set`, and it is the reason tolerating a key we can safely ignore is
 /// worth doing.)
 ///
-/// Ignoring a value the peer actually set is not free, so a value that differs
-/// from what we do warns -- see the individual notes. A value that agrees with
-/// us, or that means "unset", is silent.
+/// The two bool keys are here for a hard interop reason, and one that is
+/// version-specific: from **v3.1.20260812** on, amneziawg-go's `get=1` emits
+/// `random_trailers=0` and `disable_cookies=0` *unconditionally* -- its
+/// `boolf` has no is-set guard, unlike the five timers it emits only when set
+/// -- so every reapplied dump from such a peer carries both keys even for a
+/// configuration that never mentioned either. Refusing them would abort every
+/// such transaction. (Neither key exists at all in v3.0.20260805 and earlier:
+/// verified against `device/uapi.go` at both tags. A v3.0 dump cannot
+/// exercise this path, which is why the interop leg that does is labelled by
+/// the version that can.)
+///
+/// A value that asks for nothing (off is what this build does) is silent; a
+/// value that turns the feature on warns, because silently ignoring it would
+/// change what the peer expects on the wire; junk is EINVAL.
+///
+/// The accepted spellings are exactly `strconv.ParseBool`'s, because that is
+/// what amneziawg-go's `IpcSetOperation` parses these two keys with -- so
+/// every value a peer can legally send is one of these twelve. Narrowing the
+/// set would not merely ignore such a value: an unrecognised one is EINVAL,
+/// which aborts the whole transaction and every peer section after it. (The
+/// two tools that generate these lines both normalise first -- amneziawg-go's
+/// `boolf` and amneziawg-tools' `fprintf(f, "random_trailers=%u\n", ...)`
+/// after its `parse_bool` -- so `0`/`1` is what arrives in practice. The rest
+/// are here for hand-written and third-party `set=1` traffic, which the UAPI
+/// has no way to exclude.)
+///
+/// `header_protection_key`, `content_padding_addition` and the five tunable
+/// timers deliberately do NOT appear here: `api_set` handles them above,
+/// because this build implements them. They stay out of this fallback so that
+/// removing a feature would surface as an unhandled key rather than as silent
+/// tolerance.
 ///
 /// `Ok(())` tolerates the key; `Err(code)` fails the transaction. Split out of
 /// the `api_set` match so the acceptance policy is reachable from a test:
 /// `api_set` itself needs a `Device`, which needs root and a TUN interface.
 fn handle_awg3_device_key(key: &str, val: &str) -> Result<(), i32> {
     match key {
-        "reject_after_time"
-        | "rekey_after_time"
-        | "rekey_timeout"
-        | "keepalive_timeout"
-        | "max_handshake_attempts" => {
-            let ours = awg3_our_timer(key);
-            match parse_uint_range(val) {
-                // An all-zero range is amneziawg-go's "unset": it falls back to
-                // the same built-in default we hardcode (`IsZero()` checks in
-                // device/timers.go), so the peer is asking for exactly what we
-                // already do. Warning here would fire the one new diagnostic on
-                // a configuration that agrees with us.
-                Some((0, 0)) => {}
-                // Otherwise silence is only safe while the value matches what we
-                // hardcode. A peer that shortens reject_after_time discards a
-                // keypair we still consider live, which shows up as one-way
-                // blackholing minutes later rather than as a handshake failure
-                // -- so a mismatch has to say so. A range that merely *contains*
-                // our value is not equivalent to it: the peer re-picks, we do
-                // not.
-                Some((lo, hi)) if ours == Some(u64::from(lo)) && ours == Some(u64::from(hi)) => {}
-                Some((lo, hi)) => tracing::warn!(
-                    message = "tunable timers are not implemented; \
-                               using the built-in WireGuard constant",
-                    key = key,
-                    requested_low = lo,
-                    requested_high = hi,
-                    ours = ?ours
-                ),
-                None => return Err(EINVAL),
-            }
-        }
-        // `header_protection_key` deliberately does NOT appear here: `api_set`
-        // handles it above, because this build implements it. It stays out of
-        // this fallback so that removing the feature would surface as an
-        // unhandled key rather than as silent tolerance.
+        "random_trailers" | "disable_cookies" => match val {
+            "0" | "f" | "F" | "false" | "FALSE" | "False" => {}
+            "1" | "t" | "T" | "true" | "TRUE" | "True" => tracing::warn!(
+                message = "AmneziaWG key is not implemented; the feature stays off",
+                key = key,
+            ),
+            _ => return Err(EINVAL),
+        },
         _ => return Err(EINVAL),
     }
     Ok(())
@@ -1156,95 +1214,223 @@ mod tests {
         assert_eq!(parse_uint_range("0-5"), Some((0, 5)));
     }
 
+    /// The five tunable timers through a `set=1` merge: each range reaches the
+    /// config, an unmentioned key keeps its old value, `(0, 0)` clears back to
+    /// unset, and the floors fail the transaction with EINVAL.
+    ///
+    /// `(0, 0)` clearing is an interop requirement, not a courtesy: the kernel
+    /// module's `awg showconf` prints every unset timer as `=0`, so a
+    /// reapplied dump sends the zeros verbatim.
     #[test]
-    fn an_awg3_timer_reports_the_constant_that_actually_governs_behaviour() {
-        // The point of the warning is the mismatch case: a peer that shortens
-        // reject_after_time discards a keypair we still consider live, which
-        // surfaces as one-way blackholing minutes later rather than as a
-        // handshake failure. Silence there would be the wrong default -- so what
-        // we report as "ours" has to be what the timer wheel really uses.
-        assert_eq!(awg3_our_timer("reject_after_time"), Some(180));
-        assert_eq!(awg3_our_timer("rekey_after_time"), Some(120));
-        assert_eq!(awg3_our_timer("rekey_timeout"), Some(5));
-        assert_eq!(awg3_our_timer("keepalive_timeout"), Some(10));
-        // We have no attempt counter: the equivalent is REKEY_ATTEMPT_TIME /
-        // REKEY_TIMEOUT = 90/5, which is how amneziawg-go defines its own
-        // default (`MaxTimerHandshakes = 90 / 5`). Because `awg3_our_timer`
-        // computes it, retuning either constant fails this assertion instead of
-        // leaving the daemon claiming an agreement it no longer has -- which a
-        // hardcoded 18 asserted against a literal 18 could never catch.
-        assert_eq!(awg3_our_timer("max_handshake_attempts"), Some(18));
+    fn tunable_timers_over_the_uapi_apply_and_round_trip() {
+        let current = AmneziaConfig::default();
+
+        // Two keys set, three left alone.
+        let mut set = AwgParams::default();
+        set.set_timer("rekey_after_time", (30, 40));
+        set.set_timer("reject_after_time", (60, 80));
+        let (_, cfg) = set
+            .merged(ObfuscationRanges::default(), &current, 1420)
+            .expect("a coherent tuning is valid");
+        assert_eq!(cfg.timers.rekey_after_time, (30, 40));
+        assert_eq!(cfg.timers.reject_after_time, (60, 80));
+        assert_eq!(cfg.timers.rekey_timeout, (0, 0), "unmentioned stays unset");
+
+        // A later transaction that does not mention timers keeps them.
+        let mut untouched = AwgParams::default();
+        untouched.set_size("s1", 120);
+        let (_, kept) = untouched
+            .merged(ObfuscationRanges::default(), &cfg, 1420)
+            .expect("valid");
+        assert_eq!(kept.timers.rekey_after_time, (30, 40), "must survive");
+
+        // `(0, 0)` clears one key and leaves the other. Clearing reject is the
+        // direction the floors allow: its 180-second default satisfies every
+        // ordering.
+        let mut clear = AwgParams::default();
+        clear.set_timer("reject_after_time", (0, 0));
+        let (_, cleared) = clear
+            .merged(ObfuscationRanges::default(), &kept, 1420)
+            .expect("valid");
+        assert_eq!(cleared.timers.reject_after_time, (0, 0), "must clear");
+        assert_eq!(cleared.timers.rekey_after_time, (30, 40), "must remain");
+
+        // The reverse clear is refused: dropping rekey_after_time resurrects
+        // its 120-second default, under which the kept 60-80 reject would
+        // discard keys before the rekey replacing them completes. The floors
+        // catch configurations that become incoherent by *clearing*, not just
+        // by setting.
+        let mut bad_clear = AwgParams::default();
+        bad_clear.set_timer("rekey_after_time", (0, 0));
         assert_eq!(
-            awg3_our_timer("max_handshake_attempts"),
-            Some(REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs())
+            bad_clear
+                .merged(ObfuscationRanges::default(), &kept, 1420)
+                .err(),
+            Some(EINVAL),
+            "clearing rekey_after_time under a short reject must be refused"
         );
 
-        // Every key the caller routes into the timer arm must have an entry
-        // here. These are two hand-maintained lists on the UAPI parse path, and
-        // this assertion is what stops them drifting: with `unreachable!` in
-        // place of the `None`, adding a sixth tunable upstream and forgetting it
-        // here turned `<newkey>=<anything>` into a panic in the API thread.
+        // Floors fail the merge: a reject_after_time draw shorter than the
+        // (default) rekey_after_time + rekey_timeout would reject keys before
+        // the rekey replacing them completes.
+        let mut low = AwgParams::default();
+        low.set_timer("reject_after_time", (60, 80));
+        assert_eq!(
+            low.merged(ObfuscationRanges::default(), &current, 1420)
+                .err(),
+            Some(EINVAL),
+            "reject 60 under default rekey_after 120 + rekey_timeout 5 must be refused"
+        );
+
+        // A zero inside a set range is a zero-second timer, not "unset".
+        let mut zero = AwgParams::default();
+        zero.set_timer("rekey_timeout", (0, 5));
+        assert_eq!(
+            zero.merged(ObfuscationRanges::default(), &current, 1420)
+                .err(),
+            Some(EINVAL),
+            "a range containing 0 must be refused"
+        );
+
+        // Every key the `api_set` arm routes into `set_timer` must have a field
+        // there. These are two hand-maintained lists on the UAPI parse path,
+        // and this is what stops them drifting: a sixth tunable added to the
+        // caller and forgotten in `set_timer` fails the transaction with the
+        // EINVAL an unimplemented key gets, rather than panicking the API
+        // thread on `<newkey>=<anything>`.
+        let mut routed = AwgParams::default();
         for key in [
-            "reject_after_time",
             "rekey_after_time",
             "rekey_timeout",
+            "reject_after_time",
             "keepalive_timeout",
             "max_handshake_attempts",
         ] {
             assert!(
-                awg3_our_timer(key).is_some(),
-                "{} is routed into the timer arm but has no built-in equivalent",
+                routed.set_timer(key, (30, 30)),
+                "{} is routed into the timer arm but `set_timer` has no field for it",
                 key
             );
         }
-
-        // An unmapped key degrades to the warning, not to a panic and not to a
-        // silent 0 that would make `<newkey>=0` look like agreement.
-        assert_eq!(awg3_our_timer("some_future_tunable"), None);
-        assert_eq!(
-            handle_awg3_device_key("reject_after_time", "60"),
-            Ok(()),
-            "a disagreeing value is tolerated with a warning, not refused"
+        assert!(
+            !routed.set_timer("some_future_tunable", (30, 30)),
+            "an unmapped key must be reported, not panic and not silently ignored"
         );
+
+        // ...and each key must reach its *own* field. Presence alone is a weak
+        // claim: wiring `keepalive_timeout` to `self.rekey_timeout` keeps every
+        // assertion above green while `awg set keepalive_timeout=3` silently
+        // retunes the handshake retransmission interval instead. One key at a
+        // time, each checked against a config where only that field moved.
+        for (key, pick) in [
+            (
+                "rekey_after_time",
+                (|t: &AwgTimers| t.rekey_after_time) as fn(&AwgTimers) -> (u32, u32),
+            ),
+            ("rekey_timeout", |t: &AwgTimers| t.rekey_timeout),
+            ("reject_after_time", |t: &AwgTimers| t.reject_after_time),
+            ("keepalive_timeout", |t: &AwgTimers| t.keepalive_timeout),
+            ("max_handshake_attempts", |t: &AwgTimers| {
+                t.max_handshake_attempts
+            }),
+        ] {
+            // `reject_after_time` carries the ordering floors, so it gets a
+            // value that clears them; every other key is free to be small.
+            let want = if key == "reject_after_time" {
+                (700, 900)
+            } else {
+                (7, 9)
+            };
+            let mut one = AwgParams::default();
+            assert!(one.set_timer(key, want));
+            // A permissive base so the floors cannot mask the assertion.
+            let base = AmneziaConfig::default().with_tunable_timers(AwgTimers {
+                reject_after_time: (900, 900),
+                ..AwgTimers::default()
+            });
+            let (_, cfg) = one
+                .merged(ObfuscationRanges::default(), &base, 1420)
+                .unwrap_or_else(|e| panic!("{} merge failed: {}", key, e));
+            assert_eq!(
+                pick(&cfg.timers),
+                want,
+                "{} did not reach its own field",
+                key
+            );
+            for (other, other_pick) in [
+                (
+                    "rekey_after_time",
+                    (|t: &AwgTimers| t.rekey_after_time) as fn(&AwgTimers) -> (u32, u32),
+                ),
+                ("rekey_timeout", |t: &AwgTimers| t.rekey_timeout),
+                ("keepalive_timeout", |t: &AwgTimers| t.keepalive_timeout),
+                ("max_handshake_attempts", |t: &AwgTimers| {
+                    t.max_handshake_attempts
+                }),
+            ] {
+                if other != key {
+                    assert_eq!(
+                        other_pick(&cfg.timers),
+                        (0, 0),
+                        "setting {} also moved {}",
+                        key,
+                        other
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn an_awg3_device_key_is_tolerated_in_every_form_its_tools_emit() {
-        // The whole point of the arm: a key we ignore must not abort the
-        // transaction. For the timers, agreement and "unset" are silent, a
-        // real difference warns, and every form is tolerated.
-        for val in ["180", "0", "60", "120-200"] {
-            assert_eq!(
-                handle_awg3_device_key("reject_after_time", val),
-                Ok(()),
-                "reject_after_time={} must not abort the transaction",
-                val
-            );
-        }
-        for key in [
-            "rekey_after_time",
-            "rekey_timeout",
-            "keepalive_timeout",
-            "max_handshake_attempts",
-        ] {
-            assert_eq!(handle_awg3_device_key(key, "7"), Ok(()), "{}", key);
+        // The two bool keys amneziawg-go's `get=1` emits *unconditionally*
+        // from v3.1.20260812 on (`boolf` has no is-set guard): a reapplied
+        // dump from such a peer always carries `random_trailers=0` and
+        // `disable_cookies=0`, so refusing them would abort every such
+        // transaction. Off -- what this build does -- is silent agreement; on
+        // warns; junk is EINVAL.
+        //
+        // Every spelling below is one amneziawg-go accepts, because it parses
+        // both keys with `strconv.ParseBool`. Accepting a narrower set does not
+        // downgrade to ignoring the value: it is EINVAL, which aborts the whole
+        // `set=1` and every peer section after it.
+        for key in ["random_trailers", "disable_cookies"] {
+            for val in ["0", "f", "F", "false", "FALSE", "False"] {
+                assert_eq!(
+                    handle_awg3_device_key(key, val),
+                    Ok(()),
+                    "{}={} must not abort the transaction",
+                    key,
+                    val
+                );
+            }
+            for val in ["1", "t", "T", "true", "TRUE", "True"] {
+                assert_eq!(
+                    handle_awg3_device_key(key, val),
+                    Ok(()),
+                    "{}={} is tolerated (with a warning)",
+                    key,
+                    val
+                );
+            }
+            // Not a `ParseBool` spelling, so no peer can legally send it.
+            assert_eq!(handle_awg3_device_key(key, "maybe"), Err(EINVAL));
+            assert_eq!(handle_awg3_device_key(key, "on"), Err(EINVAL));
         }
 
-        assert_eq!(
-            handle_awg3_device_key("reject_after_time", "200-100"),
-            Err(EINVAL),
-            "inverted range"
-        );
         // And the catch-all this function replaced still rejects everything it
         // does not list.
         assert_eq!(handle_awg3_device_key("not_a_real_key", "1"), Err(EINVAL));
-        // `header_protection_key` reaches this fallback only if the `api_set`
-        // arm above stops handling it, which is what makes removing the feature
-        // surface as EINVAL rather than as silent tolerance. Any value does,
-        // including a well-formed one -- "0" is used here because it is also not
-        // a key (one hex character), so the assertion holds either way.
+        // `header_protection_key` and the timers reach this fallback only if
+        // the `api_set` arms above stop handling them, which is what makes
+        // removing a feature surface as EINVAL rather than as silent
+        // tolerance.
         assert_eq!(
             handle_awg3_device_key("header_protection_key", "0"),
+            Err(EINVAL)
+        );
+        assert_eq!(
+            handle_awg3_device_key("reject_after_time", "60"),
             Err(EINVAL)
         );
     }
@@ -1351,6 +1537,35 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("content_padding_addition=16\n"), "{}", text);
         assert!(!text.contains("16-16"), "{}", text);
+
+        // Set timers emit in the same grammar; unset ones stay absent, and the
+        // two bool keys amneziawg-go v3.1 invents unconditionally are never
+        // emitted -- this build does not implement them, and a vanilla
+        // device's output must not grow.
+        let mut out = Vec::new();
+        let cfg = AmneziaConfig::default().with_tunable_timers(AwgTimers {
+            rekey_after_time: (30, 40),
+            reject_after_time: (60, 60),
+            ..AwgTimers::default()
+        });
+        write_awg_interface_params(&mut out, &ObfuscationRanges::default(), &cfg);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("rekey_after_time=30-40\n"), "{}", text);
+        assert!(text.contains("reject_after_time=60\n"), "{}", text);
+        for absent in [
+            "rekey_timeout",
+            "keepalive_timeout",
+            "max_handshake_attempts",
+            "random_trailers",
+            "disable_cookies",
+        ] {
+            assert!(
+                !text.contains(absent),
+                "{} leaked into get=1:\n{}",
+                absent,
+                text
+            );
+        }
     }
 
     /// An all-zero header-protection key means "off", not "reject".
@@ -1642,66 +1857,50 @@ mod tests {
         assert_eq!(parse_tag_range("1-5"), Some((1, 5)));
     }
 
-    /// The acceptance policy for AmneziaWG 3.0 device keys, pinned end to end.
+    /// The acceptance policy for AmneziaWG device keys, pinned end to end.
     ///
-    /// One sentence carries this whole branch: a value that differs from what
-    /// this build does warns, and a value that agrees with us -- or that means
-    /// "unset" -- is silent. Both halves are load-bearing. Losing a warning
-    /// ships a daemon that ignores a timer the peer set and says nothing, which
-    /// surfaces as one-way blackholing minutes later rather than as a handshake
-    /// failure; gaining one on a silent row fires the new diagnostic on
-    /// configurations that agree with us, which is how a warning gets tuned out.
+    /// One sentence carries the fallback: a value that asks for behaviour this
+    /// build does not have warns, a value that agrees with what it does is
+    /// silent, and every implemented key is refused here because `api_set`
+    /// consumes it first. All three are load-bearing. Losing the warning ships
+    /// a daemon that ignores a feature the peer runs and says nothing; gaining
+    /// one on a silent row fires a diagnostic on every reapplied amneziawg-go
+    /// dump (which always carries `random_trailers=0`/`disable_cookies=0`),
+    /// which is how a warning gets tuned out; and an implemented key slipping
+    /// into the tolerance list is a feature silently vanishing instead of the
+    /// transaction failing.
     ///
-    /// Neither half was reachable from a test before this one: deleting either
-    /// `tracing::warn!` in `handle_awg3_device_key` left the suite green, and so
-    /// did making either silent arm noisy. The table below is the policy, and it
-    /// is checked against the code rather than against the comments above it.
+    /// The table below is the policy, and it is checked against the code
+    /// rather than against the comments above it.
     #[test]
-    fn an_awg3_device_key_warns_exactly_when_its_value_differs_from_ours() {
+    fn an_awg3_device_key_warns_exactly_when_it_asks_for_what_we_do_not_do() {
         const SILENT: &[tracing::Level] = &[];
         const WARNS: &[tracing::Level] = &[tracing::Level::WARN];
 
         let cases: &[PolicyRow] = &[
-            // Timers: exactly our own constant is agreement, and silent. These
-            // five numbers are the ones `awg3_our_timer` reports, so a retune
-            // that moves a constant moves the silent row with it.
-            ("reject_after_time", "180", Ok(()), SILENT),
-            ("rekey_after_time", "120", Ok(()), SILENT),
-            ("rekey_timeout", "5", Ok(()), SILENT),
-            ("keepalive_timeout", "10", Ok(()), SILENT),
-            ("max_handshake_attempts", "18", Ok(()), SILENT),
-            // The degenerate range spells the same agreement.
-            ("reject_after_time", "180-180", Ok(()), SILENT),
-            // 0 is amneziawg-go's "unset": it falls back to the same built-in
-            // we hardcode, so the peer is asking for exactly what we do.
-            ("reject_after_time", "0", Ok(()), SILENT),
-            ("rekey_after_time", "0", Ok(()), SILENT),
-            ("rekey_timeout", "0", Ok(()), SILENT),
-            ("keepalive_timeout", "0", Ok(()), SILENT),
-            ("max_handshake_attempts", "0", Ok(()), SILENT),
-            // Anything else is a difference we have to name.
-            ("reject_after_time", "60", Ok(()), WARNS),
-            ("rekey_after_time", "121", Ok(()), WARNS),
-            ("rekey_timeout", "1", Ok(()), WARNS),
-            ("keepalive_timeout", "25", Ok(()), WARNS),
-            ("max_handshake_attempts", "5", Ok(()), WARNS),
-            // Including a range that contains our value, starts at it, or ends
-            // at it: the peer re-picks inside the range and we do not, so one
-            // matching end is not an agreement.
-            ("reject_after_time", "120-200", Ok(()), WARNS),
-            ("reject_after_time", "180-200", Ok(()), WARNS),
-            ("reject_after_time", "0-180", Ok(()), WARNS),
-            // An inverted range is refused before any of that, and silently.
-            ("reject_after_time", "200-100", Err(EINVAL), SILENT),
-            // The one key we refuse outright -- a peer masking the message-type
-            // field is mutually unreachable, not degraded. The refusal is the
-            // loud case on the branch below this one, where the key is refused
-            // here. On THIS branch header protection is implemented, so
-            // `api_set` consumes the key before the fallback sees it and both
-            // spellings reach the catch-all: refused, and silently. That
-            // difference is the point of the rows -- if `api_set` ever stopped
-            // handling the key, these would start passing again while the
-            // feature was silently gone.
+            // The unimplemented bool keys: off -- what this build does -- is
+            // silent agreement in both spellings its tools produce, on warns,
+            // junk is refused silently (EINVAL already answers the operator).
+            ("random_trailers", "0", Ok(()), SILENT),
+            ("random_trailers", "false", Ok(()), SILENT),
+            ("random_trailers", "False", Ok(()), SILENT),
+            ("random_trailers", "f", Ok(()), SILENT),
+            ("random_trailers", "1", Ok(()), WARNS),
+            ("random_trailers", "true", Ok(()), WARNS),
+            ("random_trailers", "TRUE", Ok(()), WARNS),
+            ("random_trailers", "t", Ok(()), WARNS),
+            ("random_trailers", "2", Err(EINVAL), SILENT),
+            ("disable_cookies", "0", Ok(()), SILENT),
+            ("disable_cookies", "1", Ok(()), WARNS),
+            ("disable_cookies", "True", Ok(()), WARNS),
+            ("disable_cookies", "yes", Err(EINVAL), SILENT),
+            // Implemented keys must not be quietly tolerated here -- `api_set`
+            // consumes them before this fallback. If an `api_set` arm were
+            // ever removed, these rows keep the fallback refusing the key, so
+            // the whole `set=1` fails instead of the feature silently
+            // vanishing: a peer masking the message-type field (or running
+            // different timers) with our side ignoring it is mutually
+            // unreachable or blackholed, not degraded.
             (
                 "header_protection_key",
                 "abababababababababababababababababababababababababababababababab",
@@ -1714,14 +1913,15 @@ mod tests {
                 Err(EINVAL),
                 SILENT,
             ),
-            // Same contract for content padding, which `api_set` also consumes
-            // before the fallback: implemented keys must not be quietly
-            // tolerated here. If the `api_set` arm were ever removed, these
-            // rows keep the fallback refusing the key -- the whole `set=1`
-            // fails instead of the feature silently vanishing.
             ("content_padding_addition", "8-24", Err(EINVAL), SILENT),
             ("content_padding_addition", "0", Err(EINVAL), SILENT),
-            // A key from neither list is still refused, and silently.
+            ("reject_after_time", "180", Err(EINVAL), SILENT),
+            ("reject_after_time", "0", Err(EINVAL), SILENT),
+            ("rekey_after_time", "30-40", Err(EINVAL), SILENT),
+            ("rekey_timeout", "5", Err(EINVAL), SILENT),
+            ("keepalive_timeout", "10", Err(EINVAL), SILENT),
+            ("max_handshake_attempts", "18", Err(EINVAL), SILENT),
+            // A key from no list at all is still refused, and silently.
             ("not_a_real_key", "1", Err(EINVAL), SILENT),
         ];
 
@@ -1745,47 +1945,18 @@ mod tests {
             if expected_levels != WARNS {
                 continue;
             }
-            // A warning that fires is only half the contract; it also has to
-            // carry the numbers, because the operator's next question is which
-            // config line this was about and what we did instead.
+            // A warning that fires is only half the contract: it has to name
+            // the key, because the operator's next question is which config
+            // line was ignored.
             let warning = &events[0];
-            let (lo, hi) = parse_uint_range(val).expect("a warning row parses as a range");
-            assert_eq!(
-                warning.requested_low,
-                Some(u64::from(lo)),
-                "{}={} must report the low end it was given",
-                key,
-                val
-            );
-            assert_eq!(
-                warning.requested_high,
-                Some(u64::from(hi)),
-                "{}={} must report the high end it was given",
-                key,
-                val
-            );
-            // Every warning row is a timer now that padding is applied rather
-            // than warned: it names the key in a `key` field, reports the
-            // built-in it fell back to, and says which subsystem ignored it.
             assert_eq!(
                 warning.key,
                 Some(key.to_owned()),
-                "the timer warning must name the key it is about"
-            );
-            let ours = awg3_our_timer(key).expect("a timer key has a built-in equivalent");
-            // The constant we will actually use, not the one we were asked
-            // for. Reporting the request back would make the log agree with
-            // the config it is warning about.
-            assert_eq!(
-                warning.ours,
-                Some(format!("Some({})", ours)),
-                "{}={} must report the built-in it falls back to",
-                key,
-                val
+                "the warning must name the key it is about"
             );
             assert!(
-                warning.message.contains("tunable timers"),
-                "the timer warning must say which subsystem ignored the value: {}",
+                warning.message.contains("not implemented"),
+                "the warning must say the feature is not implemented: {}",
                 warning.message
             );
         }
@@ -1810,7 +1981,6 @@ mod tests {
         key: Option<String>,
         requested_low: Option<u64>,
         requested_high: Option<u64>,
-        ours: Option<String>,
     }
 
     impl tracing::field::Visit for CapturedEvent {
@@ -1829,10 +1999,8 @@ mod tests {
             }
         }
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            match field.name() {
-                "message" => self.message = format!("{:?}", value),
-                "ours" => self.ours = Some(format!("{:?}", value)),
-                _ => {}
+            if field.name() == "message" {
+                self.message = format!("{:?}", value);
             }
         }
     }
@@ -1858,7 +2026,6 @@ mod tests {
                     key: None,
                     requested_low: None,
                     requested_high: None,
-                    ours: None,
                 };
                 event.record(&mut captured);
                 self.0.lock().unwrap().push(captured);
