@@ -73,6 +73,22 @@ int check_base64_encoded_x25519_key(const char *key);
 /// to be stored then `log_func` needs to create a copy, e.g. `strcpy`.
 bool set_logging_function(void (*log_func)(const char *));
 
+/// ---------------------------------------------------------------------------
+/// Tunnel constructors
+///
+/// New code should call new_tunnel_with_awg_params(), declared at the end of
+/// this header: it takes one extensible struct, is the only entry point that
+/// can express the AmneziaWG 3.0 features (header protection, content padding,
+/// tunable timers), and validates the whole configuration before a tunnel
+/// exists.
+///
+/// The seven constructors immediately below are the earlier interface, one per
+/// combination of features, and they remain supported -- their signatures and
+/// behaviour are unchanged and existing callers need do nothing. They cannot
+/// reach the 3.0 parameters, and each new feature would have doubled their
+/// number again, which is why the struct form exists.
+/// ---------------------------------------------------------------------------
+
 /// Allocate a new tunnel, returning NULL on failure.
 ///
 /// Keys must be valid base64-encoded 32-byte keys.
@@ -360,6 +376,127 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_junk_imitation_browser(
                                     uint8_t imitation_protocol,
                                     const char *imitation_domain,
                                     uint8_t imitation_browser);
+
+/// An inclusive [lo, hi] range.
+///
+/// {0, 0} is the unset sentinel, exactly as it is in the AmneziaWG UAPI and on
+/// the wire: the built-in default governs and nothing is drawn. A degenerate
+/// range (lo == hi) is a fixed value.
+struct wireguard_awg_range
+{
+    uint32_t lo;
+    uint32_t hi;
+};
+
+/// Every AmneziaWG parameter this build understands, in one extensible struct.
+///
+/// Pass to new_tunnel_with_awg_params. This is the only way to reach the
+/// AmneziaWG 3.0 features -- header protection, content padding and the tunable
+/// timers -- which none of the new_tunnel_with_amnezia* constructors above can
+/// express.
+///
+/// VERSIONING. Set `size` to sizeof(struct wireguard_awg_params) and zero the
+/// rest, e.g.
+///
+///     struct wireguard_awg_params p = {0};
+///     p.size = sizeof(p);
+///
+/// That is what lets this struct grow without another entry point. A struct
+/// SMALLER than the library knows is a caller built against an older header;
+/// the missing tail reads as unset. A LARGER one is accepted only if every byte
+/// past what the library understands is zero -- i.e. the caller is not using
+/// the newer fields. If any is non-zero the call fails rather than silently
+/// dropping a parameter that was set: a discarded header-protection key would
+/// produce a tunnel that is mutually unreachable with its peer, which is far
+/// worse than a refused constructor.
+///
+/// LAYOUT. Every field is a uint32_t, an array of them, or a fixed byte array;
+/// there is no pointer and no sub-word member, so the struct has no padding and
+/// the same size (160 bytes) and layout in 32- and 64-bit builds. The imitation
+/// domain is a string and so is passed as its own argument.
+struct wireguard_awg_params
+{
+    /// sizeof(struct wireguard_awg_params). See VERSIONING above.
+    uint32_t size;
+
+    /// S1-S4: junk prepended to handshake initiation, handshake response,
+    /// cookie reply and transport packets. 0 disables that prefix. Output
+    /// buffers must fit the base packet plus the configured prefix.
+    uint32_t s1_init_junk;
+    uint32_t s2_response_junk;
+    uint32_t s3_cookie_junk;
+    uint32_t s4_transport_junk;
+
+    /// Jc/Jmin/Jmax/Jd: the pre-handshake junk burst -- packet count, size
+    /// bounds, and the delay between packets in milliseconds.
+    uint32_t junk_packet_count;
+    uint32_t junk_packet_size_min;
+    uint32_t junk_packet_size_max;
+    uint32_t junk_packet_delay_ms;
+
+    /// H1-H4: message-type tag ranges for initiation, response, cookie reply
+    /// and transport packets. Unset leaves the vanilla WireGuard type.
+    struct wireguard_awg_range h1_init;
+    struct wireguard_awg_range h2_resp;
+    struct wireguard_awg_range h3_cookie;
+    struct wireguard_awg_range h4_data;
+
+    /// Protocol imitation, and the browser profile QUIC imitates; the browser
+    /// is ignored for every other protocol. Same values the constructors above
+    /// take.
+    uint32_t imitation_protocol;
+    uint32_t imitation_browser;
+
+    /// AmneziaWG 3.0 content_padding_addition: zero bytes appended to each
+    /// transport plaintext, inside the AEAD. Unset still rounds the plaintext
+    /// up to a 16-byte multiple, as every WireGuard implementation does.
+    struct wireguard_awg_range content_padding_addition;
+    /// The MTU the padding is clamped against, so a full-MTU packet is not
+    /// grown past what the link carries. 0 means "no MTU known", leaving the
+    /// caller's buffer as the only bound.
+    uint32_t content_padding_mtu;
+
+    /// AmneziaWG 3.0 tunable timers, in seconds -- except
+    /// max_handshake_attempts, which is a count. Unset means the classic
+    /// WireGuard constant governs, so an all-zero block is vanilla timing.
+    struct wireguard_awg_range rekey_after_time;
+    struct wireguard_awg_range rekey_timeout;
+    struct wireguard_awg_range reject_after_time;
+    struct wireguard_awg_range keepalive_timeout;
+    struct wireguard_awg_range max_handshake_attempts;
+
+    /// AmneziaWG 3.0 header_protection_key: a 32-byte key masking the
+    /// message-type field. All zero means off, matching amneziawg-go, so this
+    /// is also how it is disabled again. Both ends must carry the same key --
+    /// it is not negotiated, so a mismatch is a tunnel that never forms.
+    uint8_t header_protection_key[32];
+};
+
+/// Allocate a new tunnel from a full set of AmneziaWG parameters.
+///
+/// The one constructor that can express every AmneziaWG feature this build
+/// implements. Keys must be valid base64-encoded 32-byte keys.
+///
+/// `params` may be NULL, which is a plain WireGuard tunnel with no AmneziaWG
+/// behaviour at all. `imitation_domain` may be NULL, and is ignored by the
+/// protocols that do not carry a hostname.
+///
+/// Unlike the constructors above, the whole configuration is validated before a
+/// tunnel exists: parameters that could never emit a valid datagram, or timers
+/// ordered so that keys would be rejected before the rekey replacing them
+/// completes, fail here rather than becoming a tunnel that silently never
+/// works.
+///
+/// Returns NULL on failure, with the reason in last_tunnel_error().
+struct wireguard_tunnel *new_tunnel_with_awg_params(
+                                    const char *static_private,
+                                    const char *server_static_public,
+                                    const char *preshared_key,
+                                    uint16_t keep_alive,
+                                    uint32_t index,
+                                    const struct wireguard_awg_params *params,
+                                    const char *imitation_domain);
+
 // Returns a pointer to the last error message from any tunnel constructor, or
 // NULL if no error is stored. The pointer is valid until the next constructor
 // call on the same thread, or until freed with last_tunnel_error_free.

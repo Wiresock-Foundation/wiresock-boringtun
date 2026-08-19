@@ -40,6 +40,7 @@ jobs:
       - test-windows
       - win7-msrv
       - jni-smoke
+      - ffi-header-layout
     steps:
       - run: exit 0
 
@@ -65,6 +66,29 @@ jobs:
           distribution: temurin
           java-version: '21'
       - run: bash scripts/jni-smoke.sh
+
+  # `wireguard_ffi.h` is hand-written -- there is no cbindgen -- so the C and
+  # Rust declarations of the ABI can only drift apart silently, and a layout
+  # disagreement is not a build failure in either language: it is a caller's
+  # `reject_after_time` arriving as somebody else's field. This compiles a file
+  # of static assertions against the header, pinning the same offsets, member
+  # widths and total size that `ffi::tests::awg_params_layout_is_pinned` pins on
+  # the Rust side. Nothing runs; a mismatch fails the compile.
+  #
+  # Both word sizes, because `wireguard_awg_params::size` is the ABI's
+  # forward-compatibility anchor and the WireSock client ships i686 and x86_64:
+  # a struct whose size differed between them would make the versioning rule
+  # meaningless.
+  ffi-header-layout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install 32-bit C support
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - name: Check the C header against the pinned ABI layout (64-bit)
+        run: gcc -m64 -std=c11 -Wall -Wextra -Werror -c scripts/ffi-layout-check.c -o /dev/null
+      - name: Check the C header against the pinned ABI layout (32-bit)
+        run: gcc -m32 -std=c11 -Wall -Wextra -Werror -c scripts/ffi-layout-check.c -o /dev/null
 
   # The WireSock client builds the i686/x86_64 Windows targets with Rust 1.75,
   # the last toolchain that supports Windows 7 (declared as rust-version in
