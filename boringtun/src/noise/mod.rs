@@ -3308,6 +3308,122 @@ mod tests {
         );
     }
 
+    /// The two give-up paths say which one fired, and carry the numbers.
+    ///
+    /// They expire for different reasons -- an untuned tunnel on the classic
+    /// 90-second window, a tuned one on its retransmission budget, at whatever
+    /// time the draws reach it -- so one shared `REKEY_ATTEMPT_TIME` message
+    /// would report a window for a cycle that never consulted one. An operator
+    /// correlating a drop with their configuration reads this line.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn the_two_give_up_paths_are_distinguishable_in_the_log() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Default)]
+        struct Captured {
+            message: String,
+            budget: Option<u64>,
+        }
+        impl Visit for Captured {
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                if field.name() == "budget" {
+                    self.budget = Some(value);
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    self.message = value.to_owned();
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" && self.message.is_empty() {
+                    self.message = format!("{:?}", value);
+                }
+            }
+        }
+        struct Capture(Arc<Mutex<Vec<Captured>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let mut c = Captured::default();
+                event.record(&mut c);
+                self.0.lock().unwrap().push(c);
+            }
+        }
+
+        let run = |amnezia: Option<AmneziaConfig>| -> Vec<Captured> {
+            let events: Arc<Mutex<Vec<Captured>>> = Arc::new(Mutex::new(Vec::new()));
+            {
+                let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+                tracing::subscriber::with_default(subscriber, || {
+                    let (mut tun, _peer) = match amnezia {
+                        Some(a) => create_two_tuns_with_amnezia(a),
+                        None => create_two_tuns(),
+                    };
+                    let mut dst = [0u8; 2048];
+                    assert!(matches!(
+                        tun.format_handshake_initiation(&mut dst, false),
+                        TunnResult::WriteToNetwork(_)
+                    ));
+                    // One long gap: the untuned tunnel expires on the window,
+                    // the tuned one retries until its budget runs out.
+                    for _ in 0..12 {
+                        mock_instant::thread_local::MockClock::advance(Duration::from_secs(30));
+                        if matches!(
+                            tun.update_timers(&mut dst),
+                            TunnResult::Err(WireGuardError::ConnectionExpired)
+                        ) {
+                            break;
+                        }
+                    }
+                });
+            }
+            let captured = std::mem::take(&mut *events.lock().unwrap());
+            captured
+        };
+
+        let untuned = run(None);
+        assert!(
+            untuned
+                .iter()
+                .any(|c| c.message.contains("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)")),
+            "an untuned tunnel must report the window it expired on: {:?}",
+            untuned.iter().map(|c| &c.message).collect::<Vec<_>>()
+        );
+
+        let tuned = run(Some(AmneziaConfig::default().with_tunable_timers(
+            amnezia::AwgTimers {
+                max_handshake_attempts: (2, 2),
+                rekey_timeout: (7, 7),
+                ..amnezia::AwgTimers::default()
+            },
+        )));
+        let budget_line = tuned
+            .iter()
+            .find(|c| {
+                c.message
+                    .contains("CONNECTION_EXPIRED(MAX_HANDSHAKE_ATTEMPTS)")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "a tuned tunnel must report the budget it exhausted: {:?}",
+                    tuned.iter().map(|c| &c.message).collect::<Vec<_>>()
+                )
+            });
+        // N = 2 buys N + 1 retransmissions, and the line has to carry it.
+        assert_eq!(budget_line.budget, Some(3));
+        assert!(
+            !tuned
+                .iter()
+                .any(|c| c.message.contains("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)")),
+            "a tuned tunnel must not blame the classic window"
+        );
+    }
+
     /// An unrelated AmneziaWG edit must not disturb the cached timer draws.
     ///
     /// `set_obfuscation` is called for any AWG change -- an `s1`, a magic

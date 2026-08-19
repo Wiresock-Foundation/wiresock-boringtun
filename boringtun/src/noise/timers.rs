@@ -109,9 +109,13 @@ impl Timers {
             should_reset_rr: reset_rr,
             retransmit_current: REKEY_TIMEOUT,
             handshake_attempts: 0,
-            max_retransmissions_current: (REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs())
-                as u32
-                - 1,
+            // Saturating, like the accessor it mirrors: retuning the constants
+            // so the division yields 0 would otherwise wrap this to
+            // `u32::MAX` -- an unbounded retry budget -- in release, and panic
+            // in debug.
+            max_retransmissions_current: ((REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs())
+                as u32)
+                .saturating_sub(1),
             keepalive_current: KEEPALIVE_TIMEOUT,
             new_handshake_current: KEEPALIVE_TIMEOUT.saturating_add(REKEY_TIMEOUT),
             rekey_after_current: REKEY_AFTER_TIME,
@@ -269,9 +273,15 @@ impl Tunn {
         for (i, t) in timers.session_timers.iter_mut().enumerate() {
             if time_now - *t > reject_after_time {
                 if let Some(session) = self.sessions[i].take() {
+                    // The message names the rule, the field names the number
+                    // that actually fired: with `reject_after_time` tuned, the
+                    // constant in the message is not what expired this
+                    // session, and an operator correlating drops with their
+                    // configuration needs the effective value.
                     tracing::debug!(
                         message = "SESSION_EXPIRED(REJECT_AFTER_TIME)",
-                        session = session.receiving_index
+                        session = session.receiving_index,
+                        after_secs = reject_after_time.as_secs()
                     );
                 }
                 *t = time_now;
@@ -324,8 +334,12 @@ impl Tunn {
             // (REJECT_AFTER_TIME * 3) ms if no new keys have been exchanged.
             // The tunable's high end stands in when configured, exactly as
             // upstream arms zeroKeyMaterial at keychainExpireTime() * 3.
-            if now - session_established >= self.amnezia.timers.keychain_expire() * 3 {
-                tracing::error!("CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
+            let zero_key_after = self.amnezia.timers.keychain_expire() * 3;
+            if now - session_established >= zero_key_after {
+                tracing::error!(
+                    message = "CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)",
+                    after_secs = zero_key_after.as_secs()
+                );
                 self.handshake.set_expired();
                 self.clear_all();
                 return TunnResult::Err(WireGuardError::ConnectionExpired);
@@ -381,7 +395,17 @@ impl Tunn {
                     // If a packet is explicitly queued up to be sent, then this
                     // timer is reset.
                     if self.timers.handshake_attempts >= self.timers.max_retransmissions_current {
-                        tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
+                        // Its own message: `REKEY_ATTEMPT_TIME` belongs to the
+                        // absolute bound above, which is the only thing that
+                        // fires on an untuned tunnel. Naming it here would
+                        // report a 90-second window for a cycle that ended on
+                        // a count, at whatever time the draws happened to
+                        // reach.
+                        tracing::error!(
+                            message = "CONNECTION_EXPIRED(MAX_HANDSHAKE_ATTEMPTS)",
+                            retransmissions = self.timers.handshake_attempts,
+                            budget = self.timers.max_retransmissions_current
+                        );
                         self.handshake.set_expired();
                         self.clear_all();
                         return TunnResult::Err(WireGuardError::ConnectionExpired);
