@@ -83,8 +83,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install 32-bit C support
-        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      # `g++-multilib` as well as `gcc-multilib`: the former is what pulls in
+      # `lib32stdc++-*-dev`, and without it `g++ -m32` dies on the first
+      # libstdc++ header. The C++ probe below survives on `gcc-multilib` alone
+      # today only because its whole include tree is `stdint.h`/`stdbool.h`/
+      # `stddef.h` -- spelling one of those the idiomatic C++ way (`<cstddef>`
+      # for `offsetof`) would break the -m32 iteration and look like a header
+      # bug rather than a missing package.
+      - name: Install 32-bit C/C++ support
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
       # `-Wpedantic` because the file goes out of its way to be conforming --
       # it takes the address OF the function pointer rather than casting the
       # pointer itself, since function-to-object-pointer conversion is not
@@ -101,18 +108,33 @@ jobs:
       # because the names come out mangled and can never match the Rust
       # `#[no_mangle]` exports. So the undefined symbols are inspected too --
       # verified by removing the guard, which turns both references mangled.
+      # `-Wpedantic` here too, for the reason it is on the C step: this file
+      # makes the identical conformance claim in its own comment ("converting
+      # one to an object pointer is not conforming") and was the one compiled
+      # without the flag that checks it. Verified the header is already clean
+      # under `g++ -Wpedantic` at both word sizes, so this is a tightening
+      # rather than a fix -- and the C-only diagnostic proves the gap was real:
+      # `(const void *)check_ctor` is `-Werror=pedantic` under gcc and silent
+      # under `g++ -Wall -Wextra -Werror`.
       - name: Check the header is usable from C++, with C linkage (64- and 32-bit)
         run: |
           for bits in 64 32; do
-            g++ -m$bits -std=c++17 -Wall -Wextra -Werror \
+            g++ -m$bits -std=c++17 -Wall -Wextra -Wpedantic -Werror \
               -c scripts/ffi-header-cpp-check.cpp -o "/tmp/cpp$bits.o"
-            if nm -u "/tmp/cpp$bits.o" | grep -qE '_Z[0-9]+new_tunnel'; then
+            # ANY mangled undefined symbol, not just `_Z..new_tunnel*`: the
+            # probe is meant to grow, and a reference added later that landed
+            # outside the `extern "C"` guard would be invisible to a grep keyed
+            # on today's function names. The object has no C++ definitions of
+            # its own, so every `_Z` in its UNDEFINED list is a failure.
+            if nm -u "/tmp/cpp$bits.o" | grep -q '_Z'; then
               echo "::error::wireguard_ffi.h declarations are C++-mangled at -m$bits;" \
                    "the extern \"C\" guard is missing or unbalanced"
               nm -u "/tmp/cpp$bits.o" | grep '_Z' || true
               exit 1
             fi
-            nm -u "/tmp/cpp$bits.o" | grep -q 'U new_tunnel_with_awg_params' || {
+            # Anchored at both ends, so a future `new_tunnel_with_awg_params_v2`
+            # cannot satisfy the "is referenced" check on its own.
+            nm -u "/tmp/cpp$bits.o" | grep -qE '(^| )U new_tunnel_with_awg_params$' || {
               echo "::error::new_tunnel_with_awg_params is not referenced at -m$bits"; exit 1; }
           done
 
