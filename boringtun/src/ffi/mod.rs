@@ -1714,7 +1714,7 @@ fn awg_params_to_config(
 ///
 /// Unlike the legacy constructors, the whole configuration is validated before
 /// a tunnel exists, and a failure is a NULL return with the reason in
-/// `last_tunnel_error()` rather than a tunnel that silently never works. Six
+/// `last_tunnel_error()` rather than a tunnel that silently never works. Five
 /// classes are refused:
 ///
 /// * parameters that could never emit a valid datagram, or that would be
@@ -1733,15 +1733,20 @@ fn awg_params_to_config(
 ///   which makes a struct carrying *only* a key a refused call;
 /// * `content_padding_addition` set while `content_padding_mtu` is 0;
 /// * timers ordered so that keys would be rejected before the rekey replacing
-///   them completes;
-/// * S-value combinations that make the cookie reply larger than the request it
-///   answers, i.e. an amplification reflector. **This last one is policy, not
-///   impossibility**: the AmneziaWG kernel module runs those profiles, weakly
-///   reflecting, and so do the legacy `new_tunnel_with_amnezia*` constructors.
-///   The rule matches what the UAPI `set=1` path applies, so a profile refused
-///   here is refused by `boringtun-cli` too -- but a caller migrating a working
-///   profile off a legacy constructor can meet it. The binding constraint is
-///   `s3_cookie_junk <= s2_response_junk + 28`.
+///   them completes.
+///
+/// One class is deliberately **not** refused here, though the UAPI `set=1` path
+/// does refuse it: S-value combinations that make the cookie reply larger than
+/// the request it answers, i.e. an amplification reflector. That rule asks
+/// whether this port would reflect, which is a question about a responder, and
+/// a tunnel built here is a client. More to the point, `s3_cookie_junk` is
+/// symmetric and interface-wide -- both ends must configure the same value or
+/// cookie replies do not parse -- so it is dictated by the server the caller is
+/// connecting to. Refusing would decline a profile the caller cannot change,
+/// that the AmneziaWG kernel module and amneziawg-go both run, and that the
+/// legacy `new_tunnel_with_amnezia*` constructors accept. It is logged instead.
+/// A profile accepted here can therefore still be refused by `boringtun-cli`,
+/// which is a responder; that divergence is intentional.
 ///
 /// Returns NULL on failure, with the reason in `last_tunnel_error()`.
 #[no_mangle]
@@ -1815,9 +1820,24 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
     // (through `Tunn::new_with_amnezia`), which was harmless while no FFI path
     // could set a key -- this one can set all three 3.0 features, which is
     // exactly what `validate` exists to catch.
-    if let Err(e) = amnezia.validate() {
+    if let Err(e) = amnezia.validate_without_reflection_policy() {
         set_last_error(&format!("Invalid AmneziaWG parameters: {}", e));
         return ptr::null_mut();
+    }
+
+    // Logged, not refused. `validate` rejects an amplifying S3 because a device
+    // is a responder on an unconnected socket; a tunnel built here is not, and
+    // S3 is not this caller's to change -- it is symmetric and interface-wide,
+    // so a client must use whatever its server was configured with or fail to
+    // parse cookie replies. Refusing would decline a profile the reference
+    // implementations run and the operator cannot alter from this end.
+    if let Some(complaint) = amnezia.cookie_amplification_complaint() {
+        tracing::warn!(
+            message = "AmneziaWG S sizes make cookie replies larger than the packets \
+                       that provoke them; harmless for a client, but this port would \
+                       reflect if it ever served handshakes",
+            detail = %complaint
+        );
     }
 
     new_tunnel_with_amnezia_config(
@@ -3337,6 +3357,151 @@ mod tests {
     /// without this the numbers were prose: the doc could name any figure and
     /// nothing would disagree. It says 1500 rather than 1420 puts the datagram
     /// over a 1500-byte link, and that is the claim, so that is the assertion.
+    /// An amplifying S3 is a server's choice, so this constructor builds it.
+    ///
+    /// S1=65, S2=86, S3=120 is an ordinary AmneziaWG 2.0 profile: the kernel
+    /// module and amneziawg-go both run it, and so do the legacy
+    /// `new_tunnel_with_amnezia*` constructors. It trips the cookie-reflection
+    /// rule on the S2 bound (64 + 120 = 184 > 92 + 86 = 178) -- the tighter of
+    /// the two -- which `validate` refuses and this entry point must not,
+    /// because S3 is symmetric and interface-wide: a client that lowered it to
+    /// satisfy the rule could no longer parse its server's cookie replies.
+    ///
+    /// Constructed at *both* ends and driven through a real handshake and a
+    /// data packet rather than asserted non-NULL, because a constructor-only
+    /// check would also pass if the fix accepted the configuration and then
+    /// dropped or mis-sized the prefixes. The two size assertions are what
+    /// prove the profile was actually applied.
+    #[test]
+    fn an_amplifying_s3_builds_and_carries_traffic_through_the_awg_constructor() {
+        last_tunnel_error_free();
+        let params = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            s1_init_junk: 65,
+            s2_response_junk: 86,
+            s3_cookie_junk: 120,
+            ..Default::default()
+        };
+
+        let secret = |k: &x25519_key| x25519_key { key: k.key };
+        let c_sec = x25519_secret_key();
+        let c_pub = x25519_public_key(secret(&c_sec));
+        let s_sec = x25519_secret_key();
+        let s_pub = x25519_public_key(secret(&s_sec));
+        let b64 = |k: x25519_key| unsafe {
+            let p = x25519_key_to_base64(k);
+            let s = CStr::from_ptr(p).to_owned();
+            x25519_key_to_str_free(p);
+            s
+        };
+        let (c_sec, c_pub, s_sec, s_pub) = (b64(c_sec), b64(c_pub), b64(s_sec), b64(s_pub));
+
+        let build = |private: &CString, public: &CString, index: u32| unsafe {
+            let t = new_tunnel_with_awg_params(
+                private.as_ptr(),
+                public.as_ptr(),
+                ptr::null(),
+                0,
+                index,
+                &params,
+                ptr::null(),
+            );
+            assert!(
+                !t.is_null(),
+                "a server-dictated S3 must not be refused here: {}",
+                last_error_string()
+            );
+            t
+        };
+        let client = build(&c_sec, &s_pub, 1);
+        let server = build(&s_sec, &c_pub, 2);
+
+        let mut a = vec![0u8; 65536 + 64];
+        let mut b = vec![0u8; 65536 + 64];
+
+        let r = unsafe { wireguard_force_handshake(client, a.as_mut_ptr(), a.len() as u32) };
+        assert!(matches!(r.op, result_type::WRITE_TO_NETWORK));
+        assert_eq!(
+            r.size,
+            148 + 65,
+            "the initiation must carry its S1 prefix, or the profile was not applied"
+        );
+        let init = a[..r.size].to_vec();
+
+        let r = unsafe {
+            wireguard_read(
+                server,
+                init.as_ptr(),
+                init.len() as u32,
+                b.as_mut_ptr(),
+                b.len() as u32,
+            )
+        };
+        assert!(matches!(r.op, result_type::WRITE_TO_NETWORK));
+        assert_eq!(
+            r.size,
+            92 + 86,
+            "the response must carry its S2 prefix, or the profile was not applied"
+        );
+        let resp = b[..r.size].to_vec();
+
+        let r = unsafe {
+            wireguard_read(
+                client,
+                resp.as_ptr(),
+                resp.len() as u32,
+                a.as_mut_ptr(),
+                a.len() as u32,
+            )
+        };
+        assert!(matches!(
+            r.op,
+            result_type::WRITE_TO_NETWORK | result_type::WIREGUARD_DONE
+        ));
+
+        // A data packet all the way through, so "the session works" is measured
+        // rather than inferred from the handshake completing.
+        let mut pkt = vec![0u8; 60];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&60u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+
+        let r = unsafe {
+            wireguard_write(
+                client,
+                pkt.as_ptr(),
+                pkt.len() as u32,
+                a.as_mut_ptr(),
+                a.len() as u32,
+            )
+        };
+        assert!(matches!(r.op, result_type::WRITE_TO_NETWORK));
+        let data = a[..r.size].to_vec();
+
+        let r = unsafe {
+            wireguard_read(
+                server,
+                data.as_ptr(),
+                data.len() as u32,
+                b.as_mut_ptr(),
+                b.len() as u32,
+            )
+        };
+        assert!(
+            matches!(r.op, result_type::WRITE_TO_TUNNEL_IPV4),
+            "the payload must arrive as plaintext"
+        );
+        assert_eq!(&b[..r.size], &pkt[..], "the payload must round-trip intact");
+
+        unsafe {
+            tunnel_free(client);
+            tunnel_free(server);
+        }
+    }
+
     #[test]
     fn content_padding_mtu_is_the_tunnel_mtu_not_the_link_mtu() {
         /// The largest UDP payload a full-MTU inner packet produces. Drawn
