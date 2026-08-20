@@ -34,6 +34,12 @@ static struct wireguard_tunnel *(*const check_legacy)(
     const char *, const char *, const char *, uint16_t, uint32_t, uint32_t, uint32_t,
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) = new_tunnel;
 
+// The MTU setter, which is the only entry point a caller must reach *after*
+// construction to keep content padding correct across a roam. A constructor
+// whose symbol resolves is no use if the refresh does not.
+static bool (*const check_mtu)(const struct wireguard_tunnel *, uint32_t) =
+    wireguard_set_content_padding_mtu;
+
 // The C++ side of the layout contract. The Rust and C guards both pin these;
 // a C++ compiler is a third implementation of the same rules, and it is the
 // one the consumer actually uses.
@@ -48,5 +54,7 @@ static_assert(offsetof(struct wireguard_awg_params, header_protection_key) == 12
 extern "C" const void *wg_ffi_cpp_check_anchor(int which);
 const void *wg_ffi_cpp_check_anchor(int which)
 {
-    return which == 0 ? (const void *)&check_ctor : (const void *)&check_legacy;
+    if (which == 0)
+        return (const void *)&check_ctor;
+    return which == 1 ? (const void *)&check_legacy : (const void *)&check_mtu;
 }

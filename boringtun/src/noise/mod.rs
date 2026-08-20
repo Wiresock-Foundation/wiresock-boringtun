@@ -494,6 +494,21 @@ impl Tunn {
         self.amnezia.content_padding_mtu = mtu;
     }
 
+    /// The MTU `content_padding` currently clamps against.
+    ///
+    /// Test-only, and `pub(crate)` for the FFI setter's tests rather than for
+    /// production: nothing shipped needs to read this back -- the device holds
+    /// its own copy in `DeviceConfig` and compares against that. The tests do
+    /// need it, because the two failure modes that matter are invisible on the
+    /// wire. A refused value must not have been stored, and an oversize one
+    /// must saturate rather than truncate -- and a clamp of 0 pads a
+    /// 1280-byte packet exactly like a clamp of 65535 does, so no amount of
+    /// datagram measurement can tell `65536 as u16` from a correct saturation.
+    #[cfg(test)]
+    pub(crate) fn content_padding_mtu(&self) -> u16 {
+        self.amnezia.content_padding_mtu
+    }
+
     /// Update the persistent-keepalive interval.
     ///
     /// Purely a timer change, so live sessions are kept: the peer's keys are

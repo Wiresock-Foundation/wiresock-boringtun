@@ -1948,6 +1948,57 @@ pub unsafe extern "C" fn wireguard_stats(tunnel: *const Mutex<Tunn>) -> stats {
     }
 }
 
+/// Refresh the tunnel MTU that `content_padding_addition` pads against.
+///
+/// `wireguard_awg_params::content_padding_mtu` is a construction-time
+/// snapshot, and an embedder's MTU does not hold still: it is recomputed on
+/// every reconnect and every roam between links, while the tunnel handle
+/// lives on. Without this the padding keeps clamping to whatever the MTU was
+/// when the tunnel was built -- too small wastes payload, too large emits
+/// packets the path drops. The device daemon has always had this refresh
+/// (it re-reads the interface MTU once a second and pushes any change into
+/// every peer); this is the same operation for callers who own their own
+/// event loop, and it is the reason an embedder no longer has to rebuild a
+/// tunnel to track a link change.
+///
+/// Only the clamp moves. The configured padding range is untouched, live
+/// sessions are kept, and any queued pre-handshake junk burst survives --
+/// deliberately, because the MTU moves at exactly the moment the first
+/// handshake's burst is most likely in flight.
+///
+/// `mtu` is the **tunnel** MTU -- the size of the packets handed to
+/// `wireguard_write` -- not the link MTU. See `content_padding_mtu` in the
+/// struct for what passing the link MTU costs.
+///
+/// Returns `true` if the clamp was updated. Returns `false`, changing
+/// nothing, when `tunnel` is NULL or `mtu` is 0. Zero is refused rather than
+/// stored because it does not mean "a zero-byte MTU", it means *no clamp at
+/// all* -- it would fail open, padding without bound, and it is the one state
+/// `new_tunnel_with_awg_params` already refuses to construct. A value above
+/// `UINT16_MAX` saturates rather than truncating, for the same reason the
+/// device saturates: `65536` truncated to 16 bits is `0`, so the arithmetic
+/// that is supposed to bound the padding would be the thing that unbounds it.
+///
+/// Unlike the older entry points, a NULL tunnel is a `false` return rather
+/// than a panic. Unwinding across the C boundary is undefined behaviour, so
+/// new entry points do not do it.
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_set_content_padding_mtu(
+    tunnel: *const Mutex<Tunn>,
+    mtu: u32,
+) -> bool {
+    if mtu == 0 {
+        return false;
+    }
+    let Some(tunnel) = tunnel.as_ref() else {
+        return false;
+    };
+    tunnel
+        .lock()
+        .set_content_padding_mtu(mtu.min(u16::MAX as u32) as u16);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3500,6 +3551,209 @@ mod tests {
             tunnel_free(client);
             tunnel_free(server);
         }
+    }
+
+    /// A live tunnel whose MTU moved pads to the new clamp, not the old one.
+    ///
+    /// This is the reason the entry point exists: `content_padding_mtu` is a
+    /// construction-time snapshot, an embedder's MTU is recomputed on every
+    /// reconnect and roam, and the tunnel handle outlives both. Measured on
+    /// the wire rather than by reading the field back, because the field being
+    /// right is not the claim -- the claim is that the *packets* get smaller.
+    ///
+    /// Drawn repeatedly at each MTU because the addition is a random range: a
+    /// single sample would pin whatever the RNG happened to return, and the
+    /// two ranges overlap heavily enough that one draw proves nothing.
+    #[test]
+    fn refreshing_the_mtu_moves_the_padding_clamp_on_a_live_tunnel() {
+        last_tunnel_error_free();
+        let params = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            content_padding_addition: wireguard_awg_range { lo: 8, hi: 200 },
+            content_padding_mtu: 1420,
+            ..Default::default()
+        };
+
+        let secret = |k: &x25519_key| x25519_key { key: k.key };
+        let c_sec = x25519_secret_key();
+        let c_pub = x25519_public_key(secret(&c_sec));
+        let s_sec = x25519_secret_key();
+        let s_pub = x25519_public_key(secret(&s_sec));
+        let b64 = |k: x25519_key| unsafe {
+            let p = x25519_key_to_base64(k);
+            let s = CStr::from_ptr(p).to_owned();
+            x25519_key_to_str_free(p);
+            s
+        };
+        let (c_sec, c_pub, s_sec, s_pub) = (b64(c_sec), b64(c_pub), b64(s_sec), b64(s_pub));
+
+        let build = |private: &CString, public: &CString, index: u32| unsafe {
+            let t = new_tunnel_with_awg_params(
+                private.as_ptr(),
+                public.as_ptr(),
+                ptr::null(),
+                0,
+                index,
+                &params,
+                ptr::null(),
+            );
+            assert!(!t.is_null(), "{}", last_error_string());
+            t
+        };
+        let client = build(&c_sec, &s_pub, 1);
+        let server = build(&s_sec, &c_pub, 2);
+
+        let mut a = vec![0u8; 65536 + 64];
+        let mut b = vec![0u8; 65536 + 64];
+
+        // A real handshake, because content padding only runs once a session
+        // exists.
+        let r = unsafe { wireguard_force_handshake(client, a.as_mut_ptr(), a.len() as u32) };
+        assert!(matches!(r.op, result_type::WRITE_TO_NETWORK));
+        let init = a[..r.size].to_vec();
+        let r = unsafe {
+            wireguard_read(
+                server,
+                init.as_ptr(),
+                init.len() as u32,
+                b.as_mut_ptr(),
+                b.len() as u32,
+            )
+        };
+        assert!(matches!(r.op, result_type::WRITE_TO_NETWORK));
+        let resp = b[..r.size].to_vec();
+        let _ = unsafe {
+            wireguard_read(
+                client,
+                resp.as_ptr(),
+                resp.len() as u32,
+                a.as_mut_ptr(),
+                a.len() as u32,
+            )
+        };
+
+        // A full-size inner packet for the *smaller* of the two MTUs, so the
+        // same payload is legal before and after and the only variable is the
+        // clamp.
+        let mut pkt = vec![0u8; 1280];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&1280u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+
+        let mut max_datagram = || {
+            let mut max = 0usize;
+            for _ in 0..300 {
+                let r = unsafe {
+                    wireguard_write(
+                        client,
+                        pkt.as_ptr(),
+                        pkt.len() as u32,
+                        a.as_mut_ptr(),
+                        a.len() as u32,
+                    )
+                };
+                assert!(matches!(r.op, result_type::WRITE_TO_NETWORK));
+                max = max.max(r.size);
+            }
+            max
+        };
+
+        let before = max_datagram();
+
+        assert!(
+            unsafe { wireguard_set_content_padding_mtu(client, 1280) },
+            "a live tunnel must accept an MTU refresh"
+        );
+
+        let after = max_datagram();
+
+        assert!(
+            after < before,
+            "the clamp must follow the MTU down: {} bytes before, {} after",
+            before,
+            after
+        );
+        // And it must land on exactly the MTU asked for, not merely somewhere
+        // smaller -- a change that clamped to any lesser value would pass the
+        // assertion above. Checked on the field because the wire cannot show
+        // it: the padding is a random draw, so no datagram size distinguishes
+        // "clamped to 1280" from "clamped to something under 1280".
+        assert_eq!(unsafe { (*client).lock().content_padding_mtu() }, 1280);
+
+        unsafe {
+            tunnel_free(client);
+            tunnel_free(server);
+        }
+    }
+
+    /// The refusals that keep the clamp from failing open.
+    ///
+    /// Zero is the dangerous input: it does not mean "a zero-byte MTU", it
+    /// means no clamp at all, so storing it would unbound the padding -- and
+    /// it is the one state `new_tunnel_with_awg_params` already refuses to
+    /// construct, so accepting it here would open by the back door a state the
+    /// front door rejects. Saturation covers the same hazard from the other
+    /// end: `65536 as u16` is `0`, so a truncating implementation turns the
+    /// largest possible MTU into no clamp at all.
+    #[test]
+    fn the_mtu_setter_refuses_the_values_that_would_unbound_the_padding() {
+        last_tunnel_error_free();
+        let params = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            content_padding_addition: wireguard_awg_range { lo: 8, hi: 200 },
+            content_padding_mtu: 1420,
+            ..Default::default()
+        };
+        let key = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+        let tunnel = unsafe {
+            new_tunnel_with_awg_params(
+                key.as_ptr(),
+                key.as_ptr(),
+                ptr::null(),
+                0,
+                1,
+                &params,
+                ptr::null(),
+            )
+        };
+        assert!(!tunnel.is_null(), "{}", last_error_string());
+
+        let clamp = || unsafe { (*tunnel).lock().content_padding_mtu() };
+
+        assert!(
+            !unsafe { wireguard_set_content_padding_mtu(tunnel, 0) },
+            "0 means no clamp at all and must be refused"
+        );
+        assert_eq!(clamp(), 1420, "a refused value must not have been stored");
+
+        // A NULL tunnel is a `false` return, not a panic. Measured rather than
+        // assumed: replacing this with the `as_ref().unwrap()` the older entry
+        // points use does not produce a clean panic here, it takes the test
+        // process down with SIGSEGV -- which is what it would do to an
+        // embedder's process too, since a panic cannot unwind out of
+        // `extern "C"`.
+        assert!(
+            !unsafe { wireguard_set_content_padding_mtu(ptr::null(), 1280) },
+            "a NULL tunnel must be refused"
+        );
+
+        assert!(unsafe { wireguard_set_content_padding_mtu(tunnel, 1280) });
+        assert_eq!(clamp(), 1280);
+
+        // Saturate, never truncate.
+        assert!(unsafe { wireguard_set_content_padding_mtu(tunnel, 65536) });
+        assert_eq!(
+            clamp(),
+            u16::MAX,
+            "an oversize MTU must saturate; truncation would store 0 and unbound the padding"
+        );
+        assert!(unsafe { wireguard_set_content_padding_mtu(tunnel, u32::MAX) });
+        assert_eq!(clamp(), u16::MAX);
+
+        unsafe { tunnel_free(tunnel) };
     }
 
     #[test]

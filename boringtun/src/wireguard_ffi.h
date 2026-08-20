@@ -676,6 +676,38 @@ struct wireguard_result wireguard_force_handshake(const struct wireguard_tunnel 
 
 struct stats wireguard_stats(const struct wireguard_tunnel *tunnel);
 
+/// Refresh the tunnel MTU that content_padding_addition pads against.
+///
+/// params.content_padding_mtu is a construction-time snapshot, and your MTU
+/// does not hold still -- it is recomputed on every reconnect and every roam
+/// between links, while the tunnel handle lives on. Without this call the
+/// padding keeps clamping to whatever the MTU was when the tunnel was built:
+/// too small wastes payload, too large emits packets the path drops. Call it
+/// wherever you already recompute your MTU; you do not have to rebuild the
+/// tunnel to track a link change.
+///
+/// Only the clamp moves. The configured padding range is untouched, live
+/// sessions are kept, and a queued pre-handshake junk burst survives --
+/// deliberately, since the MTU tends to move at exactly the moment the first
+/// handshake's burst is in flight.
+///
+/// mtu is the TUNNEL MTU -- the size of the packets you hand to
+/// wireguard_write() -- not the link MTU. See content_padding_mtu in
+/// struct wireguard_awg_params for what passing the link MTU costs.
+///
+/// Returns true if the clamp was updated. Returns false, changing nothing, if
+/// tunnel is NULL or mtu is 0: zero does not mean "a zero-byte MTU", it means
+/// NO CLAMP AT ALL, so storing it would let the padding run unbounded -- and
+/// it is the one state new_tunnel_with_awg_params already refuses to build. A
+/// value above UINT16_MAX saturates rather than truncating, because 65536
+/// truncated to 16 bits is 0, i.e. the arithmetic meant to bound the padding
+/// would be the thing that unbounds it.
+///
+/// Unlike the older entry points above, a NULL tunnel returns false rather
+/// than aborting.
+bool wireguard_set_content_padding_mtu(const struct wireguard_tunnel *tunnel,
+                                       uint32_t mtu);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
