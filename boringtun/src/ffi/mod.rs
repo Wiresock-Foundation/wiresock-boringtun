@@ -3461,7 +3461,7 @@ mod tests {
 
         // A data packet all the way through, so "the session works" is measured
         // rather than inferred from the handshake completing.
-        let mut pkt = vec![0u8; 60];
+        let mut pkt = [0u8; 60];
         pkt[0] = 0x45;
         pkt[2..4].copy_from_slice(&60u16.to_be_bytes());
         pkt[8] = 64;
