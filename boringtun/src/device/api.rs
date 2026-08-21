@@ -266,6 +266,23 @@ impl AwgParams {
             return Err(EINVAL);
         }
 
+        // The cookie-reflection policy, applied here rather than inside
+        // `validate` because it is a responder's question and this is the
+        // responder's door: a device answers handshakes on an unconnected
+        // socket, so its cookie replies are aimed at attacker-chosen sources,
+        // and the operator running `awg set` is the one party who can actually
+        // change S3. The same profile is *accepted* by the C constructors,
+        // where the caller is a client handed S3 by its server -- see
+        // `AmneziaConfig::cookie_amplification_complaint`. Refusing at `set=1`
+        // with the arithmetic in the message is the loud, actionable failure;
+        // the runtime guards (`reply_policy::cookie_verdict` here,
+        // `Tunn::decapsulate`'s emit-site check everywhere) are what actually
+        // stop the reflection, so this is early notice, not the last line.
+        if let Some(complaint) = amnezia.cookie_amplification_complaint() {
+            tracing::error!(message = "rejecting AmneziaWG parameters", error = %complaint);
+            return Err(EINVAL);
+        }
+
         Ok((obf, amnezia))
     }
 }

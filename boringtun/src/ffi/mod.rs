@@ -1737,24 +1737,21 @@ fn awg_params_to_config(
 ///
 /// One class is deliberately **not** refused here, though the UAPI `set=1` path
 /// does refuse it: S-value combinations that make the cookie reply larger than
-/// the request it answers, i.e. an amplification reflector. That rule asks
-/// whether this port would reflect, and a tunnel reached through this ABI
-/// cannot: cookie replies are formatted only by `RateLimiter::verify_packet`,
-/// which returns `UnderLoad` before formatting when the source address is
-/// `None`, and [`wireguard_read`] passes `None` because the C ABI has no
-/// address parameter. That -- not "callers of this constructor are clients" --
-/// is the invariant. This entry point builds responders too; the test
-/// `an_amplifying_s3_builds_and_carries_traffic_through_the_awg_constructor`
-/// builds both ends with it. Anything that gives `decapsulate` a real source
-/// address (a future `wireguard_read_from`) must restore a reply-size guard.
-/// More to the point, `s3_cookie_junk` is
-/// symmetric and interface-wide -- both ends must configure the same value or
-/// cookie replies do not parse -- so it is dictated by the server the caller is
-/// connecting to. Refusing would decline a profile the caller cannot change,
-/// that the AmneziaWG kernel module and amneziawg-go both run, and that the
-/// legacy `new_tunnel_with_amnezia*` constructors accept. It is logged instead.
-/// A profile accepted here can therefore still be refused by `boringtun-cli`,
-/// which is a responder; that divergence is intentional.
+/// the request it answers, i.e. an amplification reflector. Accepting it is
+/// safe because the reflection is stopped where the packet is sent, not at
+/// configuration time: `Tunn::decapsulate` refuses to emit a cookie reply
+/// larger than the datagram that provoked it, for every tunnel however it was
+/// built. (Through this ABI the reply path is doubly unreachable --
+/// [`wireguard_read`] passes no source address, so `RateLimiter::verify_packet`
+/// bails on `UnderLoad` before a cookie is even formatted.) And accepting it is
+/// *necessary* because `s3_cookie_junk` is symmetric and interface-wide -- both
+/// ends must configure the same value or cookie replies do not parse -- so it
+/// is dictated by the server the caller is connecting to. Refusing would
+/// decline a profile the caller cannot change, that the AmneziaWG kernel module
+/// and amneziawg-go both run, and that the legacy `new_tunnel_with_amnezia*`
+/// constructors accept. It is logged instead. A profile accepted here can
+/// therefore still be refused by `boringtun-cli`, which is a responder choosing
+/// its own reflection ratio; that divergence is intentional.
 ///
 /// Returns NULL on failure, with the reason in `last_tunnel_error()`.
 #[no_mangle]
@@ -1827,18 +1824,23 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
     // constructors predate this and only check the header-protection nonce
     // (through `Tunn::new_with_amnezia`), which was harmless while no FFI path
     // could set a key -- this one can set all three 3.0 features, which is
-    // exactly what `validate` exists to catch.
-    if let Err(e) = amnezia.validate_without_reflection_policy() {
+    // exactly what `validate` exists to catch. `validate` is universal -- every
+    // rule in it holds for either end of the tunnel -- so calling it here
+    // refuses nothing a client cannot fix.
+    if let Err(e) = amnezia.validate() {
         set_last_error(&format!("Invalid AmneziaWG parameters: {}", e));
         return ptr::null_mut();
     }
 
-    // Logged, not refused. `validate` rejects an amplifying S3 because a device
-    // is a responder on an unconnected socket; a tunnel built here is not, and
-    // S3 is not this caller's to change -- it is symmetric and interface-wide,
-    // so a client must use whatever its server was configured with or fail to
-    // parse cookie replies. Refusing would decline a profile the reference
-    // implementations run and the operator cannot alter from this end.
+    // The cookie-reflection policy: logged, not refused. The UAPI `set=1` path
+    // refuses this same complaint, because a device is a responder choosing its
+    // own reflection ratio; a tunnel built here is a client, and S3 is not this
+    // caller's to change -- it is symmetric and interface-wide, so a client
+    // must use whatever its server was configured with or fail to parse cookie
+    // replies. Refusing would decline a profile the reference implementations
+    // run and the operator cannot alter from this end. And warning is safe:
+    // should this tunnel ever be driven as a responder, `Tunn::decapsulate`
+    // refuses to emit an amplifying reply at the emit site itself.
     if let Some(complaint) = amnezia.cookie_amplification_complaint() {
         tracing::warn!(
             message = "AmneziaWG S sizes make cookie replies larger than the packets \

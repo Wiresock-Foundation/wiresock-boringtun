@@ -618,22 +618,25 @@ struct wireguard_awg_params
 /// ONE CLASS IS DELIBERATELY NOT REFUSED HERE, though the UAPI set=1 path does
 /// refuse it: S-value combinations that make the cookie reply larger than the
 /// request it answers, i.e. an amplification reflector (s3_cookie_junk >
-/// s2_response_junk + 28, or > s1_init_junk + 84). That rule asks whether this
-/// port would reflect, and a tunnel driven through this ABI cannot: cookie
-/// replies are only formatted for a known source address, and wireguard_read()
-/// has no address parameter to supply one. That is the invariant -- NOT that
-/// callers of this constructor are always clients; it builds responders too.
-/// Decisively, s3_cookie_junk is symmetric and
-/// interface-wide: both ends must configure the same value or cookie replies do
-/// not parse, so it is dictated by the server you are connecting to, not chosen
-/// here. Refusing would decline a profile you cannot change, that the AmneziaWG
-/// kernel module and amneziawg-go both run, and that the constructors above
-/// accept. It is logged at WARN instead, so it reaches a host that installed a
-/// callback with set_logging_function() and nothing at all otherwise -- it is
-/// NOT reported through last_tunnel_error(), which stays reserved for the NULL
+/// s2_response_junk + 28, or > s1_init_junk + 84). Accepting it is safe
+/// because the reflection is stopped where the packet would be sent, not at
+/// configuration time: the tunnel itself refuses to emit a cookie reply larger
+/// than the datagram that provoked it, however the tunnel was built. (Through
+/// this ABI the reply path is doubly unreachable -- cookie replies are only
+/// formatted for a known source address, and wireguard_read() has no address
+/// parameter to supply one.) And accepting it is NECESSARY because
+/// s3_cookie_junk is symmetric and interface-wide: both ends must configure
+/// the same value or cookie replies do not parse, so it is dictated by the
+/// server you are connecting to, not chosen here. Refusing would decline a
+/// profile you cannot change, that the AmneziaWG kernel module and
+/// amneziawg-go both run, and that the constructors above accept. It is
+/// logged at WARN instead, so it reaches a host that installed a callback
+/// with set_logging_function() and nothing at all otherwise -- it is NOT
+/// reported through last_tunnel_error(), which stays reserved for the NULL
 /// return, and a non-NULL return never means "read the error". A profile this
 /// constructor accepts may therefore still be refused by boringtun-cli, which
-/// is a responder; that divergence is intentional.
+/// is a responder choosing its own reflection ratio; that divergence is
+/// intentional.
 ///
 /// Returns NULL on failure, with the reason in last_tunnel_error().
 struct wireguard_tunnel *new_tunnel_with_awg_params(

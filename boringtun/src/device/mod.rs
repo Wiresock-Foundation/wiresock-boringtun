@@ -1976,15 +1976,20 @@ mod ingress_tests {
             .validate()
             .is_err());
 
-        // With S1 = 0 the same S3 is now refused at configuration time -- the
-        // first of the two doors, and the loud one.
+        // With S1 = 0 the same S3 earns the complaint that `device::api` turns
+        // into a refused `set=1` transaction -- the config-time door, and the
+        // loud one. `validate` itself stays silent: the reflection question is
+        // a responder's, and universal validation no longer answers it.
         let amnezia = AmneziaConfig::new(0, 0, 65_443, 0);
-        let err = amnezia
+        amnezia
             .validate()
-            .expect_err("an amplifying S3 must not be a loadable configuration");
+            .expect("universal validation does not police reflection");
+        let err = amnezia
+            .cookie_amplification_complaint()
+            .expect("an amplifying S3 must earn the config-time complaint");
         assert!(
             err.contains("larger than"),
-            "the error must say what is wrong, not just that something is: {}",
+            "the message must say what is wrong, not just that something is: {}",
             err
         );
 
