@@ -14,6 +14,7 @@ use crate::x25519::{PublicKey, StaticSecret};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use hex::encode as encode_hex;
+#[cfg(not(test))]
 use libc::{raise, SIGSEGV};
 use parking_lot::Mutex;
 use rand_core::OsRng;
@@ -29,8 +30,10 @@ use std::panic;
 use std::ptr;
 use std::ptr::null_mut;
 use std::slice;
+#[cfg(not(test))]
 use std::sync::Once;
 
+#[cfg(not(test))]
 static PANIC_HOOK: Once = Once::new();
 
 thread_local! {
@@ -444,6 +447,14 @@ unsafe fn new_tunnel_with_amnezia_config(
         }
     };
 
+    // Not in test builds. This hook replaces the default one process-wide --
+    // including libtest's, which is what prints "thread panicked at" into a
+    // failing test's report. With it installed, any test that fails after any
+    // test has called a constructor reports FAILED with an *empty* output
+    // section, which turned one real flake into three rounds of blind hunting
+    // before anyone could read the assertion text. An embedder still gets the
+    // hook: `cfg(test)` only strips it from this crate's own test binaries.
+    #[cfg(not(test))]
     PANIC_HOOK.call_once(|| {
         // FFI won't properly unwind on panic, but it will if we cause a segmentation fault
         panic::set_hook(Box::new(move |_| {
@@ -3617,6 +3628,9 @@ mod tests {
     /// successful build reads a message about a tunnel it just built fine.
     #[test]
     fn an_amplifying_s3_warns_and_leaves_the_error_slot_empty() {
+        // Failed once on macOS CI when another `with_default` test's dispatcher
+        // churn raced this one's `warn!` -- see `tracing_test_lock`.
+        let _serialized = crate::tracing_test_lock();
         use std::sync::{Arc, Mutex as StdMutex};
         use tracing::field::{Field, Visit};
         use tracing::Subscriber;
@@ -3689,20 +3703,49 @@ mod tests {
                     unsafe { tunnel_free(tunnel) };
                 });
             }
-            Arc::try_unwrap(events).ok().unwrap().into_inner().unwrap()
+            // Read through the lock rather than `Arc::try_unwrap`: tracing's
+            // dispatcher registry can keep the subscriber -- and with it the
+            // other clone of this Arc -- alive for a moment past the scope
+            // above, and `try_unwrap` turns that latency into a panic that has
+            // nothing to do with what this test asserts.
+            let captured = std::mem::take(&mut *events.lock().unwrap());
+            captured
         };
 
         // 64 + 120 = 184 > 92 + 86 = 178.
-        let amplifying = build(120);
+        //
+        // Bounded retry, and only on this half. tracing caches per-callsite
+        // interest in a process-global table; other tests hit this same
+        // `warn!` callsite from threads with no subscriber (caching "never"),
+        // and a registration racing the rebuild that `with_default` triggers
+        // can clobber it back -- the event is then dropped with this test's
+        // subscriber installed and active, which was measured here as
+        // `captured: []` roughly once per twenty runs. Real embedders never
+        // see this: they install one global subscriber at startup, before any
+        // callsite is hit, and nothing churns afterwards. A retry keeps the
+        // mutation kill intact -- a deleted `warn!` captures nothing on every
+        // attempt -- while a lost cache update wins the next round. The clean
+        // half below stays single-shot: a dropped event can only *lose* a
+        // warning, never invent one.
+        let amplifying = (0..5)
+            .map(|attempt| {
+                if attempt > 0 {
+                    tracing::callsite::rebuild_interest_cache();
+                }
+                build(120)
+            })
+            .find(|events| {
+                events
+                    .iter()
+                    .any(|c| c.detail.contains("makes a cookie reply"))
+            })
+            .unwrap_or_else(|| {
+                panic!("the constructor must log the complaint; nothing captured in 5 attempts")
+            });
         let warned = amplifying
             .iter()
             .find(|c| c.detail.contains("makes a cookie reply"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "the constructor must log the complaint; captured: {:?}",
-                    amplifying.iter().map(|c| &c.message).collect::<Vec<_>>()
-                )
-            });
+            .expect("the winning attempt carries the event");
         assert!(
             warned.message.contains("reflect"),
             "the message must say what is wrong: {}",
@@ -3904,12 +3947,14 @@ mod tests {
         );
         assert_eq!(clamp(), 1420, "a refused value must not have been stored");
 
-        // A NULL tunnel is a `false` return, not an abort. Measured rather
-        // than assumed: replacing this with the `as_ref().unwrap()` the older
-        // entry points use does not produce a clean panic here -- it takes the
-        // test process down with SIGSEGV, because this module installs a panic
-        // hook that calls `raise(SIGSEGV)` and a panic cannot unwind out of
-        // `extern "C"` to be caught first. An embedder gets the same segfault.
+        // A NULL tunnel is a `false` return, not an abort. In an embedder's
+        // build the difference is stark: the older entry points `unwrap()`,
+        // and this module's panic hook (production builds only -- it is
+        // `cfg(not(test))` so test failures keep their messages) turns that
+        // panic into a raised SIGSEGV, taking the host process down. Measured
+        // as exactly that before the hook was gated: mutating this to the
+        // older style killed the test harness with signal 11 rather than
+        // failing cleanly.
         assert!(
             !unsafe { wireguard_set_content_padding_mtu(ptr::null(), 1280) },
             "a NULL tunnel must be refused"

@@ -1699,6 +1699,7 @@ mod tests {
     /// arithmetic can drift from it; a field carrying the number cannot.
     #[test]
     fn the_keepalive_warning_reports_the_interval_it_applied() {
+        let _serialized = crate::tracing_test_lock();
         use std::sync::{Arc, Mutex};
         use tracing::field::{Field, Visit};
         use tracing::Subscriber;
@@ -1937,6 +1938,7 @@ mod tests {
     /// rather than against the comments above it.
     #[test]
     fn an_awg3_device_key_warns_exactly_when_it_asks_for_what_we_do_not_do() {
+        let _serialized = crate::tracing_test_lock();
         const SILENT: &[tracing::Level] = &[];
         const WARNS: &[tracing::Level] = &[tracing::Level::WARN];
 

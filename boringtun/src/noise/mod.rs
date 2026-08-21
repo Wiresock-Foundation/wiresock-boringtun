@@ -3470,6 +3470,7 @@ mod tests {
     #[test]
     #[cfg(feature = "mock-instant")]
     fn the_two_give_up_paths_are_distinguishable_in_the_log() {
+        let _serialized = crate::tracing_test_lock();
         use std::sync::{Arc, Mutex};
         use tracing::field::{Field, Visit};
         use tracing::Subscriber;
