@@ -389,9 +389,14 @@ impl Tunn {
         // Parity, not added strictness: amneziawg-go refuses the same four in
         // `mergeWithDevice` against its own `HeaderCipherNonceSize = 12`.
         //
-        // Only this rule, not the whole of `validate`: the cookie-amplification
-        // rule refuses configurations that do work, which is a policy judgement
-        // for the full check `device::api` runs on `set=1`.
+        // Only this rule, not the whole of `validate` -- for compatibility, not
+        // policy. `validate` is universal now (the cookie-reflection policy
+        // moved out to `device::api`, its one responder), but these
+        // constructors predate it and have accepted timer and size shapes
+        // `validate` refuses; widening the check here would break existing
+        // Rust callers for configurations that, like the kernel module, merely
+        // run badly. The struct-based C constructor, which has no such legacy,
+        // does run the whole of `validate`.
         amnezia.check_header_protection_nonce()?;
 
         let static_public = x25519::PublicKey::from(&static_private);
@@ -653,6 +658,15 @@ impl Tunn {
             return self.send_queued_packet(dst);
         }
 
+        // The received datagram's length as it arrived on the wire, taken
+        // before the rebind below strips the junk prefix. The cookie-reply
+        // guard further down compares wire length against wire length --
+        // the same two numbers `device::reply_policy::cookie_verdict` uses
+        // (`packet_len` from `recv_from` against `cookie_reply_len`) -- so the
+        // two guards cannot disagree about what "larger than the packet that
+        // provoked it" means.
+        let wire_len = datagram.len();
+
         // Header protection has to be undone before anything reads the message
         // type, and undoing it mutates. The public signature takes `&[u8]`, and
         // widening it would push a `&mut` requirement through `device`, the C
@@ -697,7 +711,81 @@ impl Tunn {
         ) {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
+                // The one place a `Tunn` emits a packet to an address it has
+                // not authenticated: `verify_packet` produces a cookie on a
+                // valid mac1, and mac1 is keyed on our *public* key, so any
+                // holder of a client config can provoke this from a forged
+                // source. If the reply as it would leave the wire -- cookie
+                // plus its S3 junk prefix -- is larger than the datagram that
+                // provoked it, sending would make this port a reflection
+                // amplifier, so it is not sent. Suppressed here, at the emit
+                // site, rather than trusted to configuration checks: this
+                // guard holds for every `Tunn` however it was built, including
+                // through the C constructors, which deliberately accept an
+                // amplifying S3 because a *client* is handed that value by its
+                // server and never reaches this arm (`wireguard_read` passes
+                // no source address, so `verify_packet` bails on `UnderLoad`
+                // before formatting). The device's ingress path applies the
+                // same parity rule through `reply_policy::cookie_verdict`,
+                // which reads the same `amnezia::reply_amplifies` this does --
+                // one expression, so the two cannot drift on which side of
+                // parity is allowed. That path covers the device's *unconnected*
+                // socket only; a peer promoted to a connected socket reaches
+                // this arm instead, which is why the warning below is here.
+                //
+                // `Done` and not an error: the datagram was valid, the peer
+                // simply gets no cookie -- the same outcome the device's
+                // suppression produces, and the same thing the peer sees from
+                // a server whose reply was lost in the flood that put the
+                // limiter under load in the first place.
                 let packet_size = cookie.len();
+                if self
+                    .amnezia
+                    .cookie_reply_would_amplify(packet_size, wire_len)
+                {
+                    // Said, not dropped in silence, for the reason
+                    // `device::reply_policy` gives at its own suppression site:
+                    // the cost of this is every handshake failing for as long as
+                    // the flood lasts, the fix is to lower S3, and the operator
+                    // can only make it if they are told. This arm is the one the
+                    // device's warning does *not* cover -- a peer on a connected
+                    // socket (`use_connected_socket` is the default) reaches
+                    // `decapsulate` and never the ingress path that warns, and a
+                    // Rust embedder driving `decapsulate(Some(addr), ..)` has no
+                    // ingress path at all.
+                    //
+                    // Latched process-wide rather than logged per packet: this
+                    // arm fires under flood, which is precisely when a line per
+                    // datagram would be its own denial of service. `static` and
+                    // not a field on `Tunn`, matching `prepend_outbound`'s
+                    // warning -- a tunnel in this state suppresses every reply,
+                    // so the second line would only be noise.
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        tracing::warn!(
+                            message = "suppressing a cookie reply: S3 makes it larger than the \
+                                       packet that provoked it, which is a reflection amplifier. \
+                                       Handshakes will fail while this tunnel is under load; \
+                                       lower S3.",
+                            reply_len = self.amnezia.cookie_reply_len(packet_size),
+                            request_len = wire_len,
+                        )
+                    });
+                    return TunnResult::Done;
+                }
+                // Every other short-buffer exit in this function reports
+                // `DestinationBufferTooSmall`; without this one the slice below
+                // panics instead, and `decapsulate` is `extern "C"`-reachable,
+                // where a panic cannot unwind and the FFI hook turns it into a
+                // raised SIGSEGV. Measured before this line existed: a
+                // `decapsulate(Some(addr), init, &mut [0u8; 32])` against a
+                // zero-budget limiter panicked with "range end index 64 out of
+                // range for slice of length 32". Checked here rather than left
+                // to `write_to_network`, which only sees the buffer after the
+                // copy has already run.
+                if dst.len() < packet_size {
+                    return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+                }
                 dst[..packet_size].copy_from_slice(cookie);
                 return self.write_to_network(dst, packet_size);
             }
@@ -2077,6 +2165,287 @@ mod tests {
         );
     }
 
+    /// The guard measures the datagram in hand, not the initiation it assumes.
+    ///
+    /// A cookie is demanded for a handshake **response** as well as an
+    /// initiation (`RateLimiter::verify_packet` matches both), and a response is
+    /// `HANDSHAKE_RESP_SZ + S2` on the wire -- 56 bytes shorter than an
+    /// initiation before any prefix. So a reply that attenuates against an
+    /// initiation can still amplify against a response, and the sibling test
+    /// above cannot see it: every case there provokes with an initiation and
+    /// sets S2 = 0.
+    ///
+    /// This is not hypothetical coverage. Replacing the guard's `wire_len` with
+    /// `HANDSHAKE_INIT_SZ + S1` -- the shape someone writes when they picture
+    /// only the initiation path -- leaves every case of the sibling test green,
+    /// and is killed here.
+    #[test]
+    fn the_response_bound_is_measured_against_the_response() {
+        // S1 = 120, S3 = 100: a 164-byte reply. Against the initiation
+        // (148 + 120 = 268) it attenuates, so the initiation-only view says
+        // "send". Against the response it is the S2 that decides.
+        //
+        // (S2, must the reply be suppressed, what the sizes mean)
+        let cases = [
+            (
+                0u16,
+                true,
+                "amplifying: 164-byte reply to a 92-byte response",
+            ),
+            (
+                200,
+                false,
+                "attenuating: 164-byte reply to a 292-byte response",
+            ),
+            (100, false, "parity: 164-byte reply to a 164-byte response"),
+        ];
+        for (s2, expect_suppressed, label) in cases {
+            // The *initiator* is starved here, so it is the one that demands a
+            // cookie -- for the response its peer sends back.
+            let (mut my_tun, mut their_tun) = cookie_provoking_pair_with_budgets(
+                AmneziaConfig::new(120, s2, 100, 0),
+                Some(0),
+                None,
+            );
+
+            let mut dst = vec![0u8; 2048];
+            let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+
+            let src = Some(std::net::IpAddr::from([10, 0, 0, 1]));
+            let mut their_dst = vec![0u8; 2048];
+            let response =
+                unwrap_network_packet(their_tun.decapsulate(src, &init, &mut their_dst)).to_vec();
+            assert_eq!(
+                response.len(),
+                HANDSHAKE_RESP_SZ + s2 as usize,
+                "sanity: the provoking packet must be a response: {}",
+                label
+            );
+
+            let mut my_dst = vec![0u8; 2048];
+            let result = my_tun.decapsulate(src, &response, &mut my_dst);
+
+            let reply_len = COOKIE_REPLY_SZ + 100;
+            assert_eq!(
+                expect_suppressed,
+                reply_len > response.len(),
+                "the case table's own arithmetic disagrees with its expectation: {}",
+                label
+            );
+            // And the initiation view really would disagree, or this test is
+            // not covering the thing it says it covers.
+            assert!(
+                reply_len <= init.len(),
+                "sanity: this reply must attenuate against the initiation,                  or the sibling test would already catch the mutation: {}",
+                label
+            );
+
+            if expect_suppressed {
+                assert!(
+                    matches!(result, TunnResult::Done),
+                    "{}: the reply must be suppressed, got {:?}",
+                    label,
+                    result
+                );
+            } else {
+                let cookie = match result {
+                    TunnResult::WriteToNetwork(c) => c,
+                    other => panic!("{}: the cookie must still be sent, got {:?}", label, other),
+                };
+                assert_eq!(cookie.len(), reply_len, "{}", label);
+            }
+        }
+    }
+
+    /// An initiator and a responder sharing `amnezia`, the responder's rate
+    /// limiter opened with a zero budget.
+    ///
+    /// Budget zero means the first handshake message the responder sees is
+    /// already "under load", so it draws a cookie reply instead of being
+    /// processed -- which is the only way to reach the cookie arm of
+    /// `decapsulate` without flooding, and why the tests that use this cannot
+    /// flake. Three of them need exactly this pair and differ only in the
+    /// config, so it is written once.
+    fn cookie_provoking_pair(amnezia: AmneziaConfig) -> (Tunn, Tunn) {
+        cookie_provoking_pair_with_budgets(amnezia, None, Some(0))
+    }
+
+    /// The same pair with either end's rate-limit budget chosen.
+    ///
+    /// `None` is the ordinary `PEER_HANDSHAKE_RATE_LIMIT`; `Some(0)` makes that
+    /// end treat its first handshake message as already under load. Which end
+    /// is starved decides *which packet kind* provokes the cookie, and that is
+    /// the whole point of having this knob: starving the responder provokes a
+    /// reply to an **initiation** (`HANDSHAKE_INIT_SZ + S1` on the wire),
+    /// starving the initiator provokes one to a **response**
+    /// (`HANDSHAKE_RESP_SZ + S2`). A guard that compared against the initiation
+    /// bound instead of the datagram in hand passes every initiation-provoked
+    /// test, so the second shape is not redundant coverage -- it is the only
+    /// thing that distinguishes the two.
+    fn cookie_provoking_pair_with_budgets(
+        amnezia: AmneziaConfig,
+        my_budget: Option<u64>,
+        their_budget: Option<u64>,
+    ) -> (Tunn, Tunn) {
+        let my_secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let my_public = x25519::PublicKey::from(&my_secret);
+        let their_secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let their_public = x25519::PublicKey::from(&their_secret);
+
+        let my_tun = Tunn::new_with_obfuscation(
+            my_secret,
+            their_public,
+            None,
+            None,
+            100,
+            my_budget.map(|b| Arc::new(RateLimiter::new(&my_public, b))),
+            Default::default(),
+            amnezia.clone(),
+        )
+        .unwrap();
+        let their_tun = Tunn::new_with_obfuscation(
+            their_secret,
+            my_public,
+            None,
+            None,
+            101,
+            their_budget.map(|b| Arc::new(RateLimiter::new(&their_public, b))),
+            Default::default(),
+            amnezia,
+        )
+        .unwrap();
+        (my_tun, their_tun)
+    }
+
+    /// A cookie reply the caller's buffer cannot hold is an error, not a panic.
+    ///
+    /// `decapsulate` is reachable through `extern "C"` entry points, where a
+    /// panic cannot unwind and the FFI panic hook turns it into `raise(SIGSEGV)`
+    /// -- so the difference between these two outcomes is a host process that
+    /// keeps running and one that does not. Every other short-buffer exit in
+    /// `decapsulate` already reports `DestinationBufferTooSmall`; this arm did
+    /// not, and panicked with "range end index 64 out of range for slice of
+    /// length 32" instead.
+    ///
+    /// S3 = 0, so the amplification guard above does not claim the return
+    /// first: this has to reach the copy to test anything.
+    #[test]
+    fn a_cookie_reply_that_does_not_fit_the_destination_is_an_error() {
+        let (mut my_tun, mut their_tun) = cookie_provoking_pair(AmneziaConfig::default());
+
+        let mut dst = vec![0u8; 2048];
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+
+        let src = Some(std::net::IpAddr::from([10, 0, 0, 1]));
+        let mut too_small = vec![0u8; COOKIE_REPLY_SZ - 1];
+        assert!(
+            matches!(
+                their_tun.decapsulate(src, &init, &mut too_small),
+                TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+            ),
+            "a destination too small for the cookie reply must be reported, not panicked on"
+        );
+
+        // And a buffer that is exactly big enough still gets the reply, or the
+        // check above could be refusing everything.
+        let mut exact = vec![0u8; COOKIE_REPLY_SZ];
+        let cookie = unwrap_network_packet(their_tun.decapsulate(src, &init, &mut exact));
+        assert_eq!(cookie.len(), COOKIE_REPLY_SZ);
+    }
+
+    /// A `Tunn` refuses to emit a cookie reply larger than the packet that
+    /// provoked it, whoever built the tunnel and however it is driven.
+    ///
+    /// This is the guard at the emit site itself, and it exists because every
+    /// other defence is positional. The config-time complaint is refused only
+    /// on the device's `set=1` door and deliberately *accepted* by the C
+    /// constructors (a client is handed S3 by its server); the device's
+    /// `reply_policy::cookie_verdict` runs only on the device's own ingress
+    /// path; and the C ABI is safe only because `wireguard_read` passes no
+    /// source address. None of that protects a Rust embedder calling
+    /// `decapsulate(Some(addr), ..)` -- which is public API -- or a future
+    /// address-carrying FFI read. This does: the comparison is wire length
+    /// against wire length, the same parity rule `cookie_verdict` applies, so
+    /// an amplifying configuration can exist without an amplifying *port*
+    /// existing anywhere.
+    ///
+    /// Three shapes: an amplifying reply is suppressed, an attenuating reply
+    /// still goes out (the guard is not a blanket drop of WireGuard's flood
+    /// defence), and exact parity still goes out (the bound is `>`, matching
+    /// `cookie_verdict` -- at parity reflection gains an attacker nothing).
+    ///
+    /// A limiter with a zero budget forces the cookie on the first message, so
+    /// this needs no flooding and cannot flake.
+    #[test]
+    fn an_amplifying_cookie_reply_is_suppressed_at_the_emit_site() {
+        // (S1, S3, must the reply be suppressed, what the sizes mean). The
+        // provoking packet is an initiation of HANDSHAKE_INIT_SZ + S1 wire
+        // bytes; the reply would be COOKIE_REPLY_SZ + S3.
+        //
+        // The expectation is declared per case, not recomputed from the sizes:
+        // with `if reply_len > init.len()` deciding which assertion runs, moving
+        // one S3 during a refactor could drop every case into the "must be sent"
+        // branch and the suppression assertion would stop executing without any
+        // test going red.
+        let cases = [
+            (
+                0u16,
+                100u16,
+                true,
+                "amplifying: 164-byte reply to a 148-byte packet",
+            ),
+            (
+                120,
+                110,
+                false,
+                "attenuating: 174-byte reply to a 268-byte packet",
+            ),
+            (0, 84, false, "parity: 148-byte reply to a 148-byte packet"),
+        ];
+        for (s1, s3, expect_suppressed, label) in cases {
+            let (mut my_tun, mut their_tun) =
+                cookie_provoking_pair(AmneziaConfig::new(s1, 0, s3, 0));
+
+            let mut dst = vec![0u8; 2048];
+            let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+            assert_eq!(
+                init.len(),
+                HANDSHAKE_INIT_SZ + s1 as usize,
+                "sanity: {}",
+                label
+            );
+
+            let src = Some(std::net::IpAddr::from([10, 0, 0, 1]));
+            let mut their_dst = vec![0u8; 2048];
+            let result = their_tun.decapsulate(src, &init, &mut their_dst);
+
+            // Named from the constants, not from 64 and 148, so a change to
+            // either wire size is caught here rather than in the field -- the
+            // reason `packet_sizes` exists for the `device` tests.
+            let reply_len = COOKIE_REPLY_SZ + s3 as usize;
+            assert_eq!(
+                expect_suppressed,
+                reply_len > init.len(),
+                "the case table's own arithmetic disagrees with its expectation: {}",
+                label
+            );
+            if expect_suppressed {
+                assert!(
+                    matches!(result, TunnResult::Done),
+                    "{}: the reply must be suppressed, got {:?}",
+                    label,
+                    result
+                );
+            } else {
+                let cookie = match result {
+                    TunnResult::WriteToNetwork(c) => c,
+                    other => panic!("{}: the cookie must still be sent, got {:?}", label, other),
+                };
+                assert_eq!(cookie.len(), reply_len, "{}", label);
+            }
+        }
+    }
+
     /// A cookie reply must round-trip masked too.
     ///
     /// It is the fourth packet kind and the one the handshake round-trip above
@@ -2091,37 +2460,9 @@ mod tests {
     #[test]
     fn header_protection_round_trips_a_cookie_reply() {
         const KEY: [u8; 32] = [0x5a; 32];
-        let amnezia = AmneziaConfig::new(120, 130, 110, 80).with_header_protection(KEY);
-
-        let my_secret = x25519::StaticSecret::random_from_rng(OsRng);
-        let my_public = x25519::PublicKey::from(&my_secret);
-        let their_secret = x25519::StaticSecret::random_from_rng(OsRng);
-        let their_public = x25519::PublicKey::from(&their_secret);
-
-        let mut my_tun = Tunn::new_with_obfuscation(
-            my_secret,
-            their_public,
-            None,
-            None,
-            100,
-            None,
-            Default::default(),
-            amnezia.clone(),
-        )
-        .unwrap();
-        // Budget 0: every handshake message is "under load", so the first one
-        // draws a cookie instead of being processed.
-        let mut their_tun = Tunn::new_with_obfuscation(
-            their_secret,
-            my_public,
-            None,
-            None,
-            101,
-            Some(Arc::new(RateLimiter::new(&their_public, 0))),
-            Default::default(),
-            amnezia,
-        )
-        .unwrap();
+        let (mut my_tun, mut their_tun) = cookie_provoking_pair(
+            AmneziaConfig::new(120, 130, 110, 80).with_header_protection(KEY),
+        );
 
         let mut dst = vec![0u8; 2048];
         let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
@@ -3338,6 +3679,7 @@ mod tests {
     #[test]
     #[cfg(feature = "mock-instant")]
     fn the_two_give_up_paths_are_distinguishable_in_the_log() {
+        let _serialized = crate::tracing_test_lock();
         use std::sync::{Arc, Mutex};
         use tracing::field::{Field, Visit};
         use tracing::Subscriber;

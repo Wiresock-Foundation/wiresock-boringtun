@@ -40,10 +40,13 @@ const MAX_JUNK_PACKET_DELAY_MS: u16 = 200;
 /// front is not a parity break: nothing that *functions* on the kernel module
 /// is refused on size grounds here.
 ///
-/// That is a claim about size only. [`AmneziaConfig::validate`] also refuses a
-/// configuration whose cookie replies would amplify, and that one *is* a
-/// deliberate parity break — the kernel accepts those and runs them. The
-/// argument for it is at the check.
+/// That is a claim about size only, and it is the whole of what `validate`
+/// refuses on these grounds. The fork's one deliberate parity break — refusing
+/// a configuration whose cookie replies would amplify, which the kernel accepts
+/// and runs — is *not* in `validate`: it is reported by
+/// [`AmneziaConfig::cookie_amplification_complaint`] and acted on at the
+/// responder's door, because the answer depends on which end of the tunnel is
+/// asking. The argument for it is there.
 const MAX_SENDABLE_DATAGRAM: usize = 65535 - 20 - 8;
 /// AmneziaWG rounds unpadded transport plaintext up to this multiple, matching
 /// amneziawg-go's `PaddingMultiple` and vanilla WireGuard's 16-byte boundary.
@@ -515,6 +518,31 @@ enum PacketKind {
     TransportData,
 }
 
+/// Whether a cookie reply of `reply_len` wire bytes amplifies the `request_len`
+/// datagram that provoked it.
+///
+/// The one spelling of the bound. Both runtime guards read it — `Tunn::decapsulate`
+/// through [`AmneziaConfig::cookie_reply_would_amplify`], and
+/// `device::reply_policy::cookie_verdict` directly, because that one is handed
+/// both lengths by its caller and has no config to ask — so the two cannot drift
+/// on which side of parity is allowed.
+///
+/// Strictly greater, deliberately: at parity a reflector gains an attacker
+/// nothing, and refusing there would drop cookie replies that are not amplifiers
+/// and with them WireGuard's flood defence.
+///
+/// Ungated, because `Tunn::decapsulate` reaches it on every build — the same
+/// reason [`AmneziaConfig::cookie_reply_len`] carries no gate.
+///
+/// Named `reply_amplifies` and not `cookie_reply_amplifies` because
+/// [`AmneziaConfig::cookie_reply_amplifies`] already exists and answers a
+/// different question — *which* bound a configuration violates, for the
+/// complaint text — and two unrelated things under one name in one file is how
+/// a reader ends up reasoning about the wrong one.
+pub(crate) fn reply_amplifies(request_len: usize, reply_len: usize) -> bool {
+    reply_len > request_len
+}
+
 impl AmneziaConfig {
     /// Create a config with the AmneziaWG S1-S4 junk prefix sizes.
     ///
@@ -754,10 +782,13 @@ impl AmneziaConfig {
     /// [`Tunn::new_with_obfuscation`](crate::noise::Tunn::new_with_obfuscation).
     ///
     /// Split out of [`Self::validate`] because it is the only rule the `Tunn`
-    /// constructors can enforce for themselves. `validate`'s cookie-amplification
-    /// rule refuses configurations that do work -- weakly reflecting -- which is a
-    /// policy judgement belonging to the full check a `set=1` runs, not to a
-    /// constructor.
+    /// constructors can enforce for themselves. The rest of `validate` refuses
+    /// timer and size shapes those constructors have always accepted, so
+    /// widening the check here would break existing Rust callers; the
+    /// struct-based C constructor, which has no such legacy, runs the whole of
+    /// `validate`. The cookie-amplification rule is in neither -- it is a policy
+    /// judgement whose answer depends on the caller's role, reported by
+    /// [`Self::cookie_amplification_complaint`] and answered at each door.
     ///
     /// Parity with amneziawg-go, which refuses the same four sizes in
     /// `mergeWithDevice` against its own `HeaderCipherNonceSize = 12`.
@@ -805,49 +836,25 @@ impl AmneziaConfig {
     /// time with `EMSGSIZE`, so it never worked there either. See
     /// `MAX_SENDABLE_DATAGRAM` for the arithmetic.
     ///
-    /// The amplification check below is a different matter and the one place
-    /// this genuinely refuses a configuration the kernel module runs. It is
-    /// intentional, and argued at the check rather than here, so that "every
-    /// working kernel configuration is accepted" is not read as covering it.
-    /// It is also the one check that is *not* universal: it asks whether the
-    /// port would reflect, which is a question about a responder, so only this
-    /// entry point applies it. The crate-internal
-    /// `validate_without_reflection_policy` is the door that does not apply it;
-    /// not linked, because a `pub` doc cannot link a `pub(crate)` item.
+    /// Every rule here is universal: it holds for either end of the tunnel, and
+    /// violating it harms the configuration's own operator. What this
+    /// deliberately does **not** contain is the cookie-reflection policy.
+    /// Whether an amplifying S3 is acceptable depends on which end you are --
+    /// S3 is symmetric and interface-wide, so a *client* is handed it by
+    /// whichever server it dials and cannot lower it without losing the ability
+    /// to parse that server's cookie replies, while a *responder* on an
+    /// unconnected socket is choosing its own reflection ratio. A question
+    /// whose answer depends on the caller's role has no business inside a
+    /// "is this configuration possible" check, so the policy lives with the
+    /// responder: `device::api` refuses it on `set=1`, `device::reply_policy`
+    /// suppresses the reply at send time, and [`Tunn::decapsulate`] refuses to
+    /// emit an amplifying reply no matter who built the tunnel. The
+    /// crate-internal reporter both of those read is
+    /// `cookie_amplification_complaint`; not linked, because a `pub` doc cannot
+    /// link a `pub(crate)` item.
+    ///
+    /// [`Tunn::decapsulate`]: crate::noise::Tunn::decapsulate
     pub fn validate(&self) -> Result<(), String> {
-        self.validate_inner(true)
-    }
-
-    /// Everything [`Self::validate`] checks except the cookie-reflection policy.
-    ///
-    /// The dropped rule is the one this type documents as policy rather than
-    /// impossibility, and it is the only rule here whose subject is not the
-    /// caller. S3 is symmetric and interface-wide -- `inbound_junk_size` and
-    /// `outbound_junk_size` read the same field, and the inbound side is an
-    /// exact-length gate -- so a client must use the S3 its server was
-    /// configured with or fail to parse cookie replies at all. It has no third
-    /// option. Worse, because S1/S2/S3 are shared, a client evaluating
-    /// `64 + S3 > 92 + S2` is computing a property of the *server's* port:
-    /// refusing there declines to start over a condition the caller cannot
-    /// reach, let alone fix.
-    ///
-    /// So the FFI constructors call this and warn, while `set=1` calls
-    /// [`Self::validate`] and refuses. That asymmetry is deliberate and is
-    /// pinned by a test: a device is a responder on an unconnected socket whose
-    /// source address is attacker-chosen, which is exactly the position the
-    /// rule exists to protect, and exactly the position a client is not in.
-    ///
-    /// Gated because the FFI constructors are the only caller: without
-    /// `ffi-bindings` this is dead code, and a crate built without the feature
-    /// would carry a `dead_code` warning for it -- the same reason
-    /// `cookie_reply_len` below is gated. `test` is in the list so the
-    /// two-doors test still runs on a default-feature `cargo test`.
-    #[cfg(any(test, feature = "ffi-bindings"))]
-    pub(crate) fn validate_without_reflection_policy(&self) -> Result<(), String> {
-        self.validate_inner(false)
-    }
-
-    fn validate_inner(&self, enforce_reflection_policy: bool) -> Result<(), String> {
         // First, and as its own pass rather than interleaved with the size rule
         // below, because the `Tunn` constructors call it on their own.
         self.check_header_protection_nonce()?;
@@ -890,12 +897,6 @@ impl AmneziaConfig {
                            collects two datagrams. Traffic is unaffected.",
                 protocol = ?self.imitation.protocol
             );
-        }
-
-        if enforce_reflection_policy {
-            if let Some(complaint) = self.cookie_amplification_complaint() {
-                return Err(complaint);
-            }
         }
 
         // Timer floors. These are OURS, deliberately: neither amneziawg-go's
@@ -1309,13 +1310,30 @@ impl AmneziaConfig {
     /// [`tests::the_predicted_cookie_reply_length_is_the_one_actually_produced`]
     /// pins the two together.
     ///
-    /// Gated because the ingress path is the only caller: without `device` this
-    /// is dead code, and a crate built without the feature would carry a
-    /// `dead_code` warning for it. `test` is in the list so the test above still
-    /// runs on a default-feature `cargo test`.
-    #[cfg(any(test, feature = "device"))]
+    /// No longer feature-gated: `Tunn::decapsulate` reads it on every build to
+    /// refuse emitting an amplifying reply, so it stopped being dead code
+    /// outside `device` the day that guard moved into the core.
     pub(crate) fn cookie_reply_len(&self, cookie_len: usize) -> usize {
         cookie_len.saturating_add(self.outbound_junk_size(PacketKind::CookieReply))
+    }
+
+    /// Whether the cookie reply this configuration would emit is larger than
+    /// `request_len`, the datagram that provoked it.
+    ///
+    /// The pairing of [`Self::cookie_reply_len`] with the bound, so the two
+    /// runtime guards read one expression rather than two copies of it:
+    /// [`Tunn::decapsulate`]'s emit-site check calls this directly, and
+    /// `device::reply_policy::cookie_verdict` — which is handed both lengths
+    /// already and has no `AmneziaConfig` to ask — calls
+    /// [`reply_amplifies`] underneath. Before this existed the same
+    /// comparison was written out at both sites, and each site's tests pinned
+    /// only its own copy, so flipping one bound left the other green — measured:
+    /// `>` to `>=` at either site failed exactly one test, and never the other
+    /// site's.
+    ///
+    /// [`Tunn::decapsulate`]: crate::noise::Tunn::decapsulate
+    pub(crate) fn cookie_reply_would_amplify(&self, cookie_len: usize, request_len: usize) -> bool {
+        reply_amplifies(request_len, self.cookie_reply_len(cookie_len))
     }
 
     /// The S sizes at which a cookie reply would be larger than the packet that
@@ -1345,18 +1363,18 @@ impl AmneziaConfig {
     /// leaves the other failing, and the operator is sent round twice.
     ///
     /// The `min_junk` values are always reachable: `min_junk + base` is exactly
-    /// `COOKIE_REPLY_SZ + S3`, and [`Self::validate`] has already bounded that
-    /// by `MAX_SENDABLE_DATAGRAM` before it gets here, so following this advice
-    /// can never trip the size check instead.
+    /// `COOKIE_REPLY_SZ + S3`, and both callers of the complaint run
+    /// [`Self::validate`] first, which bounds that by `MAX_SENDABLE_DATAGRAM`
+    /// -- so following this advice can never trip the size check instead.
     ///
     /// This function only *reports*. [`Self::cookie_amplification_complaint`]
-    /// turns it into a message, and only [`Self::validate`] turns that message
-    /// into a refusal -- see the argument on
-    /// [`Self::validate_without_reflection_policy`] for why the same
-    /// configuration is refused for a responder and merely logged for a client.
+    /// turns it into a message, and what happens then is the caller's verb:
+    /// `device::api` refuses the `set=1` transaction, the C struct constructor
+    /// warns and builds -- see the argument on the complaint for why the same
+    /// configuration earns a different answer at each door.
     ///
-    /// Not gated: [`Self::cookie_amplification_complaint`] is its only caller,
-    /// and [`Self::validate`] reaches it on every build.
+    /// Gated the same way as the complaint, its only non-test caller.
+    #[cfg(any(test, feature = "device", feature = "ffi-bindings"))]
     fn cookie_amplification_bounds(&self) -> Vec<(&'static str, usize, usize)> {
         let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
         let mut bounds: Vec<(&'static str, usize, usize)> = [
@@ -1379,22 +1397,33 @@ impl AmneziaConfig {
 
     /// The cookie-reflection complaint this configuration earns, or `None`.
     ///
-    /// Reporting is separated from rejecting because the two callers want
-    /// different verbs. A device is a responder on an unconnected socket, so
-    /// the reply it would emit is aimed at an attacker-chosen source and `set=1`
-    /// refuses. A tunnel reached through the C ABI cannot emit one at all --
-    /// `wireguard_read` passes no source address, so `verify_packet` bails on
-    /// `UnderLoad` before formatting -- and the S3 it was handed is not its to
-    /// change, so the FFI constructors log this and build the tunnel.
+    /// Reporting is separated from rejecting because the callers want different
+    /// verbs, and which verb is right depends on the caller's role -- which is
+    /// why this is not part of [`Self::validate`]. A device is a responder on
+    /// an unconnected socket, so the reply it would emit is aimed at an
+    /// attacker-chosen source: `device::api` reads this on `set=1` and refuses
+    /// the transaction. A tunnel built through the C ABI is a client handed its
+    /// S3 by the server it dials, so `new_tunnel_with_awg_params` reads this
+    /// and logs it at WARN. Neither is the last line: `Tunn::decapsulate`
+    /// refuses to *emit* an amplifying reply regardless of configuration, so
+    /// both of these are early, actionable notice rather than the guard itself.
     ///
     /// The AmneziaWG kernel module and amneziawg-go both accept these
-    /// combinations -- there is no analogous rule in either -- so this is ours,
-    /// and it is why the split above exists rather than a single verdict.
+    /// combinations -- there is no analogous rule in either -- so this is ours.
     ///
     /// Both alternatives the message offers have to work in one pass. The
     /// "raise" side therefore names every violated bound, not just the binding
     /// one: at S1=100, S2=0, S3=185 both are violated, and raising S2 alone
     /// still leaves the initiation a byte short.
+    ///
+    /// Gated because the config-time doors are the only callers -- `device::api`
+    /// on `set=1`, the C struct constructor's warning -- so without either
+    /// feature this is dead code and the crate would carry a `dead_code`
+    /// warning for it. The *runtime* guard needs none of this: `decapsulate`
+    /// compares lengths through `cookie_reply_len`, which is unconditional.
+    /// `test` is in the list so the message tests run on a default-feature
+    /// `cargo test`.
+    #[cfg(any(test, feature = "device", feature = "ffi-bindings"))]
     pub(crate) fn cookie_amplification_complaint(&self) -> Option<String> {
         let bounds = self.cookie_amplification_bounds();
         let &(which, request, _) = bounds.first()?;
@@ -2672,29 +2701,42 @@ mod tests {
     fn the_predicted_cookie_reply_length_is_the_one_actually_produced() {
         let max_s3 = (MAX_SENDABLE_DATAGRAM - COOKIE_REPLY_SZ) as u16;
         for s3 in [0u16, 1, 110, 1280, max_s3] {
-            // S1 and S2 are derived rather than zeroed: `validate` now refuses a
-            // cookie reply larger than the packet provoking it, so a bare
-            // `new(0, 0, max_s3, 0)` is no longer a configuration an operator
-            // could set, and asserting against it would be testing the
-            // prediction on a config that cannot exist. These are the smallest
-            // values that keep each S3 legal.
-            let cfg = AmneziaConfig::new(s3.saturating_sub(84), s3.saturating_sub(28), s3, 0);
-            cfg.validate().expect("S3 within the validated range");
+            // Two shapes per S3, because the prediction has to hold for both and
+            // they are the two ends of the rule it feeds. The derived S1/S2 are
+            // the smallest values that keep the reply an attenuator. The zeroed
+            // pair is the shape that amplifies once S3 passes 84 -- `validate`
+            // accepts it (the reflection policy moved out to the responder's
+            // door), and it is the shape the runtime guards actually fire on, so
+            // leaving it out would pin the prediction everywhere except where it
+            // is used.
+            for (s1, s2, shape) in [
+                (
+                    s3.saturating_sub(84),
+                    s3.saturating_sub(28),
+                    "S1/S2 derived",
+                ),
+                (0, 0, "S1 = S2 = 0"),
+            ] {
+                let cfg = AmneziaConfig::new(s1, s2, s3, 0);
+                cfg.validate().expect("S3 within the validated range");
 
-            let produced = packet_after_prepend(
-                &cfg,
-                COOKIE_REPLY_SZ,
-                COOKIE_REPLY,
-                COOKIE_REPLY_SZ + s3 as usize,
-            )
-            .len();
+                let produced = packet_after_prepend(
+                    &cfg,
+                    COOKIE_REPLY_SZ,
+                    COOKIE_REPLY,
+                    COOKIE_REPLY_SZ + s3 as usize,
+                )
+                .len();
 
-            assert_eq!(
-                cfg.cookie_reply_len(COOKIE_REPLY_SZ),
-                produced,
-                "S3 = {}: predicted length must match the datagram prepend_outbound emits",
-                s3
-            );
+                assert_eq!(
+                    cfg.cookie_reply_len(COOKIE_REPLY_SZ),
+                    produced,
+                    "S3 = {} ({}): predicted length must match the datagram \
+                     prepend_outbound emits",
+                    s3,
+                    shape
+                );
+            }
         }
     }
 
@@ -2959,87 +3001,85 @@ mod tests {
         );
     }
 
-    /// The two doors disagree on the reflection rule and on nothing else.
+    /// `validate` is universal; the reflection policy lives outside it.
     ///
-    /// `validate` is what a responder runs and it refuses; the client path
-    /// accepts, because S3 is symmetric and interface-wide and so belongs to
-    /// whoever configured the server. Without this test the split is invisible
-    /// to a later reader, who would quite reasonably "fix" the asymmetry back
-    /// into symmetry -- in either direction, and either way silently.
+    /// One door, not two: `validate` answers "is this configuration possible
+    /// for anyone", and the cookie-reflection question -- whose answer depends
+    /// on which end of the tunnel you are -- is reported separately by
+    /// `cookie_amplification_complaint` and turned into a refusal only at the
+    /// responder's door (`device::api`, pinned by
+    /// `a_set_transaction_still_refuses_the_s3_the_ffi_constructor_now_accepts`).
+    /// Without this test the separation is invisible to a later reader, who
+    /// would quite reasonably fold the complaint back into `validate` --
+    /// re-refusing, for every client, a server-dictated S3 the client cannot
+    /// change.
     ///
-    /// The second half is the one that stops the split from over-reaching: the
-    /// client path must still refuse everything else `validate` refuses.
+    /// The second half stops the separation from over-reaching: everything
+    /// *else* `validate` refuses, it must keep refusing.
     #[test]
-    fn only_the_reflection_rule_differs_between_the_two_validate_doors() {
+    fn the_reflection_policy_is_not_part_of_validate() {
         // The measured profile: 64 + 120 = 184 > 92 + 86 = 178.
         let amplifying = AmneziaConfig::new(65, 86, 120, 0);
-        let err = amplifying
-            .validate()
-            .expect_err("the responder path must refuse an amplifying S3");
-        assert!(
-            err.contains("larger than") && err.contains("S2"),
-            "and must name the binding bound: {}",
-            err
-        );
         amplifying
-            .validate_without_reflection_policy()
-            .expect("the client path must accept a server-dictated S3");
+            .validate()
+            .expect("an amplifying S3 is the server's choice, not an impossibility");
+        let complaint = amplifying
+            .cookie_amplification_complaint()
+            .expect("but it still earns the complaint the responder door refuses on");
         assert!(
-            amplifying.cookie_amplification_complaint().is_some(),
-            "the client path still has something to log"
+            complaint.contains("larger than") && complaint.contains("S2"),
+            "which must name the binding bound: {}",
+            complaint
         );
 
-        // Everything else `validate` refuses, the client path must refuse too.
-        // A timer ordering that rejects keys before their rekey completes is
-        // self-harm regardless of which end of the tunnel runs it.
+        // The universal rules are all still there. A timer ordering that
+        // rejects keys before their rekey completes is self-harm regardless of
+        // which end of the tunnel runs it.
         let incoherent = AmneziaConfig::new(0, 0, 0, 0).with_tunable_timers(AwgTimers {
             reject_after_time: (20, 20),
             ..Default::default()
         });
-        incoherent
-            .validate()
-            .expect_err("sanity: the responder path refuses this");
-        let err = incoherent
-            .validate_without_reflection_policy()
-            .expect_err("the client path must not have dropped the universal rules");
+        let err = incoherent.validate().expect_err(
+            "moving the reflection policy out must not take the universal rules with it",
+        );
         assert!(err.contains("reject_after_time"), "{}", err);
 
-        // And a clean configuration passes both, so neither door is simply
-        // refusing everything.
+        // And a clean configuration passes with nothing to complain about, so
+        // neither check is simply firing on everything.
         let clean = AmneziaConfig::new(65, 86, 114, 0);
-        clean.validate().expect("clean config, responder path");
-        clean
-            .validate_without_reflection_policy()
-            .expect("clean config, client path");
+        clean.validate().expect("clean config validates");
         assert!(
             clean.cookie_amplification_complaint().is_none(),
-            "nothing to log for a clean config"
+            "nothing to complain about at parity"
         );
     }
 
-    /// `validate` refuses a configuration whose cookie replies would amplify,
-    /// on both packet kinds and at the boundary.
+    /// The complaint fires on both packet kinds and exactly at the boundary.
     ///
-    /// This is deliberately stricter than the AmneziaWG kernel module, which
-    /// accepts these combinations. The trade is stated in `validate`: a config
-    /// refused here would have run there, weakly reflecting, and would have lost
-    /// every handshake under load once `device::reply_policy` suppressed its
-    /// cookie replies. Failing at `awg set` is the one place the operator can
-    /// still act on it.
+    /// The rule itself is deliberately stricter than the AmneziaWG kernel
+    /// module, which accepts these combinations: a config it complains about
+    /// runs there, weakly reflecting, and loses every handshake under load
+    /// once the runtime guards suppress its cookie replies. The verb belongs
+    /// to the caller -- `device::api` refuses `set=1` on this message, the C
+    /// constructor warns with it -- so this pins the *message*: where it
+    /// fires, what it names, and where it stays silent.
     #[test]
-    fn validate_refuses_a_configuration_whose_cookie_replies_would_amplify() {
+    fn the_complaint_fires_on_both_packet_kinds_and_at_the_boundary() {
         // Parity exactly: 64 + S3 == 148 + S1 and == 92 + S2. Legal.
-        AmneziaConfig::new(100, 156, 184, 0)
-            .validate()
-            .expect("parity is not amplification");
+        assert!(
+            AmneziaConfig::new(100, 156, 184, 0)
+                .cookie_amplification_complaint()
+                .is_none(),
+            "parity is not amplification"
+        );
 
         // One byte past the initiation bound.
         let err = AmneziaConfig::new(100, 156, 185, 0)
-            .validate()
-            .expect_err("one byte over must be refused");
+            .cookie_amplification_complaint()
+            .expect("one byte over must earn the complaint");
         assert!(
             err.contains("S1"),
-            "the error must name the binding value: {}",
+            "the message must name the binding value: {}",
             err
         );
         assert!(
@@ -3051,30 +3091,38 @@ mod tests {
         // The response bound is the tighter of the two, so a config can clear
         // S1 and still fail on S2.
         let err = AmneziaConfig::new(200, 100, 250, 0)
-            .validate()
-            .expect_err("the response bound must be checked too");
+            .cookie_amplification_complaint()
+            .expect("the response bound must be checked too");
         assert!(
             err.contains("S2"),
-            "the error must name S2 here, not S1: {}",
+            "the message must name S2 here, not S1: {}",
             err
         );
 
         // The shape an installer rolling S values independently produces.
         assert!(
-            AmneziaConfig::new(15, 15, 150, 0).validate().is_err(),
-            "S1=15 S3=150 amplifies and must not load"
+            AmneziaConfig::new(15, 15, 150, 0)
+                .cookie_amplification_complaint()
+                .is_some(),
+            "S1=15 S3=150 amplifies and must be complained about"
         );
 
-        // And the sizes the interop harness runs must remain loadable, or this
+        // And the sizes the interop harness runs must stay silent, or this
         // rule has broken the project's own reference configuration.
-        AmneziaConfig::new(120, 130, 110, 80)
-            .validate()
-            .expect("scripts/awg-interop-poc.sh must still be a legal config");
+        assert!(
+            AmneziaConfig::new(120, 130, 110, 80)
+                .cookie_amplification_complaint()
+                .is_none(),
+            "scripts/awg-interop-poc.sh must stay a clean config"
+        );
 
         // As must the default: vanilla WireGuard has no S values at all.
-        AmneziaConfig::default()
-            .validate()
-            .expect("the default configuration must load");
+        assert!(
+            AmneziaConfig::default()
+                .cookie_amplification_complaint()
+                .is_none(),
+            "the default configuration must stay clean"
+        );
     }
 
     /// Following the error message's advice must actually produce a loadable
@@ -3101,21 +3149,26 @@ mod tests {
                 .unwrap_or_else(|| panic!("S1={} S2={} S3={} should amplify", s1, s2, s3));
 
             let advised = (request - COOKIE_REPLY_SZ) as u16;
-            AmneziaConfig::new(s1, s2, advised, 0)
-                .validate()
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "S1={} S2={}: advised S3={} still rejected: {}",
-                        s1, s2, advised, e
-                    )
-                });
+            let followed = AmneziaConfig::new(s1, s2, advised, 0);
+            followed.validate().unwrap_or_else(|e| {
+                panic!(
+                    "S1={} S2={}: advised S3={} still rejected: {}",
+                    s1, s2, advised, e
+                )
+            });
+            if let Some(c) = followed.cookie_amplification_complaint() {
+                panic!(
+                    "S1={} S2={}: advised S3={} still complained about: {}",
+                    s1, s2, advised, c
+                );
+            }
 
             // And it is the *largest* such value, or the advice is needlessly
             // strict and the operator loses padding they could have kept.
             assert!(
                 AmneziaConfig::new(s1, s2, advised + 1, 0)
-                    .validate()
-                    .is_err(),
+                    .cookie_amplification_complaint()
+                    .is_some(),
                 "S1={} S2={}: S3={} should have been advised instead",
                 s1,
                 s2,
@@ -3167,8 +3220,8 @@ mod tests {
             (100, 156, 185, 2),        // one byte past a symmetric parity
         ] {
             let err = AmneziaConfig::new(s1, s2, s3, 0)
-                .validate()
-                .expect_err("this configuration must be refused");
+                .cookie_amplification_complaint()
+                .expect("this configuration must be complained about");
             let raises = parse_raises(&err);
             assert_eq!(
                 raises.len(),
@@ -3191,14 +3244,19 @@ mod tests {
                     other => panic!("unexpected label {} in {}", other, err),
                 }
             }
-            AmneziaConfig::new(raised_s1, raised_s2, s3, 0)
-                .validate()
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "S1={}->{} S2={}->{} S3={}: following the advice still fails: {}",
-                        s1, raised_s1, s2, raised_s2, s3, e
-                    )
-                });
+            let followed = AmneziaConfig::new(raised_s1, raised_s2, s3, 0);
+            followed.validate().unwrap_or_else(|e| {
+                panic!(
+                    "S1={}->{} S2={}->{} S3={}: following the advice still fails: {}",
+                    s1, raised_s1, s2, raised_s2, s3, e
+                )
+            });
+            if let Some(c) = followed.cookie_amplification_complaint() {
+                panic!(
+                    "S1={}->{} S2={}->{} S3={}: following the advice still complains: {}",
+                    s1, raised_s1, s2, raised_s2, s3, c
+                );
+            }
 
             // And each is the *smallest* value that works, or the advice costs
             // the operator padding they could have kept.
@@ -3209,8 +3267,8 @@ mod tests {
                 };
                 assert!(
                     AmneziaConfig::new(probe_s1, probe_s2, s3, 0)
-                        .validate()
-                        .is_err(),
+                        .cookie_amplification_complaint()
+                        .is_some(),
                     "S1={} S2={} S3={}: {} = {} would have done, so {} is too strict",
                     s1,
                     s2,
