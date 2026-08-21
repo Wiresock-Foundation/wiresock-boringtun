@@ -27,14 +27,23 @@ pub(crate) mod serialization;
 /// concurrently open a transient window in which a `warn!` callsite is cached
 /// as not-interested while the other thread's event fires -- the event is
 /// silently dropped, and the capturing test fails claiming nothing was logged.
-/// Observed exactly once, on macOS CI under `--features jni-bindings`, where
-/// scheduling happened to overlap two of these tests; five Linux runs of the
-/// same combination never reproduced it, which is what "transient window"
-/// means in practice.
+/// First seen on macOS CI under `--features jni-bindings`, and measured
+/// afterwards at roughly one run in twenty of that test binary.
 ///
-/// So every `with_default` test takes this lock first. Serializing them closes
-/// the window without touching what any of them asserts; the cost is that a
-/// handful of sub-millisecond tests no longer run in parallel.
+/// So every `with_default` test takes this lock first. That closes the window
+/// these tests open against *each other*. It does **not** close the wider one:
+/// the interest cache is keyed per callsite and process-global, so an ordinary
+/// test hitting the same `warn!` from a thread with no subscriber can cache
+/// "never" and race the rebuild regardless of this lock. Closing that needs a
+/// retry, which is why
+/// `ffi::tests::an_amplifying_s3_warns_and_leaves_the_error_slot_empty` — the
+/// one where the rate was actually measured — has one and this lock is not
+/// claimed to be sufficient on its own.
+///
+/// The cost is that a handful of sub-millisecond tests no longer run in
+/// parallel. The lock is not reentrant: a shared capture helper must leave
+/// taking it to its callers, which is why `device::api::tests::capture_awg3_key`
+/// does not take it and its caller does.
 ///
 /// The gate lists the features whose test modules hold capture tests -- every
 /// caller lives behind one of them, so in a bare `cargo test` this would be

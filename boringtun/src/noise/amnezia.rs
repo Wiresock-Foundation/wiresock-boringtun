@@ -40,10 +40,13 @@ const MAX_JUNK_PACKET_DELAY_MS: u16 = 200;
 /// front is not a parity break: nothing that *functions* on the kernel module
 /// is refused on size grounds here.
 ///
-/// That is a claim about size only. [`AmneziaConfig::validate`] also refuses a
-/// configuration whose cookie replies would amplify, and that one *is* a
-/// deliberate parity break — the kernel accepts those and runs them. The
-/// argument for it is at the check.
+/// That is a claim about size only, and it is the whole of what `validate`
+/// refuses on these grounds. The fork's one deliberate parity break — refusing
+/// a configuration whose cookie replies would amplify, which the kernel accepts
+/// and runs — is *not* in `validate`: it is reported by
+/// [`AmneziaConfig::cookie_amplification_complaint`] and acted on at the
+/// responder's door, because the answer depends on which end of the tunnel is
+/// asking. The argument for it is there.
 const MAX_SENDABLE_DATAGRAM: usize = 65535 - 20 - 8;
 /// AmneziaWG rounds unpadded transport plaintext up to this multiple, matching
 /// amneziawg-go's `PaddingMultiple` and vanilla WireGuard's 16-byte boundary.
@@ -515,6 +518,31 @@ enum PacketKind {
     TransportData,
 }
 
+/// Whether a cookie reply of `reply_len` wire bytes amplifies the `request_len`
+/// datagram that provoked it.
+///
+/// The one spelling of the bound. Both runtime guards read it — `Tunn::decapsulate`
+/// through [`AmneziaConfig::cookie_reply_would_amplify`], and
+/// `device::reply_policy::cookie_verdict` directly, because that one is handed
+/// both lengths by its caller and has no config to ask — so the two cannot drift
+/// on which side of parity is allowed.
+///
+/// Strictly greater, deliberately: at parity a reflector gains an attacker
+/// nothing, and refusing there would drop cookie replies that are not amplifiers
+/// and with them WireGuard's flood defence.
+///
+/// Ungated, because `Tunn::decapsulate` reaches it on every build — the same
+/// reason [`AmneziaConfig::cookie_reply_len`] carries no gate.
+///
+/// Named `reply_amplifies` and not `cookie_reply_amplifies` because
+/// [`AmneziaConfig::cookie_reply_amplifies`] already exists and answers a
+/// different question — *which* bound a configuration violates, for the
+/// complaint text — and two unrelated things under one name in one file is how
+/// a reader ends up reasoning about the wrong one.
+pub(crate) fn reply_amplifies(request_len: usize, reply_len: usize) -> bool {
+    reply_len > request_len
+}
+
 impl AmneziaConfig {
     /// Create a config with the AmneziaWG S1-S4 junk prefix sizes.
     ///
@@ -754,10 +782,13 @@ impl AmneziaConfig {
     /// [`Tunn::new_with_obfuscation`](crate::noise::Tunn::new_with_obfuscation).
     ///
     /// Split out of [`Self::validate`] because it is the only rule the `Tunn`
-    /// constructors can enforce for themselves. `validate`'s cookie-amplification
-    /// rule refuses configurations that do work -- weakly reflecting -- which is a
-    /// policy judgement belonging to the full check a `set=1` runs, not to a
-    /// constructor.
+    /// constructors can enforce for themselves. The rest of `validate` refuses
+    /// timer and size shapes those constructors have always accepted, so
+    /// widening the check here would break existing Rust callers; the
+    /// struct-based C constructor, which has no such legacy, runs the whole of
+    /// `validate`. The cookie-amplification rule is in neither -- it is a policy
+    /// judgement whose answer depends on the caller's role, reported by
+    /// [`Self::cookie_amplification_complaint`] and answered at each door.
     ///
     /// Parity with amneziawg-go, which refuses the same four sizes in
     /// `mergeWithDevice` against its own `HeaderCipherNonceSize = 12`.
@@ -1284,6 +1315,25 @@ impl AmneziaConfig {
     /// outside `device` the day that guard moved into the core.
     pub(crate) fn cookie_reply_len(&self, cookie_len: usize) -> usize {
         cookie_len.saturating_add(self.outbound_junk_size(PacketKind::CookieReply))
+    }
+
+    /// Whether the cookie reply this configuration would emit is larger than
+    /// `request_len`, the datagram that provoked it.
+    ///
+    /// The pairing of [`Self::cookie_reply_len`] with the bound, so the two
+    /// runtime guards read one expression rather than two copies of it:
+    /// [`Tunn::decapsulate`]'s emit-site check calls this directly, and
+    /// `device::reply_policy::cookie_verdict` — which is handed both lengths
+    /// already and has no `AmneziaConfig` to ask — calls
+    /// [`reply_amplifies`] underneath. Before this existed the same
+    /// comparison was written out at both sites, and each site's tests pinned
+    /// only its own copy, so flipping one bound left the other green — measured:
+    /// `>` to `>=` at either site failed exactly one test, and never the other
+    /// site's.
+    ///
+    /// [`Tunn::decapsulate`]: crate::noise::Tunn::decapsulate
+    pub(crate) fn cookie_reply_would_amplify(&self, cookie_len: usize, request_len: usize) -> bool {
+        reply_amplifies(request_len, self.cookie_reply_len(cookie_len))
     }
 
     /// The S sizes at which a cookie reply would be larger than the packet that
@@ -2651,29 +2701,42 @@ mod tests {
     fn the_predicted_cookie_reply_length_is_the_one_actually_produced() {
         let max_s3 = (MAX_SENDABLE_DATAGRAM - COOKIE_REPLY_SZ) as u16;
         for s3 in [0u16, 1, 110, 1280, max_s3] {
-            // S1 and S2 are derived rather than zeroed: `validate` now refuses a
-            // cookie reply larger than the packet provoking it, so a bare
-            // `new(0, 0, max_s3, 0)` is no longer a configuration an operator
-            // could set, and asserting against it would be testing the
-            // prediction on a config that cannot exist. These are the smallest
-            // values that keep each S3 legal.
-            let cfg = AmneziaConfig::new(s3.saturating_sub(84), s3.saturating_sub(28), s3, 0);
-            cfg.validate().expect("S3 within the validated range");
+            // Two shapes per S3, because the prediction has to hold for both and
+            // they are the two ends of the rule it feeds. The derived S1/S2 are
+            // the smallest values that keep the reply an attenuator. The zeroed
+            // pair is the shape that amplifies once S3 passes 84 -- `validate`
+            // accepts it (the reflection policy moved out to the responder's
+            // door), and it is the shape the runtime guards actually fire on, so
+            // leaving it out would pin the prediction everywhere except where it
+            // is used.
+            for (s1, s2, shape) in [
+                (
+                    s3.saturating_sub(84),
+                    s3.saturating_sub(28),
+                    "S1/S2 derived",
+                ),
+                (0, 0, "S1 = S2 = 0"),
+            ] {
+                let cfg = AmneziaConfig::new(s1, s2, s3, 0);
+                cfg.validate().expect("S3 within the validated range");
 
-            let produced = packet_after_prepend(
-                &cfg,
-                COOKIE_REPLY_SZ,
-                COOKIE_REPLY,
-                COOKIE_REPLY_SZ + s3 as usize,
-            )
-            .len();
+                let produced = packet_after_prepend(
+                    &cfg,
+                    COOKIE_REPLY_SZ,
+                    COOKIE_REPLY,
+                    COOKIE_REPLY_SZ + s3 as usize,
+                )
+                .len();
 
-            assert_eq!(
-                cfg.cookie_reply_len(COOKIE_REPLY_SZ),
-                produced,
-                "S3 = {}: predicted length must match the datagram prepend_outbound emits",
-                s3
-            );
+                assert_eq!(
+                    cfg.cookie_reply_len(COOKIE_REPLY_SZ),
+                    produced,
+                    "S3 = {} ({}): predicted length must match the datagram \
+                     prepend_outbound emits",
+                    s3,
+                    shape
+                );
+            }
         }
     }
 

@@ -280,7 +280,11 @@ pub(crate) fn cookie_verdict(
     if reply_target(from, Door::Cookie).is_none() {
         return CookieVerdict::RefusedSource;
     }
-    if reply_len > request_len {
+    // The bound itself lives in `noise::amnezia`, because `Tunn::decapsulate`
+    // applies the same rule at its own emit site and two copies of one
+    // comparison is exactly the shape that drifts: each site's tests pin only
+    // its own copy, so flipping one bound leaves the other green.
+    if crate::noise::amnezia::reply_amplifies(request_len, reply_len) {
         return CookieVerdict::WouldAmplify;
     }
     CookieVerdict::Send

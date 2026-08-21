@@ -1845,13 +1845,16 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
 
     // The cookie-reflection policy: logged, not refused. The UAPI `set=1` path
     // refuses this same complaint, because a device is a responder choosing its
-    // own reflection ratio; a tunnel built here is a client, and S3 is not this
-    // caller's to change -- it is symmetric and interface-wide, so a client
-    // must use whatever its server was configured with or fail to parse cookie
-    // replies. Refusing would decline a profile the reference implementations
-    // run and the operator cannot alter from this end. And warning is safe:
-    // should this tunnel ever be driven as a responder, `Tunn::decapsulate`
-    // refuses to emit an amplifying reply at the emit site itself.
+    // own reflection ratio. This entry point is not: it builds responders too --
+    // `an_amplifying_s3_builds_and_carries_traffic_through_the_awg_constructor`
+    // builds both ends with it -- so the argument is not "callers here are
+    // clients". It is that S3 is not this caller's to change: it is symmetric
+    // and interface-wide, so whoever dials a server must use the S3 that server
+    // was configured with or fail to parse its cookie replies at all. Refusing
+    // would decline a profile the reference implementations run and the operator
+    // cannot alter from this end. And warning is safe whichever role this tunnel
+    // ends up in, because `Tunn::decapsulate` refuses to emit an amplifying
+    // reply at the emit site itself.
     if let Some(complaint) = amnezia.cookie_amplification_complaint() {
         tracing::warn!(
             message = "AmneziaWG S sizes make cookie replies larger than the packets \
@@ -1921,13 +1924,16 @@ pub unsafe extern "C" fn wireguard_read(
     // Slices are not owned, and therefore will not be freed by Rust
     let src = slice::from_raw_parts(src, src_size as usize);
     let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    // The `None` is load-bearing, not just "the C ABI has no sockaddr".
-    // `RateLimiter::verify_packet` returns `UnderLoad` on a `None` source
-    // before it formats a cookie reply, which is the only reason
-    // `new_tunnel_with_awg_params` can accept an amplifying S3 that `set=1`
-    // refuses. Plumbing a real address through here (a `wireguard_read_from`)
-    // re-opens that path and needs a reply-size guard at the emit site in
-    // `noise::Tunn::decapsulate` first.
+    // `None` is not just "the C ABI has no sockaddr": `RateLimiter::verify_packet`
+    // returns `UnderLoad` on a `None` source before it formats a cookie reply, so
+    // no tunnel driven through this entry point emits one at all.
+    //
+    // That is no longer what makes an amplifying S3 safe to accept in
+    // `new_tunnel_with_awg_params` -- `Tunn::decapsulate` refuses to emit an
+    // amplifying reply at its own emit site, for every tunnel however it was
+    // built and however it is driven. So a future `wireguard_read_from` that
+    // plumbs a real address through here needs no new guard; it inherits that
+    // one. This `None` is now a second line, not the only one.
     wireguard_result::from(tunnel.decapsulate(None, src, dst))
 }
 
@@ -3465,8 +3471,12 @@ mod tests {
     ///
     /// What the two size assertions prove is that **S1 and S2** survived and
     /// the session works -- not S3, which leaves no trace here. S3 sizes cookie
-    /// replies, a `Tunn` never formats one (`format_cookie_reply` is reachable
-    /// only from `device`), and nothing in this test provokes one, so a change
+    /// replies, and nothing in this test provokes one: `verify_packet` formats
+    /// a cookie only while the limiter is under load *and* it was given a source
+    /// address, and this test floods nothing and reads through [`wireguard_read`],
+    /// which passes none. (A `Tunn` does otherwise format them -- that is the
+    /// arm `Tunn::decapsulate`'s amplification guard sits in -- so this is a
+    /// property of the test, not of the type.) So a change
     /// that dropped `s3_cookie_junk` on the floor would still pass: S3 = 0 does
     /// not amplify, and the initiation and response would be unchanged. That
     /// the value reaches the config at all is pinned by
@@ -3670,37 +3680,46 @@ mod tests {
             }
         }
 
-        let build = |s3: u32| -> Vec<Captured> {
+        // Both profiles are built inside ONE subscriber scope, so the amplifying
+        // one is a positive control for the clean one. Built separately, the
+        // clean half's `all(|c| !c.detail.contains(..))` passes on an empty
+        // capture -- which is exactly the state the retry below exists for, so
+        // the one assertion that must not fire spuriously was the one that
+        // passed for free whenever the race bit.
+        let build = |s3s: &[u32]| -> Vec<Captured> {
             let events: Arc<StdMutex<Vec<Captured>>> = Arc::new(StdMutex::new(Vec::new()));
             {
                 let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
                 tracing::subscriber::with_default(subscriber, || {
-                    last_tunnel_error_free();
-                    let params = wireguard_awg_params {
-                        size: AWG_PARAMS_SIZE_VER0 as u32,
-                        s1_init_junk: 65,
-                        s2_response_junk: 86,
-                        s3_cookie_junk: s3,
-                        ..Default::default()
-                    };
-                    let key = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
-                    let tunnel = unsafe {
-                        new_tunnel_with_awg_params(
-                            key.as_ptr(),
-                            key.as_ptr(),
-                            ptr::null(),
-                            0,
-                            1,
-                            &params,
-                            ptr::null(),
-                        )
-                    };
-                    assert!(!tunnel.is_null(), "{}", last_error_string());
-                    assert!(
-                        last_tunnel_error().is_null(),
-                        "a non-NULL return must leave the error slot empty"
-                    );
-                    unsafe { tunnel_free(tunnel) };
+                    for &s3 in s3s {
+                        last_tunnel_error_free();
+                        let params = wireguard_awg_params {
+                            size: AWG_PARAMS_SIZE_VER0 as u32,
+                            s1_init_junk: 65,
+                            s2_response_junk: 86,
+                            s3_cookie_junk: s3,
+                            ..Default::default()
+                        };
+                        let key =
+                            CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+                        let tunnel = unsafe {
+                            new_tunnel_with_awg_params(
+                                key.as_ptr(),
+                                key.as_ptr(),
+                                ptr::null(),
+                                0,
+                                1,
+                                &params,
+                                ptr::null(),
+                            )
+                        };
+                        assert!(!tunnel.is_null(), "{}", last_error_string());
+                        assert!(
+                            last_tunnel_error().is_null(),
+                            "a non-NULL return must leave the error slot empty"
+                        );
+                        unsafe { tunnel_free(tunnel) };
+                    }
                 });
             }
             // Read through the lock rather than `Arc::try_unwrap`: tracing's
@@ -3714,38 +3733,48 @@ mod tests {
 
         // 64 + 120 = 184 > 92 + 86 = 178.
         //
-        // Bounded retry, and only on this half. tracing caches per-callsite
-        // interest in a process-global table; other tests hit this same
-        // `warn!` callsite from threads with no subscriber (caching "never"),
-        // and a registration racing the rebuild that `with_default` triggers
-        // can clobber it back -- the event is then dropped with this test's
-        // subscriber installed and active, which was measured here as
-        // `captured: []` roughly once per twenty runs. Real embedders never
-        // see this: they install one global subscriber at startup, before any
-        // callsite is hit, and nothing churns afterwards. A retry keeps the
-        // mutation kill intact -- a deleted `warn!` captures nothing on every
-        // attempt -- while a lost cache update wins the next round. The clean
-        // half below stays single-shot: a dropped event can only *lose* a
-        // warning, never invent one.
-        let amplifying = (0..5)
-            .map(|attempt| {
-                if attempt > 0 {
-                    tracing::callsite::rebuild_interest_cache();
-                }
-                build(120)
-            })
-            .find(|events| {
-                events
-                    .iter()
-                    .any(|c| c.detail.contains("makes a cookie reply"))
-            })
-            .unwrap_or_else(|| {
-                panic!("the constructor must log the complaint; nothing captured in 5 attempts")
-            });
-        let warned = amplifying
-            .iter()
-            .find(|c| c.detail.contains("makes a cookie reply"))
-            .expect("the winning attempt carries the event");
+        // Bounded retry. tracing caches per-callsite interest in a
+        // process-global table; other tests hit this same `warn!` callsite from
+        // threads with no subscriber (caching "never"), and a registration
+        // racing the rebuild that `with_default` triggers can clobber it back --
+        // the event is then dropped with this test's subscriber installed and
+        // active, which was measured here as `captured: []` roughly once per
+        // twenty runs. Real embedders never see this: they install one global
+        // subscriber at startup, before any callsite is hit, and nothing churns
+        // afterwards. A retry keeps the mutation kill intact -- a deleted
+        // `warn!` captures nothing on every attempt -- while a lost cache
+        // update wins the next round.
+        //
+        // The clean profile (114) rides along in the same scope rather than
+        // getting its own retry: retrying it would be wrong (a dropped event
+        // can only *lose* a warning, never invent one, so a retry could only
+        // manufacture a pass), but building it separately would let it assert
+        // "no complaint" against a capture that lost every event. Sharing the
+        // scope makes the 120 complaint the proof that the callsite was live.
+        let mut captured = Vec::new();
+        let mut hit = None;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tracing::callsite::rebuild_interest_cache();
+            }
+            captured = build(&[120, 114]);
+            hit = captured
+                .iter()
+                .position(|c| c.detail.contains("makes a cookie reply"));
+            if hit.is_some() {
+                break;
+            }
+        }
+        // The last attempt's capture is reported on failure, not just the fact
+        // of failure: a deleted `warn!` and a renamed message both end up here,
+        // and only the events tell them apart.
+        let warned = match hit {
+            Some(i) => &captured[i],
+            None => panic!(
+                "the constructor must log the complaint; nothing in 5 attempts, last captured: {:?}",
+                captured.iter().map(|c| &c.message).collect::<Vec<_>>()
+            ),
+        };
         assert!(
             warned.message.contains("reflect"),
             "the message must say what is wrong: {}",
@@ -3757,13 +3786,20 @@ mod tests {
             warned.detail
         );
 
-        // One byte under the bound: the same build must say nothing, or the
-        // assertion above would pass on any configuration at all.
-        assert!(
-            build(114)
+        // One byte under the bound says nothing, or the assertion above would
+        // pass on any configuration at all. Counted rather than `all(!..)`:
+        // exactly one complaint across the two builds means the 120 profile
+        // produced it and the 114 profile did not, which is the claim -- and it
+        // cannot be satisfied by an empty capture, because the `hit` above
+        // already proved one event is there.
+        assert_eq!(
+            captured
                 .iter()
-                .all(|c| !c.detail.contains("makes a cookie reply")),
-            "a clean profile must not warn"
+                .filter(|c| c.detail.contains("makes a cookie reply"))
+                .count(),
+            1,
+            "a clean profile must not warn; captured: {:?}",
+            captured.iter().map(|c| &c.detail).collect::<Vec<_>>()
         );
     }
 

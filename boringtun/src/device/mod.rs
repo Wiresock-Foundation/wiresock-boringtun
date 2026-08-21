@@ -1967,8 +1967,11 @@ mod ingress_tests {
         // payload limit less the 64-byte cookie reply. Pinned by its neighbour
         // rather than quoted, so this is the real edge of the configuration
         // space and not a number someone remembered. S1 and S2 are at their own
-        // maxima, which is what it takes for an S3 that large to also clear the
-        // amplification rule.
+        // maxima only so this pair reads as one profile with the S1 = 0 case
+        // below; `validate` stopped applying the amplification rule when the
+        // policy moved out to the responder's door, so these two assertions are
+        // now purely the size rule -- as the `S1 = 0` config below, which
+        // `validate` accepts, demonstrates.
         assert!(AmneziaConfig::new(65_359, 65_415, 65_443, 0)
             .validate()
             .is_ok());
