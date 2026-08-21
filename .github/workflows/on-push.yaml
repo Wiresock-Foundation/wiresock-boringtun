@@ -134,8 +134,15 @@ jobs:
             fi
             # Anchored at both ends, so a future `new_tunnel_with_awg_params_v2`
             # cannot satisfy the "is referenced" check on its own.
-            nm -u "/tmp/cpp$bits.o" | grep -qE '(^| )U new_tunnel_with_awg_params$' || {
-              echo "::error::new_tunnel_with_awg_params is not referenced at -m$bits"; exit 1; }
+            #
+            # Every entry point the probe is supposed to cover is named here.
+            # The `_Z` grep above only proves nothing is mangled -- it passes
+            # just as happily when a symbol stopped being referenced at all,
+            # which is precisely how a guard stops guarding without failing.
+            for sym in new_tunnel_with_awg_params wireguard_set_content_padding_mtu; do
+              nm -u "/tmp/cpp$bits.o" | grep -qE "(^| )U $sym\$" || {
+                echo "::error::$sym is not referenced at -m$bits; scripts/ffi-header-cpp-check.cpp must keep a reference to it"; exit 1; }
+            done
           done
 
   # The WireSock client builds the i686/x86_64 Windows targets with Rust 1.75,

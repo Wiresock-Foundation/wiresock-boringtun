@@ -543,8 +543,9 @@ struct wireguard_awg_params
     /// full-MTU packet up to 15 bytes larger than amneziawg-go and the kernel
     /// module would send. Set it to the tunnel MTU whenever you know it.
     ///
-    /// It is a construction-time SNAPSHOT. There is no C entry point to refresh
-    /// it, so a tunnel whose interface MTU later changes must be rebuilt.
+    /// It is a construction-time SNAPSHOT, but not a permanent one: call
+    /// wireguard_set_content_padding_mtu() when the MTU moves. A tunnel whose
+    /// interface MTU later changes does NOT have to be rebuilt.
     uint32_t content_padding_mtu;
 
     /// AmneziaWG 3.0 tunable timers, in seconds -- except
@@ -618,8 +619,11 @@ struct wireguard_awg_params
 /// refuse it: S-value combinations that make the cookie reply larger than the
 /// request it answers, i.e. an amplification reflector (s3_cookie_junk >
 /// s2_response_junk + 28, or > s1_init_junk + 84). That rule asks whether this
-/// port would reflect -- a question about a responder -- and a tunnel built
-/// here is a client. Decisively, s3_cookie_junk is symmetric and
+/// port would reflect, and a tunnel driven through this ABI cannot: cookie
+/// replies are only formatted for a known source address, and wireguard_read()
+/// has no address parameter to supply one. That is the invariant -- NOT that
+/// callers of this constructor are always clients; it builds responders too.
+/// Decisively, s3_cookie_junk is symmetric and
 /// interface-wide: both ends must configure the same value or cookie replies do
 /// not parse, so it is dictated by the server you are connecting to, not chosen
 /// here. Refusing would decline a profile you cannot change, that the AmneziaWG
@@ -675,6 +679,55 @@ struct wireguard_result wireguard_force_handshake(const struct wireguard_tunnel 
                                                   uint32_t dst_size);
 
 struct stats wireguard_stats(const struct wireguard_tunnel *tunnel);
+
+/// Refresh the tunnel MTU that content_padding_addition pads against.
+///
+/// params.content_padding_mtu is a construction-time snapshot, and your MTU
+/// does not hold still -- it is recomputed on every reconnect and every roam
+/// between links, while the tunnel handle lives on. Without this call the
+/// padding keeps clamping to whatever the MTU was when the tunnel was built:
+/// too small wastes payload, too large emits packets the path drops. Call it
+/// wherever you already recompute your MTU; you do not have to rebuild the
+/// tunnel to track a link change.
+///
+/// Only the clamp moves. The configured padding range is untouched, live
+/// sessions are kept, and a queued pre-handshake junk burst survives --
+/// deliberately, since the MTU tends to move at exactly the moment the first
+/// handshake's burst is in flight.
+///
+/// mtu is the TUNNEL MTU -- the size of the packets you hand to
+/// wireguard_write() -- not the link MTU. See content_padding_mtu in
+/// struct wireguard_awg_params for what passing the link MTU costs.
+///
+/// Returns true if the clamp was updated. Returns false, changing nothing, if
+/// tunnel is NULL, mtu is 0, or mtu is above UINT16_MAX.
+///
+/// Both numeric refusals are the same refusal: neither value can bound
+/// anything. Zero does not mean "a zero-byte MTU", it means NO CLAMP AT ALL,
+/// so the padding would run unbounded. 65536 and above is that same state from
+/// the other end -- no real plaintext comes near it, so the clamp never binds
+/// -- and it is where you land when link_mtu - overhead underflows or an
+/// uninitialised field arrives as a sentinel. new_tunnel_with_awg_params
+/// already refuses an out-of-range content_padding_mtu, and a setter that
+/// answered true where the constructor answers NULL would let you reach by the
+/// back door a state the front door rejects. Note this is stricter than the
+/// constructor in one direction: it refuses a zero mtu unconditionally, while
+/// the constructor refuses it only when content_padding_addition is set, so a
+/// tunnel may START with no clamp but cannot be returned to that state here.
+///
+/// ORDERING, when you are lowering the MTU: lower the size of the packets you
+/// hand to wireguard_write() FIRST. content_padding sizes its draw against
+/// src_len % mtu, so a plaintext that is still larger than the new clamp gets
+/// MORE padding, not less -- a 1420-byte packet under a fresh 1280 clamp can
+/// grow by the full configured range rather than being capped at zero. Refresh
+/// the clamp once your write size has followed the link down.
+///
+/// Unlike the older entry points above, a NULL tunnel returns false rather
+/// than aborting. Those call unwrap() internally, and this library installs a
+/// panic hook that raises SIGSEGV, so a NULL passed to one of them takes your
+/// process down. New entry points return a value instead.
+bool wireguard_set_content_padding_mtu(const struct wireguard_tunnel *tunnel,
+                                       uint32_t mtu);
 
 #ifdef __cplusplus
 } // extern "C"
