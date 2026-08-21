@@ -1176,6 +1176,9 @@ mod tests {
         let mut params = AwgParams::default();
         params.set_size("s1", 120);
         params.set_size("s2", 130);
+        // 64 + 1 = 65 <= 92 + 130, so the untouched S3 keeps this clear of the
+        // reflection rule; see the test below, which is the one that exercises
+        // it here.
 
         let (_, merged) = params
             .merged(ObfuscationRanges::default(), &current, 1420)
@@ -1190,6 +1193,49 @@ mod tests {
         // And the keys the transaction did not mention keep their old values.
         assert_eq!(merged.cookie_packet_junk_size, 1, "s3 untouched");
         assert_eq!(merged.transport_packet_junk_size, 1, "s4 untouched");
+    }
+
+    /// The responder path keeps refusing what the C constructor now accepts.
+    ///
+    /// `new_tunnel_with_awg_params` builds S1=65/S2=86/S3=120 deliberately: S3
+    /// is symmetric and interface-wide, so a client is handed it by whichever
+    /// server it dials and cannot lower it without losing the ability to parse
+    /// that server's cookie replies. A device is the other party to exactly
+    /// that arrangement -- a responder on an unconnected socket, whose replies
+    /// go to an attacker-chosen source -- so here the operator both owns the
+    /// value and is the one who would reflect. This is the divergence stated in
+    /// `wireguard_ffi.h`, pinned from the side that still refuses.
+    #[test]
+    fn a_set_transaction_still_refuses_the_s3_the_ffi_constructor_now_accepts() {
+        let mut params = AwgParams::default();
+        params.set_size("s1", 65);
+        params.set_size("s2", 86);
+        params.set_size("s3", 120);
+
+        assert_eq!(
+            params
+                .merged(
+                    ObfuscationRanges::default(),
+                    &AmneziaConfig::default(),
+                    1420
+                )
+                .expect_err("an amplifying S3 must not load on a responder"),
+            libc::EINVAL,
+            "and must fail the transaction, not warn"
+        );
+
+        // One byte under the S2 bound loads, so the refusal above is the rule
+        // firing rather than the transaction failing for some other reason.
+        let mut ok = AwgParams::default();
+        ok.set_size("s1", 65);
+        ok.set_size("s2", 86);
+        ok.set_size("s3", 114);
+        ok.merged(
+            ObfuscationRanges::default(),
+            &AmneziaConfig::default(),
+            1420,
+        )
+        .expect("64 + 114 == 92 + 86 is parity, not amplification");
     }
 
     #[test]
