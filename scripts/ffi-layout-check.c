@@ -207,9 +207,23 @@ static struct wireguard_tunnel *(*const check_ctor)(
     const char *, const char *, const char *, uint16_t, uint32_t,
     const struct wireguard_awg_params *, const char *) = new_tunnel_with_awg_params;
 
+// The MTU setter, pinned here as well as in ffi-header-cpp-check.cpp. The C++
+// probe alone is not enough: this is the only file that compiles the header as
+// C11, so it is the only place the setter's `bool` is C's `_Bool` from
+// <stdbool.h> rather than a C++ built-in type. A constructor whose signature is
+// checked is no use if the refresh a caller must reach after construction is
+// checked in only one of the two languages the header claims to serve.
+static bool (*const check_mtu)(const struct wireguard_tunnel *,
+                               uint32_t) = wireguard_set_content_padding_mtu;
+
 // Referenced so no compiler warns it is unused; never called. Returns the
 // address OF the pointer, not the pointer cast to void*: converting a function
 // pointer to an object pointer is not conforming C (ISO C 6.3.2.3 covers only
 // object pointers), and -Wpedantic diagnoses it -- an odd thing to leave in the
 // one file whose job is to police conformance.
-const void *wg_ffi_layout_check_anchor(void) { return (const void *)&check_ctor; }
+const void *wg_ffi_layout_check_anchor(void)
+{
+    // Both pointers referenced, so neither can be optimised out or warned
+    // unused. The condition is never false; it exists only to name check_mtu.
+    return check_mtu ? (const void *)&check_ctor : (const void *)&check_mtu;
+}

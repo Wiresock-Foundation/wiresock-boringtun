@@ -1082,9 +1082,9 @@ pub struct wireguard_awg_params {
     /// capped by the MTU too, so `0` makes a full-MTU packet up to 15 bytes
     /// larger than amneziawg-go and the kernel module would send.
     ///
-    /// A construction-time snapshot. `Tunn::set_content_padding_mtu` refreshes
-    /// it for the device path; no C entry point exposes that, so an FFI tunnel
-    /// whose interface MTU later changes must be rebuilt.
+    /// A construction-time snapshot, but not a permanent one: call
+    /// [`wireguard_set_content_padding_mtu`] when the MTU moves. An FFI tunnel
+    /// whose interface MTU later changes does *not* have to be rebuilt.
     pub content_padding_mtu: u32,
 
     /// AmneziaWG 3.0 tunable timers, in seconds -- except
@@ -1738,8 +1738,16 @@ fn awg_params_to_config(
 /// One class is deliberately **not** refused here, though the UAPI `set=1` path
 /// does refuse it: S-value combinations that make the cookie reply larger than
 /// the request it answers, i.e. an amplification reflector. That rule asks
-/// whether this port would reflect, which is a question about a responder, and
-/// a tunnel built here is a client. More to the point, `s3_cookie_junk` is
+/// whether this port would reflect, and a tunnel reached through this ABI
+/// cannot: cookie replies are formatted only by `RateLimiter::verify_packet`,
+/// which returns `UnderLoad` before formatting when the source address is
+/// `None`, and [`wireguard_read`] passes `None` because the C ABI has no
+/// address parameter. That -- not "callers of this constructor are clients" --
+/// is the invariant. This entry point builds responders too; the test
+/// `an_amplifying_s3_builds_and_carries_traffic_through_the_awg_constructor`
+/// builds both ends with it. Anything that gives `decapsulate` a real source
+/// address (a future `wireguard_read_from`) must restore a reply-size guard.
+/// More to the point, `s3_cookie_junk` is
 /// symmetric and interface-wide -- both ends must configure the same value or
 /// cookie replies do not parse -- so it is dictated by the server the caller is
 /// connecting to. Refusing would decline a profile the caller cannot change,
@@ -1900,6 +1908,13 @@ pub unsafe extern "C" fn wireguard_read(
     // Slices are not owned, and therefore will not be freed by Rust
     let src = slice::from_raw_parts(src, src_size as usize);
     let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
+    // The `None` is load-bearing, not just "the C ABI has no sockaddr".
+    // `RateLimiter::verify_packet` returns `UnderLoad` on a `None` source
+    // before it formats a cookie reply, which is the only reason
+    // `new_tunnel_with_awg_params` can accept an amplifying S3 that `set=1`
+    // refuses. Plumbing a real address through here (a `wireguard_read_from`)
+    // re-opens that path and needs a reply-size guard at the emit site in
+    // `noise::Tunn::decapsulate` first.
     wireguard_result::from(tunnel.decapsulate(None, src, dst))
 }
 
@@ -1970,18 +1985,33 @@ pub unsafe extern "C" fn wireguard_stats(tunnel: *const Mutex<Tunn>) -> stats {
 /// `wireguard_write` -- not the link MTU. See `content_padding_mtu` in the
 /// struct for what passing the link MTU costs.
 ///
-/// Returns `true` if the clamp was updated. Returns `false`, changing
-/// nothing, when `tunnel` is NULL or `mtu` is 0. Zero is refused rather than
-/// stored because it does not mean "a zero-byte MTU", it means *no clamp at
-/// all* -- it would fail open, padding without bound, and it is the one state
-/// `new_tunnel_with_awg_params` already refuses to construct. A value above
-/// `UINT16_MAX` saturates rather than truncating, for the same reason the
-/// device saturates: `65536` truncated to 16 bits is `0`, so the arithmetic
-/// that is supposed to bound the padding would be the thing that unbounds it.
+/// Returns `true` if the clamp was updated. Returns `false`, changing nothing,
+/// when `tunnel` is NULL, `mtu` is 0, or `mtu` exceeds `UINT16_MAX`.
+///
+/// Both numeric refusals are the same refusal: neither value can bound
+/// anything. Zero does not mean "a zero-byte MTU", it means *no clamp at all*,
+/// so the padding would run unbounded. 65535 and above is the same state
+/// reached from the other end -- no real plaintext comes near it, so the
+/// `want.min(mtu - last_unit)` term never binds -- and it is what a caller
+/// lands on when `link_mtu - overhead` underflows to `u32::MAX` or an
+/// uninitialised field arrives as a sentinel. `new_tunnel_with_awg_params`
+/// already refuses an out-of-range `content_padding_mtu` through `size16`, and
+/// a setter that answered `true` where the constructor answers NULL would let
+/// a caller reach by the back door a state the front door rejects. Saturating
+/// to 65535 and reporting success was the earlier behaviour here and was
+/// wrong for exactly that reason.
+///
+/// This is stricter than the device, which saturates -- deliberately, because
+/// there the value comes from `iface.mtu()` and is the kernel's to be trusted,
+/// while this one is caller input.
 ///
 /// Unlike the older entry points, a NULL tunnel is a `false` return rather
-/// than a panic. Unwinding across the C boundary is undefined behaviour, so
-/// new entry points do not do it.
+/// than an abort. Those call `as_ref().unwrap()`, and a panic cannot unwind
+/// out of `extern "C"` -- since Rust 1.71 it is a defined abort rather than
+/// undefined behaviour, and in this library it is louder still: the crate
+/// installs a panic hook that calls `raise(SIGSEGV)`, so a NULL handed to an
+/// older entry point takes the embedder's process down with a segfault. New
+/// entry points return a value instead.
 #[no_mangle]
 pub unsafe extern "C" fn wireguard_set_content_padding_mtu(
     tunnel: *const Mutex<Tunn>,
@@ -1990,12 +2020,18 @@ pub unsafe extern "C" fn wireguard_set_content_padding_mtu(
     if mtu == 0 {
         return false;
     }
+    // `try_from` rather than `as`, and rather than a saturating `min`: both of
+    // those turn an out-of-range MTU into a value that is stored and reported
+    // as success, and `65536 as u16` is `0` -- the one value this entry point
+    // exists to refuse. Written this way, deleting the range check is a
+    // compile error rather than a silent return of the fail-open clamp.
+    let Ok(mtu) = u16::try_from(mtu) else {
+        return false;
+    };
     let Some(tunnel) = tunnel.as_ref() else {
         return false;
     };
-    tunnel
-        .lock()
-        .set_content_padding_mtu(mtu.min(u16::MAX as u32) as u16);
+    tunnel.lock().set_content_padding_mtu(mtu);
     true
 }
 
@@ -3399,15 +3435,6 @@ mod tests {
         assert!(format!("{:?}", unset).contains("\"unset\""));
     }
 
-    /// `content_padding_mtu` bounds the *plaintext*, so it is the tunnel MTU
-    /// and not the link MTU -- pinned as datagram sizes, end to end.
-    ///
-    /// The field's rustdoc quotes these four numbers to tell a caller what
-    /// passing the wrong MTU costs. Every other test here stops at
-    /// `awg_params_to_config`, which never reaches `content_padding`, so
-    /// without this the numbers were prose: the doc could name any figure and
-    /// nothing would disagree. It says 1500 rather than 1420 puts the datagram
-    /// over a 1500-byte link, and that is the claim, so that is the assertion.
     /// An amplifying S3 is a server's choice, so this constructor builds it.
     ///
     /// S1=65, S2=86, S3=120 is an ordinary AmneziaWG 2.0 profile: the kernel
@@ -3421,8 +3448,18 @@ mod tests {
     /// Constructed at *both* ends and driven through a real handshake and a
     /// data packet rather than asserted non-NULL, because a constructor-only
     /// check would also pass if the fix accepted the configuration and then
-    /// dropped or mis-sized the prefixes. The two size assertions are what
-    /// prove the profile was actually applied.
+    /// dropped or mis-sized the prefixes.
+    ///
+    /// What the two size assertions prove is that **S1 and S2** survived and
+    /// the session works -- not S3, which leaves no trace here. S3 sizes cookie
+    /// replies, a `Tunn` never formats one (`format_cookie_reply` is reachable
+    /// only from `device`), and nothing in this test provokes one, so a change
+    /// that dropped `s3_cookie_junk` on the floor would still pass: S3 = 0 does
+    /// not amplify, and the initiation and response would be unchanged. That
+    /// the value reaches the config at all is pinned by
+    /// [`awg_params_reach_every_feature`]; this test's job is that the
+    /// constructor no longer *refuses* the profile and that the tunnel it
+    /// returns actually works.
     #[test]
     fn an_amplifying_s3_builds_and_carries_traffic_through_the_awg_constructor() {
         last_tunnel_error_free();
@@ -3466,6 +3503,16 @@ mod tests {
         };
         let client = build(&c_sec, &s_pub, 1);
         let server = build(&s_sec, &c_pub, 2);
+
+        // The complaint is logged, never stored. Both docs state that a
+        // non-NULL return means there is nothing to read, so pin it here:
+        // routing the warning through `set_last_error` would leave a stale
+        // string that a caller checking the error after a *successful* build
+        // would read as a failure.
+        assert!(
+            last_tunnel_error().is_null(),
+            "an accepted profile must not leave a message in last_tunnel_error()"
+        );
 
         let mut a = vec![0u8; 65536 + 64];
         let mut b = vec![0u8; 65536 + 64];
@@ -3553,6 +3600,128 @@ mod tests {
         }
     }
 
+    /// The amplifying-S3 warning is actually emitted.
+    ///
+    /// The header promises it: having stopped refusing this configuration, the
+    /// WARN is the entire remaining operator-visible signal, and it is stated
+    /// as contract next to the prototype. Nothing else pins it -- the two-doors
+    /// test asserts only that `cookie_amplification_complaint` returns `Some`,
+    /// which is that there is something to log, not that anything logs it, so
+    /// deleting the `tracing::warn!` left every other test green.
+    ///
+    /// Also pins the other half of the same sentence: that the complaint does
+    /// NOT go through `last_tunnel_error()`. A non-NULL return must never mean
+    /// "read the error", or an embedder checking the error slot after a
+    /// successful build reads a message about a tunnel it just built fine.
+    #[test]
+    fn an_amplifying_s3_warns_and_leaves_the_error_slot_empty() {
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Default)]
+        struct Captured {
+            message: String,
+            detail: String,
+        }
+        impl Visit for Captured {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "message" => self.message = value.to_owned(),
+                    "detail" => self.detail = value.to_owned(),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let slot = match field.name() {
+                    "message" => &mut self.message,
+                    "detail" => &mut self.detail,
+                    _ => return,
+                };
+                if slot.is_empty() {
+                    *slot = format!("{:?}", value);
+                }
+            }
+        }
+        struct Capture(Arc<StdMutex<Vec<Captured>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let mut c = Captured::default();
+                event.record(&mut c);
+                self.0.lock().unwrap().push(c);
+            }
+        }
+
+        let build = |s3: u32| -> Vec<Captured> {
+            let events: Arc<StdMutex<Vec<Captured>>> = Arc::new(StdMutex::new(Vec::new()));
+            {
+                let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+                tracing::subscriber::with_default(subscriber, || {
+                    last_tunnel_error_free();
+                    let params = wireguard_awg_params {
+                        size: AWG_PARAMS_SIZE_VER0 as u32,
+                        s1_init_junk: 65,
+                        s2_response_junk: 86,
+                        s3_cookie_junk: s3,
+                        ..Default::default()
+                    };
+                    let key = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+                    let tunnel = unsafe {
+                        new_tunnel_with_awg_params(
+                            key.as_ptr(),
+                            key.as_ptr(),
+                            ptr::null(),
+                            0,
+                            1,
+                            &params,
+                            ptr::null(),
+                        )
+                    };
+                    assert!(!tunnel.is_null(), "{}", last_error_string());
+                    assert!(
+                        last_tunnel_error().is_null(),
+                        "a non-NULL return must leave the error slot empty"
+                    );
+                    unsafe { tunnel_free(tunnel) };
+                });
+            }
+            Arc::try_unwrap(events).ok().unwrap().into_inner().unwrap()
+        };
+
+        // 64 + 120 = 184 > 92 + 86 = 178.
+        let amplifying = build(120);
+        let warned = amplifying
+            .iter()
+            .find(|c| c.detail.contains("makes a cookie reply"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the constructor must log the complaint; captured: {:?}",
+                    amplifying.iter().map(|c| &c.message).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            warned.message.contains("reflect"),
+            "the message must say what is wrong: {}",
+            warned.message
+        );
+        assert!(
+            warned.detail.contains("S3 = 120") && warned.detail.contains("178"),
+            "and carry the arithmetic the operator acts on: {}",
+            warned.detail
+        );
+
+        // One byte under the bound: the same build must say nothing, or the
+        // assertion above would pass on any configuration at all.
+        assert!(
+            build(114)
+                .iter()
+                .all(|c| !c.detail.contains("makes a cookie reply")),
+            "a clean profile must not warn"
+        );
+    }
+
     /// A live tunnel whose MTU moved pads to the new clamp, not the old one.
     ///
     /// This is the reason the entry point exists: `content_padding_mtu` is a
@@ -3561,9 +3730,13 @@ mod tests {
     /// the wire rather than by reading the field back, because the field being
     /// right is not the claim -- the claim is that the *packets* get smaller.
     ///
-    /// Drawn repeatedly at each MTU because the addition is a random range: a
-    /// single sample would pin whatever the RNG happened to return, and the
-    /// two ranges overlap heavily enough that one draw proves nothing.
+    /// Drawn repeatedly at 1420 because the addition is a random range and the
+    /// clamp only binds on a draw of 140 or more: one sample lands under that
+    /// 68% of the time and would measure the draw rather than the clamp. The
+    /// 1280 side needs no repetition at all -- the packet is exactly 1280, so
+    /// `content_padding`'s `want.min(mtu - last_unit)` is `min(want, 0)` and
+    /// every draw is clamped to zero -- but it runs through the same closure,
+    /// which is cheaper than a second one.
     #[test]
     fn refreshing_the_mtu_moves_the_padding_clamp_on_a_live_tunnel() {
         last_tunnel_error_free();
@@ -3729,12 +3902,12 @@ mod tests {
         );
         assert_eq!(clamp(), 1420, "a refused value must not have been stored");
 
-        // A NULL tunnel is a `false` return, not a panic. Measured rather than
-        // assumed: replacing this with the `as_ref().unwrap()` the older entry
-        // points use does not produce a clean panic here, it takes the test
-        // process down with SIGSEGV -- which is what it would do to an
-        // embedder's process too, since a panic cannot unwind out of
-        // `extern "C"`.
+        // A NULL tunnel is a `false` return, not an abort. Measured rather
+        // than assumed: replacing this with the `as_ref().unwrap()` the older
+        // entry points use does not produce a clean panic here -- it takes the
+        // test process down with SIGSEGV, because this module installs a panic
+        // hook that calls `raise(SIGSEGV)` and a panic cannot unwind out of
+        // `extern "C"` to be caught first. An embedder gets the same segfault.
         assert!(
             !unsafe { wireguard_set_content_padding_mtu(ptr::null(), 1280) },
             "a NULL tunnel must be refused"
@@ -3743,19 +3916,42 @@ mod tests {
         assert!(unsafe { wireguard_set_content_padding_mtu(tunnel, 1280) });
         assert_eq!(clamp(), 1280);
 
-        // Saturate, never truncate.
-        assert!(unsafe { wireguard_set_content_padding_mtu(tunnel, 65536) });
-        assert_eq!(
-            clamp(),
-            u16::MAX,
-            "an oversize MTU must saturate; truncation would store 0 and unbound the padding"
-        );
-        assert!(unsafe { wireguard_set_content_padding_mtu(tunnel, u32::MAX) });
+        // Out of range is refused, not saturated. 65535 clamps no real
+        // plaintext, so storing it and answering `true` would report success
+        // for the same fail-open state that 0 is refused for -- and would
+        // accept through this door a value `new_tunnel_with_awg_params`
+        // refuses through the other one.
+        for oversize in [65536u32, u32::MAX] {
+            assert!(
+                !unsafe { wireguard_set_content_padding_mtu(tunnel, oversize) },
+                "an MTU above u16::MAX must be refused, not saturated: {}",
+                oversize
+            );
+            assert_eq!(
+                clamp(),
+                1280,
+                "a refused MTU must leave the previous clamp alone: {}",
+                oversize
+            );
+        }
+
+        // The largest value that IS in range still applies, so the refusal
+        // above is a bound and not a blanket rejection of large MTUs.
+        assert!(unsafe { wireguard_set_content_padding_mtu(tunnel, u16::MAX as u32) });
         assert_eq!(clamp(), u16::MAX);
 
         unsafe { tunnel_free(tunnel) };
     }
 
+    /// `content_padding_mtu` bounds the *plaintext*, so it is the tunnel MTU
+    /// and not the link MTU -- pinned as datagram sizes, end to end.
+    ///
+    /// The field's rustdoc quotes these four numbers to tell a caller what
+    /// passing the wrong MTU costs. Every other test here stops at
+    /// `awg_params_to_config`, which never reaches `content_padding`, so
+    /// without this the numbers were prose: the doc could name any figure and
+    /// nothing would disagree. It says 1500 rather than 1420 puts the datagram
+    /// over a 1500-byte link, and that is the claim, so that is the assertion.
     #[test]
     fn content_padding_mtu_is_the_tunnel_mtu_not_the_link_mtu() {
         /// The largest UDP payload a full-MTU inner packet produces. Drawn

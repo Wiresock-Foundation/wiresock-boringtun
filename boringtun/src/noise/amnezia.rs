@@ -811,8 +811,9 @@ impl AmneziaConfig {
     /// working kernel configuration is accepted" is not read as covering it.
     /// It is also the one check that is *not* universal: it asks whether the
     /// port would reflect, which is a question about a responder, so only this
-    /// entry point applies it. See [`Self::validate_without_reflection_policy`]
-    /// for the entry point that does not, and why.
+    /// entry point applies it. The crate-internal
+    /// `validate_without_reflection_policy` is the door that does not apply it;
+    /// not linked, because a `pub` doc cannot link a `pub(crate)` item.
     pub fn validate(&self) -> Result<(), String> {
         self.validate_inner(true)
     }
@@ -835,6 +836,13 @@ impl AmneziaConfig {
     /// pinned by a test: a device is a responder on an unconnected socket whose
     /// source address is attacker-chosen, which is exactly the position the
     /// rule exists to protect, and exactly the position a client is not in.
+    ///
+    /// Gated because the FFI constructors are the only caller: without
+    /// `ffi-bindings` this is dead code, and a crate built without the feature
+    /// would carry a `dead_code` warning for it -- the same reason
+    /// `cookie_reply_len` below is gated. `test` is in the list so the
+    /// two-doors test still runs on a default-feature `cargo test`.
+    #[cfg(any(test, feature = "ffi-bindings"))]
     pub(crate) fn validate_without_reflection_policy(&self) -> Result<(), String> {
         self.validate_inner(false)
     }
@@ -1347,15 +1355,37 @@ impl AmneziaConfig {
     /// [`Self::validate_without_reflection_policy`] for why the same
     /// configuration is refused for a responder and merely logged for a client.
     ///
-    /// Not gated: [`Self::validate`] calls it on every build.
+    /// Not gated: [`Self::cookie_amplification_complaint`] is its only caller,
+    /// and [`Self::validate`] reaches it on every build.
+    fn cookie_amplification_bounds(&self) -> Vec<(&'static str, usize, usize)> {
+        let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
+        let mut bounds: Vec<(&'static str, usize, usize)> = [
+            ("S1", self.init_packet_junk_size, HANDSHAKE_INIT_SZ),
+            ("S2", self.response_packet_junk_size, HANDSHAKE_RESP_SZ),
+        ]
+        .iter()
+        // Filter before the subtraction, not after: `reply - base` underflows
+        // on a configuration that does not amplify, which is most of them.
+        // `reply > base + junk` implies `reply > base`, so the map is safe only
+        // in this order.
+        .filter(|&&(_, junk, base)| reply > base + junk as usize)
+        .map(|&(label, junk, base)| (label, base + junk as usize, reply - base))
+        .collect();
+        // Stable, so an equal pair still reports S1 first and the message stays
+        // the same for the common symmetric configuration.
+        bounds.sort_by_key(|&(_, request, _)| request);
+        bounds
+    }
+
     /// The cookie-reflection complaint this configuration earns, or `None`.
     ///
     /// Reporting is separated from rejecting because the two callers want
     /// different verbs. A device is a responder on an unconnected socket, so
     /// the reply it would emit is aimed at an attacker-chosen source and `set=1`
-    /// refuses. A tunnel reached through the C ABI is not in that position, and
-    /// the S3 it was handed is not its to change, so the FFI constructors log
-    /// this and build the tunnel.
+    /// refuses. A tunnel reached through the C ABI cannot emit one at all --
+    /// `wireguard_read` passes no source address, so `verify_packet` bails on
+    /// `UnderLoad` before formatting -- and the S3 it was handed is not its to
+    /// change, so the FFI constructors log this and build the tunnel.
     ///
     /// The AmneziaWG kernel module and amneziawg-go both accept these
     /// combinations -- there is no analogous rule in either -- so this is ours,
@@ -1391,36 +1421,16 @@ impl AmneziaConfig {
         ))
     }
 
-    fn cookie_amplification_bounds(&self) -> Vec<(&'static str, usize, usize)> {
-        let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
-        let mut bounds: Vec<(&'static str, usize, usize)> = [
-            ("S1", self.init_packet_junk_size, HANDSHAKE_INIT_SZ),
-            ("S2", self.response_packet_junk_size, HANDSHAKE_RESP_SZ),
-        ]
-        .iter()
-        // Filter before the subtraction, not after: `reply - base` underflows
-        // on a configuration that does not amplify, which is most of them.
-        // `reply > base + junk` implies `reply > base`, so the map is safe only
-        // in this order.
-        .filter(|&&(_, junk, base)| reply > base + junk as usize)
-        .map(|&(label, junk, base)| (label, base + junk as usize, reply - base))
-        .collect();
-        // Stable, so an equal pair still reports S1 first and the message stays
-        // the same for the common symmetric configuration.
-        bounds.sort_by_key(|&(_, request, _)| request);
-        bounds
-    }
-
     /// The **binding** bound as `(kind, request_len, reply_len)` — the shortest
     /// provoking packet, the one S3 actually has to clear — or `None` when the
     /// configuration does not amplify.
     ///
     /// A view over [`Self::cookie_amplification_bounds`], not a second
-    /// derivation. `validate` needs every violated bound, so it calls that
-    /// directly; this narrower shape is only convenient for asserting *which*
-    /// bound binds, and `#[cfg(test)]` accordingly — left ungated it is dead
-    /// code, and the crate carries a `dead_code` warning for it with or without
-    /// the `device` feature.
+    /// derivation. [`Self::cookie_amplification_complaint`] needs every violated
+    /// bound, so it calls that directly; this narrower shape is only convenient
+    /// for asserting *which* bound binds, and `#[cfg(test)]` accordingly — left
+    /// ungated it is dead code, and the crate carries a `dead_code` warning for
+    /// it with or without the `device` feature.
     #[cfg(test)]
     fn cookie_reply_amplifies(&self) -> Option<(&'static str, usize, usize)> {
         let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
@@ -2949,15 +2959,6 @@ mod tests {
         );
     }
 
-    /// `validate` refuses a configuration whose cookie replies would amplify,
-    /// on both packet kinds and at the boundary.
-    ///
-    /// This is deliberately stricter than the AmneziaWG kernel module, which
-    /// accepts these combinations. The trade is stated in `validate`: a config
-    /// refused here would have run there, weakly reflecting, and would have lost
-    /// every handshake under load once `device::reply_policy` suppressed its
-    /// cookie replies. Failing at `awg set` is the one place the operator can
-    /// still act on it.
     /// The two doors disagree on the reflection rule and on nothing else.
     ///
     /// `validate` is what a responder runs and it refuses; the client path
@@ -3016,6 +3017,15 @@ mod tests {
         );
     }
 
+    /// `validate` refuses a configuration whose cookie replies would amplify,
+    /// on both packet kinds and at the boundary.
+    ///
+    /// This is deliberately stricter than the AmneziaWG kernel module, which
+    /// accepts these combinations. The trade is stated in `validate`: a config
+    /// refused here would have run there, weakly reflecting, and would have lost
+    /// every handshake under load once `device::reply_policy` suppressed its
+    /// cookie replies. Failing at `awg set` is the one place the operator can
+    /// still act on it.
     #[test]
     fn validate_refuses_a_configuration_whose_cookie_replies_would_amplify() {
         // Parity exactly: 64 + S3 == 148 + S1 and == 92 + S2. Legal.
