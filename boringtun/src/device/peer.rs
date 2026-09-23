@@ -153,7 +153,36 @@ impl Peer {
         }
     }
 
+    ///
+    /// # The UDP window follows the endpoint
+    ///
+    /// The tunnel's AmneziaWG 3.1 UDP window describes one path: outside the
+    /// peer's lock it always describes `endpoint.addr`. A change of address --
+    /// host or port -- starts it afresh here. Compared by address, not by
+    /// endpoint object as amneziawg-go does, which also resets whenever a
+    /// fresh object describes the same peer.
+    ///
+    /// The one moment the two differ is inside the anonymous ingress's
+    /// critical section: `commit_anonymous` starts the window for a new source
+    /// *before* committing its packet, so a reply drawn during the commit is
+    /// sized for the path it will go out on, and puts the old window back if
+    /// the commit fails; on success the handler records the source with
+    /// [`Self::adopt_endpoint`], which does not reset again. The peer's lock is
+    /// held throughout, so no other code sees the window and the endpoint
+    /// disagree.
     pub fn set_endpoint(&self, addr: SocketAddr) {
+        self.move_endpoint(addr, true)
+    }
+
+    /// Record `addr` as the endpoint without starting the UDP window afresh,
+    /// because the caller already has: `commit_anonymous` started it for this
+    /// address before committing the packet that came from it, and that
+    /// packet's contribution to it must survive. See [`Self::set_endpoint`].
+    pub(crate) fn adopt_endpoint(&self, addr: SocketAddr) {
+        self.move_endpoint(addr, false)
+    }
+
+    fn move_endpoint(&self, addr: SocketAddr, reset_window: bool) {
         let mut endpoint = self.endpoint.write();
         if endpoint.addr != Some(addr) {
             // We only need to update the endpoint if it differs from the current one
@@ -166,6 +195,10 @@ impl Peer {
             }
 
             endpoint.addr = Some(addr);
+            // The UDP window described the address we just left.
+            if reset_window {
+                self.tunnel.reset_udp_window();
+            }
             // The suppression describes the address we just left, not this
             // peer. Held across a roam it would strand the peer on the shared
             // listener for the life of the process after one bad endpoint --
@@ -393,6 +426,38 @@ mod tests {
             !peer.upgrade_suppressed(),
             "a roam to a different endpoint must rearm the upgrade"
         );
+    }
+
+    /// The AmneziaWG 3.1 UDP window follows the endpoint's *address*: a new
+    /// address -- a new port included -- starts it again at the default, and
+    /// the same address arriving again leaves it alone. amneziawg-go compares
+    /// endpoint objects instead, so a fresh object for the same address resets
+    /// it there; that is the behaviour this rules out.
+    #[test]
+    fn the_udp_window_resets_when_the_endpoint_address_changes_and_only_then() {
+        use crate::noise::amnezia::DEFAULT_UDP_WINDOW;
+        let peer = test_peer();
+        peer.tunnel.set_udp_window(1400);
+
+        peer.set_endpoint("192.0.2.7:51820".parse().unwrap());
+        assert_eq!(
+            peer.tunnel.udp_window(),
+            DEFAULT_UDP_WINDOW,
+            "first address"
+        );
+
+        peer.tunnel.set_udp_window(1400);
+        for _ in 0..3 {
+            peer.set_endpoint("192.0.2.7:51820".parse().unwrap());
+            assert_eq!(peer.tunnel.udp_window(), 1400, "the same address again");
+        }
+
+        peer.set_endpoint("192.0.2.7:51821".parse().unwrap());
+        assert_eq!(peer.tunnel.udp_window(), DEFAULT_UDP_WINDOW, "a new port");
+
+        peer.tunnel.set_udp_window(1400);
+        peer.set_endpoint("198.51.100.9:51821".parse().unwrap());
+        assert_eq!(peer.tunnel.udp_window(), DEFAULT_UDP_WINDOW, "a new host");
     }
 
     /// Environment marker naming the child half of the descriptor-exhaustion

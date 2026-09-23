@@ -442,9 +442,13 @@ struct wireguard_awg_range
 /// produce a tunnel that is mutually unreachable with its peer, which is far
 /// worse than a refused constructor.
 ///
+/// Published sizes so far: 160 bytes (the first version) and 164 (which added
+/// random_trailers). A caller built against either header works with this
+/// library; see VERSIONING.
+///
 /// LAYOUT. Every field is a uint32_t, an array of them, or a fixed byte array;
 /// there is no pointer and no sub-word member, so the struct has no padding and
-/// the same size (160 bytes) and layout in 32- and 64-bit builds. The imitation
+/// the same size (164 bytes) and layout in 32- and 64-bit builds. The imitation
 /// domain is a string and so is passed as its own argument.
 struct wireguard_awg_params
 {
@@ -582,6 +586,27 @@ struct wireguard_awg_params
     /// Traffic is unaffected. The warning is emitted through the tracing log
     /// (see set_logging_function), not through last_tunnel_error().
     uint8_t header_protection_key[32];
+
+    /// AmneziaWG 3.1 RandomTrailers: 1 turns it on, 0 (the default) leaves it
+    /// off. Any other value is refused. A uint32_t rather than bool, because
+    /// the size of a C bool is the implementation's choice and this struct's
+    /// layout must not be.
+    ///
+    /// On, each handshake message this tunnel sends carries a random suffix
+    /// after its canonical bytes, and handshake messages it receives are read
+    /// as minimum sizes rather than exact ones. Transport padding stays inside
+    /// the encryption, drawn against the largest datagram the tunnel has seen
+    /// rather than against content_padding_mtu (which is still required when
+    /// content_padding_addition is set). BOTH ENDS MUST AGREE -- it is not
+    /// negotiated, and a peer with it off rejects every extended handshake
+    /// message.
+    ///
+    /// No larger output buffer is needed: the suffix is optional and shrinks to
+    /// fit the buffer you pass.
+    ///
+    /// Added in the 164-byte version of this struct. A caller built against the
+    /// 160-byte header does not have it, and gets it off.
+    uint32_t random_trailers;
 };
 
 /// Allocate a new tunnel from a full set of AmneziaWG parameters.

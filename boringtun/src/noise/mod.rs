@@ -16,6 +16,8 @@ pub mod header_protection;
 // Receiving a datagram whose shape fits more than one packet kind. Crate-wide
 // because the device's anonymous ingress drives it too.
 pub(crate) mod inbound;
+#[cfg(test)]
+mod random_trailers_tests;
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
 pub(crate) mod quic;
 mod session;
@@ -37,6 +39,7 @@ use crate::x25519;
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,6 +101,24 @@ pub struct Tunn {
     amnezia: AmneziaConfig,
     pending_amnezia_junk: Option<PendingAmneziaJunk>,
     rate_limiter: Arc<RateLimiter>,
+    /// The largest transport frame this tunnel has sent or authenticated, in
+    /// the measure [`AmneziaConfig::transport_window_observation`] and
+    /// [`AmneziaConfig::received_window_observation`] define, never below
+    /// [`amnezia::DEFAULT_UDP_WINDOW`]. What AmneziaWG 3.1 RandomTrailers draws
+    /// its additions against.
+    ///
+    /// Per tunnel, and so per peer: one peer's traffic cannot widen another's.
+    /// Observed whether or not RandomTrailers is on -- as upstream does -- so
+    /// enabling it on a live tunnel draws against what that tunnel has already
+    /// carried. The device resets it when a peer's endpoint address changes;
+    /// a tunnel driven directly knows no endpoint and keeps it for life.
+    ///
+    /// Atomic only so that reset can take `&self`: it is called from
+    /// `device::Peer::set_endpoint`, a public `&self` method, and widening that
+    /// to `&mut self` to reach a field would change a public signature for
+    /// nothing. Every other access has `&mut Tunn`; the device holds the
+    /// peer's lock around all of them anyway, so the ordering is `Relaxed`.
+    udp_window: AtomicU32,
 }
 
 struct PendingAmneziaJunk {
@@ -199,6 +220,14 @@ pub(crate) enum Authenticated {
         receiver_idx: u32,
         len: usize,
     },
+}
+
+/// `window` grown to cover a frame of `size` bytes, as measured by the two
+/// `*_window_observation` accessors on [`AmneziaConfig`]. A free function over
+/// the field rather than a method, so the transport path can call it while it
+/// still holds a borrow of the session.
+fn grown_window(window: u32, size: usize) -> u32 {
+    window.max(u32::try_from(size).unwrap_or(u32::MAX))
 }
 
 impl Tunn {
@@ -446,6 +475,7 @@ impl Tunn {
             rx_bytes: Default::default(),
             amnezia,
             pending_amnezia_junk: None,
+            udp_window: AtomicU32::new(amnezia::DEFAULT_UDP_WINDOW),
 
             packet_queue: VecDeque::new(),
             timers: Timers::new(persistent_keepalive, rate_limiter.is_none()),
@@ -508,6 +538,47 @@ impl Tunn {
         if timers_changed {
             self.redraw_tunable_timers();
         }
+    }
+
+    /// Forget the observed UDP window: back to
+    /// [`amnezia::DEFAULT_UDP_WINDOW`].
+    ///
+    /// For the device, when a peer's endpoint *address* changes: the window
+    /// describes a path, and a new address is a new path. Not on a mere
+    /// re-registration of the same address -- amneziawg-go compares endpoint
+    /// objects rather than addresses, so it also resets whenever a fresh object
+    /// describes the same peer; that is not reproduced.
+    #[cfg(feature = "device")]
+    pub(crate) fn reset_udp_window(&self) {
+        self.udp_window
+            .store(amnezia::DEFAULT_UDP_WINDOW, AtomicOrdering::Relaxed);
+    }
+
+    /// Start the window afresh for a path a packet has just been
+    /// authenticated on, returning the window it replaces so the caller can
+    /// put it back with [`Self::restore_udp_window`] if that packet is not,
+    /// in the end, accepted.
+    #[cfg(feature = "device")]
+    pub(crate) fn begin_new_path(&self) -> u32 {
+        self.udp_window
+            .swap(amnezia::DEFAULT_UDP_WINDOW, AtomicOrdering::Relaxed)
+    }
+
+    /// Put back a window [`Self::begin_new_path`] replaced.
+    #[cfg(feature = "device")]
+    pub(crate) fn restore_udp_window(&self, window: u32) {
+        self.udp_window.store(window, AtomicOrdering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn udp_window(&self) -> u32 {
+        self.udp_window.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Stand in for traffic that would have grown the window this far.
+    #[cfg(test)]
+    pub(crate) fn set_udp_window(&self, window: u32) {
+        self.udp_window.store(window, AtomicOrdering::Relaxed);
     }
 
     /// Update only the MTU the content padding is clamped against.
@@ -629,6 +700,14 @@ impl Tunn {
                 return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
             }
 
+            // The frame is observed before its padding is drawn, as upstream's
+            // `RoutineEncryption` does, so the window already covers it.
+            let window = self.udp_window.get_mut();
+            *window = grown_window(
+                *window,
+                self.amnezia.transport_window_observation(src.len()),
+            );
+
             // The padding budget lives in one place -- `content_padding_for_frame`
             // owns the committed/space arithmetic for this site and the
             // keepalive site both, so the two bounds cannot drift apart.
@@ -636,6 +715,7 @@ impl Tunn {
                 src.len(),
                 dst.len(),
                 transport_junk,
+                self.udp_window.load(AtomicOrdering::Relaxed),
                 &mut self.handshake.rng,
             );
 
@@ -810,7 +890,23 @@ impl Tunn {
                     return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
                 }
                 dst[..packet_size].copy_from_slice(cookie);
-                self.write_to_network(dst, packet_size)
+                // The RandomTrailers suffix, if any, is drawn only from the room
+                // parity leaves (`TrailerRoom::cookie_reply`), so it cannot
+                // turn an attenuating reply into an amplifying one. The check
+                // on what actually came out stays anyway: it is the guard, and
+                // the bound above is only how the draw avoids tripping it.
+                match self.write_to_network_with(
+                    dst,
+                    packet_size,
+                    amnezia::TrailerRoom::cookie_reply(wire_len),
+                ) {
+                    TunnResult::WriteToNetwork(reply)
+                        if amnezia::reply_amplifies(wire_len, reply.len()) =>
+                    {
+                        TunnResult::Done
+                    }
+                    other => other,
+                }
             }
         }
     }
@@ -966,10 +1062,13 @@ impl Tunn {
         // The zero-fill in `format_packet_data` is what keeps it a keepalive: the
         // peer classifies any zero-first-byte plaintext as one. Same budget
         // helper as the data path, so the two frames' bounds cannot drift.
+        let window = self.udp_window.get_mut();
+        *window = grown_window(*window, self.amnezia.transport_window_observation(0));
         let pad = self.amnezia.content_padding_for_frame(
             0,
             dst.len(),
             transport_junk,
+            self.udp_window.load(AtomicOrdering::Relaxed),
             &mut self.handshake.rng,
         );
 
@@ -1035,6 +1134,14 @@ impl Tunn {
         self.set_current_session(receiver_idx as usize);
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
+
+        // Only here, past the AEAD and the replay window: nothing a false
+        // reading or a forgery can reach grows the window. Before the inner IP
+        // is examined, so an authenticated keepalive or malformed plaintext
+        // counts -- the frame crossed the path either way, and that is where
+        // amneziawg-go's `RoutineSequentialReceiver` observes it too.
+        let window = self.udp_window.get_mut();
+        *window = grown_window(*window, self.amnezia.received_window_observation(len));
 
         Ok(self.validate_decapsulated_packet(&mut dst[..len]))
     }
@@ -1337,11 +1444,25 @@ impl Tunn {
         self.packet_queue.pop_front()
     }
 
+    /// Frame `dst[..packet_size]` for the wire. A handshake message draws its
+    /// RandomTrailers suffix against this tunnel's UDP window; transport has
+    /// none (its addition was drawn as padding, inside the AEAD).
     fn write_to_network<'a>(&mut self, dst: &'a mut [u8], packet_size: usize) -> TunnResult<'a> {
-        match self.amnezia.prepend_outbound(
+        let room = amnezia::TrailerRoom::window(*self.udp_window.get_mut());
+        self.write_to_network_with(dst, packet_size, room)
+    }
+
+    fn write_to_network_with<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+        packet_size: usize,
+        room: amnezia::TrailerRoom,
+    ) -> TunnResult<'a> {
+        match self.amnezia.prepend_outbound_with_trailer(
             self.handshake.obf,
             dst,
             packet_size,
+            Some(room),
             &mut self.handshake.rng,
         ) {
             Ok(packet) => TunnResult::WriteToNetwork(packet),
