@@ -2181,29 +2181,60 @@ mod tests {
     /// and is killed here.
     #[test]
     fn the_response_bound_is_measured_against_the_response() {
-        // S1 = 120, S3 = 100: a 164-byte reply. Against the initiation
-        // (148 + 120 = 268) it attenuates, so the initiation-only view says
-        // "send". Against the response it is the S2 that decides.
+        use std::cmp::Ordering;
+
+        // S1 = 120, S3 = 100: a 64 + 100 = 164-byte reply. Against the
+        // initiation (148 + 120 = 268) it attenuates, so the initiation-only
+        // view says "send". Against the response (92 + S2) it is the S2 that
+        // decides.
+        const S3: u16 = 100;
+        let reply_len = COOKIE_REPLY_SZ + S3 as usize;
+        assert_eq!(reply_len, 164, "sanity: the reply size every label assumes");
+
+        // (S2, response wire length, reply vs response, what the sizes mean)
         //
-        // (S2, must the reply be suppressed, what the sizes mean)
+        // The wire length and the ordering are stated rather than derived so
+        // that a case cannot silently stop representing what its label says:
+        // both are checked against the arithmetic and the packet in hand.
         let cases = [
             (
                 0u16,
-                true,
+                92usize,
+                Ordering::Greater,
                 "amplifying: 164-byte reply to a 92-byte response",
             ),
             (
                 200,
-                false,
+                292,
+                Ordering::Less,
                 "attenuating: 164-byte reply to a 292-byte response",
             ),
-            (100, false, "parity: 164-byte reply to a 164-byte response"),
+            (
+                72,
+                164,
+                Ordering::Equal,
+                "parity: 164-byte reply to a 164-byte response",
+            ),
         ];
-        for (s2, expect_suppressed, label) in cases {
+        for (s2, response_len, ordering, label) in cases {
+            assert_eq!(
+                HANDSHAKE_RESP_SZ + s2 as usize,
+                response_len,
+                "the case table's response length disagrees with S2: {}",
+                label
+            );
+            assert_eq!(
+                reply_len.cmp(&response_len),
+                ordering,
+                "the case table's ordering disagrees with its lengths: {}",
+                label
+            );
+            let expect_suppressed = ordering == Ordering::Greater;
+
             // The *initiator* is starved here, so it is the one that demands a
             // cookie -- for the response its peer sends back.
             let (mut my_tun, mut their_tun) = cookie_provoking_pair_with_budgets(
-                AmneziaConfig::new(120, s2, 100, 0),
+                AmneziaConfig::new(120, s2, S3, 0),
                 Some(0),
                 None,
             );
@@ -2217,7 +2248,7 @@ mod tests {
                 unwrap_network_packet(their_tun.decapsulate(src, &init, &mut their_dst)).to_vec();
             assert_eq!(
                 response.len(),
-                HANDSHAKE_RESP_SZ + s2 as usize,
+                response_len,
                 "sanity: the provoking packet must be a response: {}",
                 label
             );
@@ -2225,13 +2256,6 @@ mod tests {
             let mut my_dst = vec![0u8; 2048];
             let result = my_tun.decapsulate(src, &response, &mut my_dst);
 
-            let reply_len = COOKIE_REPLY_SZ + 100;
-            assert_eq!(
-                expect_suppressed,
-                reply_len > response.len(),
-                "the case table's own arithmetic disagrees with its expectation: {}",
-                label
-            );
             // And the initiation view really would disagree, or this test is
             // not covering the thing it says it covers.
             assert!(
