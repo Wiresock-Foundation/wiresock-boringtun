@@ -35,6 +35,12 @@
 # `--self-test` checks the checker and the verdict plumbing against synthetic
 # inputs, including ones that must fail; it needs no root and no binaries.
 #
+# With AWG31_EVIDENCE_DIR set, a run keeps what a reviewer needs to check its
+# result independently -- the `go version -m` output, and per leg the capture,
+# the checker's verdict and summary, both daemons' logs and the rekey figures --
+# in that directory, which must not already exist. Without it, everything is
+# removed on exit as before.
+#
 # The S sizes are deliberately unequal, so the receive side's candidate
 # readings genuinely differ per packet kind. What this does NOT cover: the
 # cookie reply's trailer, which needs a responder under load and is pinned by
@@ -252,6 +258,35 @@ esac
 [ -f "$CHECKER" ] || die "wire checker not found: $CHECKER"
 reason=$(check_go) || die "amneziawg-go is not the pinned build: $reason"
 
+EVIDENCE=${AWG31_EVIDENCE_DIR:-}
+if [ -n "$EVIDENCE" ]; then
+  [ -e "$EVIDENCE" ] && die "AWG31_EVIDENCE_DIR $EVIDENCE already exists; refusing to mix runs"
+  mkdir -p "$EVIDENCE" || die "cannot create $EVIDENCE"
+  {
+    echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "boringtun-cli: $BT"
+    echo "amneziawg-go: $GO"
+    echo "S1..S4: $S1 $S2 $S3 $S4   H1..H4: $H1 $H2 $H3 $H4   window: $WINDOW"
+    echo
+    go version -m "$GO"
+  } >"$EVIDENCE/meta.txt"
+fi
+
+# Copy one leg's artifacts into the evidence directory, when there is one.
+keep_leg() { # <slug> <summary line>...
+  [ -n "$EVIDENCE" ] || return 0
+  local slug=$1 d; shift
+  d="$EVIDENCE/$slug"
+  mkdir -p "$d"
+  printf '%s\n' "$@" >"$d/summary.txt"
+  cp "$CAPTURE" "$d/capture.txt" 2>/dev/null
+  cp "$WORKDIR/judge.out" "$d/judge.stdout.txt" 2>/dev/null
+  cp "$WORKDIR/judge.err" "$d/judge.stderr.txt" 2>/dev/null
+  cp "$R_LOG" "$d/responder.log" 2>/dev/null
+  cp "$I_LOG" "$d/initiator.log" 2>/dev/null
+  return 0
+}
+
 uapi() { # <ns> <iface>; request on stdin
   ip netns exec "$1" python3 -c '
 import socket, sys, os
@@ -453,6 +488,7 @@ run_leg() { # <label> <resp impl go|bt> <rt> <cpa> <hp>
   wait_both_handshakes "$r0" "$i0"
   wait "$pinger"; ping_rc=$?
   r1=$(handshake_time "$NS_R" "$IF_R"); i1=$(handshake_time "$NS_I" "$IF_I")
+  local rekey_line="rekey: responder $r0->$r1, initiator $i0->$i1, spanning ping exit $ping_rc"
   if ! rekey_verdict "$r0" "$r1" "$i0" "$i1"; then
     bad "$label: rekey not completed on both peers (responder $r0->$r1, initiator $i0->$i1)"
   elif [ "$ping_rc" -ne 0 ]; then
@@ -465,13 +501,19 @@ run_leg() { # <label> <resp impl go|bt> <rt> <cpa> <hp>
   fi
 
   kill "$SNIFFER" 2>/dev/null; wait "$SNIFFER" 2>/dev/null
-  local jout="$WORKDIR/judge.out" jerr="$WORKDIR/judge.err"
+  local jout="$WORKDIR/judge.out" jerr="$WORKDIR/judge.err" wire_verdict
   if judge_leg "$CAPTURE" "$rt" "$cpa" "$hp" "$in_sender" "$out_sender" "$jout" "$jerr"; then
+    wire_verdict=PASS
     ok "$label: wire, per sender ($(tail -1 "$jerr"))"
   else
+    wire_verdict=FAIL
     bad "$label: wire, per sender:"
     sed 's/^/      /' "$jout" "$jerr"
   fi
+  keep_leg "rt$rt-cpa$cpa-hp$hp.$init-initiates" \
+    "leg: $label ($init initiates as $in_sender, $resp responds as $out_sender)" \
+    "$rekey_line" \
+    "wire: $wire_verdict -- $(tail -1 "$jerr")"
 }
 
 echo "boringtun    : $BT"

@@ -187,8 +187,9 @@ def judge(rows, a):
                             % (sender_of[resp_dir], init_idx))
 
     summary = "; ".join(
-        "%s: inits=%r resps=%r transport sizes=%d" % (
-            name, seen["init"], seen["resp"], len(set(seen["data"])))
+        "%s: inits=%r resps=%r transport sizes=%d (%s)" % (
+            name, seen["init"], seen["resp"], len(set(seen["data"])),
+            "%d..%d" % (min(seen["data"]), max(seen["data"])) if seen["data"] else "none")
         for name, seen in per.items()) + "; handshakes=%d" % len(completed)
     return problems, summary
 
