@@ -51,6 +51,9 @@ const MAX_SENDABLE_DATAGRAM: usize = 65535 - 20 - 8;
 /// AmneziaWG rounds unpadded transport plaintext up to this multiple, matching
 /// amneziawg-go's `PaddingMultiple` and vanilla WireGuard's 16-byte boundary.
 const PADDING_MULTIPLE: usize = 16;
+/// A transport message's header -- type, receiver index, counter -- ahead of
+/// its ciphertext. amneziawg-go's `MessageTransportHeaderSize`.
+const DATA_OFFSET_SZ: usize = 16;
 const DNS_JUNK_SIZE_MIN: usize = 50;
 const DNS_JUNK_SIZE_MAX: usize = 200;
 const QUIC_JUNK_SIZE_MIN: usize = 1200;
@@ -306,7 +309,32 @@ pub struct AmneziaConfig {
     /// AmneziaWG 3.0 tunable timers. All-default is vanilla WireGuard: every
     /// accessor falls back to its classic constant.
     pub(crate) timers: AwgTimers,
+    /// AmneziaWG 3.1 `RandomTrailers`. Off by default, and off is exactly the
+    /// 3.0 wire: handshake messages at their fixed sizes, transport padded as
+    /// before.
+    ///
+    /// On, each handshake message carries an unauthenticated random suffix
+    /// after its canonical bytes -- outside Noise, the MACs, the cookie AEAD and
+    /// header protection -- so a receiver reads handshake sizes as minimums
+    /// rather than exact values. Transport grows too, but *inside* its AEAD:
+    /// the addition is zero padding of the plaintext, never bytes after the
+    /// tag. How much of either is drawn against the tunnel's observed UDP
+    /// window; see [`DEFAULT_UDP_WINDOW`].
+    ///
+    /// A receiver must agree: a peer that is off rejects every trailer-extended
+    /// handshake message. It is not negotiated.
+    pub(crate) random_trailers: bool,
 }
+
+/// The UDP window a tunnel starts from, in bytes, and the fixed window a cookie
+/// reply's trailer is drawn against. amneziawg-go's `DefaultUdpWindow`.
+///
+/// A tunnel's window is the largest datagram it has seen go by in either
+/// direction on the current endpoint, never less than this; RandomTrailers draws
+/// every addition from the room between the packet at hand and that window, so
+/// padding never makes a datagram larger than the path has already carried.
+/// Runtime state, so it lives on `Tunn`, one per peer, not here.
+pub(crate) const DEFAULT_UDP_WINDOW: u32 = 500;
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct AmneziaPreHandshakeJunk {
@@ -614,6 +642,7 @@ impl AmneziaConfig {
             content_padding_addition: (0, 0),
             content_padding_mtu: 0,
             timers: AwgTimers::default(),
+            random_trailers: false,
         }
     }
 
@@ -655,6 +684,15 @@ impl AmneziaConfig {
     pub fn with_content_padding_addition(mut self, lo: u32, hi: u32, mtu: u16) -> Self {
         self.content_padding_addition = (lo.min(hi), lo.max(hi));
         self.content_padding_mtu = mtu;
+        self
+    }
+
+    /// Enable or disable AmneziaWG 3.1 `RandomTrailers`. See the field.
+    ///
+    /// Both ends must agree. Switching it on a live tunnel keeps the tunnel's
+    /// sessions and UDP window; only framing changes.
+    pub fn with_random_trailers(mut self, on: bool) -> Self {
+        self.random_trailers = on;
         self
     }
 
@@ -707,18 +745,89 @@ impl AmneziaConfig {
     /// `receive_handshake_response` has cleared the handshake state -- the
     /// keepalive lost for good, only on links near the MTU, only with padding
     /// active.
+    ///
+    /// `udp_window` is the tunnel's window, already grown to cover this frame
+    /// (see [`Self::transport_window_observation`]). It is read only when
+    /// RandomTrailers is on: with it off, padding is exactly what it was before
+    /// 3.1 existed -- see [`Self::window_padding`] for why that is deliberate.
     pub(crate) fn content_padding_for_frame(
         &self,
         src_len: usize,
         dst_len: usize,
         transport_junk: usize,
+        udp_window: u32,
         rng: &mut impl RngCore,
     ) -> usize {
         let committed = src_len + DATA_OVERHEAD_SZ + transport_junk;
         let space = dst_len
             .saturating_sub(committed)
             .min(MAX_SENDABLE_DATAGRAM.saturating_sub(committed));
-        self.content_padding(src_len, space, rng)
+        if self.random_trailers {
+            self.window_padding(committed, udp_window, rng).min(space)
+        } else {
+            self.content_padding(src_len, space, rng)
+        }
+    }
+
+    /// The AmneziaWG 3.1 transport padding: amneziawg-go's
+    /// `randomPaddingAddition`, else its `randomTrailer`, drawn against the UDP
+    /// window rather than the MTU. `base` is the unpadded frame on the wire,
+    /// `S4 + 32 + plaintext`.
+    ///
+    /// Precedence is by *selection*, not by amount: an active
+    /// `content_padding_addition` range decides, even when it draws zero, and
+    /// RandomTrailers never falls through to the 16-byte rounding, even when it
+    /// draws zero. The rounding is what a tunnel with neither sends, and with
+    /// RandomTrailers on that tunnel does not exist.
+    ///
+    /// Only reached with RandomTrailers on, and that is a WireSock decision
+    /// that differs from amneziawg-go 3.1. Upstream moved
+    /// `content_padding_addition` onto the window unconditionally, so every
+    /// 3.0 configuration that pads changes its distribution the day it is
+    /// upgraded, with no configuration change -- the maximum moves from "one
+    /// MTU unit less the plaintext" to "the largest datagram seen less this
+    /// one". Here a 3.0 configuration (RandomTrailers off) keeps
+    /// [`Self::content_padding`] exactly, and the window governs only a tunnel
+    /// that has opted into 3.1 framing. The wire stays interoperable either
+    /// way: padding is inside the AEAD, and every receiver trims by the inner
+    /// IP length.
+    ///
+    /// The window already covers `base` (the caller observes the frame first,
+    /// as upstream's `RoutineEncryption` does), so the headroom is never
+    /// negative; `saturating_sub` is for a caller that forgets.
+    fn window_padding(&self, base: usize, udp_window: u32, rng: &mut impl RngCore) -> usize {
+        let headroom = (udp_window as usize).saturating_sub(base);
+        let (lo, hi) = self.content_padding_addition;
+        if lo != 0 || hi != 0 {
+            random_usize_inclusive(lo as usize, hi as usize, rng).min(headroom)
+        } else {
+            random_below(headroom, rng)
+        }
+    }
+
+    /// What sending a transport frame of `src_len` plaintext bytes (before
+    /// padding) shows the UDP window: `S4 + 32 + src_len`, the frame's unpadded
+    /// wire size. amneziawg-go's `RoutineEncryption` observes exactly this
+    /// before it draws the padding, keepalives included.
+    pub(crate) fn transport_window_observation(&self, src_len: usize) -> usize {
+        self.transport_junk_size() + DATA_OVERHEAD_SZ + src_len
+    }
+
+    /// What receiving an authenticated transport frame with a `plaintext_len`
+    /// plaintext (padding included, AEAD tag not) shows the UDP window:
+    /// `S4 + 16 + plaintext_len`.
+    ///
+    /// Sixteen bytes short of the datagram: the header is counted and the tag
+    /// is not. That is amneziawg-go's `RoutineSequentialReceiver`, which adds
+    /// `MessageTransportHeaderSize` to the decrypted length where
+    /// `RoutineEncryption` adds `MinMessageSize` to the plaintext. Reproduced
+    /// on purpose rather than corrected, because the window decides how much
+    /// padding each end draws, and an implementation that disagreed with the
+    /// reference here would fingerprint itself by its size distribution.
+    /// `the_receive_window_observation_is_sixteen_short_of_the_datagram` pins
+    /// the asymmetry.
+    pub(crate) fn received_window_observation(&self, plaintext_len: usize) -> usize {
+        self.transport_junk_size() + DATA_OFFSET_SZ + plaintext_len
     }
 
     /// The number of zero bytes to append to a `src_len`-byte transport
@@ -1708,6 +1817,18 @@ fn random_imitation_domain(rng: &mut impl RngCore) -> String {
     host
 }
 
+/// A uniform draw from `0..n`, exclusive, and `0` for an empty range.
+///
+/// amneziawg-go's `fastrandn`, the draw its `randomTrailer` makes: the upper
+/// bound is never produced, so one byte of headroom still draws 0, and no
+/// headroom at all is 0 rather than a panic on an empty range.
+fn random_below(n: usize, rng: &mut impl RngCore) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    random_usize_inclusive(0, n - 1, rng)
+}
+
 fn random_usize_inclusive(min: usize, max: usize, rng: &mut impl RngCore) -> usize {
     if min >= max {
         return min;
@@ -2267,6 +2388,148 @@ mod tests {
     use super::*;
     use crate::noise::{COOKIE_REPLY, DATA, HANDSHAKE_INIT, HANDSHAKE_RESP};
     use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
+
+    /// RandomTrailers is off unless asked for, and the builder switches it both
+    /// ways without touching anything else.
+    #[test]
+    fn random_trailers_defaults_off_and_toggles() {
+        let base = AmneziaConfig::new(52, 108, 136, 148);
+        assert!(!base.random_trailers);
+        assert!(!AmneziaConfig::default().random_trailers);
+        let on = base.clone().with_random_trailers(true);
+        assert!(on.random_trailers);
+        assert_eq!(on.clone().with_random_trailers(false), base);
+    }
+
+    /// `random_below` is amneziawg-go's `fastrandn`: exclusive, and zero for an
+    /// empty range rather than a panic.
+    #[test]
+    fn random_below_is_exclusive_and_total() {
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        for _ in 0..64 {
+            assert_eq!(random_below(0, &mut rng), 0);
+            assert_eq!(
+                random_below(1, &mut rng),
+                0,
+                "one byte of room still draws 0"
+            );
+            assert!(random_below(5, &mut rng) < 5);
+        }
+    }
+
+    /// The two window observations, and the sixteen bytes between them: a
+    /// sent frame counts its whole unpadded size, a received one counts its
+    /// header and padded plaintext but not its AEAD tag. The reference's
+    /// numbers, reproduced rather than reconciled -- see
+    /// `received_window_observation`.
+    #[test]
+    fn the_receive_window_observation_is_sixteen_short_of_the_datagram() {
+        let cfg = AmneziaConfig::new(0, 0, 0, 148);
+        assert_eq!(cfg.transport_window_observation(0), 148 + 32);
+        assert_eq!(cfg.transport_window_observation(1000), 148 + 32 + 1000);
+        // A 1000-byte padded plaintext arrives as a 148 + 16 + 1000 + 16 byte
+        // datagram, and is recorded as 16 bytes less than that.
+        let datagram = 148 + 16 + 1000 + 16;
+        assert_eq!(cfg.received_window_observation(1000), datagram - 16);
+    }
+
+    /// With RandomTrailers on, the padding precedence is by selection:
+    /// an active `content_padding_addition` range decides, else RandomTrailers,
+    /// and a zero from either is final -- neither falls through to the 16-byte
+    /// rounding.
+    #[test]
+    fn window_padding_precedence_is_by_selection_not_by_amount() {
+        let rt = AmneziaConfig::new(0, 0, 0, 0).with_random_trailers(true);
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+
+        // RandomTrailers alone, with no room: 0, not the 16-byte rounding a
+        // 20-byte plaintext would otherwise get (12 bytes).
+        let base = 32 + 20;
+        assert_eq!(rt.window_padding(base, base as u32, &mut rng), 0);
+        assert_eq!(
+            rt.content_padding(20, 4096, &mut rng),
+            12,
+            "what it would have been"
+        );
+        // One byte of room still draws 0; more is drawn below the window.
+        assert_eq!(rt.window_padding(base, base as u32 + 1, &mut rng), 0);
+        for _ in 0..64 {
+            assert!(rt.window_padding(base, 500, &mut rng) < 500 - base);
+        }
+
+        // An active range that can draw zero: every result is the range's,
+        // never a RandomTrailers draw against 448 bytes of room.
+        let cpa = rt.clone().with_content_padding_addition(0, 1, 1420);
+        let draws: Vec<usize> = (0..200)
+            .map(|_| cpa.window_padding(base, 500, &mut rng))
+            .collect();
+        assert!(draws.iter().all(|&d| d <= 1), "{:?}", draws);
+        assert!(
+            draws.contains(&0),
+            "the range must be able to draw zero here"
+        );
+
+        // The range is capped by the window, not by the MTU unit.
+        let wide = rt.with_content_padding_addition(400, 400, 1420);
+        assert_eq!(wide.window_padding(132, 500, &mut rng), 500 - 132);
+    }
+
+    /// A 3.0 configuration pads exactly as before 3.1 existed; only one that
+    /// turned RandomTrailers on draws against the window. The concrete case
+    /// the two models disagree on: a 100-byte plaintext, a constant 400-byte
+    /// addition, a 1420-byte MTU and a 500-byte window -- the MTU unit leaves
+    /// room for all 400, the window for only 368.
+    #[test]
+    fn content_padding_keeps_its_3_0_meaning_unless_random_trailers_is_on() {
+        let legacy = AmneziaConfig::new(0, 0, 0, 0).with_content_padding_addition(400, 400, 1420);
+        let rt = legacy.clone().with_random_trailers(true);
+        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        let window = DEFAULT_UDP_WINDOW;
+
+        assert_eq!(
+            legacy.content_padding_for_frame(100, 4096, 0, window, &mut rng),
+            400,
+            "RandomTrailers off: the MTU-unit clamp, exactly as in 3.0"
+        );
+        assert_eq!(
+            legacy.content_padding_for_frame(100, 4096, 0, window, &mut rng),
+            legacy.content_padding(100, 4096 - 132, &mut rng),
+            "and by the very same function"
+        );
+        assert_eq!(
+            rt.content_padding_for_frame(100, 4096, 0, window, &mut rng),
+            500 - 132,
+            "RandomTrailers on: the window clamp"
+        );
+        // The window is read only when RandomTrailers is on.
+        assert_eq!(
+            legacy.content_padding_for_frame(100, 4096, 0, 60_000, &mut rng),
+            400
+        );
+    }
+
+    /// The window model never pads past the caller's buffer or the largest
+    /// sendable datagram, however wide the window has grown.
+    #[test]
+    fn window_padding_is_bounded_by_the_buffer_and_the_datagram_limit() {
+        let rt = AmneziaConfig::new(0, 0, 0, 0)
+            .with_random_trailers(true)
+            .with_content_padding_addition(60_000, 60_000, 0);
+        let mut rng = ChaCha8Rng::seed_from_u64(6);
+        assert_eq!(
+            rt.content_padding_for_frame(100, 200, 0, u32::MAX, &mut rng),
+            200 - 132
+        );
+        let near_max = MAX_SENDABLE_DATAGRAM - 32 - 10;
+        assert_eq!(
+            rt.content_padding_for_frame(near_max, usize::MAX, 0, u32::MAX, &mut rng),
+            10
+        );
+        assert_eq!(
+            rt.content_padding_for_frame(MAX_SENDABLE_DATAGRAM, usize::MAX, 0, u32::MAX, &mut rng),
+            0
+        );
+    }
 
     fn write_tag(packet: &mut [u8], tag: u32) {
         packet[..4].copy_from_slice(&tag.to_le_bytes());

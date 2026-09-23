@@ -146,7 +146,12 @@ pub(crate) fn receive<T>(
 /// anonymous ingress.
 #[cfg(test)]
 pub(crate) mod fixtures {
+    use super::*;
     use crate::noise::amnezia::AmneziaConfig;
+    use crate::noise::{Tunn, TunnResult};
+    use crate::x25519;
+    use rand_core::OsRng;
+    use std::sync::Arc;
 
     /// S1..S4 at which every kind's canonical size lands on one datagram
     /// length: 52 + 148 = 108 + 92 = 136 + 64 = 148 + 52 = [`WIRE`], the last a
@@ -210,26 +215,12 @@ pub(crate) mod fixtures {
             wire[offset + i] = b ^ keystream[NONCE + i];
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::fixtures::*;
-    use super::*;
-    use crate::noise::handshake::{b2s_hash, b2s_keyed_mac_16, LABEL_MAC1};
-    use crate::noise::{Authenticated, TunnResult, HANDSHAKE_INIT_SZ};
-    use crate::x25519;
-    use rand_core::OsRng;
-    use std::sync::Arc;
-
-    const KEY: [u8; 32] = [0x5a; 32];
-    /// A tag in no H range under the default `ObfuscationRanges`.
-    const NO_KIND: u32 = 0xffff_ffff;
-    const SRC: Option<IpAddr> = Some(IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)));
+    pub(crate) const SRC: Option<IpAddr> =
+        Some(IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)));
 
     /// An initiator and a responder under `amnezia`, the responder's rate
     /// limiter given `their_budget` (`None` for the default).
-    fn pair(amnezia: &AmneziaConfig, their_budget: Option<u64>) -> (Tunn, Tunn) {
+    pub(crate) fn pair(amnezia: &AmneziaConfig, their_budget: Option<u64>) -> (Tunn, Tunn) {
         let my_secret = x25519::StaticSecret::random_from_rng(OsRng);
         let my_public = x25519::PublicKey::from(&my_secret);
         let their_secret = x25519::StaticSecret::random_from_rng(OsRng);
@@ -259,7 +250,7 @@ mod tests {
         (mine, theirs)
     }
 
-    fn network(result: TunnResult) -> Vec<u8> {
+    pub(crate) fn network(result: TunnResult) -> Vec<u8> {
         match result {
             TunnResult::WriteToNetwork(d) => d.to_vec(),
             other => panic!("expected a datagram for the network, got {:?}", other),
@@ -267,7 +258,7 @@ mod tests {
     }
 
     /// The canonical message of the first candidate reading of `wire`.
-    fn first_message(tunn: &Tunn, wire: &[u8]) -> Vec<u8> {
+    pub(crate) fn first_message(tunn: &Tunn, wire: &[u8]) -> Vec<u8> {
         let candidates = tunn.amnezia.inbound_candidates(tunn.handshake.obf, wire);
         let first = candidates
             .iter()
@@ -282,7 +273,7 @@ mod tests {
 
     /// Complete a handshake, returning the responder's sender index -- the
     /// index its cookie state now expects a cookie reply to name.
-    fn handshake(mine: &mut Tunn, theirs: &mut Tunn) -> u32 {
+    pub(crate) fn handshake(mine: &mut Tunn, theirs: &mut Tunn) -> u32 {
         let mut buf = vec![0u8; 2048];
         let init = network(mine.format_handshake_initiation(&mut buf, false));
         let response = network(theirs.decapsulate(SRC, &init, &mut buf));
@@ -300,6 +291,20 @@ mod tests {
         ));
         their_idx
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
+    use crate::noise::handshake::{b2s_hash, b2s_keyed_mac_16, LABEL_MAC1};
+    use crate::noise::{Authenticated, TunnResult, HANDSHAKE_INIT_SZ};
+    use crate::x25519;
+    use rand_core::OsRng;
+
+    const KEY: [u8; 32] = [0x5a; 32];
+    /// A tag in no H range under the default `ObfuscationRanges`.
+    const NO_KIND: u32 = 0xffff_ffff;
 
     /// Overwrite every fixture offset before `genuine_at` with a tag in no H
     /// range, so a test that means one reading has exactly one -- rather than
