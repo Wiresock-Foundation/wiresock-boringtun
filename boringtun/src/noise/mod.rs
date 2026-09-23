@@ -859,7 +859,23 @@ impl Tunn {
                     return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
                 }
                 dst[..packet_size].copy_from_slice(cookie);
-                self.write_to_network(dst, packet_size)
+                // The RandomTrailers suffix, if any, is drawn only from the room
+                // parity leaves (`TrailerRoom::cookie_reply`), so it cannot
+                // turn an attenuating reply into an amplifying one. The check
+                // on what actually came out stays anyway: it is the guard, and
+                // the bound above is only how the draw avoids tripping it.
+                match self.write_to_network_with(
+                    dst,
+                    packet_size,
+                    amnezia::TrailerRoom::cookie_reply(wire_len),
+                ) {
+                    TunnResult::WriteToNetwork(reply)
+                        if amnezia::reply_amplifies(wire_len, reply.len()) =>
+                    {
+                        TunnResult::Done
+                    }
+                    other => other,
+                }
             }
         }
     }
@@ -1401,11 +1417,25 @@ impl Tunn {
         self.packet_queue.pop_front()
     }
 
+    /// Frame `dst[..packet_size]` for the wire. A handshake message draws its
+    /// RandomTrailers suffix against this tunnel's UDP window; transport has
+    /// none (its addition was drawn as padding, inside the AEAD).
     fn write_to_network<'a>(&mut self, dst: &'a mut [u8], packet_size: usize) -> TunnResult<'a> {
-        match self.amnezia.prepend_outbound(
+        let room = amnezia::TrailerRoom::window(self.udp_window);
+        self.write_to_network_with(dst, packet_size, room)
+    }
+
+    fn write_to_network_with<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+        packet_size: usize,
+        room: amnezia::TrailerRoom,
+    ) -> TunnResult<'a> {
+        match self.amnezia.prepend_outbound_with_trailer(
             self.handshake.obf,
             dst,
             packet_size,
+            Some(room),
             &mut self.handshake.rng,
         ) {
             Ok(packet) => TunnResult::WriteToNetwork(packet),

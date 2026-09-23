@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 
-use crate::noise::amnezia::AmneziaConfig;
+use crate::noise::amnezia::{reply_amplifies, AmneziaConfig, TrailerRoom};
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::handshake::ObfuscationRanges;
@@ -1284,14 +1284,21 @@ impl Device {
                                     // The limiter writes a bare cookie reply; it
                                     // does not know about S3. Re-prefix it in
                                     // place before sending, or the peer will
-                                    // reject it.
-                                    if let Ok(out) = d.config.amnezia.prepend_outbound(
+                                    // reject it. A RandomTrailers suffix is
+                                    // drawn only from the room parity leaves,
+                                    // and what comes out is checked again: the
+                                    // bound shapes the draw, the check is the
+                                    // guard.
+                                    if let Ok(out) = d.config.amnezia.prepend_outbound_with_trailer(
                                         obf,
                                         &mut t.dst_buf,
                                         cookie_len,
+                                        Some(TrailerRoom::cookie_reply(packet_len)),
                                         &mut t.junk_rng,
                                     ) {
-                                        let _: Result<_, _> = udp.send_to(out, &addr);
+                                        if !reply_amplifies(packet_len, out.len()) {
+                                            let _: Result<_, _> = udp.send_to(out, &addr);
+                                        }
                                     }
                                 }
                                 reply_policy::CookieVerdict::RefusedSource => {}

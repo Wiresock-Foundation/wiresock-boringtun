@@ -472,3 +472,172 @@ fn the_suffix_is_unauthenticated_and_the_core_is_not() {
         assert!(mine.handshake.has_cookie());
     }
 }
+
+/// Initiations and responses carry a suffix drawn below the tunnel's window --
+/// exact 3.0 sizes with RandomTrailers off -- and a wider window lets them grow
+/// past the default.
+#[test]
+fn handshake_messages_draw_their_suffix_below_the_tunnel_window() {
+    for key in keys() {
+        let on = unequal(key);
+        let (s1, s2) = (UNEQUAL[0] as usize, UNEQUAL[1] as usize);
+        let init_base = s1 + super::HANDSHAKE_INIT_SZ;
+        let resp_base = s2 + super::HANDSHAKE_RESP_SZ;
+
+        // A budget past the loop, so every initiation earns a response and
+        // none a cookie reply.
+        let (mut mine, mut theirs) = pair(&on, Some(10_000));
+        let mut buf = vec![0u8; 4096];
+        let (mut inits, mut resps) = (Vec::new(), Vec::new());
+        for _ in 0..48 {
+            let init = network(mine.format_handshake_initiation(&mut buf, true));
+            let resp = network(theirs.decapsulate(SRC, &init, &mut buf));
+            inits.push(init.len());
+            resps.push(resp.len());
+        }
+        let window = DEFAULT_UDP_WINDOW as usize;
+        assert!(
+            inits.iter().all(|&n| n >= init_base && n < window),
+            "{:?}",
+            inits
+        );
+        assert!(
+            resps.iter().all(|&n| n >= resp_base && n < window),
+            "{:?}",
+            resps
+        );
+        assert!(
+            inits.iter().any(|&n| n > init_base),
+            "initiations must vary"
+        );
+        assert!(resps.iter().any(|&n| n > resp_base), "responses must vary");
+
+        // The window governs: widened, the suffix follows it.
+        mine.udp_window = 1400;
+        let widest = (0..64)
+            .map(|_| network(mine.format_handshake_initiation(&mut buf, true)).len())
+            .max()
+            .unwrap();
+        assert!(widest > window && widest < 1400, "{}", widest);
+
+        // Off: the 3.0 sizes, exactly.
+        let off = on.clone().with_random_trailers(false);
+        let (mut mine, mut theirs) = pair(&off, None);
+        let init = network(mine.format_handshake_initiation(&mut buf, false));
+        assert_eq!(init.len(), init_base);
+        assert_eq!(
+            network(theirs.decapsulate(SRC, &init, &mut buf)).len(),
+            resp_base
+        );
+    }
+}
+
+/// A pair whose responder is starved, so every initiation it sees draws a
+/// cookie reply.
+fn cookie_pair(amnezia: &AmneziaConfig) -> (Tunn, Tunn) {
+    pair(amnezia, Some(0))
+}
+
+/// The cookie reply's suffix is drawn against the fixed default window, not
+/// the tunnel's -- and never makes the reply larger than the datagram that
+/// provoked it. Equality is allowed; strictly larger is not, whatever the
+/// window, the buffer or the draw.
+#[test]
+fn a_cookie_reply_suffix_is_bounded_by_the_request() {
+    for key in keys() {
+        // S1 > S3: the reply has room to grow, but only up to the request.
+        let amnezia = AmneziaConfig::new(100, 40, 20, 160).with_random_trailers(true);
+        let amnezia = match key {
+            Some(k) => amnezia.with_header_protection(k),
+            None => amnezia,
+        };
+        let (mut mine, mut theirs) = cookie_pair(&amnezia);
+        theirs.udp_window = 60_000;
+        let mut buf = vec![0u8; 4096];
+        let mut grew = false;
+        for _ in 0..64 {
+            let init = network(mine.format_handshake_initiation(&mut buf, true));
+            let reply = network(theirs.decapsulate(SRC, &init, &mut buf));
+            assert!(reply.len() >= 20 + 64);
+            assert!(
+                reply.len() <= init.len(),
+                "a {}-byte reply to a {}-byte request",
+                reply.len(),
+                init.len()
+            );
+            assert!(
+                reply.len() < DEFAULT_UDP_WINDOW as usize,
+                "the fixed window, not the tunnel's 60000"
+            );
+            grew |= reply.len() > 20 + 64;
+        }
+        assert!(grew, "the reply must draw a suffix when there is room");
+    }
+}
+
+/// At exact parity there is no room: the reply is sent at its base size,
+/// equal to the request. Where the base alone already amplifies, the reply is
+/// suppressed, as before 3.1.
+#[test]
+fn a_cookie_reply_at_parity_carries_no_suffix_and_an_amplifying_one_is_suppressed() {
+    // The request is an exact 3.0 initiation (148 bytes, S1 = 0), sent by a
+    // peer with RandomTrailers off; the responder has it on.
+    let parity = AmneziaConfig::new(0, 0, 84, 0);
+    let (mut mine, mut theirs) = cookie_pair(&parity);
+    let obf = theirs.handshake.obf;
+    theirs.set_obfuscation(obf, parity.clone().with_random_trailers(true));
+    let mut buf = vec![0u8; 4096];
+    for _ in 0..32 {
+        let init = network(mine.format_handshake_initiation(&mut buf, true));
+        assert_eq!(init.len(), 148);
+        let reply = network(theirs.decapsulate(SRC, &init, &mut buf));
+        assert_eq!(reply.len(), 148, "parity: sent, and with no suffix");
+    }
+
+    let amplifying = AmneziaConfig::new(0, 0, 100, 0);
+    let (mut mine, mut theirs) = cookie_pair(&amplifying);
+    let obf = theirs.handshake.obf;
+    theirs.set_obfuscation(obf, amplifying.with_random_trailers(true));
+    let init = network(mine.format_handshake_initiation(&mut buf, true));
+    assert!(matches!(
+        theirs.decapsulate(SRC, &init, &mut buf),
+        TunnResult::Done
+    ));
+}
+
+/// The cookie reply's destination buffer: exactly the mandatory frame sends it
+/// with no suffix, one byte less is an error rather than a panic, a few bytes
+/// more bound the suffix. A large S3 whose base alone passes the fixed window
+/// draws nothing and does not underflow.
+#[test]
+fn a_cookie_reply_respects_its_buffer_and_a_large_s3() {
+    let amnezia = AmneziaConfig::new(200, 40, 20, 160).with_random_trailers(true);
+    let base = 20 + 64;
+    let (mut mine, mut theirs) = cookie_pair(&amnezia);
+    let mut buf = vec![0u8; 4096];
+
+    let init = network(mine.format_handshake_initiation(&mut buf, true));
+    assert_eq!(
+        network(theirs.decapsulate(SRC, &init, &mut vec![0u8; base])).len(),
+        base
+    );
+    let init = network(mine.format_handshake_initiation(&mut buf, true));
+    assert!(matches!(
+        theirs.decapsulate(SRC, &init, &mut vec![0u8; base - 1]),
+        TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+    ));
+    for _ in 0..16 {
+        let init = network(mine.format_handshake_initiation(&mut buf, true));
+        assert!(
+            network(theirs.decapsulate(SRC, &init, &mut vec![0u8; base + 3])).len() <= base + 3
+        );
+    }
+
+    let large = AmneziaConfig::new(1200, 40, 1000, 160).with_random_trailers(true);
+    let (mut mine, mut theirs) = cookie_pair(&large);
+    for _ in 0..8 {
+        let init = network(mine.format_handshake_initiation(&mut buf, true));
+        let reply = network(theirs.decapsulate(SRC, &init, &mut buf));
+        assert_eq!(reply.len(), 1000 + 64, "no room below the fixed window");
+    }
+}
