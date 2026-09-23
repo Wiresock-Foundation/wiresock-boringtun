@@ -114,6 +114,14 @@ impl RateLimiter {
         self.count.fetch_add(1, Ordering::SeqCst) >= self.limit
     }
 
+    /// How many load decisions have been taken since the last reset: what
+    /// `is_under_load` has counted. For tests that must see a message *not*
+    /// counted, which no outcome can show while the budget is not yet spent.
+    #[cfg(test)]
+    pub(crate) fn load_events(&self) -> u64 {
+        self.count.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn format_cookie_reply<'a>(
         &self,
         obf: ObfuscationRanges,
@@ -153,7 +161,12 @@ impl RateLimiter {
         Ok(&mut dst[..super::COOKIE_REPLY_SZ])
     }
 
-    /// Verify the MAC fields on the datagram, and apply rate limiting if needed
+    /// Verify the MAC fields on the datagram, and apply rate limiting if needed.
+    ///
+    /// Always with the under-load cookie defense armed, as it always was: the
+    /// public entry point has no configuration to ask. AmneziaWG
+    /// `DisableCookies` reaches the receive paths through
+    /// [`Self::gate_handshake`].
     pub fn verify_packet<'a, 'b>(
         &self,
         obf: ObfuscationRanges,
@@ -168,7 +181,13 @@ impl RateLimiter {
         if let Packet::HandshakeInit(HandshakeInit { sender_idx, .. })
         | Packet::HandshakeResponse(HandshakeResponse { sender_idx, .. }) = packet
         {
-            match self.gate_handshake(src_addr, src, sender_idx, &mut LoadDecision::default()) {
+            match self.gate_handshake(
+                src_addr,
+                src,
+                sender_idx,
+                CookieDefense::Armed,
+                &mut LoadDecision::default(),
+            ) {
                 HandshakeGate::Pass => {}
                 HandshakeGate::BadMac => return Err(TunnResult::Err(WireGuardError::InvalidMac)),
                 HandshakeGate::UnderLoad => return Err(TunnResult::Err(WireGuardError::UnderLoad)),
@@ -197,11 +216,23 @@ impl RateLimiter {
     /// datagram is one event for the budget however many ways it is read. The
     /// first call that gets past mac1 decides and records it; later calls
     /// reuse it without counting again.
+    ///
+    /// `defense` is the receiver's AmneziaWG `DisableCookies` policy
+    /// ([`AmneziaConfig::cookie_defense`]). [`CookieDefense::Bypassed`] skips
+    /// everything after mac1 -- the load decision itself included, so the
+    /// message is not counted and `load` is left undecided -- and passes the
+    /// message on to Noise: no mac2, no source address needed, no cookie. That
+    /// is amneziawg-go v3.1.20260828's `!disableCookies && IsUnderLoad()`,
+    /// where the short circuit keeps `IsUnderLoad`'s own bookkeeping from
+    /// running too. mac1 is checked either way.
+    ///
+    /// [`AmneziaConfig::cookie_defense`]: super::amnezia::AmneziaConfig::cookie_defense
     pub(crate) fn gate_handshake(
         &self,
         src_addr: Option<IpAddr>,
         message: &[u8],
         sender_idx: u32,
+        defense: CookieDefense,
         load: &mut LoadDecision,
     ) -> HandshakeGate {
         let (msg, macs) = message.split_at(message.len() - 32);
@@ -210,6 +241,10 @@ impl RateLimiter {
         let computed_mac1 = b2s_keyed_mac_16(&self.mac1_key, msg);
         if !constant_time_eq(&computed_mac1[..16], mac1) {
             return HandshakeGate::BadMac;
+        }
+
+        if defense == CookieDefense::Bypassed {
+            return HandshakeGate::Pass;
         }
 
         let under_load = *load.0.get_or_insert_with(|| self.is_under_load());
@@ -256,10 +291,31 @@ impl RateLimiter {
     }
 }
 
+/// Whether the under-load cookie defense applies to a handshake message whose
+/// mac1 holds: AmneziaWG 3.1 `DisableCookies`, as the limiter takes it. See
+/// [`RateLimiter::gate_handshake`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CookieDefense {
+    /// WireGuard's defense: under load, mac2 is required and a cookie reply
+    /// demanded without it; without a source address, `UnderLoad`.
+    Armed,
+    /// `DisableCookies`: past mac1, the whole under-load branch is skipped --
+    /// the load decision included -- and the message goes on to Noise.
+    Bypassed,
+}
+
 /// Whether the limiter was under load when one received datagram reached it,
 /// decided at most once per datagram. See [`RateLimiter::gate_handshake`].
 #[derive(Default)]
 pub(crate) struct LoadDecision(Option<bool>);
+
+#[cfg(test)]
+impl LoadDecision {
+    /// Whether a load decision has been taken for this datagram.
+    pub(crate) fn is_decided(&self) -> bool {
+        self.0.is_some()
+    }
+}
 
 /// What [`RateLimiter::gate_handshake`] makes of one handshake message.
 pub(crate) enum HandshakeGate {

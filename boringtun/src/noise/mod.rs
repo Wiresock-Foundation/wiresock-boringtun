@@ -15,6 +15,8 @@ pub mod rate_limiter;
 pub mod header_protection;
 // Receiving a datagram whose shape fits more than one packet kind. Crate-wide
 // because the device's anonymous ingress drives it too.
+#[cfg(test)]
+mod disable_cookies_tests;
 pub(crate) mod inbound;
 #[cfg(test)]
 mod random_trailers_tests;

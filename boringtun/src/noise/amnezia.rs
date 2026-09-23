@@ -16,6 +16,7 @@ use super::{
 };
 use crate::noise::errors::WireGuardError;
 use crate::noise::header_protection::{HeaderProtectionKey, NONCE_SIZE, TYPE_MASK_SIZE};
+use crate::noise::rate_limiter::CookieDefense;
 use rand_core::RngCore;
 use std::convert::{TryFrom, TryInto};
 use std::time::Duration;
@@ -324,6 +325,27 @@ pub struct AmneziaConfig {
     /// A receiver must agree: a peer that is off rejects every trailer-extended
     /// handshake message. It is not negotiated.
     pub(crate) random_trailers: bool,
+    /// AmneziaWG 3.1 `DisableCookies`. Off by default, and off is WireGuard's
+    /// under-load cookie defense exactly as it was.
+    ///
+    /// On, a handshake message whose mac1 holds bypasses the *whole* under-load
+    /// cookie-defense branch: the load decision is never taken (so the message
+    /// is not counted against the handshake budget), mac2 is not checked, no
+    /// source address is needed, and no cookie reply is formed. The message
+    /// goes straight on to Noise. That is amneziawg-go v3.1.20260828's
+    /// `!disableCookies && IsUnderLoad()` (b5928ef, "disable the whole
+    /// underload"). The first 3.1 release only stopped the reply being *sent*,
+    /// and still refused, under load, every handshake whose mac2 it could no
+    /// longer ask for.
+    ///
+    /// Not "disable cookie replies": it leaves mac1, Noise and its static-key
+    /// authentication, the handshake timestamp check, transport replay
+    /// protection and the cookie replies a peer sends *us* exactly as they
+    /// are -- those are still decrypted and stored, and our own handshakes
+    /// still carry the mac2 they earn. It is local responder policy, not
+    /// negotiated, so the two ends need not agree; S3 keeps its meaning,
+    /// because the peer may still send cookie replies.
+    pub(crate) disable_cookies: bool,
 }
 
 /// How much RandomTrailers suffix an outgoing handshake message may carry: the
@@ -687,6 +709,7 @@ impl AmneziaConfig {
             content_padding_mtu: 0,
             timers: AwgTimers::default(),
             random_trailers: false,
+            disable_cookies: false,
         }
     }
 
@@ -738,6 +761,30 @@ impl AmneziaConfig {
     pub fn with_random_trailers(mut self, on: bool) -> Self {
         self.random_trailers = on;
         self
+    }
+
+    /// Enable or disable AmneziaWG 3.1 `DisableCookies`. See the field: `true`
+    /// bypasses the under-load cookie-defense branch after mac1, and nothing
+    /// else.
+    ///
+    /// Local policy; the peer need not agree. Switching it on a live tunnel
+    /// keeps the tunnel's sessions, UDP window and timers; only how a future
+    /// handshake is met under load changes.
+    pub fn with_disable_cookies(mut self, on: bool) -> Self {
+        self.disable_cookies = on;
+        self
+    }
+
+    /// Whether the rate limiter's under-load cookie defense applies to a
+    /// handshake message this configuration receives. The one place the flag
+    /// is turned into the limiter's policy, so every receive path reads it the
+    /// same way.
+    pub(crate) fn cookie_defense(&self) -> CookieDefense {
+        if self.disable_cookies {
+            CookieDefense::Bypassed
+        } else {
+            CookieDefense::Armed
+        }
     }
 
     /// Replace the AmneziaWG 3.0 tunable-timer ranges wholesale.
@@ -2659,6 +2706,45 @@ mod tests {
         let on = base.clone().with_random_trailers(true);
         assert!(on.random_trailers);
         assert_eq!(on.clone().with_random_trailers(false), base);
+    }
+
+    /// DisableCookies is off unless asked for, and is its own switch: it moves
+    /// nothing else, and nothing else moves it.
+    #[test]
+    fn disable_cookies_defaults_off_and_toggles_independently() {
+        let base = AmneziaConfig::new(52, 108, 136, 148);
+        assert!(!base.disable_cookies);
+        assert!(!AmneziaConfig::default().disable_cookies);
+        assert_eq!(base.cookie_defense(), CookieDefense::Armed);
+
+        let off = base.clone().with_disable_cookies(true);
+        assert!(off.disable_cookies);
+        assert_eq!(off.cookie_defense(), CookieDefense::Bypassed);
+        assert_eq!(off.clone().with_disable_cookies(false), base);
+
+        // Composes with every other 3.x setting in either order.
+        let full = base
+            .clone()
+            .with_random_trailers(true)
+            .with_header_protection([7; 32])
+            .with_content_padding_addition(8, 24, 1420)
+            .with_tunable_timers(AwgTimers {
+                rekey_after_time: (30, 40),
+                ..AwgTimers::default()
+            });
+        let full_off = full.clone().with_disable_cookies(true);
+        assert!(full_off.random_trailers);
+        assert_eq!(full_off.header_protection, full.header_protection);
+        assert_eq!(full_off.content_padding_addition, (8, 24));
+        assert_eq!(full_off.timers, full.timers);
+        assert_eq!(full_off.clone().with_disable_cookies(false), full);
+        assert!(
+            base.clone()
+                .with_disable_cookies(true)
+                .with_random_trailers(false)
+                .disable_cookies
+        );
+        assert!(full_off.validate().is_ok());
     }
 
     /// `random_below` is amneziawg-go's `fastrandn`: exclusive, and zero for an

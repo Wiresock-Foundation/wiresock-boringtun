@@ -65,6 +65,11 @@ pub(crate) enum Inbound<T> {
 /// the datagram got when a single reading was all there was -- a cookie reply
 /// if any reading earned one, then `UnderLoad`, then the first refusal.
 ///
+/// With AmneziaWG `DisableCookies` on (`amnezia.cookie_defense()`), there is no
+/// load decision, no cookie and no `UnderLoad` to hold back: a handshake
+/// reading whose mac1 holds goes straight to its trial, and a false one fails
+/// there like any other reading that does not authenticate.
+///
 /// Bounded by the candidate list: at most four readings, so at most one
 /// initiation's and one response's worth of Noise work, and no retries.
 pub(crate) fn receive<T>(
@@ -103,7 +108,13 @@ pub(crate) fn receive<T>(
         if let Packet::HandshakeInit(HandshakeInit { sender_idx, .. })
         | Packet::HandshakeResponse(HandshakeResponse { sender_idx, .. }) = packet
         {
-            match limiter.gate_handshake(src_addr, message, sender_idx, &mut load) {
+            match limiter.gate_handshake(
+                src_addr,
+                message,
+                sender_idx,
+                amnezia.cookie_defense(),
+                &mut load,
+            ) {
                 HandshakeGate::Pass => {}
                 HandshakeGate::BadMac => {
                     refusal.get_or_insert(WireGuardError::InvalidMac);
@@ -323,6 +334,7 @@ mod tests {
     use super::fixtures::*;
     use super::*;
     use crate::noise::handshake::{b2s_hash, b2s_keyed_mac_16, LABEL_MAC1};
+    use crate::noise::rate_limiter::CookieDefense;
     use crate::noise::{Authenticated, TunnResult, HANDSHAKE_INIT_SZ};
     use crate::x25519;
     use rand_core::OsRng;
@@ -643,19 +655,31 @@ mod tests {
         let mut load = LoadDecision::default();
         for _ in 0..3 {
             assert!(matches!(
-                limiter.gate_handshake(None, message, 0, &mut load),
+                limiter.gate_handshake(None, message, 0, CookieDefense::Armed, &mut load),
                 HandshakeGate::Pass
             ));
         }
         assert!(
             matches!(
-                limiter.gate_handshake(None, message, 0, &mut LoadDecision::default()),
+                limiter.gate_handshake(
+                    None,
+                    message,
+                    0,
+                    CookieDefense::Armed,
+                    &mut LoadDecision::default()
+                ),
                 HandshakeGate::Pass
             ),
             "the three readings of one datagram were counted more than once"
         );
         assert!(matches!(
-            limiter.gate_handshake(None, message, 0, &mut LoadDecision::default()),
+            limiter.gate_handshake(
+                None,
+                message,
+                0,
+                CookieDefense::Armed,
+                &mut LoadDecision::default()
+            ),
             HandshakeGate::UnderLoad
         ));
     }
