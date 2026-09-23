@@ -2557,7 +2557,7 @@ mod ingress_tests {
         fn decapsulate(&self, wire: &[u8], src: Option<IpAddr>) -> Option<&'static str> {
             let mut dst = vec![0u8; MAX_UDP_SIZE];
             match self.peer.lock().tunnel.decapsulate(src, wire, &mut dst) {
-                TunnResult::WriteToNetwork(d) => Some(self.kind(&d.to_vec())),
+                TunnResult::WriteToNetwork(d) => Some(self.kind(d)),
                 _ => None,
             }
         }
