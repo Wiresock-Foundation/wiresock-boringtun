@@ -14,6 +14,7 @@ use crate::x25519::{PublicKey, StaticSecret};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use hex::encode as encode_hex;
+#[cfg(not(test))]
 use libc::{raise, SIGSEGV};
 use parking_lot::Mutex;
 use rand_core::OsRng;
@@ -29,8 +30,10 @@ use std::panic;
 use std::ptr;
 use std::ptr::null_mut;
 use std::slice;
+#[cfg(not(test))]
 use std::sync::Once;
 
+#[cfg(not(test))]
 static PANIC_HOOK: Once = Once::new();
 
 thread_local! {
@@ -444,6 +447,14 @@ unsafe fn new_tunnel_with_amnezia_config(
         }
     };
 
+    // Not in test builds. This hook replaces the default one process-wide --
+    // including libtest's, which is what prints "thread panicked at" into a
+    // failing test's report. With it installed, any test that fails after any
+    // test has called a constructor reports FAILED with an *empty* output
+    // section, which turned one real flake into three rounds of blind hunting
+    // before anyone could read the assertion text. An embedder still gets the
+    // hook: `cfg(test)` only strips it from this crate's own test binaries.
+    #[cfg(not(test))]
     PANIC_HOOK.call_once(|| {
         // FFI won't properly unwind on panic, but it will if we cause a segmentation fault
         panic::set_hook(Box::new(move |_| {
@@ -1737,24 +1748,21 @@ fn awg_params_to_config(
 ///
 /// One class is deliberately **not** refused here, though the UAPI `set=1` path
 /// does refuse it: S-value combinations that make the cookie reply larger than
-/// the request it answers, i.e. an amplification reflector. That rule asks
-/// whether this port would reflect, and a tunnel reached through this ABI
-/// cannot: cookie replies are formatted only by `RateLimiter::verify_packet`,
-/// which returns `UnderLoad` before formatting when the source address is
-/// `None`, and [`wireguard_read`] passes `None` because the C ABI has no
-/// address parameter. That -- not "callers of this constructor are clients" --
-/// is the invariant. This entry point builds responders too; the test
-/// `an_amplifying_s3_builds_and_carries_traffic_through_the_awg_constructor`
-/// builds both ends with it. Anything that gives `decapsulate` a real source
-/// address (a future `wireguard_read_from`) must restore a reply-size guard.
-/// More to the point, `s3_cookie_junk` is
-/// symmetric and interface-wide -- both ends must configure the same value or
-/// cookie replies do not parse -- so it is dictated by the server the caller is
-/// connecting to. Refusing would decline a profile the caller cannot change,
-/// that the AmneziaWG kernel module and amneziawg-go both run, and that the
-/// legacy `new_tunnel_with_amnezia*` constructors accept. It is logged instead.
-/// A profile accepted here can therefore still be refused by `boringtun-cli`,
-/// which is a responder; that divergence is intentional.
+/// the request it answers, i.e. an amplification reflector. Accepting it is
+/// safe because the reflection is stopped where the packet is sent, not at
+/// configuration time: `Tunn::decapsulate` refuses to emit a cookie reply
+/// larger than the datagram that provoked it, for every tunnel however it was
+/// built. (Through this ABI the reply path is doubly unreachable --
+/// [`wireguard_read`] passes no source address, so `RateLimiter::verify_packet`
+/// bails on `UnderLoad` before a cookie is even formatted.) And accepting it is
+/// *necessary* because `s3_cookie_junk` is symmetric and interface-wide -- both
+/// ends must configure the same value or cookie replies do not parse -- so it
+/// is dictated by the server the caller is connecting to. Refusing would
+/// decline a profile the caller cannot change, that the AmneziaWG kernel module
+/// and amneziawg-go both run, and that the legacy `new_tunnel_with_amnezia*`
+/// constructors accept. It is logged instead. A profile accepted here can
+/// therefore still be refused by `boringtun-cli`, which is a responder choosing
+/// its own reflection ratio; that divergence is intentional.
 ///
 /// Returns NULL on failure, with the reason in `last_tunnel_error()`.
 #[no_mangle]
@@ -1827,18 +1835,26 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
     // constructors predate this and only check the header-protection nonce
     // (through `Tunn::new_with_amnezia`), which was harmless while no FFI path
     // could set a key -- this one can set all three 3.0 features, which is
-    // exactly what `validate` exists to catch.
-    if let Err(e) = amnezia.validate_without_reflection_policy() {
+    // exactly what `validate` exists to catch. `validate` is universal -- every
+    // rule in it holds for either end of the tunnel -- so calling it here
+    // refuses nothing a client cannot fix.
+    if let Err(e) = amnezia.validate() {
         set_last_error(&format!("Invalid AmneziaWG parameters: {}", e));
         return ptr::null_mut();
     }
 
-    // Logged, not refused. `validate` rejects an amplifying S3 because a device
-    // is a responder on an unconnected socket; a tunnel built here is not, and
-    // S3 is not this caller's to change -- it is symmetric and interface-wide,
-    // so a client must use whatever its server was configured with or fail to
-    // parse cookie replies. Refusing would decline a profile the reference
-    // implementations run and the operator cannot alter from this end.
+    // The cookie-reflection policy: logged, not refused. The UAPI `set=1` path
+    // refuses this same complaint, because a device is a responder choosing its
+    // own reflection ratio. This entry point is not: it builds responders too --
+    // `an_amplifying_s3_builds_and_carries_traffic_through_the_awg_constructor`
+    // builds both ends with it -- so the argument is not "callers here are
+    // clients". It is that S3 is not this caller's to change: it is symmetric
+    // and interface-wide, so whoever dials a server must use the S3 that server
+    // was configured with or fail to parse its cookie replies at all. Refusing
+    // would decline a profile the reference implementations run and the operator
+    // cannot alter from this end. And warning is safe whichever role this tunnel
+    // ends up in, because `Tunn::decapsulate` refuses to emit an amplifying
+    // reply at the emit site itself.
     if let Some(complaint) = amnezia.cookie_amplification_complaint() {
         tracing::warn!(
             message = "AmneziaWG S sizes make cookie replies larger than the packets \
@@ -1908,13 +1924,16 @@ pub unsafe extern "C" fn wireguard_read(
     // Slices are not owned, and therefore will not be freed by Rust
     let src = slice::from_raw_parts(src, src_size as usize);
     let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    // The `None` is load-bearing, not just "the C ABI has no sockaddr".
-    // `RateLimiter::verify_packet` returns `UnderLoad` on a `None` source
-    // before it formats a cookie reply, which is the only reason
-    // `new_tunnel_with_awg_params` can accept an amplifying S3 that `set=1`
-    // refuses. Plumbing a real address through here (a `wireguard_read_from`)
-    // re-opens that path and needs a reply-size guard at the emit site in
-    // `noise::Tunn::decapsulate` first.
+    // `None` is not just "the C ABI has no sockaddr": `RateLimiter::verify_packet`
+    // returns `UnderLoad` on a `None` source before it formats a cookie reply, so
+    // no tunnel driven through this entry point emits one at all.
+    //
+    // That is no longer what makes an amplifying S3 safe to accept in
+    // `new_tunnel_with_awg_params` -- `Tunn::decapsulate` refuses to emit an
+    // amplifying reply at its own emit site, for every tunnel however it was
+    // built and however it is driven. So a future `wireguard_read_from` that
+    // plumbs a real address through here needs no new guard; it inherits that
+    // one. This `None` is now a second line, not the only one.
     wireguard_result::from(tunnel.decapsulate(None, src, dst))
 }
 
@@ -3452,8 +3471,12 @@ mod tests {
     ///
     /// What the two size assertions prove is that **S1 and S2** survived and
     /// the session works -- not S3, which leaves no trace here. S3 sizes cookie
-    /// replies, a `Tunn` never formats one (`format_cookie_reply` is reachable
-    /// only from `device`), and nothing in this test provokes one, so a change
+    /// replies, and nothing in this test provokes one: `verify_packet` formats
+    /// a cookie only while the limiter is under load *and* it was given a source
+    /// address, and this test floods nothing and reads through [`wireguard_read`],
+    /// which passes none. (A `Tunn` does otherwise format them -- that is the
+    /// arm `Tunn::decapsulate`'s amplification guard sits in -- so this is a
+    /// property of the test, not of the type.) So a change
     /// that dropped `s3_cookie_junk` on the floor would still pass: S3 = 0 does
     /// not amplify, and the initiation and response would be unchanged. That
     /// the value reaches the config at all is pinned by
@@ -3615,6 +3638,9 @@ mod tests {
     /// successful build reads a message about a tunnel it just built fine.
     #[test]
     fn an_amplifying_s3_warns_and_leaves_the_error_slot_empty() {
+        // Failed once on macOS CI when another `with_default` test's dispatcher
+        // churn raced this one's `warn!` -- see `tracing_test_lock`.
+        let _serialized = crate::tracing_test_lock();
         use std::sync::{Arc, Mutex as StdMutex};
         use tracing::field::{Field, Visit};
         use tracing::Subscriber;
@@ -3654,53 +3680,101 @@ mod tests {
             }
         }
 
-        let build = |s3: u32| -> Vec<Captured> {
+        // Both profiles are built inside ONE subscriber scope, so the amplifying
+        // one is a positive control for the clean one. Built separately, the
+        // clean half's `all(|c| !c.detail.contains(..))` passes on an empty
+        // capture -- which is exactly the state the retry below exists for, so
+        // the one assertion that must not fire spuriously was the one that
+        // passed for free whenever the race bit.
+        let build = |s3s: &[u32]| -> Vec<Captured> {
             let events: Arc<StdMutex<Vec<Captured>>> = Arc::new(StdMutex::new(Vec::new()));
             {
                 let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
                 tracing::subscriber::with_default(subscriber, || {
-                    last_tunnel_error_free();
-                    let params = wireguard_awg_params {
-                        size: AWG_PARAMS_SIZE_VER0 as u32,
-                        s1_init_junk: 65,
-                        s2_response_junk: 86,
-                        s3_cookie_junk: s3,
-                        ..Default::default()
-                    };
-                    let key = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
-                    let tunnel = unsafe {
-                        new_tunnel_with_awg_params(
-                            key.as_ptr(),
-                            key.as_ptr(),
-                            ptr::null(),
-                            0,
-                            1,
-                            &params,
-                            ptr::null(),
-                        )
-                    };
-                    assert!(!tunnel.is_null(), "{}", last_error_string());
-                    assert!(
-                        last_tunnel_error().is_null(),
-                        "a non-NULL return must leave the error slot empty"
-                    );
-                    unsafe { tunnel_free(tunnel) };
+                    for &s3 in s3s {
+                        last_tunnel_error_free();
+                        let params = wireguard_awg_params {
+                            size: AWG_PARAMS_SIZE_VER0 as u32,
+                            s1_init_junk: 65,
+                            s2_response_junk: 86,
+                            s3_cookie_junk: s3,
+                            ..Default::default()
+                        };
+                        let key =
+                            CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+                        let tunnel = unsafe {
+                            new_tunnel_with_awg_params(
+                                key.as_ptr(),
+                                key.as_ptr(),
+                                ptr::null(),
+                                0,
+                                1,
+                                &params,
+                                ptr::null(),
+                            )
+                        };
+                        assert!(!tunnel.is_null(), "{}", last_error_string());
+                        assert!(
+                            last_tunnel_error().is_null(),
+                            "a non-NULL return must leave the error slot empty"
+                        );
+                        unsafe { tunnel_free(tunnel) };
+                    }
                 });
             }
-            Arc::try_unwrap(events).ok().unwrap().into_inner().unwrap()
+            // Read through the lock rather than `Arc::try_unwrap`: tracing's
+            // dispatcher registry can keep the subscriber -- and with it the
+            // other clone of this Arc -- alive for a moment past the scope
+            // above, and `try_unwrap` turns that latency into a panic that has
+            // nothing to do with what this test asserts.
+            let captured = std::mem::take(&mut *events.lock().unwrap());
+            captured
         };
 
         // 64 + 120 = 184 > 92 + 86 = 178.
-        let amplifying = build(120);
-        let warned = amplifying
-            .iter()
-            .find(|c| c.detail.contains("makes a cookie reply"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "the constructor must log the complaint; captured: {:?}",
-                    amplifying.iter().map(|c| &c.message).collect::<Vec<_>>()
-                )
-            });
+        //
+        // Bounded retry. tracing caches per-callsite interest in a
+        // process-global table; other tests hit this same `warn!` callsite from
+        // threads with no subscriber (caching "never"), and a registration
+        // racing the rebuild that `with_default` triggers can clobber it back --
+        // the event is then dropped with this test's subscriber installed and
+        // active, which was measured here as `captured: []` roughly once per
+        // twenty runs. Real embedders never see this: they install one global
+        // subscriber at startup, before any callsite is hit, and nothing churns
+        // afterwards. A retry keeps the mutation kill intact -- a deleted
+        // `warn!` captures nothing on every attempt -- while a lost cache
+        // update wins the next round.
+        //
+        // The clean profile (114) rides along in the same scope rather than
+        // getting its own retry: retrying it would be wrong (a dropped event
+        // can only *lose* a warning, never invent one, so a retry could only
+        // manufacture a pass), but building it separately would let it assert
+        // "no complaint" against a capture that lost every event. Sharing the
+        // scope makes the 120 complaint the proof that the callsite was live.
+        let mut captured = Vec::new();
+        let mut hit = None;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tracing::callsite::rebuild_interest_cache();
+            }
+            captured = build(&[120, 114]);
+            hit = captured
+                .iter()
+                .position(|c| c.detail.contains("makes a cookie reply"));
+            if hit.is_some() {
+                break;
+            }
+        }
+        // The last attempt's capture is reported on failure, not just the fact
+        // of failure: a deleted `warn!` and a renamed message both end up here,
+        // and only the events tell them apart.
+        let warned = match hit {
+            Some(i) => &captured[i],
+            None => panic!(
+                "the constructor must log the complaint; nothing in 5 attempts, last captured: {:?}",
+                captured.iter().map(|c| &c.message).collect::<Vec<_>>()
+            ),
+        };
         assert!(
             warned.message.contains("reflect"),
             "the message must say what is wrong: {}",
@@ -3712,13 +3786,20 @@ mod tests {
             warned.detail
         );
 
-        // One byte under the bound: the same build must say nothing, or the
-        // assertion above would pass on any configuration at all.
-        assert!(
-            build(114)
+        // One byte under the bound says nothing, or the assertion above would
+        // pass on any configuration at all. Counted rather than `all(!..)`:
+        // exactly one complaint across the two builds means the 120 profile
+        // produced it and the 114 profile did not, which is the claim -- and it
+        // cannot be satisfied by an empty capture, because the `hit` above
+        // already proved one event is there.
+        assert_eq!(
+            captured
                 .iter()
-                .all(|c| !c.detail.contains("makes a cookie reply")),
-            "a clean profile must not warn"
+                .filter(|c| c.detail.contains("makes a cookie reply"))
+                .count(),
+            1,
+            "a clean profile must not warn; captured: {:?}",
+            captured.iter().map(|c| &c.detail).collect::<Vec<_>>()
         );
     }
 
@@ -3902,12 +3983,14 @@ mod tests {
         );
         assert_eq!(clamp(), 1420, "a refused value must not have been stored");
 
-        // A NULL tunnel is a `false` return, not an abort. Measured rather
-        // than assumed: replacing this with the `as_ref().unwrap()` the older
-        // entry points use does not produce a clean panic here -- it takes the
-        // test process down with SIGSEGV, because this module installs a panic
-        // hook that calls `raise(SIGSEGV)` and a panic cannot unwind out of
-        // `extern "C"` to be caught first. An embedder gets the same segfault.
+        // A NULL tunnel is a `false` return, not an abort. In an embedder's
+        // build the difference is stark: the older entry points `unwrap()`,
+        // and this module's panic hook (production builds only -- it is
+        // `cfg(not(test))` so test failures keep their messages) turns that
+        // panic into a raised SIGSEGV, taking the host process down. Measured
+        // as exactly that before the hook was gated: mutating this to the
+        // older style killed the test harness with signal 11 rather than
+        // failing cleanly.
         assert!(
             !unsafe { wireguard_set_content_padding_mtu(ptr::null(), 1280) },
             "a NULL tunnel must be refused"
