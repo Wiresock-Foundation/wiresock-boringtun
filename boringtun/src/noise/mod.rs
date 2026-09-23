@@ -490,7 +490,12 @@ impl Tunn {
         })
     }
 
-    /// Update the private key and clear existing sessions
+    /// Update the private key and clear existing sessions.
+    ///
+    /// A pre-handshake burst in flight is kept: it holds nothing derived from
+    /// a key, and the initiation it defers is formatted later, under the new
+    /// one. Dropping it would strand the payload waiting behind it -- see
+    /// [`Self::set_obfuscation`].
     pub fn set_static_private(
         &mut self,
         static_private: x25519::StaticSecret,
@@ -506,7 +511,6 @@ impl Tunn {
         for s in &mut self.sessions {
             *s = None;
         }
-        self.pending_amnezia_junk = None;
     }
 
     /// Replace this tunnel's AmneziaWG obfuscation settings.
@@ -683,6 +687,10 @@ impl Tunn {
     ///
     /// No-op when the key is unchanged, so a configuration reload that re-sends
     /// the same value does not tear down live tunnels.
+    ///
+    /// A pre-handshake burst in flight is kept, as [`Self::set_static_private`]
+    /// keeps it: the initiation it defers is formatted later, and the new key
+    /// is mixed in when its response is consumed.
     pub fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
         // Compare the *effective* key, not the `Option`. The handshake mixes
         // `preshared_key.unwrap_or([0u8; 32])`, so `None` and `Some([0; 32])`
@@ -708,7 +716,6 @@ impl Tunn {
         for s in &mut self.sessions {
             *s = None;
         }
-        self.pending_amnezia_junk = None;
     }
 
     /// Encapsulate a single packet from the tunnel interface.

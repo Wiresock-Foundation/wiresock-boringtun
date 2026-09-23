@@ -47,10 +47,13 @@ fn pass(ms: u64) {
     std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 
-/// Two tunnels under `cfg`.
+/// Two tunnels under `cfg`, and what a key-change test needs to rebuild the
+/// peer.
 struct Pair {
     mine: Tunn,
     theirs: Tunn,
+    their_secret: x25519::StaticSecret,
+    cfg: AmneziaConfig,
 }
 
 fn pair(cfg: &AmneziaConfig) -> Pair {
@@ -72,7 +75,7 @@ fn pair(cfg: &AmneziaConfig) -> Pair {
         )
         .unwrap(),
         theirs: Tunn::new_with_obfuscation(
-            their_secret,
+            their_secret.clone(),
             my_public,
             None,
             None,
@@ -82,6 +85,8 @@ fn pair(cfg: &AmneziaConfig) -> Pair {
             cfg.clone(),
         )
         .unwrap(),
+        their_secret,
+        cfg: cfg.clone(),
     }
 }
 
@@ -909,4 +914,92 @@ fn real_clock_smoke_keep_and_restart() {
         assert!(reads_as_initiation(d, &cfg, &init), "{}", name);
         assert_eq!(complete(&mut p, &init), vec![payload(1)], "{}", name);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Key changes.
+
+/// A new pre-shared key mid-burst keeps the burst: it holds nothing derived
+/// from a key, and the initiation behind it is formatted later. The
+/// handshake then completes only with a peer holding the same new key --
+/// the PSK is mixed in when the response is consumed -- and the payload
+/// arrives once.
+#[cfg(feature = "mock-instant")]
+#[test]
+fn a_new_preshared_key_mid_burst_keeps_the_first_handshake() {
+    const PSK: [u8; 32] = [0x5c; 32];
+    for peer_follows in [true, false] {
+        let mut p = pair(&base());
+        queue(&mut p.mine, &[payload(1)]);
+        emit(&mut p.mine, 1);
+        p.mine.set_preshared_key(Some(PSK));
+        assert!(
+            p.mine.pending_amnezia_junk.is_some(),
+            "the burst was dropped"
+        );
+        if peer_follows {
+            p.theirs.set_preshared_key(Some(PSK));
+        }
+        let rest = drain(&mut p.mine, 12);
+        assert_eq!(lengths(&rest.junk), vec![JUNK; JC as usize - 2]);
+        let init = rest.init.expect("stalled");
+        if peer_follows {
+            assert_eq!(complete(&mut p, &init), vec![payload(1)]);
+        } else {
+            // The old key cannot complete it: the response is refused.
+            let mut buf = vec![0u8; 4096];
+            let response = match p.theirs.decapsulate(SRC, &init, &mut buf) {
+                TunnResult::WriteToNetwork(r) => r.to_vec(),
+                other => panic!("{:?}", other),
+            };
+            assert!(matches!(
+                p.mine.decapsulate(SRC, &response, &mut buf),
+                TunnResult::Err(_)
+            ));
+        }
+    }
+}
+
+/// A new static key mid-burst keeps the burst, and the initiation behind it
+/// carries the new identity: a peer that knows only the old public key
+/// refuses it, one configured with the new key accepts it, and the payload
+/// arrives once.
+#[cfg(feature = "mock-instant")]
+#[test]
+fn a_new_static_key_mid_burst_keeps_the_first_handshake() {
+    let mut p = pair(&base());
+    queue(&mut p.mine, &[payload(1)]);
+    emit(&mut p.mine, 1);
+    let new_secret = x25519::StaticSecret::random_from_rng(OsRng);
+    let new_public = x25519::PublicKey::from(&new_secret);
+    p.mine.set_static_private(new_secret, new_public, None);
+    assert!(
+        p.mine.pending_amnezia_junk.is_some(),
+        "the burst was dropped"
+    );
+
+    let rest = drain(&mut p.mine, 12);
+    assert_eq!(lengths(&rest.junk), vec![JUNK; JC as usize - 2]);
+    let init = rest.init.expect("stalled");
+
+    let mut buf = vec![0u8; 4096];
+    assert!(
+        matches!(
+            p.theirs.decapsulate(SRC, &init, &mut buf),
+            TunnResult::Err(_)
+        ),
+        "a peer expecting the old identity accepted the initiation"
+    );
+    p.theirs = Tunn::new_with_obfuscation(
+        p.their_secret.clone(),
+        new_public,
+        None,
+        None,
+        0x300,
+        None,
+        ObfuscationRanges::default(),
+        p.cfg.clone(),
+    )
+    .unwrap();
+    assert_eq!(complete(&mut p, &init), vec![payload(1)]);
 }
