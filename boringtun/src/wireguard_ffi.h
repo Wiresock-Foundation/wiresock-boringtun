@@ -442,13 +442,13 @@ struct wireguard_awg_range
 /// produce a tunnel that is mutually unreachable with its peer, which is far
 /// worse than a refused constructor.
 ///
-/// Published sizes so far: 160 bytes (the first version) and 164 (which added
-/// random_trailers). A caller built against either header works with this
-/// library; see VERSIONING.
+/// Published sizes so far: 160 bytes (the first version), 164 (which added
+/// random_trailers) and 168 (which added disable_cookies). A caller built
+/// against any of these headers works with this library; see VERSIONING.
 ///
 /// LAYOUT. Every field is a uint32_t, an array of them, or a fixed byte array;
 /// there is no pointer and no sub-word member, so the struct has no padding and
-/// the same size (164 bytes) and layout in 32- and 64-bit builds. The imitation
+/// the same size (168 bytes) and layout in 32- and 64-bit builds. The imitation
 /// domain is a string and so is passed as its own argument.
 struct wireguard_awg_params
 {
@@ -607,6 +607,26 @@ struct wireguard_awg_params
     /// Added in the 164-byte version of this struct. A caller built against the
     /// 160-byte header does not have it, and gets it off.
     uint32_t random_trailers;
+
+    /// AmneziaWG 3.1 DisableCookies: 1 turns it on, 0 (the default) leaves it
+    /// off. Any other value is refused. A uint32_t for the same reason as
+    /// random_trailers.
+    ///
+    /// On, a handshake message whose mac1 is valid skips the whole under-load
+    /// cookie defense and goes straight on to authentication: no mac2 is
+    /// required, no cookie reply is sent, and a tunnel under load does not
+    /// refuse handshakes for want of a source address (which wireguard_read
+    /// never has). It does NOT disable mac1, handshake authentication, replay
+    /// protection, or the cookie replies the peer sends this tunnel -- those
+    /// are still accepted and used. Local policy: the peer need not agree.
+    ///
+    /// With it on, an S3 that would make cookie replies larger than the
+    /// packets provoking them no longer draws the reflection warning, since
+    /// this tunnel sends none.
+    ///
+    /// Added in the 168-byte version of this struct. A caller built against
+    /// the 160- or 164-byte header does not have it, and gets it off.
+    uint32_t disable_cookies;
 };
 
 /// Allocate a new tunnel from a full set of AmneziaWG parameters.
