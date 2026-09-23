@@ -13,18 +13,27 @@
 #   cd amneziawg-go && git checkout b5928efb6ca19f0153958460c3d141f04abc5c2e
 #   go build -o amneziawg-go-v3.1.20260828 .        # needs Go >= 1.25
 #
-# The script refuses a binary built from anything else (`go version -m`).
+# The script refuses a binary built from anything else: `go version -m` must
+# report the module path, the tag, `vcs.revision` equal to that commit, and
+# `vcs.modified=false`. A build without VCS metadata is refused too, since it
+# cannot prove its revision. `--check-go <binary>` runs that check alone.
 #
 # For each configuration below, and for BOTH roles -- amneziawg-go initiating
 # to boringtun, and boringtun initiating to amneziawg-go -- it checks:
 #
 #   * the handshake completes and traffic passes in both directions;
-#   * a second handshake (a rekey, forced by a short rekey_after_time) completes;
-#   * the wire shape, read off the responder's veth with a raw socket:
-#       RandomTrailers off -> initiation and response at exactly S + 148 / 92;
-#       RandomTrailers on  -> both at least that, and not all exactly that;
-#       RandomTrailers on  -> transport carrying identical pings varies in size
-#                             (the addition is padding inside the AEAD).
+#   * a rekey (forced by a short rekey_after_time) completes on BOTH peers --
+#     each one's own last-handshake time advances -- with the traffic that
+#     spans it and the traffic after it both getting through;
+#   * the wire, read off the responder's veth with a raw socket and judged by
+#     scripts/awg31-wire-check.py, PER SENDER: exact handshake sizes with
+#     RandomTrailers off; with it on, each implementation's own handshake
+#     messages carry suffixes and, without content padding, its own transport
+#     varies; every datagram within the bounds the configuration allows; and
+#     after the rekey, both directions sending on the new session.
+#
+# `--self-test` checks the checker and the verdict plumbing against synthetic
+# inputs, including ones that must fail; it needs no root and no binaries.
 #
 # The S sizes are deliberately unequal, so the receive side's candidate
 # readings genuinely differ per packet kind. What this does NOT cover: the
@@ -38,12 +47,24 @@
 # network namespaces prefixed `a31-`; cleanup runs on every exit path.
 #
 # Usage: awg31-interop.sh <boringtun-cli> <amneziawg-go v3.1.20260828>
+#        awg31-interop.sh --check-go <amneziawg-go>
+#        awg31-interop.sh --self-test
 set -uo pipefail
 
-BT=${1:?path to boringtun-cli}
-GO=${2:?path to amneziawg-go v3.1.20260828}
+readonly PINNED_MODULE=github.com/amnezia-vpn/amneziawg-go/v3
 readonly PINNED_COMMIT=b5928efb6ca19f0153958460c3d141f04abc5c2e
 readonly PINNED_VERSION=v3.1.20260828
+readonly CHECKER="$(cd "$(dirname "$0")" && pwd)/awg31-wire-check.py"
+
+MODE=run
+case "${1:-}" in
+  --self-test) MODE=self-test ;;
+  --check-go) MODE=check-go; GO=${2:?path to amneziawg-go} ;;
+  *)
+    BT=${1:?path to boringtun-cli}
+    GO=${2:?path to amneziawg-go v3.1.20260828}
+    ;;
+esac
 
 PORT=51820
 RESP_TUN=10.78.0.1; INIT_TUN=10.78.0.2
@@ -55,6 +76,11 @@ readonly S1=40 S2=24 S3=32 S4=160
 readonly H1=169887817 H2=390382747 H3=1033691040 H4=1526332224
 readonly HP_KEY=5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a
 readonly INIT_SZ=148 RESP_SZ=92 DATA_MIN=32
+# amneziawg-go's DefaultUdpWindow. Every frame this harness sends is a ping or a
+# keepalive, small enough that neither implementation's window grows past it, so
+# it bounds every handshake message (below it) and every transport frame (at
+# most it) the checker sees.
+readonly WINDOW=500
 
 awg_block() { # <rt 0|1> <cpa 0|1> <hp 0|1>
   local b
@@ -68,6 +94,55 @@ awg_block() { # <rt 0|1> <cpa 0|1> <hp 0|1>
 }
 
 genkey() { head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+# Is this `go version -m` output the pinned build? Prints the reason and fails
+# if not; silent success. Missing VCS metadata is a refusal: without it the
+# binary cannot prove which commit it was built from.
+go_pin_verdict() { # metadata on stdin
+  awk -v want_mod="$PINNED_MODULE" -v want_ver="$PINNED_VERSION" -v want_rev="$PINNED_COMMIT" '
+    $1 == "mod" { mod = $2; ver = $3 }
+    $1 == "build" && index($2, "vcs.revision=") == 1 { rev = substr($2, 14) }
+    $1 == "build" && index($2, "vcs.modified=") == 1 { modified = substr($2, 14) }
+    END {
+      if (mod != want_mod) { print "module is \"" mod "\", not " want_mod; exit 1 }
+      if (ver != want_ver) { print "version is \"" ver "\", not " want_ver; exit 1 }
+      if (rev == "") {
+        print "no vcs.revision in the build metadata (built with -buildvcs=false, or"
+        print "outside the git checkout), so the commit cannot be proven; rebuild in a"
+        print "clean checkout of " want_rev
+        exit 1
+      }
+      if (rev != want_rev) { print "vcs.revision is " rev ", not " want_rev; exit 1 }
+      if (modified != "false") { print "vcs.modified is \"" modified "\": the tree was not clean"; exit 1 }
+    }'
+}
+
+check_go() {
+  command -v go >/dev/null 2>&1 ||
+    { echo "go is needed to read the build metadata (go version -m)"; return 1; }
+  local meta
+  meta=$(go version -m "$GO" 2>&1) || { echo "go version -m failed: $meta"; return 1; }
+  printf '%s\n' "$meta" | go_pin_verdict
+}
+
+# Did a rekey complete on both peers? Each one's own last-handshake time must
+# have moved: a responder that recorded a handshake the initiator never took
+# up has advanced alone, and that is not a completed rekey.
+rekey_verdict() { # <resp before> <resp after> <init before> <init after>
+  [ "$2" -gt "$1" ] && [ "$4" -gt "$3" ]
+}
+
+# Judge a capture with the wire checker. Only its exit status decides: 0 is a
+# pass; a violation (1) or a checker failure (2, an exception or a malformed
+# capture) is not. Output goes to files for the caller to show.
+judge_leg() { # <capture> <rt> <cpa> <hp> <in-sender> <out-sender> <out> <err>
+  local key=()
+  [ "$4" = 1 ] && key=(--hp-key "$HP_KEY")
+  python3 "$CHECKER" --capture "$1" --rt "$2" --cpa "$3" "${key[@]}" \
+    --in-sender "$5" --out-sender "$6" \
+    --s "$S1,$S2,$S3,$S4" --h "$H1,$H2,$H3,$H4" --window "$WINDOW" --jmax "$JMAX" \
+    >"$7" 2>"$8"
+}
 
 umask 077
 WORKDIR=$(mktemp -d /tmp/awg31-interop.XXXXXX) || { echo "no temp dir" >&2; exit 2; }
@@ -106,20 +181,76 @@ cleanup_workdir() {
 trap 'teardown; cleanup_workdir' EXIT
 
 die() { printf '\033[31mpreflight: %s\033[0m\n' "$1" >&2; exit 2; }
+
+self_test() {
+  local failures=0
+  expect() { # <name> <want status> <command...>
+    local name=$1 want=$2; shift 2
+    "$@" >"$WORKDIR/st.out" 2>&1
+    local got=$?
+    if { [ "$want" = 0 ] && [ "$got" -eq 0 ]; } || { [ "$want" = fail ] && [ "$got" -ne 0 ]; }; then
+      ok "self-test: $name"
+    else
+      bad "self-test: $name (status $got, wanted $want): $(head -3 "$WORKDIR/st.out" | tr '\n' ' ')"
+      failures=$((failures + 1))
+    fi
+  }
+  local meta_ok
+  meta_ok=$(printf '%s\n' \
+    "x: go1.27.1" \
+    "	path	$PINNED_MODULE" \
+    "	mod	$PINNED_MODULE	$PINNED_VERSION	" \
+    "	build	vcs=git" \
+    "	build	vcs.revision=$PINNED_COMMIT" \
+    "	build	vcs.modified=false")
+  expect "the pinned build is accepted" 0 go_pin_verdict <<<"$meta_ok"
+  expect "a wrong revision is refused" fail go_pin_verdict \
+    <<<"${meta_ok/$PINNED_COMMIT/da11c9f0000000000000000000000000000000000}"
+  expect "a modified tree is refused" fail go_pin_verdict \
+    <<<"${meta_ok/vcs.modified=false/vcs.modified=true}"
+  expect "missing VCS metadata is refused" fail go_pin_verdict \
+    <<<"$(printf '%s\n' "$meta_ok" | grep -v vcs)"
+  expect "a different tag is refused" fail go_pin_verdict \
+    <<<"${meta_ok/$PINNED_VERSION/v3.1.20260812}"
+
+  expect "a rekey both peers took up passes" 0 rekey_verdict 100 113 100 113
+  expect "a rekey only the responder recorded fails" fail rekey_verdict 100 113 100 100
+  expect "a rekey only the initiator recorded fails" fail rekey_verdict 100 100 100 113
+  expect "no rekey fails" fail rekey_verdict 100 100 100 100
+
+  # The verdict plumbing: a checker that throws, or cannot parse the capture,
+  # must fail the leg -- empty output is not a pass.
+  printf 'in not-a-number zz\n' >"$WORKDIR/bad.capture"
+  expect "a malformed capture fails the leg" fail \
+    judge_leg "$WORKDIR/bad.capture" 1 0 0 go rust "$WORKDIR/j.out" "$WORKDIR/j.err"
+  expect "a missing capture fails the leg" fail \
+    judge_leg "$WORKDIR/nonexistent" 1 0 0 go rust "$WORKDIR/j.out" "$WORKDIR/j.err"
+  : >"$WORKDIR/empty.capture"
+  expect "an empty capture fails the leg" fail \
+    judge_leg "$WORKDIR/empty.capture" 1 0 0 go rust "$WORKDIR/j.out" "$WORKDIR/j.err"
+
+  # And the checker's own synthetic captures, positive and negative.
+  expect "wire checker self-test" 0 python3 "$CHECKER" --self-test
+  [ "$failures" -eq 0 ] || sed 's/^/    /' "$WORKDIR/st.out"
+  echo
+  if [ "$failures" -eq 0 ]; then
+    printf '\033[32mSELF-TEST: all %d passed\033[0m\n' "$PASS"; exit 0
+  fi
+  printf '\033[31mSELF-TEST: %d FAILED\033[0m\n' "$failures"; exit 1
+}
+
+case "$MODE" in
+  self-test) self_test ;;
+  check-go)
+    if reason=$(check_go); then echo "amneziawg-go is the pinned $PINNED_VERSION ($PINNED_COMMIT)"; exit 0; fi
+    printf 'refused: %s\n' "$reason"; exit 1 ;;
+esac
+
 [ "$(id -u)" -eq 0 ] || die "must run as root (creates network namespaces)"
 [ -x "$BT" ] || die "boringtun-cli not found or not executable: $BT"
 [ -x "$GO" ] || die "amneziawg-go not found or not executable: $GO"
-
-# The reference is pinned; a binary built from anything else is refused rather
-# than reported on. `go version -m` reads the module version the linker
-# recorded, which for a build from the tagged commit is the tag.
-if command -v go >/dev/null 2>&1; then
-  built=$(go version -m "$GO" 2>/dev/null | awk '$1 == "mod" { print $3 }')
-  [ "$built" = "$PINNED_VERSION" ] ||
-    die "amneziawg-go is '$built', not $PINNED_VERSION ($PINNED_COMMIT); build the pinned commit"
-else
-  die "go is needed to verify the amneziawg-go build (go version -m)"
-fi
+[ -f "$CHECKER" ] || die "wire checker not found: $CHECKER"
+reason=$(check_go) || die "amneziawg-go is not the pinned build: $reason"
 
 uapi() { # <ns> <iface>; request on stdin
   ip netns exec "$1" python3 -c '
@@ -230,6 +361,13 @@ start_leg() {
   wait_sock "$IF_R" || { echo "responder socket never appeared: $(tail -5 "$R_LOG" 2>/dev/null | tr '\n' ' ')"; return 1; }
   wait_sock "$IF_I" || { echo "initiator socket never appeared: $(tail -5 "$I_LOG" 2>/dev/null | tr '\n' ' ')"; return 1; }
 
+  # Capture from before either peer is configured: amneziawg-go initiates the
+  # moment `set=1` hands it a peer with an endpoint and a persistent
+  # keepalive, before the interface is even up, so a sniffer started any
+  # later misses the first handshake.
+  CAPTURE="$WORKDIR/capture-$RANDOM"
+  start_sniffer "$CAPTURE"
+
   local rset="$WORKDIR/rset" iset="$WORKDIR/iset"
   uapi "$NS_R" "$IF_R" >"$rset" <<EOF
 set=1
@@ -254,105 +392,44 @@ EOF
   grep -q '^errno=0$' "$rset" || { echo "responder set=1 failed: $(cat "$rset")"; return 1; }
   grep -q '^errno=0$' "$iset" || { echo "initiator set=1 failed: $(cat "$iset")"; return 1; }
 
-  CAPTURE="$WORKDIR/capture-$RANDOM"
-  start_sniffer "$CAPTURE"
-
   ip netns exec "$NS_R" sh -c "ip addr add $RESP_TUN/24 dev $IF_R && ip link set $IF_R up mtu 1420" || return 1
   ip netns exec "$NS_I" sh -c "ip addr add $INIT_TUN/32 dev $IF_I && ip link set $IF_I up mtu 1420 && ip route add $RESP_TUN/32 dev $IF_I" || return 1
 }
 
-handshake_time() { # -> the responder's last_handshake_time_sec, or 0
+handshake_time() { # <ns> <iface> -> that peer's last_handshake_time_sec, or 0
   local hs
-  hs=$(uapi "$NS_R" "$IF_R" <<< $'get=1\n\n' | grep '^last_handshake_time_sec=' | head -1 | cut -d= -f2)
+  hs=$(printf 'get=1\n\n' | uapi "$1" "$2" | grep '^last_handshake_time_sec=' | head -1 | cut -d= -f2)
   case "${hs:-}" in ""|*[!0-9]*) hs=0 ;; esac
   echo "$hs"
 }
 
-wait_handshake() { # [after] -> 0 once the responder records one newer than $1
-  local after=${1:-0} hs
-  for _ in $(seq 1 60); do
-    hs=$(handshake_time)
-    [ "$hs" -gt "$after" ] && return 0
+# 0 once BOTH peers record a handshake newer than their own $1 / $2.
+wait_both_handshakes() { # <resp after> <init after>
+  for _ in $(seq 1 70); do
+    rekey_verdict "$1" "$(handshake_time "$NS_R" "$IF_R")" \
+      "$2" "$(handshake_time "$NS_I" "$IF_I")" && return 0
     sleep 0.5
   done
   return 1
 }
 
-# Judge the captured wire. Prints one reason per violation; silent on success.
-#
-# Each datagram is classified by its message-type tag, read at each kind's own
-# S offset -- through the header-protection keystream when a key is set -- the
-# same way a receiver reads it. The H values are single tags, so a match is not
-# a guess. Only the kinds matter here: initiations (in), responses (out), and
-# transport either way.
-judge_wire() { # <rt 0|1> <hp 0|1> <capture>
-  python3 - "$1" "$2" "$3" "$S1" "$S2" "$S4" "$H1" "$H2" "$H4" "$HP_KEY" \
-    "$INIT_SZ" "$RESP_SZ" "$DATA_MIN" <<'PY'
-import struct, sys
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
-
-rt, hp = sys.argv[1] == "1", sys.argv[2] == "1"
-rows = [l.split() for l in open(sys.argv[3]) if l.strip()]
-s1, s2, s4, h1, h2, h4 = map(int, sys.argv[4:10])
-key = bytes.fromhex(sys.argv[10])
-init_sz, resp_sz, data_min = map(int, sys.argv[11:14])
-
-
-def tag_at(head, offset):
-    if len(head) < offset + 4:
-        return None
-    tag = bytearray(head[offset:offset + 4])
-    if hp:
-        # IETF ChaCha20 (32-bit counter, 12-byte nonce): the 16-byte IV is the
-        # little-endian counter, 0, then the datagram's first 12 bytes.
-        ks = Cipher(algorithms.ChaCha20(key, b"\0" * 4 + head[:12]), mode=None).encryptor()
-        mask = ks.update(b"\0" * 4)
-        tag = bytearray(t ^ m for t, m in zip(tag, mask))
-    return struct.unpack("<I", bytes(tag))[0]
-
-
-inits, resps, transport = [], [], []
-for direction, n, head in rows:
-    n, head = int(n), bytes.fromhex(head)
-    if direction == "in" and n >= s1 + init_sz and tag_at(head, s1) == h1:
-        inits.append(n)
-    elif direction == "out" and n >= s2 + resp_sz and tag_at(head, s2) == h2:
-        resps.append(n)
-    elif n >= s4 + data_min and tag_at(head, s4) == h4:
-        transport.append(n)
-
-init_base, resp_base = s1 + init_sz, s2 + resp_sz
-problems = []
-if not inits or not resps:
-    problems.append("no handshake recognised on the wire (%d datagrams)" % len(rows))
-if not transport:
-    problems.append("no transport recognised on the wire")
-if rt:
-    if all(n == init_base for n in inits) and all(n == resp_base for n in resps):
-        problems.append("RandomTrailers on, yet no handshake message had a suffix: %r %r" % (inits, resps))
-    if len(set(transport)) < 3:
-        problems.append("RandomTrailers on, yet transport sizes barely vary: %r" % sorted(set(transport)))
-else:
-    if any(n != init_base for n in inits) or any(n != resp_base for n in resps):
-        problems.append("RandomTrailers off, yet a handshake message was not exact: %r %r" % (inits, resps))
-for problem in problems:
-    print(problem)
-print("inits=%r resps=%r distinct transport sizes=%d" % (inits, resps, len(set(transport))), file=sys.stderr)
-PY
-}
-
 run_leg() { # <label> <resp impl go|bt> <rt> <cpa> <hp>
   local label=$1 resp=$2 rt=$3 cpa=$4 hp=$5
   local init=bt; [ "$resp" = bt ] && init=go
+  # The names the wire checker attributes each direction to.
+  local in_sender=rust out_sender=rust
+  [ "$init" = go ] && in_sender=go
+  [ "$resp" = go ] && out_sender=go
   info "$label: $init initiates, $resp responds (rt=$rt cpa=$cpa hp=$hp)"
   if ! start_leg "$resp" "$(awg_block "$rt" "$cpa" "$hp")"; then
     bad "$label: setup failed -- not an interop result"; return
   fi
+  # A nudge to start the handshake; its status is not the assertion.
   ip netns exec "$NS_I" ping -c2 -w 10 -q "$RESP_TUN" >/dev/null 2>&1
-  if wait_handshake 0; then
-    ok "$label: handshake"
+  if wait_both_handshakes 0 0; then
+    ok "$label: handshake (both peers)"
   else
-    bad "$label: no handshake"
+    bad "$label: no handshake on both peers"
     echo "    resp: $(tail -3 "$R_LOG" 2>/dev/null | tr '\n' ' ')"
     echo "    init: $(tail -3 "$I_LOG" 2>/dev/null | tr '\n' ' ')"
     kill "$SNIFFER" 2>/dev/null; return
@@ -363,28 +440,42 @@ run_leg() { # <label> <resp impl go|bt> <rt> <cpa> <hp>
   else
     bad "$label: handshake but no traffic"
   fi
-  # Keep traffic flowing past rekey_after_time so the initiator rekeys.
-  local first; first=$(handshake_time)
+
+  # The rekey. Traffic runs past rekey_after_time so the initiator rekeys; it
+  # must succeed throughout (every ping answered), both peers must record the
+  # new handshake, and traffic must pass in both directions afterwards. The
+  # wire checker then shows both directions actually sending on the new
+  # session.
+  local r0 i0 r1 i1 ping_rc
+  r0=$(handshake_time "$NS_R" "$IF_R"); i0=$(handshake_time "$NS_I" "$IF_I")
   ip netns exec "$NS_I" ping -c 30 -i 0.6 -w 25 -q "$RESP_TUN" >/dev/null 2>&1 &
   local pinger=$!
-  if wait_handshake "$first"; then
-    ok "$label: second handshake (rekey)"
+  wait_both_handshakes "$r0" "$i0"
+  wait "$pinger"; ping_rc=$?
+  r1=$(handshake_time "$NS_R" "$IF_R"); i1=$(handshake_time "$NS_I" "$IF_I")
+  if ! rekey_verdict "$r0" "$r1" "$i0" "$i1"; then
+    bad "$label: rekey not completed on both peers (responder $r0->$r1, initiator $i0->$i1)"
+  elif [ "$ping_rc" -ne 0 ]; then
+    bad "$label: traffic across the rekey lost packets (ping exit $ping_rc)"
+  elif ! ip netns exec "$NS_I" ping -c3 -i 0.3 -w 10 -q "$RESP_TUN" >/dev/null 2>&1 ||
+       ! ip netns exec "$NS_R" ping -c3 -i 0.3 -w 10 -q "$INIT_TUN" >/dev/null 2>&1; then
+    bad "$label: no traffic after the rekey"
   else
-    bad "$label: no second handshake after rekey_after_time"
+    ok "$label: rekey on both peers (responder $r0->$r1, initiator $i0->$i1), traffic across and after it"
   fi
-  kill "$pinger" 2>/dev/null; wait "$pinger" 2>/dev/null
+
   kill "$SNIFFER" 2>/dev/null; wait "$SNIFFER" 2>/dev/null
-  local verdict
-  verdict=$(judge_wire "$rt" "$hp" "$CAPTURE" 2>"$WORKDIR/judge.txt")
-  if [ -z "$verdict" ]; then
-    ok "$label: wire shape ($(cat "$WORKDIR/judge.txt"))"
+  local jout="$WORKDIR/judge.out" jerr="$WORKDIR/judge.err"
+  if judge_leg "$CAPTURE" "$rt" "$cpa" "$hp" "$in_sender" "$out_sender" "$jout" "$jerr"; then
+    ok "$label: wire, per sender ($(tail -1 "$jerr"))"
   else
-    bad "$label: wire shape -- $verdict"
+    bad "$label: wire, per sender:"
+    sed 's/^/      /' "$jout" "$jerr"
   fi
 }
 
 echo "boringtun    : $BT"
-echo "amneziawg-go : $GO ($PINNED_VERSION, $PINNED_COMMIT)"
+echo "amneziawg-go : $GO ($PINNED_VERSION, vcs.revision $PINNED_COMMIT, verified)"
 echo "S1..S4       : $S1 $S2 $S3 $S4"
 echo
 
