@@ -19,6 +19,8 @@ pub mod header_protection;
 mod disable_cookies_tests;
 pub(crate) mod inbound;
 #[cfg(test)]
+mod live_reframe_tests;
+#[cfg(test)]
 mod random_trailers_tests;
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
 pub(crate) mod quic;
@@ -516,19 +518,32 @@ impl Tunn {
     ///
     /// Live sessions are kept. Obfuscation is a framing concern, not a
     /// cryptographic one — the keys and the Noise state are untouched, so
-    /// forcing a re-handshake would drop traffic for no benefit. Any queued
-    /// pre-handshake junk is dropped, since it was generated under the previous
-    /// configuration.
+    /// forcing a re-handshake would drop traffic for no benefit.
     ///
-    /// Except when nothing this end sends has changed: a change of receive
-    /// policy alone -- AmneziaWG `DisableCookies`, see
-    /// [`AmneziaConfig::differs_only_in_receive_policy`] -- keeps the burst.
-    /// Dropping it there is not a reframe but a cancellation: the initiation
-    /// the burst was deferring is never sent, no retransmission deadline is
-    /// armed because none was sent, and the payload that started it waits in
-    /// the queue until another one arrives. The new policy still applies from
-    /// the next received message, because the receive path reads it from
-    /// `self.amnezia` on every datagram.
+    /// A pre-handshake burst in flight is never dropped. It is the only record
+    /// that an initiation is still due: before that initiation is sent there is
+    /// no handshake in progress to retransmit and no session to rekey, so
+    /// dropping the burst would leave the payload that started it waiting in
+    /// the queue until another one arrived. Instead,
+    /// [`AmneziaConfig::pending_burst_change`] decides:
+    ///
+    /// * **Keep** -- the change touches only what is read as each datagram
+    ///   goes out: the S and H framing (H1 is written when the initiation is
+    ///   formatted, under its mac1), header protection, RandomTrailers, the
+    ///   junk sizes and pacing, content padding, timers, DisableCookies, or
+    ///   nothing at all. The burst goes on, and the rest of it and the
+    ///   initiation behind it are produced under the new configuration.
+    /// * **Restart** -- the change touches what the burst captured when it
+    ///   was built: the Jc count, the imitation sequence, or whether there is a
+    ///   burst at all. The burst is rebuilt from the new configuration by the
+    ///   same builder a new handshake uses, keeping its pacing clock, so the
+    ///   replacement is spaced from what already went out. A configuration
+    ///   with no burst leaves an empty one, which the next timer tick turns
+    ///   into the initiation.
+    ///
+    /// Once the initiation is out there is no burst to keep: the Noise
+    /// handshake is left as it is, and its retransmission formats a fresh
+    /// initiation under the configuration current by then.
     ///
     /// The tunable timers are re-drawn for the same reason the H/S values are
     /// pushed at all: they are cached per-arming, so without this an
@@ -544,15 +559,23 @@ impl Tunn {
     /// provide.
     pub fn set_obfuscation(&mut self, obf: ObfuscationRanges, amnezia: AmneziaConfig) {
         let timers_changed = self.amnezia.timers != amnezia.timers;
-        let reframed =
-            self.handshake.obf != obf || !self.amnezia.differs_only_in_receive_policy(&amnezia);
+        let burst = self.amnezia.pending_burst_change(&amnezia);
         self.handshake.set_obfuscation(obf);
         self.amnezia = amnezia;
-        if reframed {
-            self.pending_amnezia_junk = None;
+        if burst == amnezia::PendingBurstChange::Restart {
+            self.restart_pending_burst();
         }
         if timers_changed {
             self.redraw_tunable_timers();
+        }
+    }
+
+    /// Rebuild a pre-handshake burst in flight from the current configuration,
+    /// keeping its pacing clock; nothing to do when none is in flight. Never
+    /// leaves the tunnel without a burst it had: see [`Self::set_obfuscation`].
+    fn restart_pending_burst(&mut self) {
+        if let Some(old) = self.pending_amnezia_junk.take() {
+            self.pending_amnezia_junk = Some(self.new_pre_handshake_burst(old.last_packet_at));
         }
     }
 
@@ -608,11 +631,11 @@ impl Tunn {
     ///
     /// The MTU is runtime link state, not obfuscation configuration, so this
     /// deliberately does not go through [`Self::set_obfuscation`]: that path
-    /// drops any queued pre-handshake junk burst, which is right when the
-    /// operator changed the framing and wrong for a link property that moved
-    /// under us -- and it moves at every wg-quick bring-up, where the MTU is
-    /// set *after* `wg setconf`, exactly when the first handshake's burst is
-    /// most likely in flight.
+    /// is for the operator's changes. It moves at every wg-quick bring-up,
+    /// where the MTU is set *after* `wg setconf`, exactly when the first
+    /// handshake's burst is most likely in flight -- which a padding MTU
+    /// change would keep anyway (it is read only for transport), but a link
+    /// property has no business going through the configuration path.
     pub fn set_content_padding_mtu(&mut self, mtu: u16) {
         self.amnezia.content_padding_mtu = mtu;
     }
@@ -3708,12 +3731,10 @@ mod tests {
     /// The targeted MTU update moves the clamp and nothing else.
     ///
     /// `set_content_padding_mtu` exists so the device's once-a-second MTU
-    /// refresh does not go through `set_obfuscation`, which discards any
-    /// queued pre-handshake junk burst -- right when the operator changed the
-    /// framing, wrong for a link property that moved under us. wg-quick sets
-    /// the MTU after `wg setconf`, so the refresh lands precisely when the
-    /// first handshake's burst is most likely in flight; this pins that the
-    /// burst survives it.
+    /// refresh does not go through `set_obfuscation`, the operator's path.
+    /// wg-quick sets the MTU after `wg setconf`, so the refresh lands
+    /// precisely when the first handshake's burst is most likely in flight;
+    /// this pins that the burst survives it.
     #[test]
     fn set_content_padding_mtu_updates_the_clamp_and_keeps_a_queued_burst() {
         let amnezia = AmneziaConfig::new(120, 130, 110, 80)

@@ -348,6 +348,19 @@ pub struct AmneziaConfig {
     pub(crate) disable_cookies: bool,
 }
 
+/// What a live configuration change does to a pre-handshake burst already in
+/// flight. See [`AmneziaConfig::pending_burst_change`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingBurstChange {
+    /// Nothing the burst captured changed: it goes on, and what it still has
+    /// to send -- junk and the initiation behind it -- is produced under the
+    /// new configuration as it goes out.
+    Keep,
+    /// The Jc count, the imitation or whether there is a burst at all
+    /// changed: the burst is rebuilt from the new configuration.
+    Restart,
+}
+
 /// How much RandomTrailers suffix an outgoing handshake message may carry: the
 /// window it is drawn against, and a ceiling on the whole datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -775,45 +788,63 @@ impl AmneziaConfig {
         self
     }
 
-    /// Whether switching from this configuration to `next` changes receive
-    /// policy alone -- today only [`Self::disable_cookies`] -- and so leaves
-    /// every byte this end sends, and the pacing of anything already queued to
-    /// send, exactly as it was. `Tunn::set_obfuscation` keeps in-flight
-    /// outbound work across such a change; see there.
+    /// What switching from this configuration to `next` does to a
+    /// pre-handshake burst already in flight -- see `Tunn::set_obfuscation`.
     ///
-    /// Destructured rather than compared through a copy with the policy field
-    /// overwritten, so a field added later fails to compile here until it is
-    /// classified: send-side (compared) or receive policy (ignored).
-    pub(crate) fn differs_only_in_receive_policy(&self, next: &AmneziaConfig) -> bool {
+    /// A burst captures only two things when it is built
+    /// (`Tunn::new_pre_handshake_burst`): the imitation datagrams, generated
+    /// whole, and the Jc count. Every other field is read when the next junk
+    /// datagram, the initiation or a transport frame actually goes out, so a
+    /// change to it reaches the rest of the burst by itself and the burst is
+    /// kept. A change to what was captured leaves the burst describing a
+    /// configuration that is gone, so it is rebuilt.
+    ///
+    /// Every field is named, the Jc group's included, so a field added later
+    /// fails to compile here until it is classified.
+    pub(crate) fn pending_burst_change(&self, next: &AmneziaConfig) -> PendingBurstChange {
         let AmneziaConfig {
-            init_packet_junk_size,
-            response_packet_junk_size,
-            cookie_packet_junk_size,
-            transport_packet_junk_size,
+            // Framing, read by `prepend_outbound_with_trailer` for each
+            // message as it goes out.
+            init_packet_junk_size: _,
+            response_packet_junk_size: _,
+            cookie_packet_junk_size: _,
+            transport_packet_junk_size: _,
             pre_handshake_junk,
+            // The imitation sequence is generated whole when the burst is
+            // built.
             imitation,
+            // Decides whether there is a burst at all.
             suppress_pre_handshake,
-            header_protection,
-            content_padding_addition,
-            content_padding_mtu,
-            timers,
-            random_trailers,
-            // Receive policy: which handshake messages this end answers under
-            // load. Nothing it sends depends on it.
+            // Masking, applied as each message goes out.
+            header_protection: _,
+            // Transport only.
+            content_padding_addition: _,
+            content_padding_mtu: _,
+            // Drawn per send, cycle and session; `Tunn::set_obfuscation`
+            // redraws them itself when they change.
+            timers: _,
+            // The trailer is drawn when the message is framed.
+            random_trailers: _,
+            // Receive policy: nothing this end sends depends on it.
             disable_cookies: _,
         } = self;
-        *init_packet_junk_size == next.init_packet_junk_size
-            && *response_packet_junk_size == next.response_packet_junk_size
-            && *cookie_packet_junk_size == next.cookie_packet_junk_size
-            && *transport_packet_junk_size == next.transport_packet_junk_size
-            && *pre_handshake_junk == next.pre_handshake_junk
-            && *imitation == next.imitation
-            && *suppress_pre_handshake == next.suppress_pre_handshake
-            && *header_protection == next.header_protection
-            && *content_padding_addition == next.content_padding_addition
-            && *content_padding_mtu == next.content_padding_mtu
-            && *timers == next.timers
-            && *random_trailers == next.random_trailers
+        let AmneziaPreHandshakeJunk {
+            // Captured: how many junk datagrams the burst still owes.
+            packet_count,
+            // Read for each junk datagram as it is filled.
+            packet_size_min: _,
+            packet_size_max: _,
+            // Read at each pacing check.
+            packet_delay_ms: _,
+        } = pre_handshake_junk;
+        if *packet_count != next.pre_handshake_junk.packet_count
+            || *imitation != next.imitation
+            || *suppress_pre_handshake != next.suppress_pre_handshake
+        {
+            PendingBurstChange::Restart
+        } else {
+            PendingBurstChange::Keep
+        }
     }
 
     /// Whether the rate limiter's under-load cookie defense applies to a
@@ -2800,58 +2831,49 @@ mod tests {
         assert!(full_off.validate().is_ok());
     }
 
-    /// Only DisableCookies is receive policy. Every other field shapes what
-    /// this end sends -- or when -- so a change to any of them is a reframe,
-    /// and a change to DisableCookies alone is not.
+    /// Every field classified for a burst in flight: the three that were
+    /// captured when it was built restart it; every other field keeps it, and
+    /// so does no change at all.
     #[test]
-    fn only_disable_cookies_is_receive_policy() {
+    fn a_burst_restarts_only_for_what_it_captured() {
+        use PendingBurstChange::{Keep, Restart};
         let base = AmneziaConfig::new(52, 108, 136, 148).with_pre_handshake_junk(3, 64, 64, 100);
-        assert!(base.differs_only_in_receive_policy(&base));
-        assert!(base.differs_only_in_receive_policy(&base.clone().with_disable_cookies(true)));
-        assert!(base
-            .clone()
-            .with_disable_cookies(true)
-            .differs_only_in_receive_policy(&base));
+        assert_eq!(base.pending_burst_change(&base), Keep, "no change");
 
-        let send_side: Vec<(&str, AmneziaConfig)> = vec![
-            ("s1", {
-                let mut c = base.clone();
-                c.init_packet_junk_size += 1;
-                c
-            }),
-            ("s2", {
-                let mut c = base.clone();
-                c.response_packet_junk_size += 1;
-                c
-            }),
-            ("s3", {
-                let mut c = base.clone();
-                c.cookie_packet_junk_size += 1;
-                c
-            }),
-            ("s4", {
-                let mut c = base.clone();
-                c.transport_packet_junk_size += 1;
-                c
-            }),
-            ("junk", base.clone().with_pre_handshake_junk(4, 64, 64, 100)),
+        let with = |f: &dyn Fn(&mut AmneziaConfig)| {
+            let mut c = base.clone();
+            f(&mut c);
+            c
+        };
+        let cases: Vec<(&str, AmneziaConfig, PendingBurstChange)> = vec![
+            ("s1", with(&|c| c.init_packet_junk_size += 1), Keep),
+            ("s2", with(&|c| c.response_packet_junk_size += 1), Keep),
+            ("s3", with(&|c| c.cookie_packet_junk_size += 1), Keep),
+            ("s4", with(&|c| c.transport_packet_junk_size += 1), Keep),
             (
-                "imitation",
-                base.clone()
-                    .with_protocol_imitation(AmneziaImitationProtocol::Dns, None),
+                "jmin/jmax",
+                base.clone().with_pre_handshake_junk(3, 80, 90, 100),
+                Keep,
             ),
-            ("responder", base.clone().as_responder()),
+            (
+                "jd",
+                base.clone().with_pre_handshake_junk(3, 64, 64, 30),
+                Keep,
+            ),
             (
                 "header protection",
                 base.clone().with_header_protection([9; 32]),
+                Keep,
             ),
             (
                 "padding",
                 base.clone().with_content_padding_addition(8, 24, 0),
+                Keep,
             ),
             (
                 "padding mtu",
                 base.clone().with_content_padding_addition(0, 0, 1280),
+                Keep,
             ),
             (
                 "timers",
@@ -2859,18 +2881,74 @@ mod tests {
                     rekey_after_time: (30, 40),
                     ..AwgTimers::default()
                 }),
+                Keep,
             ),
-            ("random trailers", base.clone().with_random_trailers(true)),
+            (
+                "random trailers",
+                base.clone().with_random_trailers(true),
+                Keep,
+            ),
+            (
+                "disable cookies",
+                base.clone().with_disable_cookies(true),
+                Keep,
+            ),
+            (
+                "jc",
+                base.clone().with_pre_handshake_junk(5, 64, 64, 100),
+                Restart,
+            ),
+            (
+                "jc to 0",
+                base.clone().with_pre_handshake_junk(0, 64, 64, 100),
+                Restart,
+            ),
+            (
+                "imitation protocol",
+                base.clone()
+                    .with_protocol_imitation(AmneziaImitationProtocol::Dns, None),
+                Restart,
+            ),
+            (
+                "imitation domain",
+                base.clone().with_protocol_imitation(
+                    AmneziaImitationProtocol::Dns,
+                    Some("example.com".into()),
+                ),
+                Restart,
+            ),
+            (
+                "imitation browser",
+                base.clone().with_protocol_imitation_browser(
+                    AmneziaImitationProtocol::Quic,
+                    None,
+                    AmneziaImitationBrowser::Chrome,
+                ),
+                Restart,
+            ),
+            ("responder", base.clone().as_responder(), Restart),
         ];
-        for (name, changed) in send_side {
-            assert!(
-                !base.differs_only_in_receive_policy(&changed),
-                "{} was treated as receive policy",
-                name
-            );
-            // Still a send-side change with DisableCookies moving too.
-            assert!(!base.differs_only_in_receive_policy(&changed.with_disable_cookies(true)));
+        for (name, next, want) in cases {
+            assert_eq!(base.pending_burst_change(&next), want, "{}", name);
+            // A Keep-class change riding along does not soften a Restart.
+            if want == Restart {
+                assert_eq!(
+                    base.pending_burst_change(&next.clone().with_random_trailers(true)),
+                    Restart,
+                    "{} with RT",
+                    name
+                );
+            }
         }
+        // Between two imitation configurations, too.
+        let dns = base
+            .clone()
+            .with_protocol_imitation(AmneziaImitationProtocol::Dns, None);
+        let stun = base
+            .clone()
+            .with_protocol_imitation(AmneziaImitationProtocol::Stun, None);
+        assert_eq!(dns.pending_burst_change(&stun), Restart);
+        assert_eq!(dns.pending_burst_change(&dns.clone()), Keep);
     }
 
     /// The cookie-reflection complaint is about replies this end would emit.
