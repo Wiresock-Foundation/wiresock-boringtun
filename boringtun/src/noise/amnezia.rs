@@ -51,6 +51,9 @@ const MAX_SENDABLE_DATAGRAM: usize = 65535 - 20 - 8;
 /// AmneziaWG rounds unpadded transport plaintext up to this multiple, matching
 /// amneziawg-go's `PaddingMultiple` and vanilla WireGuard's 16-byte boundary.
 const PADDING_MULTIPLE: usize = 16;
+/// A transport message's header -- type, receiver index, counter -- ahead of
+/// its ciphertext. amneziawg-go's `MessageTransportHeaderSize`.
+const DATA_OFFSET_SZ: usize = 16;
 const DNS_JUNK_SIZE_MIN: usize = 50;
 const DNS_JUNK_SIZE_MAX: usize = 200;
 const QUIC_JUNK_SIZE_MIN: usize = 1200;
@@ -306,7 +309,68 @@ pub struct AmneziaConfig {
     /// AmneziaWG 3.0 tunable timers. All-default is vanilla WireGuard: every
     /// accessor falls back to its classic constant.
     pub(crate) timers: AwgTimers,
+    /// AmneziaWG 3.1 `RandomTrailers`. Off by default, and off is exactly the
+    /// 3.0 wire: handshake messages at their fixed sizes, transport padded as
+    /// before.
+    ///
+    /// On, each handshake message carries an unauthenticated random suffix
+    /// after its canonical bytes -- outside Noise, the MACs, the cookie AEAD and
+    /// header protection -- so a receiver reads handshake sizes as minimums
+    /// rather than exact values. Transport grows too, but *inside* its AEAD:
+    /// the addition is zero padding of the plaintext, never bytes after the
+    /// tag. How much of either is drawn against the tunnel's observed UDP
+    /// window; see [`DEFAULT_UDP_WINDOW`].
+    ///
+    /// A receiver must agree: a peer that is off rejects every trailer-extended
+    /// handshake message. It is not negotiated.
+    pub(crate) random_trailers: bool,
 }
+
+/// How much RandomTrailers suffix an outgoing handshake message may carry: the
+/// window it is drawn against, and a ceiling on the whole datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrailerRoom {
+    udp_window: u32,
+    max_wire: usize,
+}
+
+impl TrailerRoom {
+    /// An initiation or a response: drawn against the tunnel's UDP window.
+    pub(crate) fn window(udp_window: u32) -> Self {
+        Self {
+            udp_window,
+            max_wire: usize::MAX,
+        }
+    }
+
+    /// A cookie reply to a `request_len`-byte datagram.
+    ///
+    /// Drawn against the fixed [`DEFAULT_UDP_WINDOW`], never the tunnel's grown
+    /// one -- amneziawg-go's cookie path calls the device-level
+    /// `randomTrailer`, which has no peer to ask. And never past `request_len`,
+    /// the whole datagram that provoked it: a cookie reply goes to an address
+    /// nothing has authenticated, so WireSock does not let it be larger than
+    /// what was sent (#42), and a trailer is bounded to the room parity leaves
+    /// rather than drawn freely and then suppressed. Equality is allowed. The
+    /// reference draws the suffix without this ceiling; the wire is the same
+    /// shape either way.
+    pub(crate) fn cookie_reply(request_len: usize) -> Self {
+        Self {
+            udp_window: DEFAULT_UDP_WINDOW,
+            max_wire: request_len,
+        }
+    }
+}
+
+/// The UDP window a tunnel starts from, in bytes, and the fixed window a cookie
+/// reply's trailer is drawn against. amneziawg-go's `DefaultUdpWindow`.
+///
+/// A tunnel's window is the largest datagram it has seen go by in either
+/// direction on the current endpoint, never less than this; RandomTrailers draws
+/// every addition from the room between the packet at hand and that window, so
+/// padding never makes a datagram larger than the path has already carried.
+/// Runtime state, so it lives on `Tunn`, one per peer, not here.
+pub(crate) const DEFAULT_UDP_WINDOW: u32 = 500;
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct AmneziaPreHandshakeJunk {
@@ -547,6 +611,14 @@ pub(crate) struct InboundCandidate {
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct InboundCandidates([Option<InboundCandidate>; 4]);
 
+impl InboundCandidate {
+    /// Where the canonical message starts: the kind's S size.
+    #[cfg(test)]
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+}
+
 impl InboundCandidates {
     /// No reading fits: the datagram is not AmneziaWG traffic at all. What
     /// the device's ingress asks before it lets probe classification look.
@@ -614,6 +686,7 @@ impl AmneziaConfig {
             content_padding_addition: (0, 0),
             content_padding_mtu: 0,
             timers: AwgTimers::default(),
+            random_trailers: false,
         }
     }
 
@@ -655,6 +728,15 @@ impl AmneziaConfig {
     pub fn with_content_padding_addition(mut self, lo: u32, hi: u32, mtu: u16) -> Self {
         self.content_padding_addition = (lo.min(hi), lo.max(hi));
         self.content_padding_mtu = mtu;
+        self
+    }
+
+    /// Enable or disable AmneziaWG 3.1 `RandomTrailers`. See the field.
+    ///
+    /// Both ends must agree. Switching it on a live tunnel keeps the tunnel's
+    /// sessions and UDP window; only framing changes.
+    pub fn with_random_trailers(mut self, on: bool) -> Self {
+        self.random_trailers = on;
         self
     }
 
@@ -707,18 +789,89 @@ impl AmneziaConfig {
     /// `receive_handshake_response` has cleared the handshake state -- the
     /// keepalive lost for good, only on links near the MTU, only with padding
     /// active.
+    ///
+    /// `udp_window` is the tunnel's window, already grown to cover this frame
+    /// (see [`Self::transport_window_observation`]). It is read only when
+    /// RandomTrailers is on: with it off, padding is exactly what it was before
+    /// 3.1 existed -- see [`Self::window_padding`] for why that is deliberate.
     pub(crate) fn content_padding_for_frame(
         &self,
         src_len: usize,
         dst_len: usize,
         transport_junk: usize,
+        udp_window: u32,
         rng: &mut impl RngCore,
     ) -> usize {
         let committed = src_len + DATA_OVERHEAD_SZ + transport_junk;
         let space = dst_len
             .saturating_sub(committed)
             .min(MAX_SENDABLE_DATAGRAM.saturating_sub(committed));
-        self.content_padding(src_len, space, rng)
+        if self.random_trailers {
+            self.window_padding(committed, udp_window, rng).min(space)
+        } else {
+            self.content_padding(src_len, space, rng)
+        }
+    }
+
+    /// The AmneziaWG 3.1 transport padding: amneziawg-go's
+    /// `randomPaddingAddition`, else its `randomTrailer`, drawn against the UDP
+    /// window rather than the MTU. `base` is the unpadded frame on the wire,
+    /// `S4 + 32 + plaintext`.
+    ///
+    /// Precedence is by *selection*, not by amount: an active
+    /// `content_padding_addition` range decides, even when it draws zero, and
+    /// RandomTrailers never falls through to the 16-byte rounding, even when it
+    /// draws zero. The rounding is what a tunnel with neither sends, and with
+    /// RandomTrailers on that tunnel does not exist.
+    ///
+    /// Only reached with RandomTrailers on, and that is a WireSock decision
+    /// that differs from amneziawg-go 3.1. Upstream moved
+    /// `content_padding_addition` onto the window unconditionally, so every
+    /// 3.0 configuration that pads changes its distribution the day it is
+    /// upgraded, with no configuration change -- the maximum moves from "one
+    /// MTU unit less the plaintext" to "the largest datagram seen less this
+    /// one". Here a 3.0 configuration (RandomTrailers off) keeps
+    /// [`Self::content_padding`] exactly, and the window governs only a tunnel
+    /// that has opted into 3.1 framing. The wire stays interoperable either
+    /// way: padding is inside the AEAD, and every receiver trims by the inner
+    /// IP length.
+    ///
+    /// The window already covers `base` (the caller observes the frame first,
+    /// as upstream's `RoutineEncryption` does), so the headroom is never
+    /// negative; `saturating_sub` is for a caller that forgets.
+    fn window_padding(&self, base: usize, udp_window: u32, rng: &mut impl RngCore) -> usize {
+        let headroom = (udp_window as usize).saturating_sub(base);
+        let (lo, hi) = self.content_padding_addition;
+        if lo != 0 || hi != 0 {
+            random_usize_inclusive(lo as usize, hi as usize, rng).min(headroom)
+        } else {
+            random_below(headroom, rng)
+        }
+    }
+
+    /// What sending a transport frame of `src_len` plaintext bytes (before
+    /// padding) shows the UDP window: `S4 + 32 + src_len`, the frame's unpadded
+    /// wire size. amneziawg-go's `RoutineEncryption` observes exactly this
+    /// before it draws the padding, keepalives included.
+    pub(crate) fn transport_window_observation(&self, src_len: usize) -> usize {
+        self.transport_junk_size() + DATA_OVERHEAD_SZ + src_len
+    }
+
+    /// What receiving an authenticated transport frame with a `plaintext_len`
+    /// plaintext (padding included, AEAD tag not) shows the UDP window:
+    /// `S4 + 16 + plaintext_len`.
+    ///
+    /// Sixteen bytes short of the datagram: the header is counted and the tag
+    /// is not. That is amneziawg-go's `RoutineSequentialReceiver`, which adds
+    /// `MessageTransportHeaderSize` to the decrypted length where
+    /// `RoutineEncryption` adds `MinMessageSize` to the plaintext. Reproduced
+    /// on purpose rather than corrected, because the window decides how much
+    /// padding each end draws, and an implementation that disagreed with the
+    /// reference here would fingerprint itself by its size distribution.
+    /// `the_receive_window_observation_is_sixteen_short_of_the_datagram` pins
+    /// the asymmetry.
+    pub(crate) fn received_window_observation(&self, plaintext_len: usize) -> usize {
+        self.transport_junk_size() + DATA_OFFSET_SZ + plaintext_len
     }
 
     /// The number of zero bytes to append to a `src_len`-byte transport
@@ -1183,7 +1336,9 @@ impl AmneziaConfig {
     /// Every packet kind an inbound datagram could be, in trial order.
     ///
     /// At most one candidate per kind, each at that kind's own S offset: the
-    /// three handshake kinds by exact size, transport by minimum size, and each
+    /// three handshake kinds by exact size -- by minimum size, with
+    /// RandomTrailers, the canonical message still their fixed size and the
+    /// rest a suffix -- transport by minimum size, and each
     /// only when the tag at its offset -- unmasked, when a header-protection key
     /// is set -- falls in its kind's H range. Nothing else is scanned, neither
     /// another offset nor another length, so the list is bounded at four and
@@ -1261,9 +1416,19 @@ impl AmneziaConfig {
         {
             let kind = *kind;
             let offset = self.inbound_junk_size(kind);
-            let fits = match *exact_len {
-                Some(len) => wire_len == offset + len,
-                None => wire_len >= offset + DATA_OVERHEAD_SZ,
+            // A handshake message is exactly its size, or -- with
+            // RandomTrailers -- at least its size, the rest an unauthenticated
+            // suffix. Its canonical extent is the fixed size either way: the
+            // suffix never reaches the parser, the MACs, Noise, the cookie
+            // AEAD or header protection. Transport's minimum is unchanged,
+            // because its RandomTrailers addition is inside the AEAD.
+            let (fits, message_len) = match *exact_len {
+                Some(len) if self.random_trailers => (wire_len >= offset + len, len),
+                Some(len) => (wire_len == offset + len, len),
+                None => (
+                    wire_len >= offset + DATA_OVERHEAD_SZ,
+                    wire_len.saturating_sub(offset),
+                ),
             };
             if !fits || (protected && offset < NONCE_SIZE) {
                 continue;
@@ -1275,7 +1440,7 @@ impl AmneziaConfig {
                 found.0[slot] = Some(InboundCandidate {
                     kind,
                     offset,
-                    message_len: wire_len - offset,
+                    message_len,
                     wire_len,
                     protected,
                 });
@@ -1285,6 +1450,9 @@ impl AmneziaConfig {
     }
 
     /// The canonical message `candidate` reads out of `datagram`.
+    ///
+    /// Only the canonical extent: a handshake message's RandomTrailers suffix
+    /// is left behind in `datagram`, never parsed, authenticated or unmasked.
     ///
     /// Borrowed straight from `datagram` when the candidate is unprotected.
     /// Otherwise copied into `scratch` and unmasked there, so `datagram` stays
@@ -1333,7 +1501,7 @@ impl AmneziaConfig {
         self.candidates_under_mask(obf, packet, [0u8; TYPE_MASK_SIZE], false)
             .iter()
             .next()
-            .map(|c| &packet[c.offset..])
+            .map(|c| &packet[c.offset..c.offset + c.message_len])
     }
 
     /// Unmask the first candidate in place and return its offset -- the old
@@ -1350,7 +1518,7 @@ impl AmneziaConfig {
         let message = self
             .candidate_message(packet, &candidate, &mut scratch)?
             .to_vec();
-        packet[candidate.offset..].copy_from_slice(&message);
+        packet[candidate.offset..candidate.offset + message.len()].copy_from_slice(&message);
         Some(candidate.offset)
     }
 
@@ -1566,11 +1734,39 @@ impl AmneziaConfig {
         Some((label, request, reply))
     }
 
+    /// Frame an outgoing packet with no RandomTrailers suffix: its S prefix and
+    /// header protection only. A suffix of zero is always valid on the wire, so
+    /// this is correct for any configuration. Test-only: every send path in the
+    /// crate now goes through [`Self::prepend_outbound_with_trailer`], and the
+    /// framing tests that predate 3.1 pin the prefix and masking through this.
+    #[cfg(test)]
     pub(crate) fn prepend_outbound<'a>(
         &self,
         obf: ObfuscationRanges,
         buffer: &'a mut [u8],
         packet_size: usize,
+        rng: &mut impl RngCore,
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        self.prepend_outbound_with_trailer(obf, buffer, packet_size, None, rng)
+    }
+
+    /// Frame the canonical packet in `buffer[..packet_size]` for the wire: the
+    /// S prefix in front, header protection over the canonical bytes, and --
+    /// for a handshake message with RandomTrailers on -- a random suffix
+    /// behind, as large as `room` allows.
+    ///
+    /// The suffix is optional and so never an error: it shrinks to whatever
+    /// the buffer, [`MAX_SENDABLE_DATAGRAM`] and `room`'s wire ceiling leave,
+    /// down to nothing. Only the mandatory frame -- prefix plus canonical
+    /// packet -- can fail for want of space, exactly as before 3.1. Header
+    /// protection masks the canonical bytes only, nonced by the prefix as
+    /// always; the suffix is written after and is never masked.
+    pub(crate) fn prepend_outbound_with_trailer<'a>(
+        &self,
+        obf: ObfuscationRanges,
+        buffer: &'a mut [u8],
+        packet_size: usize,
+        room: Option<TrailerRoom>,
         rng: &mut impl RngCore,
     ) -> Result<&'a mut [u8], WireGuardError> {
         let packet = buffer
@@ -1581,20 +1777,22 @@ impl AmneziaConfig {
         };
 
         let junk_size = self.outbound_junk_size(kind);
+        let new_size = packet_size
+            .checked_add(junk_size)
+            .ok_or(WireGuardError::DestinationBufferTooSmall)?;
+        let trailer = self.trailer_len(kind, new_size, buffer.len(), room, rng);
+
         // With header protection off, no prefix means nothing to do. With it on,
         // no prefix also means no nonce -- and returning here would emit the
         // packet in the clear, which is the one outcome setting a key is meant
         // to prevent. `validate` rejects that configuration, but
         // `Tunn::new_with_obfuscation` does not call `validate`, so the public
         // constructors reach it. Falling through instead routes it into the
-        // masking backstop below, which refuses.
-        if junk_size == 0 && !self.header_protection_enabled() {
+        // masking backstop below, which refuses. A suffix is work to do too.
+        if junk_size == 0 && !self.header_protection_enabled() && trailer == 0 {
             return Ok(&mut buffer[..packet_size]);
         }
 
-        let new_size = packet_size
-            .checked_add(junk_size)
-            .ok_or(WireGuardError::DestinationBufferTooSmall)?;
         if buffer.len() < new_size {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
@@ -1633,7 +1831,41 @@ impl AmneziaConfig {
             });
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
-        Ok(&mut buffer[..new_size])
+        // `trailer_len` bounded this by the buffer, so the slice is in range.
+        let wire_len = new_size + trailer;
+        fill_random(&mut buffer[new_size..wire_len], rng);
+        Ok(&mut buffer[..wire_len])
+    }
+
+    /// How long a RandomTrailers suffix a `kind` message whose mandatory frame
+    /// is `base` bytes gets, in a `buffer_len`-byte buffer.
+    ///
+    /// Zero -- without touching `rng` -- unless RandomTrailers is on, the
+    /// message is a handshake kind and the caller supplied `room`. Otherwise
+    /// amneziawg-go's `randomTrailer`: a uniform draw from `0..(window - base)`,
+    /// exclusive, so one byte of headroom still draws zero. Where the
+    /// reference simply draws, this first intersects that range with every
+    /// ceiling the suffix has to respect -- the buffer, the largest sendable
+    /// datagram and `room.max_wire` -- and draws within what is left, so a
+    /// ceiling narrows the distribution instead of refusing the packet.
+    fn trailer_len(
+        &self,
+        kind: PacketKind,
+        base: usize,
+        buffer_len: usize,
+        room: Option<TrailerRoom>,
+        rng: &mut impl RngCore,
+    ) -> usize {
+        let Some(room) = room else { return 0 };
+        if !self.random_trailers || kind == PacketKind::TransportData {
+            return 0;
+        }
+        let headroom = (room.udp_window as usize).saturating_sub(base);
+        let ceiling = buffer_len
+            .min(MAX_SENDABLE_DATAGRAM)
+            .min(room.max_wire)
+            .saturating_sub(base);
+        random_below(headroom.min(ceiling.saturating_add(1)), rng)
     }
 
     pub fn fill_pre_handshake_junk<'a>(
@@ -1706,6 +1938,18 @@ fn random_imitation_domain(rng: &mut impl RngCore) -> String {
     host.push('.');
     host.push_str(TLDS[(rng.next_u32() as usize) % TLDS.len()]);
     host
+}
+
+/// A uniform draw from `0..n`, exclusive, and `0` for an empty range.
+///
+/// amneziawg-go's `fastrandn`, the draw its `randomTrailer` makes: the upper
+/// bound is never produced, so one byte of headroom still draws 0, and no
+/// headroom at all is 0 rather than a panic on an empty range.
+fn random_below(n: usize, rng: &mut impl RngCore) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    random_usize_inclusive(0, n - 1, rng)
 }
 
 fn random_usize_inclusive(min: usize, max: usize, rng: &mut impl RngCore) -> usize {
@@ -2267,6 +2511,285 @@ mod tests {
     use super::*;
     use crate::noise::{COOKIE_REPLY, DATA, HANDSHAKE_INIT, HANDSHAKE_RESP};
     use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
+
+    /// The suffix length: zero, and no draw at all, unless RandomTrailers is on
+    /// for a handshake kind with room supplied; otherwise below the window,
+    /// exclusive, and inside every ceiling at once.
+    #[test]
+    fn trailer_len_is_drawn_inside_every_ceiling() {
+        let off = AmneziaConfig::new(0, 0, 0, 0);
+        let on = off.clone().with_random_trailers(true);
+        let room = Some(TrailerRoom::window(DEFAULT_UDP_WINDOW));
+        let init = PacketKind::HandshakeInit;
+
+        // Off, transport, or no room: zero, and the RNG is not touched -- so
+        // every 3.0 wire stays byte-identical under a seeded RNG.
+        let mut a = ChaCha8Rng::seed_from_u64(1);
+        let b = a.clone();
+        assert_eq!(off.trailer_len(init, 148, 4096, room, &mut a), 0);
+        assert_eq!(
+            on.trailer_len(PacketKind::TransportData, 148, 4096, room, &mut a),
+            0
+        );
+        assert_eq!(on.trailer_len(init, 148, 4096, None, &mut a), 0);
+        assert_eq!(a, b, "no draw may be made when no trailer is possible");
+
+        let mut rng = ChaCha8Rng::seed_from_u64(2);
+        for _ in 0..200 {
+            // The window: exclusive, so one byte of headroom draws zero.
+            assert!(on.trailer_len(init, 148, 4096, room, &mut rng) < 500 - 148);
+            assert_eq!(on.trailer_len(init, 499, 4096, room, &mut rng), 0);
+            assert_eq!(on.trailer_len(init, 500, 4096, room, &mut rng), 0);
+            assert_eq!(on.trailer_len(init, 900, 4096, room, &mut rng), 0);
+            // The buffer.
+            assert!(on.trailer_len(init, 148, 148 + 5, room, &mut rng) <= 5);
+            assert_eq!(on.trailer_len(init, 148, 148, room, &mut rng), 0);
+            assert_eq!(on.trailer_len(init, 148, 100, room, &mut rng), 0);
+            // The largest sendable datagram, however wide the window.
+            let wide = Some(TrailerRoom::window(u32::MAX));
+            let near = MAX_SENDABLE_DATAGRAM - 3;
+            assert!(on.trailer_len(init, near, usize::MAX, wide, &mut rng) <= 3);
+            assert_eq!(
+                on.trailer_len(init, MAX_SENDABLE_DATAGRAM, usize::MAX, wide, &mut rng),
+                0
+            );
+            // A cookie reply: the fixed window, and never past the request.
+            let reply = PacketKind::CookieReply;
+            let to_request = |len| Some(TrailerRoom::cookie_reply(len));
+            assert!(on.trailer_len(reply, 64, 4096, to_request(64 + 3), &mut rng) <= 3);
+            assert_eq!(on.trailer_len(reply, 64, 4096, to_request(64), &mut rng), 0);
+            assert_eq!(on.trailer_len(reply, 64, 4096, to_request(10), &mut rng), 0);
+            assert!(on.trailer_len(reply, 64, 4096, to_request(60_000), &mut rng) < 500 - 64);
+        }
+        // Within a ceiling the whole range is still reachable, the ceiling included.
+        let seen: std::collections::BTreeSet<usize> = (0..400)
+            .map(|_| on.trailer_len(init, 148, 148 + 3, room, &mut rng))
+            .collect();
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+    }
+
+    /// The suffix follows the canonical message, outside header protection:
+    /// the receiver recovers exactly the canonical bytes, whatever the suffix
+    /// holds. With no S prefix and no key the suffix is still added -- the
+    /// early return for "nothing to frame" does not swallow it.
+    #[test]
+    fn the_suffix_follows_the_masked_core_and_is_not_masked() {
+        let obf = ObfuscationRanges::default();
+        let mut rng = ChaCha8Rng::seed_from_u64(4);
+        let mut canonical = vec![0u8; HANDSHAKE_INIT_SZ];
+        canonical[..4].copy_from_slice(&HANDSHAKE_INIT.to_le_bytes());
+        for (i, b) in canonical[4..].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let room = Some(TrailerRoom::window(DEFAULT_UDP_WINDOW));
+
+        for cfg in [
+            AmneziaConfig::new(40, 24, 32, 160).with_header_protection([0x5a; 32]),
+            AmneziaConfig::new(40, 24, 32, 160),
+            AmneziaConfig::new(0, 0, 0, 0),
+        ] {
+            let cfg = cfg.with_random_trailers(true);
+            let s1 = cfg.init_packet_junk_size as usize;
+            let mut longest = 0;
+            for _ in 0..64 {
+                let mut buffer = vec![0u8; 2048];
+                buffer[..HANDSHAKE_INIT_SZ].copy_from_slice(&canonical);
+                let mut wire = cfg
+                    .prepend_outbound_with_trailer(
+                        obf,
+                        &mut buffer,
+                        HANDSHAKE_INIT_SZ,
+                        room,
+                        &mut rng,
+                    )
+                    .unwrap()
+                    .to_vec();
+                assert!(wire.len() >= s1 + HANDSHAKE_INIT_SZ && wire.len() < 500);
+                longest = longest.max(wire.len());
+                // Rewrite the suffix: the canonical message is unaffected.
+                let end = wire.len();
+                wire[s1 + HANDSHAKE_INIT_SZ..end].fill(0x99);
+                let found = cfg.inbound_candidates(obf, &wire);
+                let reading = found.iter().next().expect("our own initiation");
+                let mut scratch = Vec::new();
+                assert_eq!(
+                    cfg.candidate_message(&wire, reading, &mut scratch).unwrap(),
+                    &canonical[..]
+                );
+            }
+            assert!(
+                longest > s1 + HANDSHAKE_INIT_SZ,
+                "a suffix must be drawn: {}",
+                longest
+            );
+        }
+    }
+
+    /// The mandatory frame is still the only thing that can fail for space:
+    /// exactly enough buffer sends it with no suffix, one byte less refuses it.
+    #[test]
+    fn only_the_mandatory_frame_can_fail_for_space() {
+        let obf = ObfuscationRanges::default();
+        let cfg = AmneziaConfig::new(40, 24, 32, 160).with_random_trailers(true);
+        let room = Some(TrailerRoom::window(u32::MAX));
+        let mut rng = ChaCha8Rng::seed_from_u64(8);
+        let mut make = |len: usize| {
+            let mut buffer = vec![0u8; len];
+            buffer[..4].copy_from_slice(&HANDSHAKE_INIT.to_le_bytes());
+            cfg.prepend_outbound_with_trailer(obf, &mut buffer, HANDSHAKE_INIT_SZ, room, &mut rng)
+                .map(|w| w.len())
+        };
+        assert!(matches!(make(40 + HANDSHAKE_INIT_SZ), Ok(n) if n == 40 + HANDSHAKE_INIT_SZ));
+        assert!(matches!(
+            make(40 + HANDSHAKE_INIT_SZ - 1),
+            Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+        for _ in 0..32 {
+            assert!(make(40 + HANDSHAKE_INIT_SZ + 2).unwrap() <= 40 + HANDSHAKE_INIT_SZ + 2);
+        }
+    }
+
+    /// RandomTrailers is off unless asked for, and the builder switches it both
+    /// ways without touching anything else.
+    #[test]
+    fn random_trailers_defaults_off_and_toggles() {
+        let base = AmneziaConfig::new(52, 108, 136, 148);
+        assert!(!base.random_trailers);
+        assert!(!AmneziaConfig::default().random_trailers);
+        let on = base.clone().with_random_trailers(true);
+        assert!(on.random_trailers);
+        assert_eq!(on.clone().with_random_trailers(false), base);
+    }
+
+    /// `random_below` is amneziawg-go's `fastrandn`: exclusive, and zero for an
+    /// empty range rather than a panic.
+    #[test]
+    fn random_below_is_exclusive_and_total() {
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        for _ in 0..64 {
+            assert_eq!(random_below(0, &mut rng), 0);
+            assert_eq!(
+                random_below(1, &mut rng),
+                0,
+                "one byte of room still draws 0"
+            );
+            assert!(random_below(5, &mut rng) < 5);
+        }
+    }
+
+    /// The two window observations, and the sixteen bytes between them: a
+    /// sent frame counts its whole unpadded size, a received one counts its
+    /// header and padded plaintext but not its AEAD tag. The reference's
+    /// numbers, reproduced rather than reconciled -- see
+    /// `received_window_observation`.
+    #[test]
+    fn the_receive_window_observation_is_sixteen_short_of_the_datagram() {
+        let cfg = AmneziaConfig::new(0, 0, 0, 148);
+        assert_eq!(cfg.transport_window_observation(0), 148 + 32);
+        assert_eq!(cfg.transport_window_observation(1000), 148 + 32 + 1000);
+        // A 1000-byte padded plaintext arrives as a 148 + 16 + 1000 + 16 byte
+        // datagram, and is recorded as 16 bytes less than that.
+        let datagram = 148 + 16 + 1000 + 16;
+        assert_eq!(cfg.received_window_observation(1000), datagram - 16);
+    }
+
+    /// With RandomTrailers on, the padding precedence is by selection:
+    /// an active `content_padding_addition` range decides, else RandomTrailers,
+    /// and a zero from either is final -- neither falls through to the 16-byte
+    /// rounding.
+    #[test]
+    fn window_padding_precedence_is_by_selection_not_by_amount() {
+        let rt = AmneziaConfig::new(0, 0, 0, 0).with_random_trailers(true);
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+
+        // RandomTrailers alone, with no room: 0, not the 16-byte rounding a
+        // 20-byte plaintext would otherwise get (12 bytes).
+        let base = 32 + 20;
+        assert_eq!(rt.window_padding(base, base as u32, &mut rng), 0);
+        assert_eq!(
+            rt.content_padding(20, 4096, &mut rng),
+            12,
+            "what it would have been"
+        );
+        // One byte of room still draws 0; more is drawn below the window.
+        assert_eq!(rt.window_padding(base, base as u32 + 1, &mut rng), 0);
+        for _ in 0..64 {
+            assert!(rt.window_padding(base, 500, &mut rng) < 500 - base);
+        }
+
+        // An active range that can draw zero: every result is the range's,
+        // never a RandomTrailers draw against 448 bytes of room.
+        let cpa = rt.clone().with_content_padding_addition(0, 1, 1420);
+        let draws: Vec<usize> = (0..200)
+            .map(|_| cpa.window_padding(base, 500, &mut rng))
+            .collect();
+        assert!(draws.iter().all(|&d| d <= 1), "{:?}", draws);
+        assert!(
+            draws.contains(&0),
+            "the range must be able to draw zero here"
+        );
+
+        // The range is capped by the window, not by the MTU unit.
+        let wide = rt.with_content_padding_addition(400, 400, 1420);
+        assert_eq!(wide.window_padding(132, 500, &mut rng), 500 - 132);
+    }
+
+    /// A 3.0 configuration pads exactly as before 3.1 existed; only one that
+    /// turned RandomTrailers on draws against the window. The concrete case
+    /// the two models disagree on: a 100-byte plaintext, a constant 400-byte
+    /// addition, a 1420-byte MTU and a 500-byte window -- the MTU unit leaves
+    /// room for all 400, the window for only 368.
+    #[test]
+    fn content_padding_keeps_its_3_0_meaning_unless_random_trailers_is_on() {
+        let legacy = AmneziaConfig::new(0, 0, 0, 0).with_content_padding_addition(400, 400, 1420);
+        let rt = legacy.clone().with_random_trailers(true);
+        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        let window = DEFAULT_UDP_WINDOW;
+
+        assert_eq!(
+            legacy.content_padding_for_frame(100, 4096, 0, window, &mut rng),
+            400,
+            "RandomTrailers off: the MTU-unit clamp, exactly as in 3.0"
+        );
+        assert_eq!(
+            legacy.content_padding_for_frame(100, 4096, 0, window, &mut rng),
+            legacy.content_padding(100, 4096 - 132, &mut rng),
+            "and by the very same function"
+        );
+        assert_eq!(
+            rt.content_padding_for_frame(100, 4096, 0, window, &mut rng),
+            500 - 132,
+            "RandomTrailers on: the window clamp"
+        );
+        // The window is read only when RandomTrailers is on.
+        assert_eq!(
+            legacy.content_padding_for_frame(100, 4096, 0, 60_000, &mut rng),
+            400
+        );
+    }
+
+    /// The window model never pads past the caller's buffer or the largest
+    /// sendable datagram, however wide the window has grown.
+    #[test]
+    fn window_padding_is_bounded_by_the_buffer_and_the_datagram_limit() {
+        let rt = AmneziaConfig::new(0, 0, 0, 0)
+            .with_random_trailers(true)
+            .with_content_padding_addition(60_000, 60_000, 0);
+        let mut rng = ChaCha8Rng::seed_from_u64(6);
+        assert_eq!(
+            rt.content_padding_for_frame(100, 200, 0, u32::MAX, &mut rng),
+            200 - 132
+        );
+        let near_max = MAX_SENDABLE_DATAGRAM - 32 - 10;
+        assert_eq!(
+            rt.content_padding_for_frame(near_max, usize::MAX, 0, u32::MAX, &mut rng),
+            10
+        );
+        assert_eq!(
+            rt.content_padding_for_frame(MAX_SENDABLE_DATAGRAM, usize::MAX, 0, u32::MAX, &mut rng),
+            0
+        );
+    }
 
     fn write_tag(packet: &mut [u8], tag: u32) {
         packet[..4].copy_from_slice(&tag.to_le_bytes());

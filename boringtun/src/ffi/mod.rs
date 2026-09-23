@@ -1135,6 +1135,16 @@ pub struct wireguard_awg_params {
     /// `last_tunnel_error()`, so a C caller sees it only through
     /// `set_logging_function`.
     pub header_protection_key: [u8; 32],
+    /// AmneziaWG 3.1 RandomTrailers: `1` on, `0` off. Any other value is
+    /// refused, so a caller that meant something else is told rather than
+    /// guessed at. Both ends must agree; it is not negotiated.
+    ///
+    /// A `uint32_t` rather than a C `bool`, whose size the C standard leaves to
+    /// the implementation: every field here is fixed-width, which is what keeps
+    /// the layout identical on i686 and x86_64. Appended in the second published
+    /// version of this struct ([`AWG_PARAMS_SIZE_VER1`]); a caller built
+    /// against the first leaves it unset, which is off.
+    pub random_trailers: u32,
 }
 
 impl PartialEq for wireguard_awg_params {
@@ -1183,6 +1193,7 @@ impl PartialEq for wireguard_awg_params {
             keepalive_timeout,
             max_handshake_attempts,
             header_protection_key,
+            random_trailers,
         } = self;
 
         *size == other.size
@@ -1207,6 +1218,7 @@ impl PartialEq for wireguard_awg_params {
             && *reject_after_time == other.reject_after_time
             && *keepalive_timeout == other.keepalive_timeout
             && *max_handshake_attempts == other.max_handshake_attempts
+            && *random_trailers == other.random_trailers
             && bool::from(header_protection_key.ct_eq(&other.header_protection_key))
     }
 }
@@ -1261,6 +1273,7 @@ impl std::fmt::Debug for wireguard_awg_params {
             keepalive_timeout,
             max_handshake_attempts,
             header_protection_key,
+            random_trailers,
         } = self;
 
         f.debug_struct("wireguard_awg_params")
@@ -1294,6 +1307,7 @@ impl std::fmt::Debug for wireguard_awg_params {
                     "unset"
                 },
             )
+            .field("random_trailers", random_trailers)
             .finish()
     }
 }
@@ -1306,6 +1320,9 @@ impl std::fmt::Debug for wireguard_awg_params {
 /// callers built against it.
 const AWG_PARAMS_SIZE_VER0: usize = 160;
 
+/// The size of the second published version: version 0 plus `random_trailers`.
+const AWG_PARAMS_SIZE_VER1: usize = 164;
+
 /// Every size of [`wireguard_awg_params`] that has ever been published.
 ///
 /// A caller's `size` must be one of these, or at least this build's own size (a
@@ -1315,7 +1332,7 @@ const AWG_PARAMS_SIZE_VER0: usize = 160;
 /// field's leading bytes and leaves the rest zero. For a key that is a tunnel
 /// mutually unreachable with its peer and no diagnostic anywhere -- exactly the
 /// outcome the zero-tail rule refuses in the other direction.
-const AWG_PARAMS_PUBLISHED_SIZES: [usize; 1] = [AWG_PARAMS_SIZE_VER0];
+const AWG_PARAMS_PUBLISHED_SIZES: [usize; 2] = [AWG_PARAMS_SIZE_VER0, AWG_PARAMS_SIZE_VER1];
 
 /// The largest `size` this build will read.
 ///
@@ -1348,10 +1365,9 @@ const _: () = assert!(AWG_PARAMS_SIZE_MAX > std::mem::size_of::<wireguard_awg_pa
 
 /// Likewise, this build's own size must be a size we have published, or the
 /// short-struct path refuses callers built against the current header. It
-/// holds trivially today (the table is `[AWG_PARAMS_SIZE_VER0]` and that is
-/// this build's size) and stops holding the moment a field is appended --
-/// which is exactly when the table needs the old size added to it, and the
-/// only repair that makes this compile again.
+/// stops holding the moment a field is appended -- which is exactly when the
+/// table needs the new size added to it, and the only repair that makes this
+/// compile again. (It did its job when `random_trailers` arrived.)
 const _: () = assert!(awg_params_size_is_published(std::mem::size_of::<
     wireguard_awg_params,
 >()));
@@ -1372,12 +1388,10 @@ const fn awg_params_size_is_published(size: usize) -> bool {
 /// How many of a caller's bytes to copy: never more than they passed, never
 /// more than this build understands.
 ///
-/// Split out because it is the ABI's forward-compatibility rule and, today,
-/// unreachable: `AWG_PARAMS_SIZE_VER0` equals this build's size, so a struct
-/// that is valid *and* short cannot exist yet, and the clamp cannot be
-/// exercised through [`read_awg_params`]. Extracting it makes the promise
-/// testable now rather than in the release that first depends on it -- when
-/// getting it wrong would read past a caller's allocation.
+/// Split out because it is the ABI's forward-compatibility rule, and it was
+/// unreachable through [`read_awg_params`] until the struct first grew; the
+/// pure function let it be pinned before any caller depended on it. A
+/// version-0 caller now exercises it on every call.
 fn awg_params_copy_len(caller_size: usize, our_size: usize) -> usize {
     caller_size.min(our_size)
 }
@@ -1390,11 +1404,11 @@ fn awg_params_copy_len(caller_size: usize, our_size: usize) -> usize {
 /// leading bytes set and the rest zero, which for a key is a tunnel mutually
 /// unreachable with its peer and no diagnostic anywhere.
 ///
-/// Split out for the same reason `awg_params_copy_len` is, and it needs it
-/// more: while `AWG_PARAMS_SIZE_VER0 == our_size` no size is both valid and
-/// short, so [`read_awg_params`] cannot reach this rule and deleting it outright
-/// leaves every other test green. A pure function can be pinned now instead of
-/// in the release that first depends on it.
+/// Split out for the same reason `awg_params_copy_len` is: it was pinned as a
+/// pure function while no size could be both valid and short. With two
+/// published versions it is load-bearing, and
+/// `a_version_0_caller_reads_as_random_trailers_off` drives it through
+/// [`read_awg_params`] too.
 fn awg_params_size_is_readable(caller_size: usize, our_size: usize) -> bool {
     caller_size >= our_size || AWG_PARAMS_PUBLISHED_SIZES.contains(&caller_size)
 }
@@ -1455,9 +1469,7 @@ unsafe fn read_awg_params(params: *const wireguard_awg_params) -> Option<wiregua
 
     // A short struct must be a size we actually published, not merely a size
     // above the floor: the clamp below copies `caller_size` bytes, and a size
-    // landing inside a field would copy that field in half. Unreachable while
-    // `AWG_PARAMS_SIZE_VER0 == our_size`; it becomes the load-bearing check the
-    // first time a field is appended.
+    // landing inside a field would copy that field in half.
     if !awg_params_size_is_readable(caller_size, our_size) {
         set_last_error(&format!(
             "Invalid AmneziaWG parameters: size is {}, which is not a published size of struct \
@@ -1613,6 +1625,18 @@ fn awg_params_to_config(
         return None;
     }
 
+    let random_trailers = match p.random_trailers {
+        0 => false,
+        1 => true,
+        other => {
+            set_last_error(&format!(
+                "Invalid AmneziaWG parameters: random_trailers is {}; it must be 0 (off) or 1 (on)",
+                other
+            ));
+            return None;
+        }
+    };
+
     let domain_supplied = imitation_domain.is_some();
 
     let config = AmneziaConfig::new(s1, s2, s3, s4)
@@ -1630,7 +1654,8 @@ fn awg_params_to_config(
             reject_after_time: p.reject_after_time.into(),
             keepalive_timeout: p.keepalive_timeout.into(),
             max_handshake_attempts: p.max_handshake_attempts.into(),
-        });
+        })
+        .with_random_trailers(random_trailers);
 
     // `AmneziaPreHandshakeJunk::new` substitutes silently rather than failing:
     // a Jc above its ceiling becomes 0 -- the burst switched off entirely --
@@ -2107,7 +2132,7 @@ mod tests {
         assert_eq!(std::mem::size_of_val(&r.lo), 4);
         assert_eq!(std::mem::size_of_val(&r.hi), 4);
 
-        assert_eq!(size_of::<wireguard_awg_params>(), 160);
+        assert_eq!(size_of::<wireguard_awg_params>(), 164);
         assert_eq!(align_of::<wireguard_awg_params>(), 4);
         // This build's size must be a *published* size -- not specifically
         // version 0's.
@@ -2241,6 +2266,11 @@ mod tests {
                 offset(&p.header_protection_key as *const u8),
                 128,
             ),
+            (
+                "random_trailers",
+                offset(&p.random_trailers as *const u32 as *const u8),
+                160,
+            ),
         ] {
             assert_eq!(
                 actual, expected,
@@ -2255,7 +2285,7 @@ mod tests {
         // every later offset stay put while the member reads fewer bytes. The
         // C guard missed exactly that until a mutation caught it, so both
         // sides check widths now.
-        // All twenty-three, matching `scripts/ffi-layout-check.c` one for one.
+        // All twenty-four, matching `scripts/ffi-layout-check.c` one for one.
         // This list used to hold fourteen while the comment above claimed
         // "both sides check widths now" -- and the nine it omitted included
         // `reject_after_time`, the field every rationale in this commit names
@@ -2283,6 +2313,7 @@ mod tests {
         assert_eq!(std::mem::size_of_val(&p.keepalive_timeout), 8);
         assert_eq!(std::mem::size_of_val(&p.max_handshake_attempts), 8);
         assert_eq!(std::mem::size_of_val(&p.header_protection_key), 32);
+        assert_eq!(std::mem::size_of_val(&p.random_trailers), 4);
     }
 
     /// The two by-value return structs, pinned against the same answer
@@ -2570,11 +2601,13 @@ mod tests {
     #[test]
     fn awg_params_versioning_reads_short_and_refuses_used_unknown_fields() {
         last_tunnel_error_free();
+        let our = std::mem::size_of::<wireguard_awg_params>();
         let full = wireguard_awg_params {
-            size: AWG_PARAMS_SIZE_VER0 as u32,
+            size: our as u32,
             s1_init_junk: 120,
             rekey_after_time: wireguard_awg_range { lo: 30, hi: 40 },
             header_protection_key: [0xcd; 32],
+            random_trailers: 1,
             ..Default::default()
         };
 
@@ -2582,15 +2615,9 @@ mod tests {
         let read = unsafe { read_awg_params(&full) }.expect("our own size is valid");
         assert_eq!(read, full);
 
-        // A struct shorter than version 0 is refused outright. Note what this
-        // does NOT test: "a short struct's absent tail reads as unset" is
-        // unreachable today, because `AWG_PARAMS_SIZE_VER0` is this build's
-        // size, so no size is both valid and short. `awg_params_copy_len_*`
-        // pins the arithmetic; the copy that uses it has only ever run at
-        // `copy == our_size`. An earlier version of this test dressed the
-        // buffer up with a 0xff fill and a partial copy as though the tail were
-        // being observed -- setup that nothing could read, in front of an
-        // assertion about a different rule.
+        // A struct shorter than version 0 is refused outright. (The absent
+        // tail of a *published* short struct reading as unset is
+        // `a_version_0_caller_reads_as_random_trailers_off`.)
         let mut buffer = [0u8; 256];
         let short_len = 40usize;
         unsafe {
@@ -2648,24 +2675,21 @@ mod tests {
         // is not using the new fields.
         last_tunnel_error_free();
         let mut long = [0u8; 256];
-        let long_len = AWG_PARAMS_SIZE_VER0 + 8;
+        let long_len = our + 8;
         unsafe {
-            ptr::copy_nonoverlapping(
-                &full as *const _ as *const u8,
-                long.as_mut_ptr(),
-                AWG_PARAMS_SIZE_VER0,
-            );
+            ptr::copy_nonoverlapping(&full as *const _ as *const u8, long.as_mut_ptr(), our);
             ptr::write_unaligned(long.as_mut_ptr() as *mut u32, long_len as u32);
         }
         let read = unsafe { read_awg_params(long.as_ptr() as *const wireguard_awg_params) }
             .expect("a zero-padded newer struct is usable");
         assert_eq!(read.s1_init_junk, 120);
         assert_eq!(read.header_protection_key, [0xcd; 32]);
+        assert_eq!(read.random_trailers, 1);
 
         // The same struct with one non-zero byte in the unknown tail: the
         // caller is setting something this build does not implement, and
         // dropping it silently is how a tunnel ends up mutually unreachable.
-        long[AWG_PARAMS_SIZE_VER0 + 2] = 1;
+        long[our + 2] = 1;
         let refused = unsafe { read_awg_params(long.as_ptr() as *const wireguard_awg_params) };
         assert!(refused.is_none(), "a used unknown field must be refused");
         assert!(
@@ -2673,6 +2697,82 @@ mod tests {
             "{}",
             last_error_string()
         );
+    }
+
+    /// A caller built against the 160-byte header -- the first published
+    /// version -- is read with `random_trailers` off, whatever its memory holds
+    /// past its own struct; a size between the two versions is refused, since
+    /// it would copy the new field in half.
+    #[test]
+    fn a_version_0_caller_reads_as_random_trailers_off() {
+        last_tunnel_error_free();
+        // A 160-byte caller whose allocation happens to continue with 0xff:
+        // none of it may be read as `random_trailers`.
+        let mut buffer = [0xffu8; 256];
+        let v0 = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            s1_init_junk: 120,
+            random_trailers: 0xffff_ffff,
+            ..Default::default()
+        };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                &v0 as *const _ as *const u8,
+                buffer.as_mut_ptr(),
+                AWG_PARAMS_SIZE_VER0,
+            );
+        }
+        let read = unsafe { read_awg_params(buffer.as_ptr() as *const wireguard_awg_params) }
+            .expect("a published version-0 struct is readable");
+        assert_eq!(read.s1_init_junk, 120);
+        assert_eq!(read.random_trailers, 0, "the absent tail reads as unset");
+        assert!(!awg_params_to_config(&read, None).unwrap().random_trailers);
+
+        for between in AWG_PARAMS_SIZE_VER0 + 1..AWG_PARAMS_SIZE_VER1 {
+            unsafe {
+                ptr::write_unaligned(buffer.as_mut_ptr() as *mut u32, between as u32);
+            }
+            assert!(
+                unsafe { read_awg_params(buffer.as_ptr() as *const wireguard_awg_params) }
+                    .is_none(),
+                "size {} is inside random_trailers",
+                between
+            );
+            assert!(
+                last_error_string().contains("not a published size"),
+                "{}",
+                last_error_string()
+            );
+        }
+    }
+
+    /// `random_trailers` is 0 or 1 and nothing else; 1 reaches the tunnel.
+    #[test]
+    fn random_trailers_is_zero_or_one() {
+        last_tunnel_error_free();
+        let with = |random_trailers| wireguard_awg_params {
+            size: std::mem::size_of::<wireguard_awg_params>() as u32,
+            random_trailers,
+            ..Default::default()
+        };
+        assert!(
+            !awg_params_to_config(&with(0), None)
+                .unwrap()
+                .random_trailers
+        );
+        assert!(
+            awg_params_to_config(&with(1), None)
+                .unwrap()
+                .random_trailers
+        );
+        for bad in [2u32, 0x100, u32::MAX] {
+            assert!(awg_params_to_config(&with(bad), None).is_none(), "{}", bad);
+            assert!(
+                last_error_string().contains("random_trailers"),
+                "{}",
+                last_error_string()
+            );
+        }
     }
 
     /// The constructor validates the whole configuration before a tunnel
@@ -3358,7 +3458,7 @@ mod tests {
         type Mutator = (&'static str, fn(&mut wireguard_awg_params));
 
         let one = wireguard_awg_range { lo: 1, hi: 1 };
-        let mutators: [Mutator; 23] = [
+        let mutators: [Mutator; 24] = [
             ("size", |p| p.size += 1),
             ("s1_init_junk", |p| p.s1_init_junk += 1),
             ("s2_response_junk", |p| p.s2_response_junk += 1),
@@ -3388,6 +3488,7 @@ mod tests {
             ("header_protection_key", |p| {
                 p.header_protection_key[31] ^= 1
             }),
+            ("random_trailers", |p| p.random_trailers ^= 1),
         ];
 
         // A base with every field non-zero, so `hi` cannot be left behind by a
@@ -3417,6 +3518,7 @@ mod tests {
             keepalive_timeout: one,
             max_handshake_attempts: one,
             header_protection_key: [7u8; 32],
+            random_trailers: 1,
         };
         assert_eq!(base, base, "a struct must equal itself");
 

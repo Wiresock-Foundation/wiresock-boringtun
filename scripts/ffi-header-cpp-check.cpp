@@ -44,9 +44,11 @@ static bool (*const check_mtu)(const struct wireguard_tunnel *, uint32_t) =
 // a C++ compiler is a third implementation of the same rules, and it is the
 // one the consumer actually uses.
 static_assert(sizeof(struct wireguard_awg_range) == 8, "range must be two uint32_t");
-static_assert(sizeof(struct wireguard_awg_params) == 160, "params size is the ABI anchor");
+static_assert(sizeof(struct wireguard_awg_params) == 164, "params size is the ABI anchor");
 static_assert(offsetof(struct wireguard_awg_params, header_protection_key) == 128,
               "header_protection_key moved");
+static_assert(offsetof(struct wireguard_awg_params, random_trailers) == 160,
+              "random_trailers moved");
 
 // Returns the addresses OF the pointers, never the pointers themselves: a
 // function pointer compared against null is a diagnosable tautology under
