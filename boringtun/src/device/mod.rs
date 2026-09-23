@@ -379,6 +379,29 @@ fn authenticate_anonymous<'m>(
     Ok((peer, guard, packet))
 }
 
+/// Commit a reading `authenticate_anonymous` accepted from `from`.
+///
+/// A new source address is a new path, so the peer's UDP window starts again
+/// first (`Peer::prepare_path`): after authentication, so nothing unauthenticated
+/// can reset it, and before the commit, so a response or keepalive drawn now is
+/// sized for the path it is sent on, and an accepted transport frame's size
+/// counts toward the fresh window rather than being thrown away with the old
+/// one. amneziawg-go orders it the same way: `SetEndpointFromPacket` before
+/// the response is sent or the frame observed.
+///
+/// Endpoint acceptance is not moved: the handler still records `from` with
+/// `set_endpoint` only after a successful commit, exactly as before. That call
+/// finds the window already started for `from` and leaves it alone.
+fn commit_anonymous<'a>(
+    peer: &mut Peer,
+    packet: Authenticated,
+    from: SocketAddr,
+    dst: &'a mut [u8],
+) -> TunnResult<'a> {
+    peer.prepare_path(from);
+    peer.tunnel.commit(packet, dst)
+}
+
 /// Read and discard up to `MAX_ITR` queued datagrams.
 ///
 /// Required for correctness, not tidiness. `EventPoll::new_event` documents
@@ -1328,7 +1351,7 @@ impl Device {
 
                     // We found a peer, use it to decapsulate the message+
                     let mut flush = false; // Are there packets to send from the queue?
-                    match p.tunnel.commit(packet, &mut t.dst_buf[..]) {
+                    match commit_anonymous(&mut p, packet, from, &mut t.dst_buf[..]) {
                         TunnResult::Done => {}
                         TunnResult::Err(_) => continue,
                         TunnResult::WriteToNetwork(packet) => {
@@ -2021,6 +2044,283 @@ mod ingress_tests {
                 other => panic!("decapsulate did not deliver: {:?}", other),
             }
         }
+    }
+
+    /// What one anonymous-ingress datagram came to, owned so a test can keep
+    /// it past the buffer it was written into.
+    #[derive(Debug)]
+    enum Delivered {
+        /// No reading authenticated; the handler drops it.
+        Refused,
+        Network(Vec<u8>),
+        Tunnel,
+        Done,
+        Error,
+    }
+
+    /// A server peer and the client that dials it, handshaken, under a
+    /// RandomTrailers configuration with unequal S sizes.
+    struct Roaming {
+        client: Tunn,
+        /// The peer's window as the last commit left it, read before
+        /// `set_endpoint` ran: what any reply that commit produced was drawn
+        /// against.
+        window_at_commit: std::cell::Cell<u32>,
+        peer: Arc<Mutex<Peer>>,
+        peers: HashMap<x25519::PublicKey, Arc<Mutex<Peer>>>,
+        peers_by_idx: HashMap<u32, Arc<Mutex<Peer>>>,
+        server_secret: x25519::StaticSecret,
+        server_public: x25519::PublicKey,
+        limiter: RateLimiter,
+        amnezia: AmneziaConfig,
+    }
+
+    const ROAM_S: [u16; 4] = [40, 24, 32, 160];
+    const OLD_WINDOW: u32 = 1400;
+
+    impl Roaming {
+        fn new() -> Self {
+            const SERVER_IDX: u32 = 0x0012_3456;
+            let obf = ObfuscationRanges::default();
+            let amnezia = AmneziaConfig::new(ROAM_S[0], ROAM_S[1], ROAM_S[2], ROAM_S[3])
+                .with_random_trailers(true);
+            let server_secret = x25519::StaticSecret::random_from_rng(OsRng);
+            let server_public = x25519::PublicKey::from(&server_secret);
+            let client_secret = x25519::StaticSecret::random_from_rng(OsRng);
+            let client_public = x25519::PublicKey::from(&client_secret);
+            let mut client = Tunn::new_with_obfuscation(
+                client_secret,
+                server_public,
+                None,
+                None,
+                1,
+                None,
+                obf,
+                amnezia.clone(),
+            )
+            .unwrap();
+            let mut server = Tunn::new_with_obfuscation(
+                server_secret.clone(),
+                client_public,
+                None,
+                None,
+                SERVER_IDX,
+                None,
+                obf,
+                amnezia.clone(),
+            )
+            .unwrap();
+            let network = |r: TunnResult| match r {
+                TunnResult::WriteToNetwork(d) => d.to_vec(),
+                other => panic!("expected a datagram, got {:?}", other),
+            };
+            let mut buf = vec![0u8; MAX_UDP_SIZE];
+            let src = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)));
+            let init = network(client.format_handshake_initiation(&mut buf, false));
+            let response = network(server.decapsulate(src, &init, &mut buf));
+            let keepalive = network(client.decapsulate(src, &response, &mut buf));
+            assert!(matches!(
+                server.decapsulate(src, &keepalive, &mut buf),
+                TunnResult::Done
+            ));
+            let peer = Arc::new(Mutex::new(Peer::new(server, SERVER_IDX, None, None)));
+            Roaming {
+                client,
+                window_at_commit: std::cell::Cell::new(0),
+                peers: HashMap::from([(client_public, Arc::clone(&peer))]),
+                peers_by_idx: HashMap::from([(SERVER_IDX, Arc::clone(&peer))]),
+                peer,
+                server_secret,
+                server_public,
+                limiter: RateLimiter::new(&server_public, HANDSHAKE_RATE_LIMIT),
+                amnezia,
+            }
+        }
+
+        /// The peer settled on `endpoint`, with a window grown there.
+        fn settled_at(self, endpoint: SocketAddr) -> Self {
+            {
+                let p = self.peer.lock();
+                p.set_endpoint(endpoint);
+                p.tunnel.set_udp_window(OLD_WINDOW);
+            }
+            self
+        }
+
+        /// One datagram through the anonymous ingress, step for step as
+        /// `register_udp_handler` takes it: classify, try the readings,
+        /// commit the accepted one through `commit_anonymous`, and record the
+        /// source as the endpoint only if that commit did not fail.
+        fn ingress(&self, wire: &[u8], from: SocketAddr) -> Delivered {
+            let candidates = match probe_reply::classify(
+                wire,
+                &self.amnezia,
+                ObfuscationRanges::default(),
+                from,
+                None,
+                &mut ChaCha8Rng::seed_from_u64(1),
+            ) {
+                probe_reply::Ingress::Wireguard(candidates) => candidates,
+                _ => return Delivered::Refused,
+            };
+            let mut dst = vec![0u8; MAX_UDP_SIZE];
+            let (_, mut guard, packet) = match inbound::receive(
+                &self.amnezia,
+                ObfuscationRanges::default(),
+                &self.limiter,
+                Some(from.ip()),
+                &candidates,
+                wire,
+                |packet| {
+                    authenticate_anonymous(
+                        &self.peers,
+                        &self.peers_by_idx,
+                        &self.server_secret,
+                        &self.server_public,
+                        packet,
+                        &mut dst[..],
+                    )
+                },
+            ) {
+                inbound::Inbound::Accepted(accepted) => accepted,
+                _ => return Delivered::Refused,
+            };
+            // The same buffer the trial wrote the plaintext into, as the
+            // handler uses `t.dst_buf` for both.
+            let delivered = match commit_anonymous(&mut guard, packet, from, &mut dst[..]) {
+                TunnResult::WriteToNetwork(d) => Delivered::Network(d.to_vec()),
+                TunnResult::WriteToTunnelV4(..) => Delivered::Tunnel,
+                TunnResult::WriteToTunnelV6(..) => Delivered::Tunnel,
+                TunnResult::Done => Delivered::Done,
+                TunnResult::Err(_) => return Delivered::Error,
+            };
+            self.window_at_commit.set(guard.tunnel.udp_window());
+            guard.set_endpoint(from);
+            delivered
+        }
+
+        fn window(&self) -> u32 {
+            self.peer.lock().tunnel.udp_window()
+        }
+
+        fn endpoint(&self) -> Option<SocketAddr> {
+            self.peer.lock().endpoint().addr
+        }
+
+        /// A transport datagram from the client carrying a `len`-byte packet.
+        fn transport(&mut self, len: usize) -> Vec<u8> {
+            let mut packet = vec![0u8; len];
+            packet[0] = 0x45;
+            packet[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+            packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
+            packet[16..20].copy_from_slice(&[10, 0, 0, 1]);
+            let mut buf = vec![0u8; MAX_UDP_SIZE];
+            match self.client.encapsulate(&packet, &mut buf) {
+                TunnResult::WriteToNetwork(d) => d.to_vec(),
+                other => panic!("expected transport, got {:?}", other),
+            }
+        }
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// An initiation from a new address is answered on the new path's fresh
+    /// window, not the old path's. The window is 500 when the response is
+    /// drawn -- read after the commit, which a handshake message does not grow
+    /// -- and the response is below it. The endpoint is then recorded as
+    /// before.
+    ///
+    /// Before the fix the reset ran in `set_endpoint`, after the commit, so
+    /// the response was drawn against the old 1400-byte window.
+    #[test]
+    fn a_roaming_initiation_is_answered_on_the_fresh_window() {
+        let mut r = Roaming::new().settled_at(addr("198.51.100.1:40000"));
+        let mut buf = vec![0u8; MAX_UDP_SIZE];
+        let init = match r.client.format_handshake_initiation(&mut buf, true) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+        let response = match r.ingress(&init, addr("203.0.113.9:51000")) {
+            Delivered::Network(d) => d,
+            other => panic!("expected a response, got {:?}", other),
+        };
+        assert_eq!(
+            r.window_at_commit.get(),
+            crate::noise::amnezia::DEFAULT_UDP_WINDOW,
+            "the window the response was drawn against"
+        );
+        assert_eq!(r.window(), crate::noise::amnezia::DEFAULT_UDP_WINDOW);
+        let base = ROAM_S[1] as usize + 92;
+        assert!(
+            response.len() >= base
+                && response.len() < crate::noise::amnezia::DEFAULT_UDP_WINDOW as usize,
+            "a {}-byte response is not drawn below the fresh window",
+            response.len()
+        );
+        assert_eq!(r.endpoint(), Some(addr("203.0.113.9:51000")));
+    }
+
+    /// An authenticated transport frame from a new address starts the window
+    /// afresh and then counts toward it, and recording the endpoint afterwards
+    /// keeps that: the window is exactly the frame's receive observation --
+    /// neither the old path's 1400 nor a second reset's 500. A port-only change
+    /// is a new path too.
+    #[test]
+    fn a_roaming_transport_frame_counts_toward_the_fresh_window() {
+        for new_source in ["203.0.113.9:51000", "198.51.100.1:40001"] {
+            let mut r = Roaming::new().settled_at(addr("198.51.100.1:40000"));
+            let wire = r.transport(900);
+            match r.ingress(&wire, addr(new_source)) {
+                Delivered::Tunnel => {}
+                other => panic!("expected delivery, got {:?}", other),
+            }
+            let observed = (wire.len() - 16) as u32;
+            assert_eq!(
+                r.window_at_commit.get(),
+                observed,
+                "{}: at commit",
+                new_source
+            );
+            assert!(observed > crate::noise::amnezia::DEFAULT_UDP_WINDOW && observed < OLD_WINDOW);
+            assert_eq!(
+                r.window(),
+                observed,
+                "{}: the fresh window must hold this frame's observation",
+                new_source
+            );
+            assert_eq!(r.endpoint(), Some(addr(new_source)));
+        }
+    }
+
+    /// Nothing moves the window for the address it was measured on, and
+    /// nothing unauthenticated moves it at all: a forged frame from a new
+    /// address neither resets the window nor becomes the endpoint.
+    #[test]
+    fn only_an_authenticated_new_path_resets_the_window() {
+        let old = addr("198.51.100.1:40000");
+        let mut r = Roaming::new().settled_at(old);
+        let wire = r.transport(900);
+        assert!(matches!(r.ingress(&wire, old), Delivered::Tunnel));
+        assert_eq!(
+            r.window(),
+            OLD_WINDOW,
+            "same path: kept, and not grown past it"
+        );
+
+        let mut forged = r.transport(900);
+        *forged.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            r.ingress(&forged, addr("203.0.113.9:51000")),
+            Delivered::Refused
+        ));
+        assert_eq!(
+            r.window(),
+            OLD_WINDOW,
+            "a forgery must not reset the window"
+        );
+        assert_eq!(r.endpoint(), Some(old), "nor become the endpoint");
     }
 
     /// An AmneziaWG client's obfuscated initiation is demuxed to the right peer.
