@@ -518,6 +518,55 @@ enum PacketKind {
     TransportData,
 }
 
+/// One way to read an inbound datagram: a packet kind at that kind's S offset.
+///
+/// Carries everything needed to recover the canonical message from the
+/// original datagram again -- where it starts, how long it is, and whether it
+/// was header-protected -- so each reading can be normalised from the same
+/// untouched bytes. Built only by [`AmneziaConfig::inbound_candidates`], and
+/// only meaningful against the datagram it was built from.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct InboundCandidate {
+    kind: PacketKind,
+    /// Where the canonical message starts: the kind's S size.
+    offset: usize,
+    /// The canonical message's length -- the kind's fixed size for the
+    /// handshake kinds, the rest of the datagram for transport.
+    message_len: usize,
+    /// The datagram's length as it arrived.
+    wire_len: usize,
+    /// Whether the message was header-protected and must be unmasked.
+    protected: bool,
+}
+
+/// The candidate readings of one datagram, at most one per packet kind, in
+/// trial order: initiation, response, cookie reply, transport.
+///
+/// A fixed array rather than a `Vec`, because the bound is structural -- four
+/// kinds, one offset each -- and building it runs for every datagram received.
+#[derive(Debug, Copy, Clone, Default)]
+pub(crate) struct InboundCandidates([Option<InboundCandidate>; 4]);
+
+impl InboundCandidates {
+    /// No reading fits: the datagram is not AmneziaWG traffic at all. What
+    /// the device's ingress asks before it lets probe classification look.
+    #[cfg(feature = "device")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.iter().all(Option::is_none)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &InboundCandidate> {
+        self.0.iter().flatten()
+    }
+
+    /// Each candidate's offset, in trial order -- which, in a fixture whose S
+    /// sizes are distinct, says which kinds were found.
+    #[cfg(test)]
+    pub(crate) fn offsets(&self) -> Vec<usize> {
+        self.iter().map(|c| c.offset).collect()
+    }
+}
+
 /// Whether a cookie reply of `reply_len` wire bytes amplifies the `request_len`
 /// datagram that provoked it.
 ///
@@ -1131,90 +1180,178 @@ impl AmneziaConfig {
         }
     }
 
-    fn inbound_kind_at_offset(
-        &self,
-        obf: ObfuscationRanges,
-        packet: &[u8],
-        kind: PacketKind,
-        base_size: usize,
-        mask: [u8; TYPE_MASK_SIZE],
-    ) -> bool {
-        let junk_size = self.inbound_junk_size(kind);
-        if packet.len() != junk_size + base_size {
-            return false;
-        }
-        Self::read_tag_masked(packet, junk_size, mask)
-            .map(|tag| Self::tag_matches(obf, kind, tag))
-            .unwrap_or(false)
-    }
-
-    /// Strip the AmneziaWG junk prefix from an inbound datagram, or reject it.
+    /// Every packet kind an inbound datagram could be, in trial order.
     ///
-    /// Returns `None` when the datagram matches no configured packet shape.
+    /// At most one candidate per kind, each at that kind's own S offset: the
+    /// three handshake kinds by exact size, transport by minimum size, and each
+    /// only when the tag at its offset -- unmasked, when a header-protection key
+    /// is set -- falls in its kind's H range. Nothing else is scanned, neither
+    /// another offset nor another length, so the list is bounded at four and
+    /// costs four length compares, four range tests and at most one keystream
+    /// block to build.
     ///
     /// The padding rule is *per packet kind*, not global: a kind whose S is
     /// non-zero must arrive padded, while a kind whose S is zero must arrive
     /// unpadded. A configuration with `S1 = 15, S4 = 0` therefore rejects a
     /// bare initiation and accepts a bare transport packet, and both are
-    /// correct. Rejecting everything unpadded would break the second case.
+    /// correct. A datagram matching no kind is not re-read at offset 0 either:
+    /// the S-prefix is an input filter, as in the kernel module, which drops
+    /// such a datagram outright (`prepare_awg_message`, `src/receive.c`).
     ///
-    /// Handing a non-matching datagram back unmodified -- as this used to --
-    /// let the caller re-read the tag at offset 0 and accept it, which made
-    /// the S-prefix an obfuscation rather than an input filter. The kernel
-    /// module drops such a datagram outright (`prepare_awg_message`,
-    /// `src/receive.c`).
+    /// The list can hold more than one candidate. The H ranges are disjoint, so
+    /// one offset matches at most one kind -- but the offsets differ per kind. A
+    /// datagram of `S1 + 148` bytes whose tag at `S1` is in H1 is *also* a
+    /// transport candidate when `S1 + 148 >= S4 + 32` and its bytes at `S4`
+    /// happen to be in H4, and two handshake kinds collide the same way when
+    /// their S sizes differ by the gap between their message sizes. Which
+    /// reading is real is settled only by authenticating it, so the receive
+    /// paths try every candidate in this order, and a reading that fails does
+    /// not end the search (`noise::inbound`).
     ///
-    /// A datagram cannot match two kinds: `ObfuscationRanges::new` validates
-    /// the H ranges as non-overlapping, and the three handshake kinds have
-    /// distinct fixed sizes. With every S at zero these tests reduce to the
-    /// same (tag, length) pairs `Tunn::parse_incoming_packet` applies, so
-    /// plain WireGuard is unaffected.
+    /// Empty means the datagram is not AmneziaWG traffic, and is what sends it
+    /// on to probe classification. With every S at zero these tests reduce to
+    /// the (tag, length) pairs `Tunn::parse_incoming_packet` applies, and the
+    /// three handshake sizes are distinct, so plain WireGuard always sees the
+    /// one candidate it always did.
+    ///
+    /// With a key set, the tag is range-tested *unmasked*: the tag on the wire
+    /// is XORed, so testing it raw would reject every packet and accept packets
+    /// nobody masked. The same four keystream bytes apply at every offset,
+    /// because the sender starts its keystream at the message, whatever the
+    /// padding in front of it. A candidate whose prefix cannot hold the nonce
+    /// is left out rather than read unprotected; the constructors refuse such a
+    /// configuration, but a device configuration supplied at startup does not
+    /// pass through them.
+    pub(crate) fn inbound_candidates(
+        &self,
+        obf: ObfuscationRanges,
+        datagram: &[u8],
+    ) -> InboundCandidates {
+        if !self.header_protection_enabled() {
+            // No key: the ordinary path, byte-identical to before.
+            return self.candidates_under_mask(obf, datagram, [0u8; TYPE_MASK_SIZE], false);
+        }
+        match self.header_protection.type_mask(datagram) {
+            Some(mask) => self.candidates_under_mask(obf, datagram, mask, true),
+            // Too short to nonce, and so too short for any packet kind.
+            None => InboundCandidates::default(),
+        }
+    }
+
+    /// [`Self::inbound_candidates`] with the type mask already chosen.
+    fn candidates_under_mask(
+        &self,
+        obf: ObfuscationRanges,
+        datagram: &[u8],
+        mask: [u8; TYPE_MASK_SIZE],
+        protected: bool,
+    ) -> InboundCandidates {
+        let wire_len = datagram.len();
+        let mut found = InboundCandidates::default();
+        for (slot, (kind, exact_len)) in [
+            (PacketKind::HandshakeInit, Some(HANDSHAKE_INIT_SZ)),
+            (PacketKind::HandshakeResponse, Some(HANDSHAKE_RESP_SZ)),
+            (PacketKind::CookieReply, Some(COOKIE_REPLY_SZ)),
+            // Transport is variable length, so a minimum rather than an exact
+            // size. With S4 = 0 the offset is 0 and this is the vanilla check.
+            (PacketKind::TransportData, None),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let kind = *kind;
+            let offset = self.inbound_junk_size(kind);
+            let fits = match *exact_len {
+                Some(len) => wire_len == offset + len,
+                None => wire_len >= offset + DATA_OVERHEAD_SZ,
+            };
+            if !fits || (protected && offset < NONCE_SIZE) {
+                continue;
+            }
+            let tag_matches = Self::read_tag_masked(datagram, offset, mask)
+                .map(|tag| Self::tag_matches(obf, kind, tag))
+                .unwrap_or(false);
+            if tag_matches {
+                found.0[slot] = Some(InboundCandidate {
+                    kind,
+                    offset,
+                    message_len: wire_len - offset,
+                    wire_len,
+                    protected,
+                });
+            }
+        }
+        found
+    }
+
+    /// The canonical message `candidate` reads out of `datagram`.
+    ///
+    /// Borrowed straight from `datagram` when the candidate is unprotected.
+    /// Otherwise copied into `scratch` and unmasked there, so `datagram` stays
+    /// the bytes that arrived: every candidate starts from them, and so does
+    /// probe classification if none of them is ours. Unmasking in place would
+    /// leave a failed reading's XOR behind for the next one to trip over.
+    ///
+    /// `None` only if the unmask refuses, which the conditions
+    /// [`Self::inbound_candidates`] applies already rule out.
+    pub(crate) fn candidate_message<'a>(
+        &self,
+        datagram: &'a [u8],
+        candidate: &InboundCandidate,
+        scratch: &'a mut Vec<u8>,
+    ) -> Option<&'a [u8]> {
+        debug_assert_eq!(datagram.len(), candidate.wire_len);
+        let message = datagram.get(candidate.offset..candidate.offset + candidate.message_len)?;
+        if !candidate.protected {
+            return Some(message);
+        }
+        scratch.clear();
+        scratch.extend_from_slice(message);
+        let masked = Self::masked_len(candidate.kind, candidate.message_len);
+        if !self
+            .header_protection
+            .unmask_detached(datagram, scratch, masked)
+        {
+            return None;
+        }
+        Some(scratch)
+    }
+
+    /// The first candidate's message, with the tag read through no mask.
+    ///
+    /// The one-verdict view the receive path had before it learned to try
+    /// several readings, kept for the tests written against it: they pin the
+    /// shape rules, which [`Self::candidates_under_mask`] still applies. The
+    /// zero mask is deliberate even with a key set -- several of those tests
+    /// use it to show what an *unprotected* receiver would accept.
+    #[cfg(test)]
     pub(crate) fn strip_inbound<'a>(
         &self,
         obf: ObfuscationRanges,
         packet: &'a [u8],
     ) -> Option<&'a [u8]> {
-        self.classify_inbound(obf, packet, [0u8; TYPE_MASK_SIZE])
-            .map(|(_, junk)| &packet[junk..])
+        self.candidates_under_mask(obf, packet, [0u8; TYPE_MASK_SIZE], false)
+            .iter()
+            .next()
+            .map(|c| &packet[c.offset..])
     }
 
-    /// Classify an inbound datagram, returning its kind and junk offset.
-    ///
-    /// `mask` unmasks the candidate type field as it is tested, which is what
-    /// lets header protection be undone *before* the H1-H4 range test rather
-    /// than after: the tag on the wire is XORed, so range-testing it raw would
-    /// reject every packet. The same four bytes apply at every candidate
-    /// offset, because the sender always starts its keystream at the message,
-    /// whatever the padding in front of it.
-    fn classify_inbound(
+    /// Unmask the first candidate in place and return its offset -- the old
+    /// receive step, rebuilt on the candidate list for the tests written
+    /// against it. A datagram with no candidate is left untouched.
+    #[cfg(test)]
+    pub(crate) fn unmask_and_classify_inbound(
         &self,
         obf: ObfuscationRanges,
-        packet: &[u8],
-        mask: [u8; TYPE_MASK_SIZE],
-    ) -> Option<(PacketKind, usize)> {
-        for (kind, base) in [
-            (PacketKind::HandshakeInit, HANDSHAKE_INIT_SZ),
-            (PacketKind::HandshakeResponse, HANDSHAKE_RESP_SZ),
-            (PacketKind::CookieReply, COOKIE_REPLY_SZ),
-        ] {
-            if self.inbound_kind_at_offset(obf, packet, kind, base, mask) {
-                return Some((kind, self.inbound_junk_size(kind)));
-            }
-        }
-
-        // Transport data is variable length, so this is a minimum rather than
-        // an exact size. With S4 = 0 the offset is 0 and this is exactly the
-        // vanilla check.
-        let junk = self.inbound_junk_size(PacketKind::TransportData);
-        if packet.len() >= junk + DATA_OVERHEAD_SZ
-            && Self::read_tag_masked(packet, junk, mask)
-                .map(|tag| Self::tag_matches(obf, PacketKind::TransportData, tag))
-                .unwrap_or(false)
-        {
-            return Some((PacketKind::TransportData, junk));
-        }
-
-        None
+        packet: &mut [u8],
+    ) -> Option<usize> {
+        let candidate = *self.inbound_candidates(obf, packet).iter().next()?;
+        let mut scratch = Vec::new();
+        let message = self
+            .candidate_message(packet, &candidate, &mut scratch)?
+            .to_vec();
+        packet[candidate.offset..].copy_from_slice(&message);
+        Some(candidate.offset)
     }
 
     /// How many bytes of a message of `kind` the sender masked.
@@ -1238,45 +1375,6 @@ impl AmneziaConfig {
             PacketKind::TransportData => TRANSPORT_HEADER_SZ,
             _ => message_len,
         }
-    }
-
-    /// Undo header protection on a received datagram and strip its junk prefix.
-    ///
-    /// Combines what [`Self::strip_inbound`] does with the unmasking, because
-    /// the two cannot be separated: classification needs the type field
-    /// unmasked, and unmasking the body needs the padding that classification
-    /// determines.
-    /// Returns the junk-prefix length, so the caller slices its own buffer.
-    /// Returning a slice instead would borrow `packet` for the caller's whole
-    /// use of it, which conflicts with the `&mut` this needs.
-    pub(crate) fn unmask_and_classify_inbound(
-        &self,
-        obf: ObfuscationRanges,
-        packet: &mut [u8],
-    ) -> Option<usize> {
-        let Some(mask) = self.header_protection.type_mask(packet) else {
-            // No key: the ordinary path, byte-identical to before.
-            let (_, junk) = self.classify_inbound(obf, packet, [0u8; TYPE_MASK_SIZE])?;
-            return Some(junk);
-        };
-
-        let (kind, junk) = self.classify_inbound(obf, packet, mask)?;
-        let message_len = packet.len() - junk;
-        let masked = Self::masked_len(kind, message_len);
-
-        // Body first, then the type field. The order matters only on the
-        // failure path: unmasking the type field is an in-place XOR that cannot
-        // report failure, so doing it first would leave the caller holding a
-        // datagram with four corrupted bytes when `unmask_inbound` then refuses
-        // -- and the caller's contract is that a rejected datagram is unchanged,
-        // because it goes on to probe classification.
-        if !self.header_protection.unmask_inbound(packet, junk, masked) {
-            return None;
-        }
-        for i in 0..TYPE_MASK_SIZE {
-            packet[junk + i] ^= mask[i];
-        }
-        Some(junk)
     }
 
     fn classify_outbound(&self, obf: ObfuscationRanges, packet: &[u8]) -> Option<PacketKind> {

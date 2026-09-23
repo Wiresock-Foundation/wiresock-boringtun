@@ -52,7 +52,9 @@
 //! is what makes it line up with a sender that XORed the whole message in one
 //! pass from offset zero.
 
-use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+#[cfg(test)]
+use chacha20::cipher::StreamCipherSeek;
+use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
 
 /// Bytes of the junk prefix used as the ChaCha20 nonce.
@@ -162,6 +164,38 @@ impl HeaderProtectionKey {
         Some(mask)
     }
 
+    /// Unmask a detached copy of one inbound message, leaving the datagram alone.
+    ///
+    /// `datagram` is the datagram as received, and only its first
+    /// [`NONCE_SIZE`] bytes are read. `message` is a copy of the message that
+    /// sat at some offset in it, and its first `len` bytes were masked. The
+    /// sender's keystream starts at the message, whatever the padding in front
+    /// of it, so the copy is unmasked from keystream position zero -- type field
+    /// and body in one pass.
+    ///
+    /// Detached because a receiver may have to read one datagram as several
+    /// packet kinds at several offsets before one of them authenticates. Each
+    /// reading unmasks its own copy, so a reading that fails cannot leave the
+    /// datagram XORed for the next one.
+    ///
+    /// The same bytes [`Self::type_mask`] followed by [`Self::unmask_inbound`]
+    /// produce in place; `detached_unmask_matches_the_in_place_one` pins that.
+    pub(crate) fn unmask_detached(&self, datagram: &[u8], message: &mut [u8], len: usize) -> bool {
+        if !self.is_set() {
+            return true;
+        }
+        if datagram.len() < NONCE_SIZE || message.len() < len || len < TYPE_MASK_SIZE {
+            return false;
+        }
+        let mut nonce = [0u8; NONCE_SIZE];
+        nonce.copy_from_slice(&datagram[..NONCE_SIZE]);
+        let Some(mut cipher) = self.cipher(&nonce) else {
+            return true;
+        };
+        cipher.apply_keystream(&mut message[..len]);
+        true
+    }
+
     /// Unmask an inbound message in place, once its padding is known.
     ///
     /// Skips the first [`TYPE_MASK_SIZE`] bytes: the caller has already applied
@@ -169,6 +203,10 @@ impl HeaderProtectionKey {
     /// and re-applying it here would mask it straight back. The cipher is
     /// *seeked* to that offset rather than restarted, so the stream stays
     /// continuous with the sender's single pass.
+    ///
+    /// Test-only since receive moved to [`Self::unmask_detached`]: it is the
+    /// in-place reference that one is pinned against.
+    #[cfg(test)]
     pub(crate) fn unmask_inbound(&self, datagram: &mut [u8], offset: usize, len: usize) -> bool {
         if !self.is_set() {
             return true;
@@ -238,6 +276,39 @@ mod tests {
 
     /// The type mask must be the same four bytes whatever the padding is --
     /// that is what lets a receiver classify before it knows the padding.
+    /// The detached unmask recovers exactly what the in-place one does, and
+    /// never touches the datagram it takes its nonce from.
+    #[test]
+    fn detached_unmask_matches_the_in_place_one() {
+        let k = key();
+        for (offset, len, masked) in [(120usize, 148usize, 148usize), (12, 200, 16)] {
+            let mut wire = vec![0u8; offset + len];
+            for (i, b) in wire.iter_mut().enumerate() {
+                *b = (i * 11 + 5) as u8;
+            }
+            let original = wire.clone();
+            assert!(k.mask_outbound(&mut wire, offset, masked));
+            let received = wire.clone();
+
+            let mut in_place = wire.clone();
+            let mask = k.type_mask(&in_place).expect("key is set");
+            for i in 0..TYPE_MASK_SIZE {
+                in_place[offset + i] ^= mask[i];
+            }
+            assert!(k.unmask_inbound(&mut in_place, offset, masked));
+
+            let mut copy = wire[offset..].to_vec();
+            assert!(k.unmask_detached(&wire, &mut copy, masked));
+            assert_eq!(copy, &in_place[offset..], "the two unmasks disagree");
+            assert_eq!(
+                copy,
+                &original[offset..],
+                "unmasking must recover the message"
+            );
+            assert_eq!(wire, received, "the datagram itself must be untouched");
+        }
+    }
+
     #[test]
     fn the_type_mask_does_not_depend_on_the_padding_length() {
         let k = key();

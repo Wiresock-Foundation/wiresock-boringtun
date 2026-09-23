@@ -168,27 +168,13 @@ impl RateLimiter {
         if let Packet::HandshakeInit(HandshakeInit { sender_idx, .. })
         | Packet::HandshakeResponse(HandshakeResponse { sender_idx, .. }) = packet
         {
-            let (msg, macs) = src.split_at(src.len() - 32);
-            let (mac1, mac2) = macs.split_at(16);
-
-            let computed_mac1 = b2s_keyed_mac_16(&self.mac1_key, msg);
-            if !constant_time_eq(&computed_mac1[..16], mac1) {
-                return Err(TunnResult::Err(WireGuardError::InvalidMac));
-            }
-
-            if self.is_under_load() {
-                let addr = match src_addr {
-                    None => return Err(TunnResult::Err(WireGuardError::UnderLoad)),
-                    Some(addr) => addr,
-                };
-
-                // Only given an address can we validate mac2
-                let cookie = self.current_cookie(addr);
-                let computed_mac2 = b2s_keyed_mac_16_2(&cookie, msg, mac1);
-
-                if !constant_time_eq(&computed_mac2[..16], mac2) {
+            match self.gate_handshake(src_addr, src, sender_idx, &mut LoadDecision::default()) {
+                HandshakeGate::Pass => {}
+                HandshakeGate::BadMac => return Err(TunnResult::Err(WireGuardError::InvalidMac)),
+                HandshakeGate::UnderLoad => return Err(TunnResult::Err(WireGuardError::UnderLoad)),
+                HandshakeGate::CookieDemanded(demand) => {
                     let cookie_packet = self
-                        .format_cookie_reply(obf, rng, sender_idx, cookie, mac1, dst)
+                        .format_cookie_demand(obf, rng, &demand, dst)
                         .map_err(TunnResult::Err)?;
                     return Err(TunnResult::WriteToNetwork(cookie_packet));
                 }
@@ -197,4 +183,105 @@ impl RateLimiter {
 
         Ok(packet)
     }
+
+    /// The mac1 and load checks for one handshake message, without formatting
+    /// anything.
+    ///
+    /// `message` is the canonical initiation or response, macs included. The
+    /// order is the one `verify_packet` has always applied: mac1 first, and
+    /// only a message with a valid mac1 is counted against the load budget.
+    ///
+    /// `load` is where the load decision for the *datagram* lives. A receiver
+    /// reading one datagram as several packet kinds may reach this more than
+    /// once -- an initiation at one offset, a response at another -- and a
+    /// datagram is one event for the budget however many ways it is read. The
+    /// first call that gets past mac1 decides and records it; later calls
+    /// reuse it without counting again.
+    pub(crate) fn gate_handshake(
+        &self,
+        src_addr: Option<IpAddr>,
+        message: &[u8],
+        sender_idx: u32,
+        load: &mut LoadDecision,
+    ) -> HandshakeGate {
+        let (msg, macs) = message.split_at(message.len() - 32);
+        let (mac1, mac2) = macs.split_at(16);
+
+        let computed_mac1 = b2s_keyed_mac_16(&self.mac1_key, msg);
+        if !constant_time_eq(&computed_mac1[..16], mac1) {
+            return HandshakeGate::BadMac;
+        }
+
+        let under_load = *load.0.get_or_insert_with(|| self.is_under_load());
+        if !under_load {
+            return HandshakeGate::Pass;
+        }
+        let addr = match src_addr {
+            None => return HandshakeGate::UnderLoad,
+            Some(addr) => addr,
+        };
+
+        // Only given an address can we validate mac2
+        let cookie = self.current_cookie(addr);
+        let computed_mac2 = b2s_keyed_mac_16_2(&cookie, msg, mac1);
+
+        if !constant_time_eq(&computed_mac2[..16], mac2) {
+            let mut last_mac1 = [0u8; 16];
+            last_mac1.copy_from_slice(mac1);
+            return HandshakeGate::CookieDemanded(CookieDemand {
+                sender_idx,
+                cookie,
+                mac1: last_mac1,
+            });
+        }
+        HandshakeGate::Pass
+    }
+
+    /// Format the cookie reply a [`HandshakeGate::CookieDemanded`] called for.
+    pub(crate) fn format_cookie_demand<'a>(
+        &self,
+        obf: ObfuscationRanges,
+        rng: &mut impl RngCore,
+        demand: &CookieDemand,
+        dst: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        self.format_cookie_reply(
+            obf,
+            rng,
+            demand.sender_idx,
+            demand.cookie,
+            &demand.mac1,
+            dst,
+        )
+    }
+}
+
+/// Whether the limiter was under load when one received datagram reached it,
+/// decided at most once per datagram. See [`RateLimiter::gate_handshake`].
+#[derive(Default)]
+pub(crate) struct LoadDecision(Option<bool>);
+
+/// What [`RateLimiter::gate_handshake`] makes of one handshake message.
+pub(crate) enum HandshakeGate {
+    /// mac1 holds, and either the limiter is not under load or mac2 holds too:
+    /// the message may go on to the Noise handshake.
+    Pass,
+    /// mac1 does not hold. Not a handshake message to this key.
+    BadMac,
+    /// Under load, with no source address to check mac2 against.
+    UnderLoad,
+    /// Under load, and mac2 does not hold: the answer is a cookie reply, not
+    /// Noise work. Nothing about the sender has been authenticated -- mac1 is
+    /// keyed on our *public* key -- which is why a receiver with other readings
+    /// of the datagram to try holds this back until they have all failed.
+    CookieDemanded(CookieDemand),
+}
+
+/// The inputs to the cookie reply a [`HandshakeGate::CookieDemanded`] calls
+/// for, kept so the reply can be formatted only once it is known to be the
+/// answer.
+pub(crate) struct CookieDemand {
+    sender_idx: u32,
+    cookie: Cookie,
+    mac1: [u8; 16],
 }

@@ -523,6 +523,26 @@ struct Cookies {
     write_cookie: Option<[u8; 16]>,
 }
 
+/// An initiation that has authenticated but not yet been accepted.
+///
+/// What [`Handshake::authenticate_initiation`] learned, carried to
+/// [`Handshake::commit_initiation`] so the Noise work is done once.
+pub(crate) struct AuthenticatedInit {
+    chaining_key: [u8; KEY_LEN],
+    hash: [u8; KEY_LEN],
+    peer_ephemeral_public: x25519::PublicKey,
+    peer_index: u32,
+    timestamp: Tai64N,
+}
+
+/// A handshake response that has authenticated but not yet been accepted.
+pub(crate) struct AuthenticatedResponse {
+    /// Which in-flight initiation it answers: `previous`, or `state`.
+    is_previous: bool,
+    rtt_ms: u32,
+    session: Session,
+}
+
 #[derive(Debug)]
 pub struct HalfHandshake {
     pub peer_index: u32,
@@ -707,11 +727,19 @@ impl Handshake {
         self.params.preshared_key = preshared_key;
     }
 
-    pub(super) fn receive_handshake_initialization<'a>(
-        &mut self,
-        packet: HandshakeInit,
-        dst: &'a mut [u8],
-    ) -> Result<(&'a mut [u8], Session), WireGuardError> {
+    /// Authenticate an initiation without accepting it.
+    ///
+    /// Everything that can refuse the initiation happens here -- both AEAD
+    /// opens, the static-key check and the replay check on the timestamp --
+    /// and none of it writes: `&self` is what makes that a guarantee rather
+    /// than a convention. A receiver reading one datagram several ways can
+    /// therefore ask "is this an initiation from our peer?" and walk away on
+    /// "no" with the handshake state exactly as it was. What `Ok` means is
+    /// that [`Self::commit_initiation`] will take it.
+    pub(super) fn authenticate_initiation(
+        &self,
+        packet: &HandshakeInit,
+    ) -> Result<AuthenticatedInit, WireGuardError> {
         // initiator.chaining_key = HASH(CONSTRUCTION)
         let mut chaining_key = INITIAL_CHAIN_KEY;
         // initiator.hash = HASH(HASH(initiator.chaining_key || IDENTIFIER) || responder.static_public)
@@ -774,28 +802,58 @@ impl Handshake {
             // Possibly a replay
             return Err(WireGuardError::WrongTai64nTimestamp);
         }
-        self.last_handshake_timestamp = timestamp;
 
         // initiator.hash = HASH(initiator.hash || msg.encrypted_timestamp)
         hash = b2s_hash(&hash, packet.encrypted_timestamp);
 
+        Ok(AuthenticatedInit {
+            chaining_key,
+            hash,
+            peer_ephemeral_public,
+            peer_index,
+            timestamp,
+        })
+    }
+
+    /// Accept an authenticated initiation and answer it.
+    ///
+    /// The timestamp is recorded first, so a destination buffer too small for
+    /// the response fails *after* the initiation has been accepted -- as it
+    /// always has. Nothing between the two halves can have moved the timestamp:
+    /// both run under the one `&mut Tunn` borrow of a single receive.
+    pub(super) fn commit_initiation<'a>(
+        &mut self,
+        init: AuthenticatedInit,
+        dst: &'a mut [u8],
+    ) -> Result<(&'a mut [u8], Session), WireGuardError> {
+        self.last_handshake_timestamp = init.timestamp;
+
         self.previous = std::mem::replace(
             &mut self.state,
             HandshakeState::InitReceived {
-                chaining_key,
-                hash,
-                peer_ephemeral_public,
-                peer_index,
+                chaining_key: init.chaining_key,
+                hash: init.hash,
+                peer_ephemeral_public: init.peer_ephemeral_public,
+                peer_index: init.peer_index,
             },
         );
 
         self.format_handshake_response(dst)
     }
 
-    pub(super) fn receive_handshake_response(
-        &mut self,
-        packet: HandshakeResponse,
-    ) -> Result<Session, WireGuardError> {
+    /// Authenticate a handshake response without consuming the handshake it
+    /// answers.
+    ///
+    /// The receiver index picks which of our in-flight initiations this
+    /// answers, and a mismatch is refused before any Diffie-Hellman -- but the
+    /// index is only a routing hint, and it is the AEAD over the empty payload
+    /// that authenticates. `&self` for the reason
+    /// [`Self::authenticate_initiation`] gives: the initiation state this
+    /// would answer survives a refusal, so the real response can still use it.
+    pub(super) fn authenticate_response(
+        &self,
+        packet: &HandshakeResponse,
+    ) -> Result<AuthenticatedResponse, WireGuardError> {
         // Check if there is a handshake awaiting a response and return the correct one
         let (state, is_previous) = match (&self.state, &self.previous) {
             (HandshakeState::InitSent(s), _) if s.local_index == packet.receiver_idx => (s, false),
@@ -864,20 +922,38 @@ impl Handshake {
         let temp3 = b2s_hmac2(&temp1, &temp2, &[0x02]);
 
         let rtt_time = Instant::now().duration_since(state.time_sent);
-        self.last_rtt = Some(rtt_time.as_millis() as u32);
 
-        if is_previous {
+        Ok(AuthenticatedResponse {
+            is_previous,
+            rtt_ms: rtt_time.as_millis() as u32,
+            session: Session::new(local_index, peer_index, temp3, temp2),
+        })
+    }
+
+    /// Accept an authenticated response: retire the initiation it answered.
+    pub(super) fn commit_response(&mut self, response: AuthenticatedResponse) -> Session {
+        self.last_rtt = Some(response.rtt_ms);
+
+        if response.is_previous {
             self.previous = HandshakeState::None;
         } else {
             self.state = HandshakeState::None;
         }
-        Ok(Session::new(local_index, peer_index, temp3, temp2))
+        response.session
     }
 
-    pub(super) fn receive_cookie_reply(
-        &mut self,
-        packet: PacketCookieReply,
-    ) -> Result<(), WireGuardError> {
+    /// Decrypt a cookie reply without storing the cookie.
+    ///
+    /// A cookie reply authenticates nothing about its sender the way a Noise
+    /// message does; what makes one acceptable is context. It must name the
+    /// index of our last handshake message and decrypt under that message's
+    /// mac1 as associated data. Both are checked here, the index before the
+    /// XChaCha20-Poly1305 open, and a reply failing either leaves the cookie we
+    /// hold untouched.
+    pub(super) fn authenticate_cookie_reply(
+        &self,
+        packet: &PacketCookieReply,
+    ) -> Result<[u8; 16], WireGuardError> {
         let mac1 = match self.cookies.last_mac1 {
             Some(mac) => mac,
             None => {
@@ -901,11 +977,14 @@ impl Handshake {
             .decrypt(packet.nonce.into(), payload)
             .map_err(|_| WireGuardError::InvalidAeadTag)?;
 
-        let cookie = plaintext
+        plaintext
             .try_into()
-            .map_err(|_| WireGuardError::InvalidPacket)?;
+            .map_err(|_| WireGuardError::InvalidPacket)
+    }
+
+    /// Store a cookie [`Self::authenticate_cookie_reply`] accepted.
+    pub(super) fn commit_cookie(&mut self, cookie: [u8; 16]) {
         self.cookies.write_cookie = Some(cookie);
-        Ok(())
     }
 
     // Compute and append mac1 and mac2 to a handshake message
