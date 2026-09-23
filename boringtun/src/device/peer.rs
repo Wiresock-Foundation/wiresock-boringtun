@@ -166,6 +166,18 @@ impl Peer {
             }
 
             endpoint.addr = Some(addr);
+            // The AmneziaWG 3.1 UDP window describes the path to the address
+            // we just left. Compared by address, deliberately: amneziawg-go
+            // compares endpoint *objects*, so it also resets when a fresh object
+            // describes the same peer, and a window that resets on every
+            // re-registration never grows.
+            //
+            // The datagram that reveals the new address has usually been
+            // committed already -- the ingress calls this after
+            // `Tunn::commit` -- so its own size is not counted toward the fresh
+            // window, where upstream resets before counting. The next frame in
+            // either direction counts; the difference lasts one datagram.
+            self.tunnel.reset_udp_window();
             // The suppression describes the address we just left, not this
             // peer. Held across a roam it would strand the peer on the shared
             // listener for the life of the process after one bad endpoint --
@@ -393,6 +405,38 @@ mod tests {
             !peer.upgrade_suppressed(),
             "a roam to a different endpoint must rearm the upgrade"
         );
+    }
+
+    /// The AmneziaWG 3.1 UDP window follows the endpoint's *address*: a new
+    /// address -- a new port included -- starts it again at the default, and
+    /// the same address arriving again leaves it alone. amneziawg-go compares
+    /// endpoint objects instead, so a fresh object for the same address resets
+    /// it there; that is the behaviour this rules out.
+    #[test]
+    fn the_udp_window_resets_when_the_endpoint_address_changes_and_only_then() {
+        use crate::noise::amnezia::DEFAULT_UDP_WINDOW;
+        let peer = test_peer();
+        peer.tunnel.set_udp_window(1400);
+
+        peer.set_endpoint("192.0.2.7:51820".parse().unwrap());
+        assert_eq!(
+            peer.tunnel.udp_window(),
+            DEFAULT_UDP_WINDOW,
+            "first address"
+        );
+
+        peer.tunnel.set_udp_window(1400);
+        for _ in 0..3 {
+            peer.set_endpoint("192.0.2.7:51820".parse().unwrap());
+            assert_eq!(peer.tunnel.udp_window(), 1400, "the same address again");
+        }
+
+        peer.set_endpoint("192.0.2.7:51821".parse().unwrap());
+        assert_eq!(peer.tunnel.udp_window(), DEFAULT_UDP_WINDOW, "a new port");
+
+        peer.tunnel.set_udp_window(1400);
+        peer.set_endpoint("198.51.100.9:51821".parse().unwrap());
+        assert_eq!(peer.tunnel.udp_window(), DEFAULT_UDP_WINDOW, "a new host");
     }
 
     /// Environment marker naming the child half of the descriptor-exhaustion

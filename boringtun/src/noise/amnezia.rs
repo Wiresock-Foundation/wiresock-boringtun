@@ -1736,8 +1736,10 @@ impl AmneziaConfig {
 
     /// Frame an outgoing packet with no RandomTrailers suffix: its S prefix and
     /// header protection only. A suffix of zero is always valid on the wire, so
-    /// this is correct for any configuration; the tunnel's own send paths use
-    /// [`Self::prepend_outbound_with_trailer`] to draw one.
+    /// this is correct for any configuration. Test-only: every send path in the
+    /// crate now goes through [`Self::prepend_outbound_with_trailer`], and the
+    /// framing tests that predate 3.1 pin the prefix and masking through this.
+    #[cfg(test)]
     pub(crate) fn prepend_outbound<'a>(
         &self,
         obf: ObfuscationRanges,

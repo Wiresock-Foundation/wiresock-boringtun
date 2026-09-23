@@ -513,7 +513,7 @@ fn handshake_messages_draw_their_suffix_below_the_tunnel_window() {
         assert!(resps.iter().any(|&n| n > resp_base), "responses must vary");
 
         // The window governs: widened, the suffix follows it.
-        mine.udp_window = 1400;
+        mine.set_udp_window(1400);
         let widest = (0..64)
             .map(|_| network(mine.format_handshake_initiation(&mut buf, true)).len())
             .max()
@@ -552,7 +552,7 @@ fn a_cookie_reply_suffix_is_bounded_by_the_request() {
             None => amnezia,
         };
         let (mut mine, mut theirs) = cookie_pair(&amnezia);
-        theirs.udp_window = 60_000;
+        theirs.set_udp_window(60_000);
         let mut buf = vec![0u8; 4096];
         let mut grew = false;
         for _ in 0..64 {
