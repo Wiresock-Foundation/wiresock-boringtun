@@ -13,6 +13,9 @@ pub mod rate_limiter;
 
 // AmneziaWG 3.0 header protection: ChaCha20 keystream mask, nonce from the junk prefix.
 pub mod header_protection;
+// Receiving a datagram whose shape fits more than one packet kind. Crate-wide
+// because the device's anonymous ingress drives it too.
+pub(crate) mod inbound;
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
 pub(crate) mod quic;
 mod session;
@@ -26,6 +29,7 @@ use handshake::ObfuscationRanges;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
+use crate::noise::inbound::Inbound;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
 use crate::x25519;
@@ -175,6 +179,26 @@ pub enum Packet<'a> {
     HandshakeResponse(HandshakeResponse<'a>),
     PacketCookieReply(PacketCookieReply<'a>),
     PacketData(PacketData<'a>),
+}
+
+/// A received packet that has authenticated as the kind it claimed to be, and
+/// has not yet been acted on.
+///
+/// The token between [`Tunn::authenticate`] and [`Tunn::commit`]. It owns what
+/// authentication learned, so the Noise and AEAD work is done once whether or
+/// not the packet is accepted, and it borrows nothing from the datagram -- so a
+/// receiver can hold it past the loop that tried the datagram's other readings.
+pub(crate) enum Authenticated {
+    HandshakeInit(handshake::AuthenticatedInit),
+    /// Boxed: it carries the new `Session`, which is most of a kilobyte, and
+    /// a response is rare enough that the allocation costs nothing.
+    HandshakeResponse(Box<handshake::AuthenticatedResponse>),
+    CookieReply([u8; 16]),
+    /// The plaintext is in the `dst` handed to `authenticate`, at `..len`.
+    Data {
+        receiver_idx: u32,
+        len: usize,
+    },
 }
 
 impl Tunn {
@@ -658,62 +682,61 @@ impl Tunn {
             return self.send_queued_packet(dst);
         }
 
-        // The received datagram's length as it arrived on the wire, taken
-        // before the rebind below strips the junk prefix. The cookie-reply
-        // guard further down compares wire length against wire length --
-        // the same two numbers `device::reply_policy::cookie_verdict` uses
-        // (`packet_len` from `recv_from` against `cookie_reply_len`) -- so the
-        // two guards cannot disagree about what "larger than the packet that
-        // provoked it" means.
+        // The received datagram's length as it arrived on the wire, junk prefix
+        // included. The cookie-reply guard further down compares wire length
+        // against wire length -- the same two numbers
+        // `device::reply_policy::cookie_verdict` uses (`packet_len` from
+        // `recv_from` against `cookie_reply_len`) -- so the two guards cannot
+        // disagree about what "larger than the packet that provoked it" means.
         let wire_len = datagram.len();
 
-        // Header protection has to be undone before anything reads the message
-        // type, and undoing it mutates. The public signature takes `&[u8]`, and
-        // widening it would push a `&mut` requirement through `device`, the C
-        // API and the JNI bindings -- and make `wireguard_read` scribble on a
-        // buffer its header describes as the received packet. So the protected
-        // path copies instead.
+        // Every packet kind the datagram's shape fits, each at its own S offset.
+        // A datagram that fits none is rejected here rather than re-parsed at
+        // offset 0: with a junk prefix configured this is the S-prefix doing its
+        // job as an input filter.
         //
-        // The copy is one allocation per inbound datagram, and only when a key
-        // is set; the unprotected path below is untouched. A buffer owned by
-        // `Tunn` would avoid it, but it cannot be borrowed across the `&mut
-        // self` calls further down, so that wants `mem::take` and a restore on
-        // every early return -- worth doing, not worth doing first.
-        let unmasked;
-        let datagram = if self.amnezia.header_protection_enabled() {
-            let mut buf = datagram.to_vec();
-            match self
-                .amnezia
-                .unmask_and_classify_inbound(self.handshake.obf, &mut buf)
-            {
-                Some(junk) => {
-                    unmasked = buf;
-                    &unmasked[junk..]
-                }
-                None => return TunnResult::Err(WireGuardError::InvalidPacket),
-            }
-        } else {
-            // A datagram that matches no configured shape is rejected here
-            // rather than re-parsed at offset 0. With a junk prefix configured
-            // this is the S-prefix doing its job as an input filter.
-            match self.amnezia.strip_inbound(self.handshake.obf, datagram) {
-                Some(d) => d,
-                None => return TunnResult::Err(WireGuardError::InvalidPacket),
-            }
+        // More than one kind can fit, so the reading accepted is the first that
+        // authenticates, and a reading that fails changes nothing on the way
+        // (`inbound::receive`, and `authenticate` below). Header protection is
+        // undone per reading in a copy rather than in `datagram`: the public
+        // signature takes `&[u8]`, and widening it would push a `&mut`
+        // requirement through `device`, the C API and the JNI bindings -- and
+        // make `wireguard_read` scribble on a buffer its header describes as the
+        // received packet. The copy costs an allocation per datagram, and only
+        // when a key is set; the unprotected path borrows.
+        let obf = self.handshake.obf;
+        let candidates = self.amnezia.inbound_candidates(obf, datagram);
+        let outcome = {
+            let this = &*self;
+            inbound::receive(
+                &this.amnezia,
+                obf,
+                &this.rate_limiter,
+                src_addr,
+                &candidates,
+                datagram,
+                |packet| this.authenticate(packet, dst),
+            )
         };
-        let mut cookie = [0u8; COOKIE_REPLY_SZ];
-        let packet = match self.rate_limiter.verify_packet(
-            self.handshake.obf,
-            &mut self.handshake.rng,
-            src_addr,
-            datagram,
-            &mut cookie,
-        ) {
-            Ok(packet) => packet,
-            Err(TunnResult::WriteToNetwork(cookie)) => {
+
+        match outcome {
+            Inbound::Accepted(packet) => self.commit(packet, dst),
+            Inbound::NotOurs => TunnResult::Err(WireGuardError::InvalidPacket),
+            Inbound::Refused(e) => TunnResult::Err(e),
+            Inbound::Cookie(demand) => {
+                let mut cookie = [0u8; COOKIE_REPLY_SZ];
+                let cookie = match self.rate_limiter.format_cookie_demand(
+                    obf,
+                    &mut self.handshake.rng,
+                    &demand,
+                    &mut cookie,
+                ) {
+                    Ok(cookie) => cookie,
+                    Err(e) => return TunnResult::Err(e),
+                };
                 // The one place a `Tunn` emits a packet to an address it has
-                // not authenticated: `verify_packet` produces a cookie on a
-                // valid mac1, and mac1 is keyed on our *public* key, so any
+                // not authenticated: the limiter demands a cookie on a valid
+                // mac1, and mac1 is keyed on our *public* key, so any
                 // holder of a client config can provoke this from a forged
                 // source. If the reply as it would leave the wire -- cookie
                 // plus its S3 junk prefix -- is larger than the datagram that
@@ -724,8 +747,8 @@ impl Tunn {
                 // through the C constructors, which deliberately accept an
                 // amplifying S3 because a *client* is handed that value by its
                 // server and never reaches this arm (`wireguard_read` passes
-                // no source address, so `verify_packet` bails on `UnderLoad`
-                // before formatting). The device's ingress path applies the
+                // no source address, so `gate_handshake` bails on `UnderLoad`
+                // before demanding one). The device's ingress path applies the
                 // same parity rule through `reply_policy::cookie_verdict`,
                 // which reads the same `amnezia::reply_amplifies` this does --
                 // one expression, so the two cannot drift on which side of
@@ -787,40 +810,135 @@ impl Tunn {
                     return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
                 }
                 dst[..packet_size].copy_from_slice(cookie);
-                return self.write_to_network(dst, packet_size);
+                self.write_to_network(dst, packet_size)
             }
-            Err(TunnResult::Err(e)) => return TunnResult::Err(e),
-            _ => unreachable!(),
-        };
-
-        self.handle_verified_packet(packet, dst)
+        }
     }
 
+    /// Authenticate and act on one already-parsed packet, with no other
+    /// reading of its datagram to fall back on. For the device tests that
+    /// drive a responder from a parsed initiation; receive itself goes through
+    /// [`inbound::receive`], which may try several readings.
+    #[cfg(all(test, feature = "device"))]
     pub(crate) fn handle_verified_packet<'a>(
         &mut self,
         packet: Packet,
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
+        match self.authenticate(packet, dst) {
+            Ok(packet) => self.commit(packet, dst),
+            Err(e) => TunnResult::Err(e),
+        }
+    }
+
+    /// Authenticate `packet` as the kind it parsed as, without acting on it.
+    ///
+    /// The half of receive that may run for a reading of a datagram that turns
+    /// out to be wrong (`inbound::receive`), so a refusal must leave nothing
+    /// behind: `&self` makes that structural. No handshake state, timestamp,
+    /// cookie, session or timer can have moved. The one write is transport's
+    /// replay window, and only as the last step of an AEAD open that has
+    /// already succeeded -- which is acceptance, after which no other reading
+    /// is tried. `dst` then holds the plaintext; on a refusal it is scratch.
+    ///
+    /// The receiver index of a response, cookie reply or transport packet is
+    /// used to find the state to check it against, and a mismatch is refused
+    /// before any cryptography -- but it is a routing hint, never the proof.
+    pub(crate) fn authenticate(
+        &self,
+        packet: Packet,
+        dst: &mut [u8],
+    ) -> Result<Authenticated, WireGuardError> {
         match packet {
-            Packet::HandshakeInit(p) => self.handle_handshake_init(p, dst),
-            Packet::HandshakeResponse(p) => self.handle_handshake_response(p, dst),
-            Packet::PacketCookieReply(p) => self.handle_cookie_reply(p),
-            Packet::PacketData(p) => self.handle_data(p, dst),
+            Packet::HandshakeInit(p) => {
+                tracing::debug!(
+                    message = "Received handshake_initiation",
+                    remote_idx = p.sender_idx
+                );
+                self.handshake
+                    .authenticate_initiation(&p)
+                    .map(Authenticated::HandshakeInit)
+            }
+            Packet::HandshakeResponse(p) => {
+                tracing::debug!(
+                    message = "Received handshake_response",
+                    local_idx = p.receiver_idx,
+                    remote_idx = p.sender_idx
+                );
+
+                // Checked before the response is accepted, not after. The
+                // keepalive `commit` sends is a data packet with an empty
+                // payload, so it needs exactly DATA_OVERHEAD_SZ plus whatever S4
+                // prefix `write_to_network` will add -- a fixed requirement,
+                // knowable here. Accepting the response retires the initiation
+                // it answers (`Handshake::commit_response`), so an error raised
+                // after it would discard a valid response and leave the retry
+                // -- with a correct buffer -- failing as UnexpectedPacket.
+                // Unlike the data path, whose equivalent error is retryable,
+                // that would cost the keepalive for good.
+                if dst.len() < DATA_OVERHEAD_SZ + self.amnezia.transport_junk_size() {
+                    return Err(WireGuardError::DestinationBufferTooSmall);
+                }
+
+                self.handshake
+                    .authenticate_response(&p)
+                    .map(|response| Authenticated::HandshakeResponse(Box::new(response)))
+            }
+            Packet::PacketCookieReply(p) => {
+                tracing::debug!(
+                    message = "Received cookie_reply",
+                    local_idx = p.receiver_idx
+                );
+                self.handshake
+                    .authenticate_cookie_reply(&p)
+                    .map(Authenticated::CookieReply)
+            }
+            Packet::PacketData(p) => {
+                let r_idx = p.receiver_idx;
+
+                // Get the (probably) right session
+                let session = self.sessions[r_idx as usize % N_SESSIONS].as_ref();
+                let session = session.ok_or_else(|| {
+                    tracing::trace!(message = "No current session available", remote_idx = r_idx);
+                    WireGuardError::NoCurrentSession
+                })?;
+                let len = session.receive_packet_data(p, dst)?.len();
+                Ok(Authenticated::Data {
+                    receiver_idx: r_idx,
+                    len,
+                })
+            }
+        }
+    }
+
+    /// Act on a packet [`Self::authenticate`] accepted.
+    ///
+    /// Everything from here on is the packet's own business. A failure --
+    /// a transport plaintext that is not a well-formed IP packet, a `dst` too
+    /// small for the handshake response -- is reported, but the datagram has
+    /// been accepted as what it authenticated as, and is not read any other way.
+    pub(crate) fn commit<'a>(
+        &mut self,
+        packet: Authenticated,
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        match packet {
+            Authenticated::HandshakeInit(init) => self.commit_handshake_init(init, dst),
+            Authenticated::HandshakeResponse(response) => {
+                self.commit_handshake_response(*response, dst)
+            }
+            Authenticated::CookieReply(cookie) => self.commit_cookie_reply(cookie),
+            Authenticated::Data { receiver_idx, len } => self.commit_data(receiver_idx, len, dst),
         }
         .unwrap_or_else(TunnResult::from)
     }
 
-    fn handle_handshake_init<'a>(
+    fn commit_handshake_init<'a>(
         &mut self,
-        p: HandshakeInit,
+        init: handshake::AuthenticatedInit,
         dst: &'a mut [u8],
     ) -> Result<TunnResult<'a>, WireGuardError> {
-        tracing::debug!(
-            message = "Received handshake_initiation",
-            remote_idx = p.sender_idx
-        );
-
-        let (packet, session) = self.handshake.receive_handshake_initialization(p, dst)?;
+        let (packet, session) = self.handshake.commit_initiation(init, dst)?;
         let packet_size = packet.len();
 
         // Store new session in ring buffer
@@ -836,32 +954,13 @@ impl Tunn {
         Ok(self.write_to_network(dst, packet_size))
     }
 
-    fn handle_handshake_response<'a>(
+    fn commit_handshake_response<'a>(
         &mut self,
-        p: HandshakeResponse,
+        response: handshake::AuthenticatedResponse,
         dst: &'a mut [u8],
     ) -> Result<TunnResult<'a>, WireGuardError> {
-        tracing::debug!(
-            message = "Received handshake_response",
-            local_idx = p.receiver_idx,
-            remote_idx = p.sender_idx
-        );
-
-        // Checked before the response is consumed, not after. The keepalive
-        // below is a data packet with an empty payload, so it needs exactly
-        // DATA_OVERHEAD_SZ plus whatever S4 prefix `write_to_network` will add
-        // -- a fixed requirement, knowable here.
-        // `receive_handshake_response` clears the handshake state
-        // (handshake.rs:869-873), so an error raised after it would discard a
-        // valid response and leave the retry -- with a correct buffer -- failing
-        // as UnexpectedPacket. Unlike the data path, whose equivalent error is
-        // retryable, that would cost the keepalive for good.
         let transport_junk = self.amnezia.transport_junk_size();
-        if dst.len() < DATA_OVERHEAD_SZ + transport_junk {
-            return Err(WireGuardError::DestinationBufferTooSmall);
-        }
-
-        let session = self.handshake.receive_handshake_response(p)?;
+        let session = self.handshake.commit_response(response);
 
         // A keepalive is padded too -- upstream draws against an empty plaintext.
         // The zero-fill in `format_packet_data` is what keeps it a keepalive: the
@@ -896,16 +995,11 @@ impl Tunn {
         Ok(self.write_to_network(dst, keepalive_packet_size)) // Send a keepalive as a response
     }
 
-    fn handle_cookie_reply<'a>(
+    fn commit_cookie_reply<'a>(
         &mut self,
-        p: PacketCookieReply,
+        cookie: [u8; 16],
     ) -> Result<TunnResult<'a>, WireGuardError> {
-        tracing::debug!(
-            message = "Received cookie_reply",
-            local_idx = p.receiver_idx
-        );
-
-        self.handshake.receive_cookie_reply(p)?;
+        self.handshake.commit_cookie(cookie);
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeCookieReceived);
 
@@ -930,30 +1024,19 @@ impl Tunn {
         }
     }
 
-    /// Decrypts a data packet, and stores the decapsulated packet in dst.
-    fn handle_data<'a>(
+    /// Act on a transport packet whose plaintext `authenticate` left in
+    /// `dst[..len]`.
+    fn commit_data<'a>(
         &mut self,
-        packet: PacketData,
+        receiver_idx: u32,
+        len: usize,
         dst: &'a mut [u8],
     ) -> Result<TunnResult<'a>, WireGuardError> {
-        let r_idx = packet.receiver_idx as usize;
-        let idx = r_idx % N_SESSIONS;
-
-        // Get the (probably) right session
-        let decapsulated_packet = {
-            let session = self.sessions[idx].as_ref();
-            let session = session.ok_or_else(|| {
-                tracing::trace!(message = "No current session available", remote_idx = r_idx);
-                WireGuardError::NoCurrentSession
-            })?;
-            session.receive_packet_data(packet, dst)?
-        };
-
-        self.set_current_session(r_idx);
+        self.set_current_session(receiver_idx as usize);
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
 
-        Ok(self.validate_decapsulated_packet(decapsulated_packet))
+        Ok(self.validate_decapsulated_packet(&mut dst[..len]))
     }
 
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
