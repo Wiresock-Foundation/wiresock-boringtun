@@ -554,6 +554,22 @@ impl Tunn {
             .store(amnezia::DEFAULT_UDP_WINDOW, AtomicOrdering::Relaxed);
     }
 
+    /// Start the window afresh for a path a packet has just been
+    /// authenticated on, returning the window it replaces so the caller can
+    /// put it back with [`Self::restore_udp_window`] if that packet is not,
+    /// in the end, accepted.
+    #[cfg(feature = "device")]
+    pub(crate) fn begin_new_path(&self) -> u32 {
+        self.udp_window
+            .swap(amnezia::DEFAULT_UDP_WINDOW, AtomicOrdering::Relaxed)
+    }
+
+    /// Put back a window [`Self::begin_new_path`] replaced.
+    #[cfg(feature = "device")]
+    pub(crate) fn restore_udp_window(&self, window: u32) {
+        self.udp_window.store(window, AtomicOrdering::Relaxed);
+    }
+
     #[cfg(test)]
     pub(crate) fn udp_window(&self) -> u32 {
         self.udp_window.load(AtomicOrdering::Relaxed)

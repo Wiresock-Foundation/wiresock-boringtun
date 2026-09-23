@@ -1,7 +1,7 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use socket2::{Domain, Protocol, Type};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -72,16 +72,6 @@ pub struct Peer {
     /// `set_endpoint`'s `&self` signatures stay put; every `Peer` is already
     /// behind a `Mutex`, so there is no contention to speak of.
     upgrade_suppressed: AtomicBool,
-    /// The address the tunnel's AmneziaWG 3.1 UDP window was last started
-    /// for. Kept apart from `endpoint.addr` because the two move at different
-    /// moments: the anonymous ingress starts the window afresh for a new
-    /// source *before* committing the packet that came from it (so a reply
-    /// drawn now is sized for the new path, and the packet's own size counts
-    /// toward it), while the endpoint itself is recorded only afterwards, and
-    /// only if the commit succeeded. Remembering which path the window
-    /// belongs to is what stops that later `set_endpoint` resetting it a
-    /// second time and discarding what the packet contributed.
-    window_path: Mutex<Option<SocketAddr>>,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -125,27 +115,6 @@ impl Peer {
             }),
             preshared_key,
             upgrade_suppressed: AtomicBool::new(false),
-            window_path: Mutex::new(endpoint),
-        }
-    }
-
-    /// Start the tunnel's UDP window afresh if `addr` is not the path it was
-    /// measured on; otherwise leave it alone.
-    ///
-    /// Idempotent per path: the first call for a new address resets, and every
-    /// later call for the same address -- including the `set_endpoint` that
-    /// records it -- does nothing. Compared by address, host and port:
-    /// amneziawg-go compares endpoint *objects*, so it also resets when a fresh
-    /// object describes the same peer, and a window that resets on every
-    /// re-registration never grows.
-    ///
-    /// Only for an address something has authenticated: the ingress calls it
-    /// once a reading has been accepted, never for one that failed.
-    pub(crate) fn prepare_path(&self, addr: SocketAddr) {
-        let mut path = self.window_path.lock();
-        if *path != Some(addr) {
-            *path = Some(addr);
-            self.tunnel.reset_udp_window();
         }
     }
 
@@ -184,7 +153,36 @@ impl Peer {
         }
     }
 
+    ///
+    /// # The UDP window follows the endpoint
+    ///
+    /// The tunnel's AmneziaWG 3.1 UDP window describes one path: outside the
+    /// peer's lock it always describes `endpoint.addr`. A change of address --
+    /// host or port -- starts it afresh here. Compared by address, not by
+    /// endpoint object as amneziawg-go does, which also resets whenever a
+    /// fresh object describes the same peer.
+    ///
+    /// The one moment the two differ is inside the anonymous ingress's
+    /// critical section: `commit_anonymous` starts the window for a new source
+    /// *before* committing its packet, so a reply drawn during the commit is
+    /// sized for the path it will go out on, and puts the old window back if
+    /// the commit fails; on success the handler records the source with
+    /// [`Self::adopt_endpoint`], which does not reset again. The peer's lock is
+    /// held throughout, so no other code sees the window and the endpoint
+    /// disagree.
     pub fn set_endpoint(&self, addr: SocketAddr) {
+        self.move_endpoint(addr, true)
+    }
+
+    /// Record `addr` as the endpoint without starting the UDP window afresh,
+    /// because the caller already has: `commit_anonymous` started it for this
+    /// address before committing the packet that came from it, and that
+    /// packet's contribution to it must survive. See [`Self::set_endpoint`].
+    pub(crate) fn adopt_endpoint(&self, addr: SocketAddr) {
+        self.move_endpoint(addr, false)
+    }
+
+    fn move_endpoint(&self, addr: SocketAddr, reset_window: bool) {
         let mut endpoint = self.endpoint.write();
         if endpoint.addr != Some(addr) {
             // We only need to update the endpoint if it differs from the current one
@@ -197,12 +195,10 @@ impl Peer {
             }
 
             endpoint.addr = Some(addr);
-            // The AmneziaWG 3.1 UDP window describes the path to the address
-            // we just left. On the anonymous ingress `prepare_path` has already
-            // started it for this address, before the commit, so this finds it
-            // done and keeps what that packet contributed; an endpoint set
-            // through the UAPI starts it here.
-            self.prepare_path(addr);
+            // The UDP window described the address we just left.
+            if reset_window {
+                self.tunnel.reset_udp_window();
+            }
             // The suppression describes the address we just left, not this
             // peer. Held across a roam it would strand the peer on the shared
             // listener for the life of the process after one bad endpoint --
