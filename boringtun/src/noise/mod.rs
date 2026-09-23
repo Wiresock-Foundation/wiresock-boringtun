@@ -1189,22 +1189,50 @@ impl Tunn {
         }
 
         if self.amnezia.emits_pre_handshake() {
-            let imitation_datagrams = self
-                .amnezia
-                .pre_handshake_imitation_datagrams(&mut self.handshake.rng);
-            // Like wgbooster (execute_imitation_obfuscation then
-            // send_random_packets then the handshake), the imitation sequence and
-            // the Jc random/protocol-shaped junk are both emitted: the sequence
-            // first, then `packet_count` junk packets, then the initiation.
-            self.pending_amnezia_junk = Some(PendingAmneziaJunk {
-                imitation_datagrams,
-                remaining: self.amnezia.pre_handshake_junk.packet_count,
-                last_packet_at: None,
-            });
+            self.pending_amnezia_junk = Some(self.new_pre_handshake_burst(None));
             return self.advance_amnezia_junk(dst);
         }
 
         self.format_handshake_initiation_now(dst, force_resend)
+    }
+
+    /// The pre-handshake burst the current configuration calls for, ahead of
+    /// an initiation: the one place a [`PendingAmneziaJunk`] is built.
+    ///
+    /// Like wgbooster (execute_imitation_obfuscation then send_random_packets
+    /// then the handshake), the imitation sequence and the Jc
+    /// random/protocol-shaped junk are both emitted: the sequence first, then
+    /// `packet_count` junk packets, then the initiation. What is captured here
+    /// is only what cannot be read later -- the imitation datagrams, generated
+    /// whole, and the Jc count; everything else about the burst and the
+    /// initiation behind it is read from the configuration as each datagram
+    /// goes out.
+    ///
+    /// When the configuration calls for no burst at all -- no Jc, no
+    /// imitation, or pre-handshake suppressed -- this is an empty burst: no
+    /// datagrams, nothing remaining. [`Self::advance_amnezia_junk`] treats that
+    /// as "the initiation is due", which is what a pending burst whose
+    /// configuration no longer has one must still say.
+    ///
+    /// `last_packet_at` is the pacing clock the burst starts from: `None` for
+    /// a burst no datagram has preceded, or the time the previous burst last
+    /// emitted when this one replaces it, so the replacement keeps the same
+    /// spacing from what already went out.
+    fn new_pre_handshake_burst(&mut self, last_packet_at: Option<Instant>) -> PendingAmneziaJunk {
+        if !self.amnezia.emits_pre_handshake() {
+            return PendingAmneziaJunk {
+                imitation_datagrams: VecDeque::new(),
+                remaining: 0,
+                last_packet_at,
+            };
+        }
+        PendingAmneziaJunk {
+            imitation_datagrams: self
+                .amnezia
+                .pre_handshake_imitation_datagrams(&mut self.handshake.rng),
+            remaining: self.amnezia.pre_handshake_junk.packet_count,
+            last_packet_at,
+        }
     }
 
     fn format_handshake_initiation_now<'a>(
