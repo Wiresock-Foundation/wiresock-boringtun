@@ -575,6 +575,14 @@ pub(crate) struct InboundCandidate {
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct InboundCandidates([Option<InboundCandidate>; 4]);
 
+impl InboundCandidate {
+    /// Where the canonical message starts: the kind's S size.
+    #[cfg(test)]
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+}
+
 impl InboundCandidates {
     /// No reading fits: the datagram is not AmneziaWG traffic at all. What
     /// the device's ingress asks before it lets probe classification look.
@@ -1292,7 +1300,9 @@ impl AmneziaConfig {
     /// Every packet kind an inbound datagram could be, in trial order.
     ///
     /// At most one candidate per kind, each at that kind's own S offset: the
-    /// three handshake kinds by exact size, transport by minimum size, and each
+    /// three handshake kinds by exact size -- by minimum size, with
+    /// RandomTrailers, the canonical message still their fixed size and the
+    /// rest a suffix -- transport by minimum size, and each
     /// only when the tag at its offset -- unmasked, when a header-protection key
     /// is set -- falls in its kind's H range. Nothing else is scanned, neither
     /// another offset nor another length, so the list is bounded at four and
@@ -1370,9 +1380,19 @@ impl AmneziaConfig {
         {
             let kind = *kind;
             let offset = self.inbound_junk_size(kind);
-            let fits = match *exact_len {
-                Some(len) => wire_len == offset + len,
-                None => wire_len >= offset + DATA_OVERHEAD_SZ,
+            // A handshake message is exactly its size, or -- with
+            // RandomTrailers -- at least its size, the rest an unauthenticated
+            // suffix. Its canonical extent is the fixed size either way: the
+            // suffix never reaches the parser, the MACs, Noise, the cookie
+            // AEAD or header protection. Transport's minimum is unchanged,
+            // because its RandomTrailers addition is inside the AEAD.
+            let (fits, message_len) = match *exact_len {
+                Some(len) if self.random_trailers => (wire_len >= offset + len, len),
+                Some(len) => (wire_len == offset + len, len),
+                None => (
+                    wire_len >= offset + DATA_OVERHEAD_SZ,
+                    wire_len.saturating_sub(offset),
+                ),
             };
             if !fits || (protected && offset < NONCE_SIZE) {
                 continue;
@@ -1384,7 +1404,7 @@ impl AmneziaConfig {
                 found.0[slot] = Some(InboundCandidate {
                     kind,
                     offset,
-                    message_len: wire_len - offset,
+                    message_len,
                     wire_len,
                     protected,
                 });
@@ -1394,6 +1414,9 @@ impl AmneziaConfig {
     }
 
     /// The canonical message `candidate` reads out of `datagram`.
+    ///
+    /// Only the canonical extent: a handshake message's RandomTrailers suffix
+    /// is left behind in `datagram`, never parsed, authenticated or unmasked.
     ///
     /// Borrowed straight from `datagram` when the candidate is unprotected.
     /// Otherwise copied into `scratch` and unmasked there, so `datagram` stays
@@ -1442,7 +1465,7 @@ impl AmneziaConfig {
         self.candidates_under_mask(obf, packet, [0u8; TYPE_MASK_SIZE], false)
             .iter()
             .next()
-            .map(|c| &packet[c.offset..])
+            .map(|c| &packet[c.offset..c.offset + c.message_len])
     }
 
     /// Unmask the first candidate in place and return its offset -- the old
@@ -1459,7 +1482,7 @@ impl AmneziaConfig {
         let message = self
             .candidate_message(packet, &candidate, &mut scratch)?
             .to_vec();
-        packet[candidate.offset..].copy_from_slice(&message);
+        packet[candidate.offset..candidate.offset + message.len()].copy_from_slice(&message);
         Some(candidate.offset)
     }
 

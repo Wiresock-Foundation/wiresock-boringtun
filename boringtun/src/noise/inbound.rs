@@ -190,6 +190,21 @@ pub(crate) mod fixtures {
         packet
     }
 
+    /// Write a whole message -- `core`, as it reads unmasked -- at `offset` of
+    /// `wire`, masked the way a sender under `amnezia` masks a handshake
+    /// message: every byte of it, keystream from position zero, nonced by the
+    /// first 12 bytes of `wire`, which are left alone.
+    pub(crate) fn plant_core(wire: &mut [u8], amnezia: &AmneziaConfig, offset: usize, core: &[u8]) {
+        const NONCE: usize = crate::noise::header_protection::NONCE_SIZE;
+        assert!(offset >= NONCE, "a plant must not disturb the nonce");
+        let mut scratch = wire[..NONCE].to_vec();
+        scratch.extend_from_slice(core);
+        assert!(amnezia
+            .header_protection
+            .mask_outbound(&mut scratch, NONCE, core.len()));
+        wire[offset..offset + core.len()].copy_from_slice(&scratch[NONCE..]);
+    }
+
     /// Write a false message header -- `tag`, then `index` in the field after
     /// it -- at `offset` of `wire`, masked the way a sender under `amnezia`
     /// masks a real one. `offset` must be past the nonce, which is left alone.
@@ -221,6 +236,16 @@ pub(crate) mod fixtures {
     /// An initiator and a responder under `amnezia`, the responder's rate
     /// limiter given `their_budget` (`None` for the default).
     pub(crate) fn pair(amnezia: &AmneziaConfig, their_budget: Option<u64>) -> (Tunn, Tunn) {
+        let (mine, theirs, _) = keyed_pair(amnezia, their_budget);
+        (mine, theirs)
+    }
+
+    /// [`pair`], also returning the initiator's static public key -- what a
+    /// test needs to compute a valid mac1 for a message *to* the initiator.
+    pub(crate) fn keyed_pair(
+        amnezia: &AmneziaConfig,
+        their_budget: Option<u64>,
+    ) -> (Tunn, Tunn, x25519::PublicKey) {
         let my_secret = x25519::StaticSecret::random_from_rng(OsRng);
         let my_public = x25519::PublicKey::from(&my_secret);
         let their_secret = x25519::StaticSecret::random_from_rng(OsRng);
@@ -247,7 +272,7 @@ pub(crate) mod fixtures {
             amnezia.clone(),
         )
         .unwrap();
-        (mine, theirs)
+        (mine, theirs, my_public)
     }
 
     pub(crate) fn network(result: TunnResult) -> Vec<u8> {

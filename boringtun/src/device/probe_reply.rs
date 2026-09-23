@@ -405,6 +405,52 @@ mod tests {
         }
     }
 
+    /// RandomTrailers widens what counts as AmneziaWG -- a handshake message is
+    /// now any datagram at least its size whose tag fits -- and the widened
+    /// shape still wins over probe detection. Our own initiation under `ip=dns`
+    /// with a trailer appended is a valid DNS query to `reply_to`, and yet it is
+    /// tunnel traffic; a receiver without RandomTrailers sees no AmneziaWG
+    /// reading in it at all, which is what shows the trailer is what made it
+    /// ours.
+    #[test]
+    fn a_trailer_extended_initiation_is_still_tunnel_traffic() {
+        let obf = ObfuscationRanges::default();
+        let off = AmneziaConfig::new(150, 130, 110, 80).with_protocol_imitation(
+            AmneziaImitationProtocol::Dns,
+            Some("example.com".to_owned()),
+        );
+        let on = off.clone().with_random_trailers(true);
+        let (_, padded) = conforming_initiation(&off, obf, &mut ChaCha8Rng::seed_from_u64(0xA53));
+        let mut extended = padded.clone();
+        extended.extend_from_slice(&[0x11; 23]);
+
+        assert!(
+            reply(
+                &extended,
+                "203.0.113.5:40000",
+                AmneziaImitationProtocol::Dns
+            )
+            .is_some(),
+            "precondition: the extended initiation must still be a valid DNS query"
+        );
+        assert!(
+            off.inbound_candidates(obf, &extended).offsets().is_empty(),
+            "precondition: without RandomTrailers the suffix makes it not ours"
+        );
+        match classify(
+            &extended,
+            &on,
+            obf,
+            peer("203.0.113.5:40000"),
+            Some(&responder()),
+            &mut ChaCha8Rng::seed_from_u64(12),
+        ) {
+            Ingress::Wireguard(candidates) => assert_eq!(candidates.offsets(), vec![150]),
+            Ingress::Reply(_) => panic!("a trailer-extended initiation was answered as a probe"),
+            Ingress::Drop => panic!("a trailer-extended initiation was dropped before the tunnel"),
+        }
+    }
+
     /// A datagram that is neither AmneziaWG nor a probe is dropped in silence,
     /// which is what a bare WireGuard port already does.
     #[test]
