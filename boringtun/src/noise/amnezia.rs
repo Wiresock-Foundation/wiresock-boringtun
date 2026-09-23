@@ -775,6 +775,47 @@ impl AmneziaConfig {
         self
     }
 
+    /// Whether switching from this configuration to `next` changes receive
+    /// policy alone -- today only [`Self::disable_cookies`] -- and so leaves
+    /// every byte this end sends, and the pacing of anything already queued to
+    /// send, exactly as it was. `Tunn::set_obfuscation` keeps in-flight
+    /// outbound work across such a change; see there.
+    ///
+    /// Destructured rather than compared through a copy with the policy field
+    /// overwritten, so a field added later fails to compile here until it is
+    /// classified: send-side (compared) or receive policy (ignored).
+    pub(crate) fn differs_only_in_receive_policy(&self, next: &AmneziaConfig) -> bool {
+        let AmneziaConfig {
+            init_packet_junk_size,
+            response_packet_junk_size,
+            cookie_packet_junk_size,
+            transport_packet_junk_size,
+            pre_handshake_junk,
+            imitation,
+            suppress_pre_handshake,
+            header_protection,
+            content_padding_addition,
+            content_padding_mtu,
+            timers,
+            random_trailers,
+            // Receive policy: which handshake messages this end answers under
+            // load. Nothing it sends depends on it.
+            disable_cookies: _,
+        } = self;
+        *init_packet_junk_size == next.init_packet_junk_size
+            && *response_packet_junk_size == next.response_packet_junk_size
+            && *cookie_packet_junk_size == next.cookie_packet_junk_size
+            && *transport_packet_junk_size == next.transport_packet_junk_size
+            && *pre_handshake_junk == next.pre_handshake_junk
+            && *imitation == next.imitation
+            && *suppress_pre_handshake == next.suppress_pre_handshake
+            && *header_protection == next.header_protection
+            && *content_padding_addition == next.content_padding_addition
+            && *content_padding_mtu == next.content_padding_mtu
+            && *timers == next.timers
+            && *random_trailers == next.random_trailers
+    }
+
     /// Whether the rate limiter's under-load cookie defense applies to a
     /// handshake message this configuration receives. The one place the flag
     /// is turned into the limiter's policy, so every receive path reads it the
@@ -2757,6 +2798,79 @@ mod tests {
                 .disable_cookies
         );
         assert!(full_off.validate().is_ok());
+    }
+
+    /// Only DisableCookies is receive policy. Every other field shapes what
+    /// this end sends -- or when -- so a change to any of them is a reframe,
+    /// and a change to DisableCookies alone is not.
+    #[test]
+    fn only_disable_cookies_is_receive_policy() {
+        let base = AmneziaConfig::new(52, 108, 136, 148).with_pre_handshake_junk(3, 64, 64, 100);
+        assert!(base.differs_only_in_receive_policy(&base));
+        assert!(base.differs_only_in_receive_policy(&base.clone().with_disable_cookies(true)));
+        assert!(base
+            .clone()
+            .with_disable_cookies(true)
+            .differs_only_in_receive_policy(&base));
+
+        let send_side: Vec<(&str, AmneziaConfig)> = vec![
+            ("s1", {
+                let mut c = base.clone();
+                c.init_packet_junk_size += 1;
+                c
+            }),
+            ("s2", {
+                let mut c = base.clone();
+                c.response_packet_junk_size += 1;
+                c
+            }),
+            ("s3", {
+                let mut c = base.clone();
+                c.cookie_packet_junk_size += 1;
+                c
+            }),
+            ("s4", {
+                let mut c = base.clone();
+                c.transport_packet_junk_size += 1;
+                c
+            }),
+            ("junk", base.clone().with_pre_handshake_junk(4, 64, 64, 100)),
+            (
+                "imitation",
+                base.clone()
+                    .with_protocol_imitation(AmneziaImitationProtocol::Dns, None),
+            ),
+            ("responder", base.clone().as_responder()),
+            (
+                "header protection",
+                base.clone().with_header_protection([9; 32]),
+            ),
+            (
+                "padding",
+                base.clone().with_content_padding_addition(8, 24, 0),
+            ),
+            (
+                "padding mtu",
+                base.clone().with_content_padding_addition(0, 0, 1280),
+            ),
+            (
+                "timers",
+                base.clone().with_tunable_timers(AwgTimers {
+                    rekey_after_time: (30, 40),
+                    ..AwgTimers::default()
+                }),
+            ),
+            ("random trailers", base.clone().with_random_trailers(true)),
+        ];
+        for (name, changed) in send_side {
+            assert!(
+                !base.differs_only_in_receive_policy(&changed),
+                "{} was treated as receive policy",
+                name
+            );
+            // Still a send-side change with DisableCookies moving too.
+            assert!(!base.differs_only_in_receive_policy(&changed.with_disable_cookies(true)));
+        }
     }
 
     /// The cookie-reflection complaint is about replies this end would emit.

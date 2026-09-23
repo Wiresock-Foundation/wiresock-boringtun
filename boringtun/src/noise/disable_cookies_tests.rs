@@ -791,3 +791,235 @@ fn verify_packet_keeps_the_armed_defense() {
         Err(TunnResult::Err(WireGuardError::UnderLoad))
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Live toggles before a session exists.
+
+/// The pre-handshake burst the pending-work tests run: three 64-byte junk
+/// datagrams, 100 ms apart, then the initiation. No persistent keepalive.
+const BURST: u16 = 3;
+const JUNK: usize = 64;
+const JD_MS: u64 = 100;
+
+fn bursting(trailers: bool, disable: bool) -> AmneziaConfig {
+    config(None, trailers, disable).with_pre_handshake_junk(
+        BURST,
+        JUNK as u16,
+        JUNK as u16,
+        JD_MS as u16,
+    )
+}
+
+/// Let `ms` pass: the mocked clock under `mock-instant`, real time otherwise.
+fn pass(ms: u64) {
+    #[cfg(feature = "mock-instant")]
+    mock_instant::thread_local::MockClock::advance(std::time::Duration::from_millis(ms));
+    #[cfg(not(feature = "mock-instant"))]
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
+
+/// Poll `tunn`'s timers, one pacing interval apart, until it emits a
+/// datagram that is not burst junk, or `polls` run out. Returns everything
+/// emitted, the last one being the initiation if it came.
+fn poll_until_initiation(tunn: &mut Tunn, polls: usize) -> Vec<Vec<u8>> {
+    let mut emitted = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    for _ in 0..polls {
+        pass(JD_MS + 10);
+        if let TunnResult::WriteToNetwork(d) = tunn.update_timers(&mut buf) {
+            let done = d.len() != JUNK;
+            emitted.push(d.to_vec());
+            if done {
+                break;
+            }
+        }
+    }
+    emitted
+}
+
+fn lengths(datagrams: &[Vec<u8>]) -> Vec<usize> {
+    datagrams.iter().map(Vec::len).collect()
+}
+
+/// Complete the handshake `init` starts and deliver whatever `mine` had
+/// queued: the payload must arrive at `theirs` without being sent again.
+fn complete_and_deliver(mine: &mut Tunn, theirs: &mut Tunn, init: &[u8], payload: &[u8]) {
+    let mut buf = vec![0u8; 4096];
+    let mut out = vec![0u8; 4096];
+    let response = network(theirs.decapsulate(SRC, init, &mut buf));
+    assert_eq!(kind_of(mine, &response), "response");
+    let mut to_them = vec![network(mine.decapsulate(SRC, &response, &mut buf))];
+    while let TunnResult::WriteToNetwork(d) = mine.decapsulate(SRC, &[], &mut buf) {
+        to_them.push(d.to_vec());
+    }
+    let delivered: Vec<Vec<u8>> = to_them
+        .iter()
+        .filter_map(|wire| match theirs.decapsulate(SRC, wire, &mut out) {
+            TunnResult::WriteToTunnelV4(p, _) => Some(p.to_vec()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered, vec![payload.to_vec()], "the queued payload");
+}
+
+/// Start `mine`'s first handshake by queueing `payload`, and let `sent` junk
+/// datagrams of the burst go out.
+fn first_payload_behind(mine: &mut Tunn, payload: &[u8], sent: usize) {
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(network(mine.encapsulate(payload, &mut buf)).len(), JUNK);
+    let more = poll_until_initiation(mine, sent - 1);
+    assert_eq!(lengths(&more), vec![JUNK; sent - 1], "precondition");
+    assert!(mine.pending_amnezia_junk.is_some(), "precondition");
+}
+
+/// A DisableCookies-only live toggle while the first payload waits behind the
+/// pre-handshake burst must not cancel the burst: the remaining junk and then
+/// the initiation follow at their pacing, the handshake completes, and the
+/// payload queued before the toggle is delivered -- with no second payload,
+/// no externally forced initiation, and no new tunnel.
+///
+/// Toggled after each of the three junk datagrams (after the last, only the
+/// initiation is still due), in both directions, with RandomTrailers off and
+/// on.
+#[test]
+fn a_disable_cookies_toggle_keeps_the_pending_first_handshake() {
+    for trailers in [false, true] {
+        for from in [false, true] {
+            for sent in 1..=BURST as usize {
+                let case = format!(
+                    "trailers={} dc {}->{} after {} junk",
+                    trailers, from, !from, sent
+                );
+                let cfg = bursting(trailers, from);
+                let mut e = ends(&cfg, &cfg, None, None);
+                let obf = e.mine.handshake.obf;
+                let payload = ipv4_packet(60);
+                first_payload_behind(&mut e.mine, &payload, sent);
+
+                e.mine
+                    .set_obfuscation(obf, cfg.clone().with_disable_cookies(!from));
+                assert_eq!(e.mine.amnezia.disable_cookies, !from, "{}", case);
+
+                let rest = poll_until_initiation(&mut e.mine, BURST as usize + 3);
+                let sizes = lengths(&rest);
+                assert_eq!(
+                    sizes.len(),
+                    BURST as usize - sent + 1,
+                    "{}: the burst stalled after the toggle: {:?}",
+                    case,
+                    sizes
+                );
+                assert!(
+                    sizes[..sizes.len() - 1].iter().all(|&l| l == JUNK),
+                    "{}",
+                    case
+                );
+                let init = rest.last().unwrap();
+                assert_eq!(kind_of(&e.mine, init), "initiation", "{}", case);
+                if !trailers {
+                    assert_eq!(init.len(), 40 + HANDSHAKE_INIT_SZ, "{}", case);
+                }
+                assert!(e.mine.pending_amnezia_junk.is_none(), "{}", case);
+
+                complete_and_deliver(&mut e.mine, &mut e.theirs, init, &payload);
+            }
+        }
+    }
+}
+
+/// Keeping the burst does not postpone the policy. With the first handshake
+/// pending and the receiver starved, the toggle takes effect on the very next
+/// handshake message received: the peer's own initiation is answered with
+/// cookies now off, and owed a cookie with them now on.
+///
+/// Either way the payload queued before the toggle gets through. Cookies off,
+/// the answered initiation establishes a session and the payload goes over
+/// it. Cookies on, the burst carries on to our own initiation, and the peer
+/// -- which took the cookie -- answers it with a mac2 that holds under load.
+#[test]
+fn a_toggle_with_the_first_handshake_pending_applies_at_the_next_message() {
+    for trailers in [false, true] {
+        for from in [false, true] {
+            let to = !from;
+            let case = format!("trailers={} dc {}->{}", trailers, from, to);
+            let mine_cfg = bursting(trailers, from);
+            let theirs_cfg = config(None, trailers, false);
+            let mut e = ends(&mine_cfg, &theirs_cfg, Some(0), None);
+            let obf = e.mine.handshake.obf;
+            let payload = ipv4_packet(60);
+            first_payload_behind(&mut e.mine, &payload, 1);
+
+            e.mine
+                .set_obfuscation(obf, mine_cfg.clone().with_disable_cookies(to));
+            assert!(e.mine.pending_amnezia_junk.is_some(), "{}", case);
+
+            let mut buf = vec![0u8; 4096];
+            let mut out = vec![0u8; 4096];
+            let their_init = fresh_initiation(&mut e.theirs, &mut buf);
+            let reply = network(e.mine.decapsulate(SRC, &their_init, &mut buf));
+            let load = e.my_limiter.as_ref().unwrap().load_events();
+            if to {
+                assert_eq!(kind_of(&e.theirs, &reply), "response", "{}", case);
+                assert_eq!(load, 0, "{}", case);
+                let keepalive = network(e.theirs.decapsulate(SRC, &reply, &mut out));
+                assert!(matches!(
+                    e.mine.decapsulate(SRC, &keepalive, &mut out),
+                    TunnResult::Done
+                ));
+                let mut delivered = Vec::new();
+                while let TunnResult::WriteToNetwork(d) = e.mine.decapsulate(SRC, &[], &mut buf) {
+                    if let TunnResult::WriteToTunnelV4(p, _) =
+                        e.theirs.decapsulate(SRC, d, &mut out)
+                    {
+                        delivered.push(p.to_vec());
+                    }
+                }
+                assert_eq!(delivered, vec![payload.clone()], "{}", case);
+            } else {
+                assert_eq!(kind_of(&e.theirs, &reply), "cookie", "{}", case);
+                assert_eq!(load, 1, "{}", case);
+                assert!(e.mine.pending_amnezia_junk.is_some(), "{}", case);
+                assert!(matches!(
+                    e.theirs.decapsulate(SRC, &reply, &mut out),
+                    TunnResult::Done
+                ));
+                let rest = poll_until_initiation(&mut e.mine, BURST as usize + 3);
+                assert_eq!(
+                    lengths(&rest[..rest.len() - 1]),
+                    vec![JUNK; BURST as usize - 1],
+                    "{}",
+                    case
+                );
+                let init = rest.last().unwrap();
+                assert_eq!(kind_of(&e.mine, init), "initiation", "{}", case);
+                complete_and_deliver(&mut e.mine, &mut e.theirs, init, &payload);
+            }
+        }
+    }
+}
+
+/// The distinction is DisableCookies alone. A change that reframes what this
+/// end sends -- here S1 -- still drops a pending burst, exactly as before: the
+/// behaviour of every other field is left as it was.
+#[test]
+fn a_send_side_change_still_drops_the_pending_burst() {
+    let cfg = bursting(false, false);
+    let mut e = ends(&cfg, &cfg, None, None);
+    let obf = e.mine.handshake.obf;
+    first_payload_behind(&mut e.mine, &ipv4_packet(60), 1);
+    let mut s1 = cfg.clone().with_disable_cookies(true);
+    s1.init_packet_junk_size += 4;
+    e.mine.set_obfuscation(obf, s1);
+    assert!(e.mine.pending_amnezia_junk.is_none());
+
+    // And identical settings keep it: nothing was reframed.
+    let mut e = ends(&cfg, &cfg, None, None);
+    first_payload_behind(&mut e.mine, &ipv4_packet(60), 1);
+    e.mine.set_obfuscation(obf, cfg.clone());
+    assert!(e.mine.pending_amnezia_junk.is_some());
+    // Nor does a change of magic headers count as policy.
+    let moved = ObfuscationRanges::new(5, 5, 6, 6, 7, 7, 8, 8).unwrap();
+    e.mine
+        .set_obfuscation(moved, cfg.clone().with_disable_cookies(true));
+    assert!(e.mine.pending_amnezia_junk.is_none());
+}

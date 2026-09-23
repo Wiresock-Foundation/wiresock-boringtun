@@ -2607,6 +2607,60 @@ mod ingress_tests {
         }
     }
 
+    /// A DisableCookies toggle reaches every copy of the configuration without
+    /// cancelling a peer's pending first handshake. Applied as
+    /// `Device::set_obfuscation` applies one -- the interface's copy, which
+    /// the anonymous ingress reads, and each peer tunnel's -- while the peer
+    /// has a payload queued behind its pre-handshake burst: the burst
+    /// survives, and both receive paths meet the next initiation under the new
+    /// policy at once.
+    #[test]
+    fn a_disable_cookies_toggle_reaches_every_copy_and_keeps_a_pending_burst() {
+        let from = addr("203.0.113.1:40000");
+        let obf = ObfuscationRanges::default();
+        for disable in [false, true] {
+            let plain = AmneziaConfig::new(ROAM_S[0], ROAM_S[1], ROAM_S[2], ROAM_S[3])
+                .with_disable_cookies(!disable);
+            let mut s = Starved::new(plain.clone());
+            // The server peer bursts before its own initiation; the client
+            // does not, so its initiations below are initiations.
+            let bursting = plain.clone().with_pre_handshake_junk(3, 64, 64, 100);
+            s.amnezia = bursting.clone();
+            s.peer.lock().tunnel.set_obfuscation(obf, bursting.clone());
+
+            let mut payload = vec![0u8; 60];
+            payload[0] = 0x45;
+            payload[2..4].copy_from_slice(&60u16.to_be_bytes());
+            let mut buf = vec![0u8; MAX_UDP_SIZE];
+            match s.peer.lock().tunnel.encapsulate(&payload, &mut buf) {
+                TunnResult::WriteToNetwork(d) => assert_eq!(d.len(), 64),
+                other => panic!("expected the burst's first junk, got {:?}", other),
+            }
+
+            // The toggle, to both copies.
+            s.amnezia = bursting.clone().with_disable_cookies(disable);
+            s.peer
+                .lock()
+                .tunnel
+                .set_obfuscation(obf, bursting.clone().with_disable_cookies(disable));
+            assert!(
+                s.peer.lock().tunnel.has_pending_burst(),
+                "disable={}: the toggle cancelled the pending burst",
+                disable
+            );
+
+            let expected = if disable { "response" } else { "cookie" };
+            let init = s.initiation();
+            assert_eq!(s.ingress(&init, from), Some(expected), "ingress");
+            let init = s.initiation();
+            assert_eq!(
+                s.decapsulate(&init, Some(from.ip())),
+                Some(expected),
+                "peer tunnel"
+            );
+        }
+    }
+
     /// A live DisableCookies toggle, as `Device::set_obfuscation` applies one --
     /// the device's configuration and every peer tunnel's together -- keeps the
     /// peer's endpoint, UDP window and session, and changes only how the next
