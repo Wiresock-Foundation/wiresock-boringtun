@@ -156,15 +156,28 @@ fn drain(t: &mut Tunn, polls: usize) -> Drained {
 }
 
 /// Let `n` more datagrams of the burst out, one pacing interval apart.
+///
+/// Bounded: a burst that stalls -- the failure these tests exist to catch --
+/// fails the test here instead of spinning the mocked clock forever.
 fn emit(t: &mut Tunn, n: usize) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; 4096];
-    while out.len() < n {
+    for _ in 0..n * 4 + 4 {
+        if out.len() == n {
+            break;
+        }
         pass(JD + 5);
         if let TunnResult::WriteToNetwork(d) = t.update_timers(&mut buf) {
             out.push(d.to_vec());
         }
     }
+    assert_eq!(
+        out.len(),
+        n,
+        "the burst stalled after {} of {}",
+        out.len(),
+        n
+    );
     assert!(t.pending_amnezia_junk.is_some(), "the burst ended early");
     out
 }
