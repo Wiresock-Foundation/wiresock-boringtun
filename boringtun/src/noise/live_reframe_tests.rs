@@ -13,7 +13,9 @@
 //! captured (`AmneziaConfig::pending_burst_change`).
 //!
 //! The matrix runs under the mocked clock, where pacing is exact; a smoke set
-//! runs under the real one.
+//! runs under the real one. Built without `mock-instant`, only the smoke set
+//! and the helpers it shares are live, hence the allowance below.
+#![cfg_attr(not(feature = "mock-instant"), allow(dead_code, unused_imports))]
 
 use super::amnezia::{AmneziaConfig, AmneziaImitationProtocol, AwgTimers};
 use super::handshake::ObfuscationRanges;
@@ -682,6 +684,9 @@ fn a_restarted_burst_keeps_the_pacing_clock() {
 // ---------------------------------------------------------------------------
 // Repeated changes, the queue, and after the initiation.
 
+/// One live change, as a function of the configuration before it.
+type Step = Box<dyn Fn(&AmneziaConfig) -> AmneziaConfig>;
+
 /// Changes in quick succession before the initiation -- S1 (keep), imitation
 /// (restart), RT (keep), Jc (restart), header protection (keep) -- converge
 /// on the last configuration. No datagram of a replaced imitation sequence
@@ -697,7 +702,7 @@ fn repeated_changes_converge_and_deliver_the_queue_once_in_order() {
     let payloads = vec![payload(1), payload(2), payload(3)];
     queue(&mut p.mine, &payloads);
 
-    let steps: Vec<Box<dyn Fn(&AmneziaConfig) -> AmneziaConfig>> = vec![
+    let steps: [Step; 5] = [
         Box::new(|c| {
             let mut c = c.clone();
             c.init_packet_junk_size += 8;
