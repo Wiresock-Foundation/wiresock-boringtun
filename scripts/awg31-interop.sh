@@ -30,7 +30,14 @@
 #     RandomTrailers off; with it on, each implementation's own handshake
 #     messages carry suffixes and, without content padding, its own transport
 #     varies; every datagram within the bounds the configuration allows; and
-#     after the rekey, both directions sending on the new session.
+#     after the rekey, both directions sending on the new session;
+#   * both daemons accepted the configuration's `disable_cookies` and report it
+#     back over `get=1`: `disable_cookies=1` exactly when it was set.
+#
+# The DisableCookies legs run the ordinary profile with the flag on at both
+# ends -- alone, with RandomTrailers, and with everything -- and hold them to
+# every check above: the flag must not disturb the handshake, the traffic, the
+# rekey or the wire.
 #
 # `--self-test` checks the checker and the verdict plumbing against synthetic
 # inputs, including ones that must fail; it needs no root and no binaries.
@@ -42,11 +49,14 @@
 # removed on exit as before.
 #
 # The S sizes are deliberately unequal, so the receive side's candidate
-# readings genuinely differ per packet kind. What this does NOT cover: the
-# cookie reply's trailer, which needs a responder under load and is pinned by
-# the unit tests (`noise::random_trailers_tests`), and WireSock's CPA policy
-# with RandomTrailers off, which cannot be told apart on the wire from inside a
-# single run and is pinned by `amnezia::tests` with concrete values.
+# readings genuinely differ per packet kind. What this does NOT cover:
+# anything that needs a responder under load, because neither implementation
+# can be put there deterministically from outside without flooding it -- the
+# cookie reply's trailer (`noise::random_trailers_tests`) and DisableCookies'
+# actual bypass of the cookie defense (`noise::disable_cookies_tests`, which
+# starve the limiter instead); and WireSock's CPA policy with RandomTrailers
+# off, which cannot be told apart on the wire from inside a single run and is
+# pinned by `amnezia::tests` with concrete values.
 #
 # Requires: root, iproute2, python3 with `cryptography`, ping, a built
 # boringtun-cli, and the amneziawg-go above. Everything lives in throwaway
@@ -88,7 +98,7 @@ readonly INIT_SZ=148 RESP_SZ=92 DATA_MIN=32
 # most it) the checker sees.
 readonly WINDOW=500
 
-awg_block() { # <rt 0|1> <cpa 0|1> <hp 0|1>
+awg_block() { # <rt 0|1> <cpa 0|1> <hp 0|1> <dc 0|1>
   local b
   b=$'jc='"$JC"$'\njmin='"$JMIN"$'\njmax='"$JMAX"$'\ns1='"$S1"$'\ns2='"$S2"$'\ns3='"$S3"$'\ns4='"$S4"$'\nh1='"$H1"$'\nh2='"$H2"$'\nh3='"$H3"$'\nh4='"$H4"$'\n'
   # A short rekey, so each leg sees a second handshake inside its run time.
@@ -96,6 +106,7 @@ awg_block() { # <rt 0|1> <cpa 0|1> <hp 0|1>
   [ "$1" = 1 ] && b+=$'random_trailers=1\n'
   [ "$2" = 1 ] && b+=$'content_padding_addition=8-120\n'
   [ "$3" = 1 ] && b+=$'header_protection_key='"$HP_KEY"$'\n'
+  [ "$4" = 1 ] && b+=$'disable_cookies=1\n'
   printf '%s' "$b"
 }
 
@@ -136,6 +147,13 @@ check_go() {
 # up has advanced alone, and that is not a completed rekey.
 rekey_verdict() { # <resp before> <resp after> <init before> <init after>
   [ "$2" -gt "$1" ] && [ "$4" -gt "$3" ]
+}
+
+# 0 when a peer's `get=1` (on stdin) reports DisableCookies as configured:
+# `disable_cookies=1` exactly when it was set. amneziawg-go prints `=0` when
+# it is off and boringtun omits the key, so off is "no `=1`", not "`=0`".
+dc_verdict() { # <want 0|1>
+  if [ "$1" = 1 ]; then grep -qx 'disable_cookies=1'; else ! grep -qx 'disable_cookies=1'; fi
 }
 
 # Judge a capture with the wire checker. Only its exit status decides: 0 is a
@@ -223,6 +241,15 @@ self_test() {
   expect "a rekey only the responder recorded fails" fail rekey_verdict 100 113 100 100
   expect "a rekey only the initiator recorded fails" fail rekey_verdict 100 100 100 113
   expect "no rekey fails" fail rekey_verdict 100 100 100 100
+
+  expect "disable_cookies=1 set and reported passes" 0 dc_verdict 1 \
+    <<<$'random_trailers=1\ndisable_cookies=1'
+  expect "disable_cookies set but reported off fails" fail dc_verdict 1 <<<'disable_cookies=0'
+  expect "disable_cookies set but not reported fails" fail dc_verdict 1 <<<'random_trailers=1'
+  expect "disable_cookies off, reported =0 (amneziawg-go) passes" 0 dc_verdict 0 \
+    <<<'disable_cookies=0'
+  expect "disable_cookies off, omitted (boringtun) passes" 0 dc_verdict 0 <<<'s1=40'
+  expect "disable_cookies off but reported on fails" fail dc_verdict 0 <<<'disable_cookies=1'
 
   # The verdict plumbing: a checker that throws, or cannot parse the capture,
   # must fail the leg -- empty output is not a pass.
@@ -448,16 +475,29 @@ wait_both_handshakes() { # <resp after> <init after>
   return 1
 }
 
-run_leg() { # <label> <resp impl go|bt> <rt> <cpa> <hp>
-  local label=$1 resp=$2 rt=$3 cpa=$4 hp=$5
+run_leg() { # <label> <resp impl go|bt> <rt> <cpa> <hp> <dc>
+  local label=$1 resp=$2 rt=$3 cpa=$4 hp=$5 dc=$6
   local init=bt; [ "$resp" = bt ] && init=go
   # The names the wire checker attributes each direction to.
   local in_sender=rust out_sender=rust
   [ "$init" = go ] && in_sender=go
   [ "$resp" = go ] && out_sender=go
-  info "$label: $init initiates, $resp responds (rt=$rt cpa=$cpa hp=$hp)"
-  if ! start_leg "$resp" "$(awg_block "$rt" "$cpa" "$hp")"; then
+  info "$label: $init initiates, $resp responds (rt=$rt cpa=$cpa hp=$hp dc=$dc)"
+  if ! start_leg "$resp" "$(awg_block "$rt" "$cpa" "$hp" "$dc")"; then
     bad "$label: setup failed -- not an interop result"; return
+  fi
+  # Both daemons took the configuration -- `set=1` answered errno=0 in
+  # `start_leg` -- and report DisableCookies as it was set.
+  local r_get="$WORKDIR/r.get" i_get="$WORKDIR/i.get"
+  printf 'get=1\n\n' | uapi "$NS_R" "$IF_R" >"$r_get"
+  printf 'get=1\n\n' | uapi "$NS_I" "$IF_I" >"$i_get"
+  local dc_line
+  dc_line="disable_cookies reported: responder $(grep -x 'disable_cookies=.' "$r_get" || echo absent)"
+  dc_line+=", initiator $(grep -x 'disable_cookies=.' "$i_get" || echo absent)"
+  if dc_verdict "$dc" <"$r_get" && dc_verdict "$dc" <"$i_get"; then
+    ok "$label: disable_cookies=$dc accepted and reported by both peers"
+  else
+    bad "$label: disable_cookies=$dc not reported by both peers ($dc_line)"
   fi
   # A nudge to start the handshake; its status is not the assertion.
   ip netns exec "$NS_I" ping -c2 -w 10 -q "$RESP_TUN" >/dev/null 2>&1
@@ -510,8 +550,9 @@ run_leg() { # <label> <resp impl go|bt> <rt> <cpa> <hp>
     bad "$label: wire, per sender:"
     sed 's/^/      /' "$jout" "$jerr"
   fi
-  keep_leg "rt$rt-cpa$cpa-hp$hp.$init-initiates" \
+  keep_leg "rt$rt-cpa$cpa-hp$hp-dc$dc.$init-initiates" \
     "leg: $label ($init initiates as $in_sender, $resp responds as $out_sender)" \
+    "$dc_line" \
     "$rekey_line" \
     "wire: $wire_verdict -- $(tail -1 "$jerr")"
 }
@@ -521,11 +562,13 @@ echo "amneziawg-go : $GO ($PINNED_VERSION, vcs.revision $PINNED_COMMIT, verified
 echo "S1..S4       : $S1 $S2 $S3 $S4"
 echo
 
-for cfg in "0 0 0" "0 1 0" "1 0 0" "1 1 0" "1 1 1"; do
+# RandomTrailers/CPA/HP with DisableCookies off, then DisableCookies on alone,
+# with RandomTrailers, and with everything.
+for cfg in "0 0 0 0" "0 1 0 0" "1 0 0 0" "1 1 0 0" "1 1 1 0" "0 0 0 1" "1 0 0 1" "1 1 1 1"; do
   set -- $cfg
-  name="rt=$1 cpa=$2 hp=$3"
-  run_leg "[$name] go->bt" bt "$1" "$2" "$3"
-  run_leg "[$name] bt->go" go "$1" "$2" "$3"
+  name="rt=$1 cpa=$2 hp=$3 dc=$4"
+  run_leg "[$name] go->bt" bt "$1" "$2" "$3" "$4"
+  run_leg "[$name] bt->go" go "$1" "$2" "$3" "$4"
 done
 
 echo
