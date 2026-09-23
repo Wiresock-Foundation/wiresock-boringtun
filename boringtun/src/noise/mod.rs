@@ -548,7 +548,7 @@ impl Tunn {
     /// re-registration of the same address -- amneziawg-go compares endpoint
     /// objects rather than addresses, so it also resets whenever a fresh object
     /// describes the same peer; that is not reproduced.
-    #[cfg(any(test, feature = "device"))]
+    #[cfg(feature = "device")]
     pub(crate) fn reset_udp_window(&self) {
         self.udp_window
             .store(amnezia::DEFAULT_UDP_WINDOW, AtomicOrdering::Relaxed);

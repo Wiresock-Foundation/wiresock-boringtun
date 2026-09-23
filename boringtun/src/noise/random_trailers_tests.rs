@@ -43,6 +43,18 @@ fn delivered(result: TunnResult) -> Vec<u8> {
     }
 }
 
+/// A new initiation from `tunn`, with the clock moved on first.
+///
+/// A responder refuses an initiation whose TAI64N timestamp is not newer than
+/// the last it accepted -- replay protection -- and under `mock-instant` the
+/// clock only moves when told to, so back-to-back initiations would carry the
+/// same timestamp and all but the first would be refused as replays.
+fn fresh_initiation(tunn: &mut Tunn, buf: &mut [u8]) -> Vec<u8> {
+    #[cfg(feature = "mock-instant")]
+    mock_instant::thread_local::MockClock::advance(std::time::Duration::from_millis(5));
+    network(tunn.format_handshake_initiation(buf, true))
+}
+
 fn keys() -> [Option<[u8; 32]>; 2] {
     [None, Some(KEY)]
 }
@@ -266,9 +278,9 @@ fn a_response_that_fails_noise_leaves_its_initiation_pending() {
             // A rekey in flight: one initiation, or two with the target in
             // the `previous` slot.
             let mut buf = vec![0u8; 4096];
-            let target = network(mine.format_handshake_initiation(&mut buf, true));
+            let target = fresh_initiation(&mut mine, &mut buf);
             if previous_slot {
-                network(mine.format_handshake_initiation(&mut buf, true));
+                fresh_initiation(&mut mine, &mut buf);
             }
             let target_idx = sender_idx(&mine, &target);
 
@@ -347,7 +359,7 @@ fn a_lone_response_that_fails_noise_is_refused_by_noise() {
         let (mut mine, mut theirs, my_public) = keyed_pair(&amnezia, None);
         handshake(&mut mine, &mut theirs);
         let mut buf = vec![0u8; 4096];
-        let target = network(mine.format_handshake_initiation(&mut buf, true));
+        let target = fresh_initiation(&mut mine, &mut buf);
         let target_idx = sender_idx(&mine, &target);
 
         let s2 = UNEQUAL[1] as usize;
@@ -450,7 +462,7 @@ fn the_suffix_is_unauthenticated_and_the_core_is_not() {
         ));
 
         // ...while a flipped core byte is not.
-        let init = network(mine.format_handshake_initiation(&mut buf, true));
+        let init = fresh_initiation(&mut mine, &mut buf);
         let mut wire = with_suffix(&init, 9);
         wire[UNEQUAL[0] as usize + 100] ^= 1;
         assert!(matches!(
@@ -490,7 +502,7 @@ fn handshake_messages_draw_their_suffix_below_the_tunnel_window() {
         let mut buf = vec![0u8; 4096];
         let (mut inits, mut resps) = (Vec::new(), Vec::new());
         for _ in 0..48 {
-            let init = network(mine.format_handshake_initiation(&mut buf, true));
+            let init = fresh_initiation(&mut mine, &mut buf);
             let resp = network(theirs.decapsulate(SRC, &init, &mut buf));
             inits.push(init.len());
             resps.push(resp.len());
@@ -515,7 +527,7 @@ fn handshake_messages_draw_their_suffix_below_the_tunnel_window() {
         // The window governs: widened, the suffix follows it.
         mine.set_udp_window(1400);
         let widest = (0..64)
-            .map(|_| network(mine.format_handshake_initiation(&mut buf, true)).len())
+            .map(|_| fresh_initiation(&mut mine, &mut buf).len())
             .max()
             .unwrap();
         assert!(widest > window && widest < 1400, "{}", widest);
@@ -556,7 +568,7 @@ fn a_cookie_reply_suffix_is_bounded_by_the_request() {
         let mut buf = vec![0u8; 4096];
         let mut grew = false;
         for _ in 0..64 {
-            let init = network(mine.format_handshake_initiation(&mut buf, true));
+            let init = fresh_initiation(&mut mine, &mut buf);
             let reply = network(theirs.decapsulate(SRC, &init, &mut buf));
             assert!(reply.len() >= 20 + 64);
             assert!(
@@ -588,7 +600,7 @@ fn a_cookie_reply_at_parity_carries_no_suffix_and_an_amplifying_one_is_suppresse
     theirs.set_obfuscation(obf, parity.clone().with_random_trailers(true));
     let mut buf = vec![0u8; 4096];
     for _ in 0..32 {
-        let init = network(mine.format_handshake_initiation(&mut buf, true));
+        let init = fresh_initiation(&mut mine, &mut buf);
         assert_eq!(init.len(), 148);
         let reply = network(theirs.decapsulate(SRC, &init, &mut buf));
         assert_eq!(reply.len(), 148, "parity: sent, and with no suffix");
@@ -598,7 +610,7 @@ fn a_cookie_reply_at_parity_carries_no_suffix_and_an_amplifying_one_is_suppresse
     let (mut mine, mut theirs) = cookie_pair(&amplifying);
     let obf = theirs.handshake.obf;
     theirs.set_obfuscation(obf, amplifying.with_random_trailers(true));
-    let init = network(mine.format_handshake_initiation(&mut buf, true));
+    let init = fresh_initiation(&mut mine, &mut buf);
     assert!(matches!(
         theirs.decapsulate(SRC, &init, &mut buf),
         TunnResult::Done
@@ -616,18 +628,18 @@ fn a_cookie_reply_respects_its_buffer_and_a_large_s3() {
     let (mut mine, mut theirs) = cookie_pair(&amnezia);
     let mut buf = vec![0u8; 4096];
 
-    let init = network(mine.format_handshake_initiation(&mut buf, true));
+    let init = fresh_initiation(&mut mine, &mut buf);
     assert_eq!(
         network(theirs.decapsulate(SRC, &init, &mut vec![0u8; base])).len(),
         base
     );
-    let init = network(mine.format_handshake_initiation(&mut buf, true));
+    let init = fresh_initiation(&mut mine, &mut buf);
     assert!(matches!(
         theirs.decapsulate(SRC, &init, &mut vec![0u8; base - 1]),
         TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
     ));
     for _ in 0..16 {
-        let init = network(mine.format_handshake_initiation(&mut buf, true));
+        let init = fresh_initiation(&mut mine, &mut buf);
         assert!(
             network(theirs.decapsulate(SRC, &init, &mut vec![0u8; base + 3])).len() <= base + 3
         );
@@ -636,7 +648,7 @@ fn a_cookie_reply_respects_its_buffer_and_a_large_s3() {
     let large = AmneziaConfig::new(1200, 40, 1000, 160).with_random_trailers(true);
     let (mut mine, mut theirs) = cookie_pair(&large);
     for _ in 0..8 {
-        let init = network(mine.format_handshake_initiation(&mut buf, true));
+        let init = fresh_initiation(&mut mine, &mut buf);
         let reply = network(theirs.decapsulate(SRC, &init, &mut buf));
         assert_eq!(reply.len(), 1000 + 64, "no room below the fixed window");
     }
