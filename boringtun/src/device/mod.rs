@@ -42,14 +42,15 @@ use crate::noise::amnezia::AmneziaConfig;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::handshake::ObfuscationRanges;
+use crate::noise::inbound;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::{Packet, Tunn, TunnResult};
+use crate::noise::{Authenticated, Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
-use probe_reply::{HeaderProtectionVerdict, ProbeResponder};
+use probe_reply::ProbeResponder;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{OsRng, RngCore, SeedableRng};
 use socket2::{Domain, Protocol, Type};
@@ -331,6 +332,51 @@ fn index_prefixes<D>(index: &AllowedIps<Arc<D>>, owner: &Arc<D>) -> Vec<(IpAddr,
         .filter(|(found, _, _)| Arc::ptr_eq(found, owner))
         .map(|(_, addr, cidr)| (addr, cidr))
         .collect()
+}
+
+/// A reading `authenticate_anonymous` accepted: the peer it belongs to, that
+/// peer held locked, and the packet waiting to be committed.
+type AcceptedFromPeer<'m> = (&'m Arc<Mutex<Peer>>, MutexGuard<'m, Peer>, Authenticated);
+
+/// One candidate reading's trial on the anonymous socket: find the peer the
+/// packet names, and have that peer's tunnel authenticate it.
+///
+/// An initiation names its peer by the static key inside it, which costs the
+/// Diffie-Hellman `parse_handshake_anon` has always cost here; every other kind
+/// names it by receiver index, which is a routing hint and nothing more -- the
+/// tunnel's `authenticate` is what decides. On success the peer stays locked,
+/// so nothing can move its state between this and the commit. On failure the
+/// lock is released and nothing has changed, which is what lets
+/// `inbound::receive` go on to the datagram's next reading.
+///
+/// A free function over the two peer maps rather than inline in the handler,
+/// so the device tests run the lookup production runs.
+fn authenticate_anonymous<'m>(
+    peers: &'m HashMap<x25519::PublicKey, Arc<Mutex<Peer>>>,
+    peers_by_idx: &'m HashMap<u32, Arc<Mutex<Peer>>>,
+    private_key: &x25519::StaticSecret,
+    public_key: &x25519::PublicKey,
+    packet: Packet,
+    dst: &mut [u8],
+) -> Result<AcceptedFromPeer<'m>, WireGuardError> {
+    let peer = match &packet {
+        Packet::HandshakeInit(p) => parse_handshake_anon(private_key, public_key, p)
+            .ok()
+            .and_then(|hh| peers.get(&x25519::PublicKey::from(hh.peer_static_public)))
+            .ok_or(WireGuardError::WrongKey)?,
+        Packet::HandshakeResponse(p) => peers_by_idx
+            .get(&(p.receiver_idx >> 8))
+            .ok_or(WireGuardError::WrongIndex)?,
+        Packet::PacketCookieReply(p) => peers_by_idx
+            .get(&(p.receiver_idx >> 8))
+            .ok_or(WireGuardError::WrongIndex)?,
+        Packet::PacketData(p) => peers_by_idx
+            .get(&(p.receiver_idx >> 8))
+            .ok_or(WireGuardError::WrongIndex)?,
+    };
+    let guard = peer.lock();
+    let packet = guard.tunnel.authenticate(packet, dst)?;
+    Ok((peer, guard, packet))
 }
 
 /// Read and discard up to `MAX_ITR` queued datagrams.
@@ -1151,31 +1197,17 @@ impl Device {
                         continue;
                     };
 
-                    // Header protection comes off before anything reads the
-                    // message type, and this is the outermost point that owns a
-                    // mutable buffer -- the connected-socket path below reaches
-                    // `Tunn::decapsulate`, which does its own, but this one
-                    // classifies and finds the peer before any `Tunn` exists.
-                    //
-                    // Its verdict is then AUTHORITATIVE, and that is the whole
-                    // point: `classify`'s own `strip_inbound` range-tests the
-                    // tag with an all-zero mask, so letting it have a second
-                    // opinion would both reject our own peers (whose tags are
-                    // masked) and accept datagrams that were never masked at
-                    // all -- header protection would be enforced on send and
-                    // nowhere on receive. An earlier version of this discarded
-                    // the verdict and did exactly that.
-                    let verdict = HeaderProtectionVerdict::for_ingress(
-                        &d.config.amnezia,
-                        obf,
-                        &mut t.src_buf[..packet_len],
-                    );
-
                     // AmneziaWG framing first, probe detection only if that
                     // fails. The order lives inside `classify` rather than here
                     // so it can be tested; see its doc for why getting it
                     // backwards makes the server answer its own clients.
-                    let packet = match verdict.classify(
+                    //
+                    // `classify` reads the message type through the
+                    // header-protection mask when a key is set, and that reading
+                    // is the only one: an unmasked tag cannot pass for ours on a
+                    // device that requires masking. It never modifies the
+                    // datagram, so what probe detection sees is what arrived.
+                    let candidates = match probe_reply::classify(
                         &t.src_buf[..packet_len],
                         &d.config.amnezia,
                         obf,
@@ -1183,36 +1215,69 @@ impl Device {
                         d.probe_responder.as_ref(),
                         &mut t.probe_rng,
                     ) {
-                        probe_reply::Ingress::Wireguard(packet) => packet,
+                        probe_reply::Ingress::Wireguard(candidates) => candidates,
                         probe_reply::Ingress::Reply(reply) => {
                             let _: Result<_, _> = udp.send_to(&reply, &addr);
                             continue;
                         }
                         probe_reply::Ingress::Drop => continue,
                     };
-                    // The rate limiter checks mac1 and mac2 over the slice
-                    // `classify` handed back -- the S-prefix already stripped.
-                    // That order is mandatory: the MACs are computed over the
-                    // unpadded packet, so verifying the padded datagram fails
-                    // the check. It mirrors the kernel module, which strips at
-                    // device level before peer lookup.
-                    let parsed_packet = match rate_limiter.verify_packet(
+
+                    // The datagram's shape can fit more than one packet kind, so
+                    // each is tried in turn and the first that authenticates is
+                    // the one accepted (`noise::inbound`). The rate limiter
+                    // checks mac1 and mac2 over each candidate's canonical
+                    // message -- the S-prefix stripped and header protection
+                    // undone. That order is mandatory: the MACs are computed
+                    // over the unpadded packet, so verifying the padded datagram
+                    // fails the check. It mirrors the kernel module, which
+                    // strips at device level before peer lookup.
+                    //
+                    // A trial is `authenticate_anonymous`: find the peer the
+                    // candidate names and have its tunnel authenticate it. A
+                    // trial that fails changes nothing, so the next candidate
+                    // meets the same peers; the one that succeeds keeps its
+                    // peer locked until the packet is committed below.
+                    let datagram = &t.src_buf[..packet_len];
+                    let dst_buf = &mut t.dst_buf;
+                    let outcome = inbound::receive(
+                        &d.config.amnezia,
                         obf,
-                        &mut OsRng,
+                        rate_limiter,
                         Some(from.ip()),
-                        packet,
-                        &mut t.dst_buf,
-                    ) {
-                        Ok(packet) => packet,
-                        Err(TunnResult::WriteToNetwork(cookie)) => {
-                            // Nothing here has been authenticated. `verify_packet`
-                            // returns a cookie on a valid mac1, and mac1 is keyed
+                        &candidates,
+                        datagram,
+                        |packet| {
+                            authenticate_anonymous(
+                                &d.peers,
+                                &d.peers_by_idx,
+                                private_key,
+                                public_key,
+                                packet,
+                                &mut dst_buf[..],
+                            )
+                        },
+                    );
+
+                    let (peer, mut p, packet) = match outcome {
+                        inbound::Inbound::Accepted(accepted) => accepted,
+                        inbound::Inbound::Cookie(demand) => {
+                            // Nothing here has been authenticated. The limiter
+                            // demands a cookie on a valid mac1, and mac1 is keyed
                             // on this server's *public* key -- which is in every
-                            // client configuration -- so the source address is as
-                            // attacker-chosen as a probe's, and the reply is as
-                            // amplifiable. Decided before the junk is generated:
-                            // see `cookie_reply_len`.
-                            let cookie_len = cookie.len();
+                            // client configuration -- so the source address is
+                            // as attacker-chosen as a probe's, and the reply is
+                            // as amplifiable. Decided before the junk is
+                            // generated: see `cookie_reply_len`.
+                            let cookie_len = match rate_limiter.format_cookie_demand(
+                                obf,
+                                &mut OsRng,
+                                &demand,
+                                &mut t.dst_buf,
+                            ) {
+                                Ok(cookie) => cookie.len(),
+                                Err(_) => continue,
+                            };
                             let reply_len = d.config.amnezia.cookie_reply_len(cookie_len);
                             match reply_policy::cookie_verdict(from, packet_len, reply_len) {
                                 reply_policy::CookieVerdict::Send => {
@@ -1248,35 +1313,15 @@ impl Device {
                             }
                             continue;
                         }
-                        Err(_) => continue,
+                        // Recognised framing that no peer authenticated -- an
+                        // unknown peer, a stale index, a forgery. Dropped, not
+                        // handed back to probe detection.
+                        inbound::Inbound::Refused(_) | inbound::Inbound::NotOurs => continue,
                     };
-
-                    let peer = match &parsed_packet {
-                        Packet::HandshakeInit(p) => {
-                            parse_handshake_anon(private_key, public_key, p)
-                                .ok()
-                                .and_then(|hh| {
-                                    d.peers.get(&x25519::PublicKey::from(hh.peer_static_public))
-                                })
-                        }
-                        Packet::HandshakeResponse(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
-                        Packet::PacketCookieReply(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
-                        Packet::PacketData(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
-                    };
-
-                    let peer = match peer {
-                        None => continue,
-                        Some(peer) => peer,
-                    };
-
-                    let mut p = peer.lock();
 
                     // We found a peer, use it to decapsulate the message+
                     let mut flush = false; // Are there packets to send from the queue?
-                    match p
-                        .tunnel
-                        .handle_verified_packet(parsed_packet, &mut t.dst_buf[..])
-                    {
+                    match p.tunnel.commit(packet, &mut t.dst_buf[..]) {
                         TunnResult::Done => {}
                         TunnResult::Err(_) => continue,
                         TunnResult::WriteToNetwork(packet) => {
@@ -1366,9 +1411,9 @@ impl Device {
                             // many peers, and drivable by an *authenticated*
                             // peer roaming rapidly, since every new source
                             // address arrives here. Not by an unauthenticated
-                            // flood: this runs only after `verify_packet`, peer
-                            // lookup and `handle_verified_packet` have all
-                            // succeeded. Note the sibling `Result` one line
+                            // flood: this runs only after the rate limiter, peer
+                            // lookup and the tunnel have all accepted the
+                            // datagram. Note the sibling `Result` one line
                             // above is already handled this way.
                             if let Err(e) = d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
                             {
@@ -1759,12 +1804,12 @@ mod ingress_tests {
     /// Run the device's anonymous-ingress sequence over `datagram`, returning
     /// the initiator's static public key when it demuxes to a handshake.
     ///
-    /// Mirrors `register_udp_handler`: strip the S-prefix, verify with the
-    /// device-scoped ranges, then identify the peer from the parse result.
+    /// Mirrors `register_udp_handler`: classify with the device-scoped ranges,
+    /// gate each candidate on mac1, then identify the peer from the parse.
     ///
     /// The source address is supplied for the same reason the real path
     /// supplies it (`Some(addr.as_socket().unwrap().ip())`): once the limiter
-    /// is under load, `verify_packet` rejects a `None` address outright with
+    /// is under load, the limiter rejects a `None` address outright with
     /// `UnderLoad`, because mac2 cannot be validated without one. Passing
     /// `None` here would pass today only because two packets never trip the
     /// 100/s limit -- the helper would quietly stop mirroring production the
@@ -1777,41 +1822,197 @@ mod ingress_tests {
     ) -> Option<[u8; 32]> {
         let server_public = x25519::PublicKey::from(server_secret);
         let limiter = RateLimiter::new(&server_public, HANDSHAKE_RATE_LIMIT);
-        let mut scratch = vec![0u8; MAX_UDP_SIZE];
 
         // RFC 5737 TEST-NET-3, so the value is obviously a fixture.
         let src_addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
 
-        // The production sequence, not a shortcut. `for_ingress` builds the
-        // authoritative header-protection verdict -- unmasking in place when a
-        // key is set -- and `classify` consumes it. An earlier version of this
-        // helper called `strip_inbound` directly, which mirrors the production
-        // path as it was *before* header protection: with a key configured the
-        // helper and the daemon then disagreed about which datagrams exist,
-        // and the enforcement branch had no automated coverage at all --
-        // deleting it left the whole suite green.
-        let mut wire = datagram.to_vec();
-        let verdict = HeaderProtectionVerdict::for_ingress(amnezia, obf, &mut wire);
-        let stripped = match verdict.classify(
-            &wire,
+        // The production sequence, not a shortcut: `classify` decides whether
+        // the datagram is AmneziaWG -- through the header-protection mask when
+        // a key is set -- and `inbound::receive` tries its candidates with the
+        // same mac1/load gate and the same anonymous peer lookup the handler
+        // runs. An earlier version of this helper called `strip_inbound`
+        // directly, which mirrors the production path as it was *before*
+        // header protection: with a key configured the helper and the daemon
+        // then disagreed about which datagrams exist, and the enforcement
+        // branch had no automated coverage at all -- deleting it left the
+        // whole suite green.
+        let candidates = match probe_reply::classify(
+            datagram,
             amnezia,
             obf,
             SocketAddr::new(src_addr, 40000),
             None,
             &mut ChaCha8Rng::seed_from_u64(1),
         ) {
-            probe_reply::Ingress::Wireguard(p) => p,
+            probe_reply::Ingress::Wireguard(candidates) => candidates,
             probe_reply::Ingress::Reply(_) | probe_reply::Ingress::Drop => return None,
         };
-        let parsed = limiter
-            .verify_packet(obf, &mut OsRng, Some(src_addr), stripped, &mut scratch)
-            .ok()?;
-
-        match parsed {
-            Packet::HandshakeInit(p) => parse_handshake_anon(server_secret, &server_public, &p)
-                .ok()
-                .map(|hh| hh.peer_static_public),
+        match inbound::receive(
+            amnezia,
+            obf,
+            &limiter,
+            Some(src_addr),
+            &candidates,
+            datagram,
+            |packet| match packet {
+                Packet::HandshakeInit(p) => parse_handshake_anon(server_secret, &server_public, &p)
+                    .map(|hh| hh.peer_static_public),
+                _ => Err(WireGuardError::WrongPacketType),
+            },
+        ) {
+            inbound::Inbound::Accepted(peer_static_public) => Some(peer_static_public),
             _ => None,
+        }
+    }
+
+    /// The anonymous ingress reads an ambiguous datagram the way
+    /// `Tunn::decapsulate` does: false readings fall through to the one that
+    /// authenticates, with or without header protection.
+    ///
+    /// The two paths differ in how they find the peer -- the ingress has no
+    /// `Tunn` until `authenticate_anonymous` looks one up -- so each gets a
+    /// transport packet whose junk prefix also reads as an initiation, a
+    /// response and a cookie reply, the cookie naming the server's real cookie
+    /// index so that it is refused by its AEAD and not by the lookup. Two
+    /// packets rather than one because a packet accepted by either path spends
+    /// its counter.
+    #[test]
+    fn the_anonymous_ingress_falls_through_false_readings_like_decapsulate() {
+        use crate::noise::inbound::fixtures::*;
+
+        const SERVER_IDX: u32 = 0x00C4_2A17;
+        let src_addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        let obf = ObfuscationRanges::default();
+
+        for key in [None, Some([0x5a; 32])] {
+            let amnezia = colliding(key);
+            let server_secret = x25519::StaticSecret::random_from_rng(OsRng);
+            let server_public = x25519::PublicKey::from(&server_secret);
+            let client_secret = x25519::StaticSecret::random_from_rng(OsRng);
+            let client_public = x25519::PublicKey::from(&client_secret);
+            let limiter = RateLimiter::new(&server_public, HANDSHAKE_RATE_LIMIT);
+
+            let mut client = Tunn::new_with_obfuscation(
+                client_secret,
+                server_public,
+                None,
+                None,
+                1,
+                None,
+                obf,
+                amnezia.clone(),
+            )
+            .unwrap();
+            let mut server = Tunn::new_with_obfuscation(
+                server_secret.clone(),
+                client_public,
+                None,
+                None,
+                SERVER_IDX,
+                None,
+                obf,
+                amnezia.clone(),
+            )
+            .unwrap();
+
+            let network = |r: TunnResult| match r {
+                TunnResult::WriteToNetwork(d) => d.to_vec(),
+                other => panic!("expected a datagram, got {:?}", other),
+            };
+            let mut buf = vec![0u8; MAX_UDP_SIZE];
+            let init = network(client.format_handshake_initiation(&mut buf, false));
+            let response = network(server.decapsulate(Some(src_addr), &init, &mut buf));
+            let keepalive = network(client.decapsulate(Some(src_addr), &response, &mut buf));
+            assert!(matches!(
+                server.decapsulate(Some(src_addr), &keepalive, &mut buf),
+                TunnResult::Done
+            ));
+            // The server's cookie state names the index it answered with: the
+            // response's sender index, read from behind its S2 prefix.
+            let mut unmasked = response.clone();
+            let at = amnezia
+                .unmask_and_classify_inbound(obf, &mut unmasked)
+                .expect("our own response");
+            let server_cookie_idx = u32::from_le_bytes([
+                unmasked[at + 4],
+                unmasked[at + 5],
+                unmasked[at + 6],
+                unmasked[at + 7],
+            ]);
+
+            let peer = Arc::new(Mutex::new(Peer::new(server, SERVER_IDX, None, None)));
+            let peers = HashMap::from([(client_public, Arc::clone(&peer))]);
+            let peers_by_idx = HashMap::from([(SERVER_IDX, Arc::clone(&peer))]);
+
+            let ambiguous = |client: &mut Tunn| {
+                let mut wire = network(client.encapsulate(&bare_ipv4(), &mut [0u8; WIRE]));
+                assert_eq!(wire.len(), WIRE);
+                plant(&mut wire, &amnezia, INIT_AT, 1, 0x0bad_0001);
+                plant(&mut wire, &amnezia, RESPONSE_AT, 2, 0x0bad_0002);
+                plant(&mut wire, &amnezia, COOKIE_AT, 3, server_cookie_idx);
+                wire
+            };
+
+            // The anonymous ingress, step for step.
+            let wire = ambiguous(&mut client);
+            let candidates = match probe_reply::classify(
+                &wire,
+                &amnezia,
+                obf,
+                SocketAddr::new(src_addr, 40000),
+                None,
+                &mut ChaCha8Rng::seed_from_u64(1),
+            ) {
+                probe_reply::Ingress::Wireguard(candidates) => candidates,
+                _ => panic!("an ambiguous datagram is still AmneziaWG traffic"),
+            };
+            assert_eq!(
+                candidates.offsets(),
+                vec![INIT_AT, RESPONSE_AT, COOKIE_AT, DATA_AT]
+            );
+            let mut dst = vec![0u8; MAX_UDP_SIZE];
+            let (found, guard, packet) = match inbound::receive(
+                &amnezia,
+                obf,
+                &limiter,
+                Some(src_addr),
+                &candidates,
+                &wire,
+                |packet| {
+                    authenticate_anonymous(
+                        &peers,
+                        &peers_by_idx,
+                        &server_secret,
+                        &server_public,
+                        packet,
+                        &mut dst[..],
+                    )
+                },
+            ) {
+                inbound::Inbound::Accepted(accepted) => accepted,
+                _ => panic!(
+                    "key {:?}: the ingress refused the transport reading",
+                    key.is_some()
+                ),
+            };
+            assert!(Arc::ptr_eq(found, &peer));
+            let mut guard = guard;
+            match guard.tunnel.commit(packet, &mut dst[..]) {
+                TunnResult::WriteToTunnelV4(p, _) => assert_eq!(p, &bare_ipv4()[..]),
+                other => panic!("the ingress did not deliver: {:?}", other),
+            }
+            drop(guard);
+
+            // `decapsulate` -- the connected-socket path -- on the same peer.
+            let wire = ambiguous(&mut client);
+            let mut guard = peer.lock();
+            match guard
+                .tunnel
+                .decapsulate(Some(src_addr), &wire, &mut dst[..])
+            {
+                TunnResult::WriteToTunnelV4(p, _) => assert_eq!(p, &bare_ipv4()[..]),
+                other => panic!("decapsulate did not deliver: {:?}", other),
+            }
         }
     }
 
@@ -2289,8 +2490,8 @@ mod ingress_tests {
 
     /// The device demux enforces header protection in both directions.
     ///
-    /// This drives `HeaderProtectionVerdict::for_ingress` -- the exact step the
-    /// production handler runs -- through `demux_handshake`. Before the helper
+    /// This drives `probe_reply::classify` and `inbound::receive` -- the exact
+    /// steps the production handler runs -- through `demux_handshake`. Before the helper
     /// was rewritten to share that step, this branch had no automated coverage:
     /// deleting it, swapping the unmasking classifier for the zero-mask one,
     /// and mis-slicing the buffer all left the suite green, on the branch that

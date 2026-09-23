@@ -9,7 +9,7 @@
 //!
 //! # Where this runs, and why the order is not negotiable
 //!
-//! Only after [`AmneziaConfig::strip_inbound`] has already returned `None` —
+//! Only after [`AmneziaConfig::inbound_candidates`] has come back empty —
 //! that is, after the datagram has failed to be AmneziaWG. The reverse order
 //! answers our own clients: the invariant table in [`crate::noise::amnezia`]
 //! shows that under `ip=dns` or `ip=sip`, at the S sizes an installer
@@ -30,7 +30,7 @@
 //! describe a host that does not exist; the point is to look like the one
 //! service the operator chose.
 //!
-//! [`AmneziaConfig::strip_inbound`]: crate::noise::amnezia::AmneziaConfig
+//! [`AmneziaConfig::inbound_candidates`]: crate::noise::amnezia::AmneziaConfig
 
 use std::net::SocketAddr;
 
@@ -38,7 +38,7 @@ use rand_core::RngCore;
 
 use super::probe_budget::ProbeBudget;
 use super::reply_policy::{reply_target, Door};
-use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationProtocol};
+use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationProtocol, InboundCandidates};
 use crate::noise::handshake::ObfuscationRanges;
 use crate::noise::imitation::detect::{detect, Probe};
 use crate::noise::imitation::{dns, stun};
@@ -122,10 +122,12 @@ impl ProbeResponder {
 /// (`Foreign(reply)` then `reply.is_none()`) where it should assert on the
 /// outcome. `Drop` is a distinct variant, so "answered" and "stayed silent"
 /// cannot be confused by a test that only looks one level deep.
-pub(crate) enum Ingress<'a> {
-    /// AmneziaWG framing recognised. This is the payload to verify, with any
-    /// S-prefix already removed.
-    Wireguard(&'a [u8]),
+pub(crate) enum Ingress {
+    /// AmneziaWG framing recognised: these are the packet kinds the datagram's
+    /// shape fits, for the tunnel path to authenticate. Never empty. If none of
+    /// them authenticates the datagram is dropped -- it does not come back here
+    /// to be answered as a probe.
+    Wireguard(InboundCandidates),
     /// Not ours, and worth answering. Send this, then drop the datagram.
     Reply(Vec<u8>),
     /// Not ours, and not worth answering. Drop it in silence — which is what a
@@ -140,108 +142,26 @@ pub(crate) enum Ingress<'a> {
 /// [`tests::a_conforming_initiation_is_tunnel_traffic_even_though_it_is_a_valid_dns_query`]
 /// for the test that pins it.
 ///
+/// "AmneziaWG" means any packet kind fits the datagram's shape, as
+/// [`AmneziaConfig::inbound_candidates`] reads it -- through the
+/// header-protection mask when a key is set, which is what keeps an unmasked
+/// datagram from reaching the tunnel path on a device that requires masking.
+/// The datagram is read, never modified, so a datagram with no candidate
+/// reaches probe detection exactly as it arrived.
+///
 /// `responder` is `None` when probe replies are switched off, which is the
 /// default and the only state a vanilla WireGuard interface has.
-pub(crate) fn classify<'a>(
-    datagram: &'a [u8],
+pub(crate) fn classify(
+    datagram: &[u8],
     amnezia: &AmneziaConfig,
     obf: ObfuscationRanges,
     from: SocketAddr,
     responder: Option<&ProbeResponder>,
     rng: &mut impl RngCore,
-) -> Ingress<'a> {
-    classify_with_verdict(
-        datagram,
-        amnezia
-            .strip_inbound(obf, datagram)
-            .map(|p| datagram.len() - p.len()),
-        amnezia,
-        from,
-        responder,
-        rng,
-    )
-}
-
-/// Which classifier is authoritative for one inbound datagram.
-///
-/// A two-state enum rather than an `Option<Option<usize>>` because the outer
-/// and inner `None`s mean opposite things -- "no key configured, ask
-/// `strip_inbound`" versus "a key is configured and this datagram is not ours".
-/// Conflating them is exactly the bug this type was introduced to prevent.
-pub(crate) enum HeaderProtectionVerdict {
-    /// No key set: the ordinary path, byte-identical to before.
-    NotConfigured,
-    /// A key is set and the unmasking classifier has already ruled.
-    Masked(Option<usize>),
-}
-
-impl HeaderProtectionVerdict {
-    /// Build the authoritative verdict for one anonymous-ingress datagram,
-    /// unmasking `datagram` in place when a header-protection key is set.
-    ///
-    /// This is the step `register_udp_handler` performs before classifying,
-    /// extracted so `ingress_tests::demux_handshake` runs the same code the
-    /// production demux runs. While it lived inline in the handler it had no
-    /// automated coverage: deleting the branch, swapping the unmasking
-    /// classifier for the zero-mask one, and mis-slicing the buffer each left
-    /// the whole suite green -- on the exact branch that closes the
-    /// enforced-on-send-only hole.
-    pub(crate) fn for_ingress(
-        amnezia: &AmneziaConfig,
-        obf: ObfuscationRanges,
-        datagram: &mut [u8],
-    ) -> Self {
-        if amnezia.header_protection_enabled() {
-            Self::Masked(amnezia.unmask_and_classify_inbound(obf, datagram))
-        } else {
-            Self::NotConfigured
-        }
-    }
-
-    pub(crate) fn classify<'a>(
-        &self,
-        datagram: &'a [u8],
-        amnezia: &AmneziaConfig,
-        obf: ObfuscationRanges,
-        from: SocketAddr,
-        responder: Option<&ProbeResponder>,
-        rng: &mut impl RngCore,
-    ) -> Ingress<'a> {
-        match self {
-            Self::NotConfigured => classify(datagram, amnezia, obf, from, responder, rng),
-            Self::Masked(verdict) => {
-                classify_with_verdict(datagram, *verdict, amnezia, from, responder, rng)
-            }
-        }
-    }
-}
-
-/// [`classify`], but with the AmneziaWG verdict already decided by the caller.
-///
-/// Exists for header protection. When a key is set, the message type is masked,
-/// so [`AmneziaConfig::strip_inbound`] -- which range-tests the tag with an
-/// all-zero mask -- would reject our own peers' datagrams and *accept* datagrams
-/// that were never masked at all. The unmasking classifier is then the only
-/// authority, and this entry point is how its verdict is carried in without
-/// giving `strip_inbound` a second opinion.
-///
-/// `verdict` is `Some(junk_offset)` when the datagram is ours, `None` when it is
-/// not and probe detection should have it.
-///
-/// Kept here rather than exposing a probe-only helper: the module doc's rule is
-/// that AmneziaWG classification happens before probe classification, and that
-/// rule is enforced by [`reply_to`] having exactly one caller. This preserves
-/// that -- it moves *where* the verdict comes from, not the order.
-pub(crate) fn classify_with_verdict<'a>(
-    datagram: &'a [u8],
-    verdict: Option<usize>,
-    amnezia: &AmneziaConfig,
-    from: SocketAddr,
-    responder: Option<&ProbeResponder>,
-    rng: &mut impl RngCore,
-) -> Ingress<'a> {
-    if let Some(junk) = verdict {
-        return Ingress::Wireguard(&datagram[junk..]);
+) -> Ingress {
+    let candidates = amnezia.inbound_candidates(obf, datagram);
+    if !candidates.is_empty() {
+        return Ingress::Wireguard(candidates);
     }
     match responder.and_then(|r| reply_to(datagram, from, amnezia.imitation.protocol, r, rng)) {
         Some(reply) => Ingress::Reply(reply),
@@ -272,7 +192,7 @@ fn reply_to(
     // Cheapest test first, and the one that short-circuits the common case: a
     // vanilla interface, or one imitating nothing, never runs the classifier at
     // all. `detect` walks a DNS QNAME and eleven SIP prefixes, and it would run
-    // on every datagram that fails `strip_inbound` — for a verdict that
+    // on every datagram that fits no AmneziaWG shape — for a verdict that
     // `probe.is(imitation)` was always going to discard.
     if imitation == AmneziaImitationProtocol::None {
         return None;
@@ -332,16 +252,16 @@ mod tests {
     /// An UNMASKED AmneziaWG datagram must not reach the tunnel path on a device
     /// that has a header-protection key set.
     ///
-    /// This is the hole [`HeaderProtectionVerdict`] exists to close. The first
-    /// version of the ingress ran the unmasking classifier, threw its verdict
-    /// away, and then called [`classify`] -- whose `strip_inbound` range-tests
-    /// the tag with an all-zero mask and therefore *accepts* a datagram nobody
-    /// masked. Header protection was enforced on send and nowhere on receive,
-    /// and a prober holding only the server's public key and the S/H values
-    /// could still get a cookie reply out of it.
+    /// The first version of the ingress ran the unmasking classifier, threw its
+    /// verdict away, and then classified again with the tag range-tested
+    /// through an all-zero mask -- which *accepts* a datagram nobody masked.
+    /// Header protection was enforced on send and nowhere on receive, and a
+    /// prober holding only the server's public key and the S/H values could
+    /// still get a cookie reply out of it. [`classify`] now has one opinion,
+    /// read through the mask.
     ///
     /// The precondition assert is the load-bearing part: it states that the
-    /// zero-mask classifier does accept this datagram, so the test cannot pass
+    /// zero-mask reading does accept this datagram, so the test cannot pass
     /// by accident on input that was never dangerous.
     #[test]
     fn an_unmasked_datagram_is_not_accepted_when_a_key_is_set() {
@@ -358,11 +278,8 @@ mod tests {
             "precondition: the zero-mask classifier must accept this, or the test proves nothing"
         );
 
-        let mut buf = wire.clone();
-        let verdict =
-            HeaderProtectionVerdict::Masked(cfg.unmask_and_classify_inbound(obf, &mut buf));
-        match verdict.classify(
-            &buf,
+        match classify(
+            &wire,
             &cfg,
             obf,
             from,
@@ -474,11 +391,15 @@ mod tests {
             Some(&responder()),
             &mut rng,
         ) {
-            Ingress::Wireguard(packet) => assert_eq!(
-                packet,
-                &original[..],
-                "the initiation must come back exactly as it went in"
-            ),
+            Ingress::Wireguard(candidates) => {
+                let first = candidates.iter().next().expect("never empty");
+                let mut scratch = Vec::new();
+                assert_eq!(
+                    config.candidate_message(&padded, first, &mut scratch),
+                    Some(&original[..]),
+                    "the initiation must come back exactly as it went in"
+                )
+            }
             Ingress::Reply(_) => panic!("a conforming initiation was answered as a probe"),
             Ingress::Drop => panic!("a conforming initiation was dropped"),
         }
@@ -736,7 +657,7 @@ mod tests {
     /// there is no "is this ours?" test at this layer and none is possible: the
     /// burst is a well-formed DNS query by construction, indistinguishable from
     /// a prober's. The only thing standing between a *real handshake* and a
-    /// SERVFAIL is that the caller runs `strip_inbound` first, which is why the
+    /// SERVFAIL is that the caller tests for AmneziaWG shapes first, which is why the
     /// module doc calls that order mandatory rather than preferred.
     #[test]
     fn our_own_dns_cover_traffic_is_answered_because_nothing_here_can_tell() {
