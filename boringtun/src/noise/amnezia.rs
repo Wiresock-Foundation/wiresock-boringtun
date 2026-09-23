@@ -1729,6 +1729,15 @@ impl AmneziaConfig {
     /// one: at S1=100, S2=0, S3=185 both are violated, and raising S2 alone
     /// still leaves the initiation a byte short.
     ///
+    /// `None` with [`Self::disable_cookies`] on, whatever the sizes: the only
+    /// thing that forms a cookie reply is the under-load branch it bypasses,
+    /// so this end emits none and there is nothing to reflect. The sizes are
+    /// still judged the moment it goes off again -- `device::api` asks this of
+    /// the whole configuration a `set=1` would leave, so turning cookies back
+    /// on over an amplifying S3 is refused with the same message, and the
+    /// device stays as it was. What stays unconditional is [`Self::validate`]:
+    /// S3 still frames the cookie replies a peer sends us.
+    ///
     /// Gated because the config-time doors are the only callers -- `device::api`
     /// on `set=1`, the C struct constructor's warning -- so without either
     /// feature this is dead code and the crate would carry a `dead_code`
@@ -1738,6 +1747,9 @@ impl AmneziaConfig {
     /// `cargo test`.
     #[cfg(any(test, feature = "device", feature = "ffi-bindings"))]
     pub(crate) fn cookie_amplification_complaint(&self) -> Option<String> {
+        if self.disable_cookies {
+            return None;
+        }
         let bounds = self.cookie_amplification_bounds();
         let &(which, request, _) = bounds.first()?;
         let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
@@ -2745,6 +2757,43 @@ mod tests {
                 .disable_cookies
         );
         assert!(full_off.validate().is_ok());
+    }
+
+    /// The cookie-reflection complaint is about replies this end would emit.
+    /// With DisableCookies on it emits none, so an amplifying S3 draws no
+    /// complaint; the same sizes draw it again the moment cookies are back on.
+    /// `validate` is not the complaint and does not change with the flag.
+    #[test]
+    fn the_cookie_complaint_applies_only_while_cookies_are_on() {
+        let amplifying = AmneziaConfig::new(0, 0, 100, 0);
+        assert!(amplifying.cookie_amplification_complaint().is_some());
+        let off = amplifying.clone().with_disable_cookies(true);
+        assert_eq!(off.cookie_amplification_complaint(), None);
+        assert!(off
+            .clone()
+            .with_disable_cookies(false)
+            .cookie_amplification_complaint()
+            .is_some());
+        // The size arithmetic itself is untouched: the reply would still be
+        // larger than its request, which is what the runtime guard reads.
+        assert!(off.cookie_reply_would_amplify(COOKIE_REPLY_SZ, HANDSHAKE_INIT_SZ));
+
+        // Universal validity is unconditional: an S3 that cannot frame a
+        // cookie reply at all is refused either way, because a peer may still
+        // send us one.
+        let unframable = AmneziaConfig::new(0, 0, u16::MAX, 0);
+        assert!(unframable.validate().is_err());
+        assert!(unframable.with_disable_cookies(true).validate().is_err());
+
+        // And a configuration that does not amplify is clean either way.
+        let clean = AmneziaConfig::new(100, 40, 20, 160);
+        assert_eq!(clean.cookie_amplification_complaint(), None);
+        assert_eq!(
+            clean
+                .with_disable_cookies(true)
+                .cookie_amplification_complaint(),
+            None
+        );
     }
 
     /// `random_below` is amneziawg-go's `fastrandn`: exclusive, and zero for an

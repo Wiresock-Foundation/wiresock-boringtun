@@ -2419,6 +2419,244 @@ mod ingress_tests {
         assert_eq!(r.window(), OLD_WINDOW);
     }
 
+    /// A server whose peer tunnel and device ingress share one starved limiter
+    /// and one DisableCookies setting, and the client that dials it.
+    struct Starved {
+        client: Tunn,
+        peer: Arc<Mutex<Peer>>,
+        peers: HashMap<x25519::PublicKey, Arc<Mutex<Peer>>>,
+        peers_by_idx: HashMap<u32, Arc<Mutex<Peer>>>,
+        server_secret: x25519::StaticSecret,
+        server_public: x25519::PublicKey,
+        limiter: Arc<RateLimiter>,
+        amnezia: AmneziaConfig,
+    }
+
+    impl Starved {
+        fn new(amnezia: AmneziaConfig) -> Self {
+            const SERVER_IDX: u32 = 0x00d1_5ab1;
+            let obf = ObfuscationRanges::default();
+            let server_secret = x25519::StaticSecret::random_from_rng(OsRng);
+            let server_public = x25519::PublicKey::from(&server_secret);
+            let client_secret = x25519::StaticSecret::random_from_rng(OsRng);
+            let client_public = x25519::PublicKey::from(&client_secret);
+            // What `set_key` does: one limiter for the interface, handed to
+            // every peer tunnel as well as kept for the ingress.
+            let limiter = Arc::new(RateLimiter::new(&server_public, 0));
+            let client = Tunn::new_with_obfuscation(
+                client_secret,
+                server_public,
+                None,
+                None,
+                1,
+                None,
+                obf,
+                amnezia.clone(),
+            )
+            .unwrap();
+            let server = Tunn::new_with_obfuscation(
+                server_secret.clone(),
+                client_public,
+                None,
+                None,
+                SERVER_IDX,
+                Some(Arc::clone(&limiter)),
+                obf,
+                amnezia.clone(),
+            )
+            .unwrap();
+            let peer = Arc::new(Mutex::new(Peer::new(server, SERVER_IDX, None, None)));
+            Starved {
+                client,
+                peers: HashMap::from([(client_public, Arc::clone(&peer))]),
+                peers_by_idx: HashMap::from([(SERVER_IDX, Arc::clone(&peer))]),
+                peer,
+                server_secret,
+                server_public,
+                limiter,
+                amnezia,
+            }
+        }
+
+        /// A fresh initiation from the client (the clock moved on first, so
+        /// that under `mock-instant` it is not a replay of the last).
+        fn initiation(&mut self) -> Vec<u8> {
+            #[cfg(feature = "mock-instant")]
+            mock_instant::thread_local::MockClock::advance(std::time::Duration::from_millis(5));
+            let mut buf = vec![0u8; MAX_UDP_SIZE];
+            match self.client.format_handshake_initiation(&mut buf, true) {
+                TunnResult::WriteToNetwork(d) => d.to_vec(),
+                other => panic!("expected an initiation, got {:?}", other),
+            }
+        }
+
+        /// What the client reads a datagram from the server as.
+        fn kind(&self, wire: &[u8]) -> &'static str {
+            use crate::noise::inbound::fixtures::first_message;
+            match Tunn::parse_incoming_packet(
+                ObfuscationRanges::default(),
+                &first_message(&self.client, wire),
+            ) {
+                Ok(Packet::HandshakeResponse(_)) => "response",
+                Ok(Packet::PacketCookieReply(_)) => "cookie",
+                other => panic!("unexpected reply: {:?}", other),
+            }
+        }
+
+        /// The device's anonymous ingress: what it would put on the wire, or
+        /// `None` for nothing.
+        fn ingress(&self, wire: &[u8], from: SocketAddr) -> Option<&'static str> {
+            let obf = ObfuscationRanges::default();
+            let candidates = match probe_reply::classify(
+                wire,
+                &self.amnezia,
+                obf,
+                from,
+                None,
+                &mut ChaCha8Rng::seed_from_u64(1),
+            ) {
+                probe_reply::Ingress::Wireguard(candidates) => candidates,
+                _ => return None,
+            };
+            let mut dst = vec![0u8; MAX_UDP_SIZE];
+            match inbound::receive(
+                &self.amnezia,
+                obf,
+                &self.limiter,
+                Some(from.ip()),
+                &candidates,
+                wire,
+                |packet| {
+                    authenticate_anonymous(
+                        &self.peers,
+                        &self.peers_by_idx,
+                        &self.server_secret,
+                        &self.server_public,
+                        packet,
+                        &mut dst[..],
+                    )
+                },
+            ) {
+                inbound::Inbound::Accepted((_, mut guard, packet)) => {
+                    match commit_anonymous(&mut guard, packet, from, &mut dst[..]) {
+                        TunnResult::WriteToNetwork(d) => {
+                            let d = d.to_vec();
+                            guard.adopt_endpoint(from);
+                            Some(self.kind(&d))
+                        }
+                        other => panic!("an accepted initiation gave {:?}", other),
+                    }
+                }
+                inbound::Inbound::Cookie(_) => Some("cookie"),
+                _ => None,
+            }
+        }
+
+        /// The peer tunnel's own receive path -- a connected socket, or an
+        /// embedder driving `Tunn` directly.
+        fn decapsulate(&self, wire: &[u8], src: Option<IpAddr>) -> Option<&'static str> {
+            let mut dst = vec![0u8; MAX_UDP_SIZE];
+            match self.peer.lock().tunnel.decapsulate(src, wire, &mut dst) {
+                TunnResult::WriteToNetwork(d) => Some(self.kind(&d.to_vec())),
+                _ => None,
+            }
+        }
+    }
+
+    /// Parity: the device ingress and the peer tunnel read DisableCookies from
+    /// the same configuration and meet a starved interface limiter the same
+    /// way. Cookies on, both demand a cookie; cookies off, both answer the
+    /// initiation, the tunnel even without a source address, and neither
+    /// counts it against the shared budget.
+    #[test]
+    fn the_ingress_and_the_peer_tunnel_agree_on_disable_cookies() {
+        let from = addr("203.0.113.1:40000");
+        for key in [None, Some([0x5a; 32])] {
+            for disable in [false, true] {
+                let amnezia = AmneziaConfig::new(ROAM_S[0], ROAM_S[1], ROAM_S[2], ROAM_S[3])
+                    .with_disable_cookies(disable);
+                let amnezia = match key {
+                    Some(k) => amnezia.with_header_protection(k),
+                    None => amnezia,
+                };
+                let mut s = Starved::new(amnezia);
+                let expected = if disable { "response" } else { "cookie" };
+
+                let init = s.initiation();
+                assert_eq!(s.ingress(&init, from), Some(expected), "ingress");
+                let init = s.initiation();
+                assert_eq!(
+                    s.decapsulate(&init, Some(from.ip())),
+                    Some(expected),
+                    "decapsulate"
+                );
+                let init = s.initiation();
+                assert_eq!(
+                    s.decapsulate(&init, None),
+                    if disable { Some("response") } else { None },
+                    "decapsulate without an address"
+                );
+                assert_eq!(
+                    s.limiter.load_events(),
+                    if disable { 0 } else { 3 },
+                    "key={} disable={}",
+                    key.is_some(),
+                    disable
+                );
+            }
+        }
+    }
+
+    /// A live DisableCookies toggle, as `Device::set_obfuscation` applies one --
+    /// the device's configuration and every peer tunnel's together -- keeps the
+    /// peer's endpoint, UDP window and session, and changes only how the next
+    /// initiation is met under load.
+    #[test]
+    fn a_live_disable_cookies_toggle_keeps_endpoint_window_and_session() {
+        let a = addr("198.51.100.1:40000");
+        let mut r = Roaming::new().settled_at(a);
+        r.limiter = RateLimiter::new(&r.server_public, 0);
+        let obf = ObfuscationRanges::default();
+        let mut buf = vec![0u8; MAX_UDP_SIZE];
+
+        for disable in [true, false, true, false] {
+            r.amnezia = r.amnezia.clone().with_disable_cookies(disable);
+            r.peer.lock().tunnel.set_obfuscation(obf, r.amnezia.clone());
+            assert_eq!(r.endpoint(), Some(a), "the toggle moved the endpoint");
+            assert_eq!(r.window(), OLD_WINDOW, "the toggle moved the window");
+
+            // The session still carries traffic from the endpoint, and a
+            // same-address frame does not reset the window.
+            let wire = r.transport(200);
+            assert!(matches!(r.ingress(&wire, a), Delivered::Tunnel));
+            assert_eq!(r.endpoint(), Some(a));
+            assert_eq!(r.window(), OLD_WINDOW);
+
+            // A new initiation meets the policy now in force: answered with
+            // cookies off, and owed only a cookie -- which this fixture does
+            // not send -- with them on.
+            #[cfg(feature = "mock-instant")]
+            mock_instant::thread_local::MockClock::advance(std::time::Duration::from_millis(5));
+            let init = match r.client.format_handshake_initiation(&mut buf, true) {
+                TunnResult::WriteToNetwork(d) => d.to_vec(),
+                other => panic!("expected an initiation, got {:?}", other),
+            };
+            match (disable, r.ingress(&init, a)) {
+                (true, Delivered::Network(response)) => {
+                    // Complete it, so the next round starts established.
+                    let keepalive = match r.client.decapsulate(None, &response, &mut buf) {
+                        TunnResult::WriteToNetwork(d) => d.to_vec(),
+                        other => panic!("expected a keepalive, got {:?}", other),
+                    };
+                    assert!(matches!(r.ingress(&keepalive, a), Delivered::Done));
+                    r.peer.lock().tunnel.set_udp_window(OLD_WINDOW);
+                }
+                (false, Delivered::Refused) => {}
+                (d, other) => panic!("disable={}: {:?}", d, other),
+            }
+        }
+    }
+
     /// Nothing moves the window for the address it was measured on, and
     /// nothing unauthenticated moves it at all: a forged frame from a new
     /// address neither resets the window nor becomes the endpoint.
