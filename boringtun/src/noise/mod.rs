@@ -15,6 +15,8 @@ pub mod rate_limiter;
 pub mod header_protection;
 // Receiving a datagram whose shape fits more than one packet kind. Crate-wide
 // because the device's anonymous ingress drives it too.
+#[cfg(test)]
+mod disable_cookies_tests;
 pub(crate) mod inbound;
 #[cfg(test)]
 mod random_trailers_tests;
@@ -518,6 +520,16 @@ impl Tunn {
     /// pre-handshake junk is dropped, since it was generated under the previous
     /// configuration.
     ///
+    /// Except when nothing this end sends has changed: a change of receive
+    /// policy alone -- AmneziaWG `DisableCookies`, see
+    /// [`AmneziaConfig::differs_only_in_receive_policy`] -- keeps the burst.
+    /// Dropping it there is not a reframe but a cancellation: the initiation
+    /// the burst was deferring is never sent, no retransmission deadline is
+    /// armed because none was sent, and the payload that started it waits in
+    /// the queue until another one arrives. The new policy still applies from
+    /// the next received message, because the receive path reads it from
+    /// `self.amnezia` on every datagram.
+    ///
     /// The tunable timers are re-drawn for the same reason the H/S values are
     /// pushed at all: they are cached per-arming, so without this an
     /// established session keeps running the *previous* configuration's
@@ -532,9 +544,13 @@ impl Tunn {
     /// provide.
     pub fn set_obfuscation(&mut self, obf: ObfuscationRanges, amnezia: AmneziaConfig) {
         let timers_changed = self.amnezia.timers != amnezia.timers;
+        let reframed =
+            self.handshake.obf != obf || !self.amnezia.differs_only_in_receive_policy(&amnezia);
         self.handshake.set_obfuscation(obf);
         self.amnezia = amnezia;
-        self.pending_amnezia_junk = None;
+        if reframed {
+            self.pending_amnezia_junk = None;
+        }
         if timers_changed {
             self.redraw_tunable_timers();
         }
@@ -568,6 +584,13 @@ impl Tunn {
     #[cfg(feature = "device")]
     pub(crate) fn restore_udp_window(&self, window: u32) {
         self.udp_window.store(window, AtomicOrdering::Relaxed);
+    }
+
+    /// Whether a pre-handshake burst is queued, the initiation behind it not
+    /// yet sent. For the device tests, which cannot see the field.
+    #[cfg(all(test, feature = "device"))]
+    pub(crate) fn has_pending_burst(&self) -> bool {
+        self.pending_amnezia_junk.is_some()
     }
 
     #[cfg(test)]

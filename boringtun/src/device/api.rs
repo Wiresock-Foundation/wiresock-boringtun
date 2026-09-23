@@ -103,6 +103,7 @@ struct AwgParams {
     keepalive_timeout: Option<(u32, u32)>,
     max_handshake_attempts: Option<(u32, u32)>,
     random_trailers: Option<bool>,
+    disable_cookies: Option<bool>,
     seen: bool,
 }
 
@@ -133,6 +134,11 @@ impl AwgParams {
 
     fn set_random_trailers(&mut self, on: bool) {
         self.random_trailers = Some(on);
+        self.seen = true;
+    }
+
+    fn set_disable_cookies(&mut self, on: bool) {
+        self.disable_cookies = Some(on);
         self.seen = true;
     }
 
@@ -254,6 +260,14 @@ impl AwgParams {
         // not touched; `set_obfuscation` keeps it, and the sessions.
         amnezia = amnezia.with_random_trailers(self.random_trailers.unwrap_or(current_trailers));
 
+        // DisableCookies: likewise whatever this transaction said, else what
+        // is set. Staged with everything else and judged below as part of
+        // the finished configuration, never on its own line: that is what
+        // makes `disable_cookies=0` ahead of or behind an `s3=` in the same
+        // transaction come to the same answer.
+        let current_cookies = amnezia.disable_cookies;
+        amnezia = amnezia.with_disable_cookies(self.disable_cookies.unwrap_or(current_cookies));
+
         // Timers: each range this transaction carried, else whatever is
         // already set. `(0, 0)` is amneziawg-go's "unset" -- the built-in
         // constant governs again -- which is also what a reapplied kernel
@@ -290,6 +304,12 @@ impl AwgParams {
         // the runtime guards (`reply_policy::cookie_verdict` here,
         // `Tunn::decapsulate`'s emit-site check everywhere) are what actually
         // stop the reflection, so this is early notice, not the last line.
+        //
+        // Silent while DisableCookies is on -- this end then forms no cookie
+        // reply at all -- and asked of the merged result, not of the lines
+        // that changed: a transaction turning cookies back on over an
+        // amplifying S3 is refused here, before anything is applied, and the
+        // device keeps cookies off.
         if let Some(complaint) = amnezia.cookie_amplification_complaint() {
             tracing::error!(message = "rejecting AmneziaWG parameters", error = %complaint);
             return Err(EINVAL);
@@ -527,10 +547,11 @@ impl Device {
 ///
 /// Emitted only when they differ from plain WireGuard, so a vanilla device's
 /// output is byte-identical to upstream's -- amneziawg-go's `IpcGetOperation`
-/// guards each of these on `!IsZero()` the same way. (Not *every* 3.0 key:
-/// `random_trailers` and `disable_cookies` go through its unguarded `boolf`
-/// and are always emitted. See `handle_awg3_device_key`, which is where that
-/// asymmetry is stated once and where the set side absorbs it.) (The kernel
+/// guards each of these on `!IsZero()` the same way. (Not *every* 3.x key:
+/// from v3.1.20260812 on, `random_trailers` and `disable_cookies` go through
+/// its unguarded `boolf` and are always emitted, as `=0` when off. Here each
+/// appears only when on, and the set side reads Go's `=0` as the off it is,
+/// so a dump from either implementation reapplies.) (The kernel
 /// amneziawg-tools differ: `awg showconf` prints `ContentPaddingAddition = 0`
 /// and the five timers unconditionally, which is why the *set* side reads a
 /// `=0` from a reapplied config dump as "unset" rather than as a request.)
@@ -603,11 +624,10 @@ fn write_awg_interface_params(
     // emits each of these only when non-zero (`!IsZero()` in
     // `IpcGetOperation`), so unset stays absent and a vanilla device's output
     // is unchanged. amneziawg-go emits its two v3.1 bool keys
-    // *unconditionally* (`random_trailers=0`, `disable_cookies=0`); here
-    // `random_trailers` follows every other AmneziaWG key and appears only when
-    // set, so a device that never asked for it prints what it always printed.
-    // `disable_cookies` is not implemented and never appears. A `=0` on the set
-    // side is accepted either way, so a dump from either implementation
+    // *unconditionally* (`random_trailers=0`, `disable_cookies=0`); here both
+    // follow every other AmneziaWG key and appear only when set, so a device
+    // that never asked for them prints what it always printed. A `=0` on the
+    // set side is accepted either way, so a dump from either implementation
     // reapplies.
     let t = &a.timers;
     for (key, range) in [
@@ -625,6 +645,9 @@ fn write_awg_interface_params(
 
     if a.random_trailers {
         writeln!(writer, "random_trailers=1");
+    }
+    if a.disable_cookies {
+        writeln!(writer, "disable_cookies=1");
     }
 }
 
@@ -818,6 +841,15 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                             Some(on) => awg.set_random_trailers(on),
                             None => return EINVAL,
                         },
+                        // AmneziaWG 3.1 DisableCookies, applied for real and
+                        // parsed the same way. Staged: whether the result is
+                        // acceptable -- cookies back on over an amplifying S3
+                        // is not -- is decided in `merged`, for the whole
+                        // transaction at once.
+                        "disable_cookies" => match parse_go_bool(val) {
+                            Some(on) => awg.set_disable_cookies(on),
+                            None => return EINVAL,
+                        },
                         // AWG 2.0 signature packets. A responder only has to
                         // tolerate these; accept and ignore rather than failing
                         // the whole transaction on a config that carries them.
@@ -826,10 +858,6 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                         // and there is no in-band signal, so a mismatch is a
                         // tunnel that never forms rather than one that degrades.
                         // An all-zero key means off, matching amneziawg-go.
-                        //
-                        // This arm is what `handle_awg3_device_key` refuses when
-                        // header protection is not compiled in; here it is, so
-                        // the key is accepted before reaching that fallback.
                         "header_protection_key" => match val.parse::<KeyBytes>() {
                             Ok(key_bytes) => awg.set_header_protection(key_bytes.0),
                             Err(_) => return EINVAL,
@@ -857,16 +885,10 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                             }
                             None => return EINVAL,
                         },
-                        // AmneziaWG device keys this build does not implement:
-                        // tolerated where ignoring them is safe. Everything
-                        // else still fails the transaction, because
-                        // `handle_awg3_device_key` ends in the same EINVAL
-                        // this arm used to be.
-                        _ => {
-                            if let Err(code) = handle_awg3_device_key(key, val) {
-                                return code;
-                            }
-                        }
+                        // Every AmneziaWG device key amneziawg-go v3.1 emits is
+                        // implemented above; anything else fails the
+                        // transaction.
+                        _ => return EINVAL,
                     }
                 }
                 cmd.clear();
@@ -878,73 +900,13 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
     .unwrap_or(EIO)
 }
 
-/// AmneziaWG device keys this build does not implement.
-///
-/// Tolerated rather than rejected because one unknown key aborts the rest of
-/// the `set=1`: an AWG profile would otherwise lose every jc/s/h line it
-/// carries, and every peer section after the offending one. (It does *not*
-/// leave the device untouched -- `private_key`, `listen_port`, `fwmark`,
-/// `replace_peers` and any peer already committed are applied as they are
-/// parsed and there is no rollback, so an abort mid-stream can leave the
-/// interface rekeyed with no peers. That is the pre-existing shape of
-/// `api_set`, and it is the reason tolerating a key we can safely ignore is
-/// worth doing.)
-///
-/// `disable_cookies` is here for a hard interop reason, and one that is
-/// version-specific: from **v3.1.20260812** on, amneziawg-go's `get=1` emits
-/// `random_trailers=0` and `disable_cookies=0` *unconditionally* -- its
-/// `boolf` has no is-set guard, unlike the five timers it emits only when set
-/// -- so every reapplied dump from such a peer carries both keys even for a
-/// configuration that never mentioned either. Refusing them would abort every
-/// such transaction. (`random_trailers` used to be tolerated here too; it is
-/// implemented now, so `api_set` handles it.) (Neither key exists at all in v3.0.20260805 and earlier:
-/// verified against `device/uapi.go` at both tags. A v3.0 dump cannot
-/// exercise this path, which is why the interop leg that does is labelled by
-/// the version that can.)
-///
-/// A value that asks for nothing (off is what this build does) is silent; a
-/// value that turns the feature on warns, because silently ignoring it would
-/// change what the peer expects on the wire; junk is EINVAL.
-///
-/// The accepted spellings are exactly `strconv.ParseBool`'s, because that is
-/// what amneziawg-go's `IpcSetOperation` parses these two keys with -- so
-/// every value a peer can legally send is one of these twelve. Narrowing the
-/// set would not merely ignore such a value: an unrecognised one is EINVAL,
-/// which aborts the whole transaction and every peer section after it. (The
-/// two tools that generate these lines both normalise first -- amneziawg-go's
-/// `boolf` and amneziawg-tools' `fprintf(f, "random_trailers=%u\n", ...)`
-/// after its `parse_bool` -- so `0`/`1` is what arrives in practice. The rest
-/// are here for hand-written and third-party `set=1` traffic, which the UAPI
-/// has no way to exclude.)
-///
-/// `header_protection_key`, `content_padding_addition`, `random_trailers` and
-/// the five tunable timers deliberately do NOT appear here: `api_set` handles
-/// them above,
-/// because this build implements them. They stay out of this fallback so that
-/// removing a feature would surface as an unhandled key rather than as silent
-/// tolerance.
-///
-/// `Ok(())` tolerates the key; `Err(code)` fails the transaction. Split out of
-/// the `api_set` match so the acceptance policy is reachable from a test:
-/// `api_set` itself needs a `Device`, which needs root and a TUN interface.
-fn handle_awg3_device_key(key: &str, val: &str) -> Result<(), i32> {
-    match key {
-        "disable_cookies" => match parse_go_bool(val) {
-            Some(false) => {}
-            Some(true) => tracing::warn!(
-                message = "AmneziaWG key is not implemented; the feature stays off",
-                key = key,
-            ),
-            None => return Err(EINVAL),
-        },
-        _ => return Err(EINVAL),
-    }
-    Ok(())
-}
-
 /// A boolean in exactly the spellings Go's `strconv.ParseBool` accepts, which
-/// is what amneziawg-go parses its v3.1 bool keys with -- so every value a peer
-/// can legally send is one of these twelve, and nothing else is.
+/// is what amneziawg-go parses its v3.1 bool keys -- `random_trailers` and
+/// `disable_cookies` -- with, so every value a peer can legally send is one of
+/// these twelve, and nothing else is. Narrower would not merely ignore a
+/// value: an unrecognised one is EINVAL, which aborts the whole `set=1` and
+/// every peer section after it. (Both tools that generate these lines
+/// normalise to `0`/`1` first; the rest are for hand-written `set=1`.)
 fn parse_go_bool(val: &str) -> Option<bool> {
     match val {
         "0" | "f" | "F" | "false" | "FALSE" | "False" => Some(false),
@@ -1483,62 +1445,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_awg3_device_key_is_tolerated_in_every_form_its_tools_emit() {
-        // The bool key amneziawg-go's `get=1` emits *unconditionally* from
-        // v3.1.20260812 on (`boolf` has no is-set guard) and this build does
-        // not implement: a reapplied dump from such a peer always carries
-        // `disable_cookies=0`, so refusing it would abort every such
-        // transaction. Off -- what this build does -- is silent agreement; on
-        // warns; junk is EINVAL. (`random_trailers` rides the same `boolf` and
-        // is implemented; `random_trailers_over_the_uapi_applies_and_round_trips`
-        // covers its spellings.)
-        //
-        // Every spelling below is one amneziawg-go accepts, because it parses
-        // both keys with `strconv.ParseBool`. Accepting a narrower set does not
-        // downgrade to ignoring the value: it is EINVAL, which aborts the whole
-        // `set=1` and every peer section after it.
-        for key in ["disable_cookies"] {
-            for val in ["0", "f", "F", "false", "FALSE", "False"] {
-                assert_eq!(
-                    handle_awg3_device_key(key, val),
-                    Ok(()),
-                    "{}={} must not abort the transaction",
-                    key,
-                    val
-                );
-            }
-            for val in ["1", "t", "T", "true", "TRUE", "True"] {
-                assert_eq!(
-                    handle_awg3_device_key(key, val),
-                    Ok(()),
-                    "{}={} is tolerated (with a warning)",
-                    key,
-                    val
-                );
-            }
-            // Not a `ParseBool` spelling, so no peer can legally send it.
-            assert_eq!(handle_awg3_device_key(key, "maybe"), Err(EINVAL));
-            assert_eq!(handle_awg3_device_key(key, "on"), Err(EINVAL));
-        }
-
-        // And the catch-all this function replaced still rejects everything it
-        // does not list.
-        assert_eq!(handle_awg3_device_key("not_a_real_key", "1"), Err(EINVAL));
-        // `header_protection_key` and the timers reach this fallback only if
-        // the `api_set` arms above stop handling them, which is what makes
-        // removing a feature surface as EINVAL rather than as silent
-        // tolerance.
-        assert_eq!(
-            handle_awg3_device_key("header_protection_key", "0"),
-            Err(EINVAL)
-        );
-        assert_eq!(
-            handle_awg3_device_key("reject_after_time", "60"),
-            Err(EINVAL)
-        );
-    }
-
     /// `content_padding_addition` through a `set=1` merge applies the range and
     /// the MTU, survives a merge that does not mention it, and clears on `(0,0)`.
     ///
@@ -1654,6 +1560,153 @@ mod tests {
         assert_eq!(again, cfg);
     }
 
+    /// `disable_cookies` over the UAPI: the `strconv.ParseBool` spellings
+    /// `random_trailers` takes, applied by a merge, kept by a merge that does
+    /// not mention it, cleared by an explicit false, and emitted as
+    /// `disable_cookies=1` only while on -- so a `get=1` dump reapplies. It
+    /// moves nothing else, RandomTrailers included.
+    #[test]
+    fn disable_cookies_over_the_uapi_applies_and_round_trips() {
+        let current = AmneziaConfig::new(52, 108, 136, 148)
+            .with_random_trailers(true)
+            .with_content_padding_addition(0, 0, 1420);
+        let mut on = AwgParams::default();
+        on.set_disable_cookies(parse_go_bool("true").unwrap());
+        let (_, cfg) = on
+            .merged(ObfuscationRanges::default(), &current, 1420)
+            .expect("valid");
+        assert!(cfg.disable_cookies);
+        assert!(cfg.random_trailers, "RandomTrailers is its own key");
+        assert_eq!(
+            cfg.clone().with_disable_cookies(false),
+            current,
+            "nothing else moved"
+        );
+
+        let mut untouched = AwgParams::default();
+        untouched.set_size("s1", 60);
+        let (_, kept) = untouched
+            .merged(ObfuscationRanges::default(), &cfg, 1420)
+            .expect("valid");
+        assert!(kept.disable_cookies, "omitted means unchanged");
+
+        let mut trailers_off = AwgParams::default();
+        trailers_off.set_random_trailers(false);
+        let (_, kept) = trailers_off
+            .merged(ObfuscationRanges::default(), &cfg, 1420)
+            .expect("valid");
+        assert!(kept.disable_cookies && !kept.random_trailers);
+
+        let mut off = AwgParams::default();
+        off.set_disable_cookies(parse_go_bool("0").unwrap());
+        let (_, cleared) = off
+            .merged(ObfuscationRanges::default(), &cfg, 1420)
+            .expect("valid");
+        assert!(!cleared.disable_cookies, "an explicit false clears it");
+
+        let emit = |a: &AmneziaConfig| {
+            let mut out = Vec::new();
+            write_awg_interface_params(&mut out, &ObfuscationRanges::default(), a);
+            String::from_utf8(out).expect("utf8")
+        };
+        assert!(emit(&cfg).contains("disable_cookies=1\n"), "{}", emit(&cfg));
+        assert!(
+            !emit(&cleared).contains("disable_cookies"),
+            "{}",
+            emit(&cleared)
+        );
+        let line = emit(&cfg)
+            .lines()
+            .find(|l| l.starts_with("disable_cookies="))
+            .map(|l| l["disable_cookies=".len()..].to_owned())
+            .unwrap();
+        let mut reapplied = AwgParams::default();
+        reapplied.set_disable_cookies(parse_go_bool(&line).unwrap());
+        let (_, again) = reapplied
+            .merged(ObfuscationRanges::default(), &current, 1420)
+            .expect("valid");
+        assert_eq!(again, cfg);
+
+        // amneziawg-go's dump carries `disable_cookies=0` unconditionally; it
+        // reads as the off it is.
+        let mut go_dump = AwgParams::default();
+        go_dump.set_disable_cookies(parse_go_bool("0").unwrap());
+        let (_, from_go) = go_dump
+            .merged(ObfuscationRanges::default(), &current, 1420)
+            .expect("valid");
+        assert_eq!(from_go, current);
+    }
+
+    /// The reflection policy is judged on the configuration a transaction
+    /// would leave, so turning cookies back on cannot arm a reflector.
+    ///
+    /// An amplifying S3 is acceptable while cookies are off -- this end forms
+    /// no cookie reply -- and refused the moment a transaction would turn
+    /// them back on over it, leaving the device exactly as it was: cookies
+    /// still off. Changing S3 is judged the same way against whichever
+    /// setting the result carries, and a transaction that changes both is
+    /// judged once, on the result, whatever order its lines came in.
+    #[test]
+    fn cookies_cannot_be_turned_back_on_over_an_amplifying_s3() {
+        let obf = ObfuscationRanges::default();
+        // S1 = S2 = 0, S3 = 100: a 164-byte cookie reply to a 148-byte
+        // initiation.
+        let amplifying = AmneziaConfig::new(0, 0, 100, 0).with_content_padding_addition(0, 0, 1420);
+        assert!(amplifying.cookie_amplification_complaint().is_some());
+        let dc_on = amplifying.clone().with_disable_cookies(true);
+
+        // Re-enable alone: refused, and `merged` produced nothing to apply.
+        let mut reenable = AwgParams::default();
+        reenable.set_disable_cookies(false);
+        assert_eq!(reenable.merged(obf, &dc_on, 1420), Err(EINVAL));
+
+        // An unrelated key over the same device is fine: cookies stay off.
+        let mut unrelated = AwgParams::default();
+        unrelated.set_random_trailers(true);
+        let (_, still_off) = unrelated.merged(obf, &dc_on, 1420).expect("valid");
+        assert!(still_off.disable_cookies);
+
+        // S3 raised into amplification: accepted with cookies off, refused
+        // with them on.
+        let safe = AmneziaConfig::new(0, 0, 20, 0).with_content_padding_addition(0, 0, 1420);
+        let mut raise = AwgParams::default();
+        raise.set_size("s3", 100);
+        let (_, raised) = raise
+            .merged(obf, &safe.clone().with_disable_cookies(true), 1420)
+            .expect("valid while cookies are off");
+        assert_eq!(raised.cookie_packet_junk_size, 100);
+        assert_eq!(raise.merged(obf, &safe, 1420), Err(EINVAL));
+
+        // One transaction turning cookies off and raising S3: accepted,
+        // because the result is judged, not the order the lines came in.
+        let mut both = AwgParams::default();
+        both.set_size("s3", 100);
+        both.set_disable_cookies(true);
+        let (_, both_applied) = both.merged(obf, &safe, 1420).expect("valid");
+        assert!(both_applied.disable_cookies);
+        let mut both_reordered = AwgParams::default();
+        both_reordered.set_disable_cookies(true);
+        both_reordered.set_size("s3", 100);
+        assert_eq!(
+            both_reordered.merged(obf, &safe, 1420),
+            Ok((obf, both_applied))
+        );
+
+        // Re-enabling together with a fix to S3: accepted.
+        let mut fix = AwgParams::default();
+        fix.set_disable_cookies(false);
+        fix.set_size("s3", 20);
+        let (_, fixed) = fix.merged(obf, &dc_on, 1420).expect("valid");
+        assert!(!fixed.disable_cookies);
+        assert_eq!(fixed.cookie_packet_junk_size, 20);
+
+        // Universal validity does not relax with cookies off: an S3 that
+        // cannot frame a cookie reply is refused either way.
+        let mut unframable = AwgParams::default();
+        unframable.set_size("s3", u16::MAX);
+        assert_eq!(unframable.merged(obf, &dc_on, 1420), Err(EINVAL));
+    }
+
     /// The `get=1` emit grammar, pinned against a plain buffer.
     ///
     /// The emit half of the feature previously had no coverage at all -- the
@@ -1719,8 +1772,8 @@ mod tests {
 
         // Set timers emit in the same grammar; unset ones stay absent, and so
         // do the two bool keys amneziawg-go v3.1 emits unconditionally --
-        // `random_trailers` appears only when on, `disable_cookies` never --
-        // so a vanilla device's output does not grow.
+        // each appears only when on -- so a vanilla device's output does not
+        // grow.
         let mut out = Vec::new();
         let cfg = AmneziaConfig::default().with_tunable_timers(AwgTimers {
             rekey_after_time: (30, 40),
@@ -2035,186 +2088,5 @@ mod tests {
         // Non-zero starts are unaffected.
         assert_eq!(parse_tag_range("1"), Some((1, 1)));
         assert_eq!(parse_tag_range("1-5"), Some((1, 5)));
-    }
-
-    /// The acceptance policy for AmneziaWG device keys, pinned end to end.
-    ///
-    /// One sentence carries the fallback: a value that asks for behaviour this
-    /// build does not have warns, a value that agrees with what it does is
-    /// silent, and every implemented key is refused here because `api_set`
-    /// consumes it first. All three are load-bearing. Losing the warning ships
-    /// a daemon that ignores a feature the peer runs and says nothing; gaining
-    /// one on a silent row fires a diagnostic on every reapplied amneziawg-go
-    /// dump (which always carries `random_trailers=0`/`disable_cookies=0`),
-    /// which is how a warning gets tuned out; and an implemented key slipping
-    /// into the tolerance list is a feature silently vanishing instead of the
-    /// transaction failing.
-    ///
-    /// The table below is the policy, and it is checked against the code
-    /// rather than against the comments above it.
-    #[test]
-    fn an_awg3_device_key_warns_exactly_when_it_asks_for_what_we_do_not_do() {
-        let _serialized = crate::tracing_test_lock();
-        const SILENT: &[tracing::Level] = &[];
-        const WARNS: &[tracing::Level] = &[tracing::Level::WARN];
-
-        let cases: &[PolicyRow] = &[
-            // The unimplemented bool key: off -- what this build does -- is
-            // silent agreement in both spellings its tools produce, on warns,
-            // junk is refused silently (EINVAL already answers the operator).
-            ("disable_cookies", "0", Ok(()), SILENT),
-            ("disable_cookies", "false", Ok(()), SILENT),
-            ("disable_cookies", "f", Ok(()), SILENT),
-            ("disable_cookies", "1", Ok(()), WARNS),
-            ("disable_cookies", "True", Ok(()), WARNS),
-            ("disable_cookies", "yes", Err(EINVAL), SILENT),
-            // RandomTrailers is implemented: `api_set` consumes it, so the
-            // fallback refuses it in either value rather than tolerating it.
-            ("random_trailers", "0", Err(EINVAL), SILENT),
-            ("random_trailers", "1", Err(EINVAL), SILENT),
-            // Implemented keys must not be quietly tolerated here -- `api_set`
-            // consumes them before this fallback. If an `api_set` arm were
-            // ever removed, these rows keep the fallback refusing the key, so
-            // the whole `set=1` fails instead of the feature silently
-            // vanishing: a peer masking the message-type field (or running
-            // different timers) with our side ignoring it is mutually
-            // unreachable or blackholed, not degraded.
-            (
-                "header_protection_key",
-                "abababababababababababababababababababababababababababababababab",
-                Err(EINVAL),
-                SILENT,
-            ),
-            (
-                "header_protection_key",
-                "0000000000000000000000000000000000000000000000000000000000000000",
-                Err(EINVAL),
-                SILENT,
-            ),
-            ("content_padding_addition", "8-24", Err(EINVAL), SILENT),
-            ("content_padding_addition", "0", Err(EINVAL), SILENT),
-            ("reject_after_time", "180", Err(EINVAL), SILENT),
-            ("reject_after_time", "0", Err(EINVAL), SILENT),
-            ("rekey_after_time", "30-40", Err(EINVAL), SILENT),
-            ("rekey_timeout", "5", Err(EINVAL), SILENT),
-            ("keepalive_timeout", "10", Err(EINVAL), SILENT),
-            ("max_handshake_attempts", "18", Err(EINVAL), SILENT),
-            // A key from no list at all is still refused, and silently.
-            ("not_a_real_key", "1", Err(EINVAL), SILENT),
-        ];
-
-        for &(key, val, expected_result, expected_levels) in cases {
-            let (result, events) = capture_awg3_key(key, val);
-            assert_eq!(
-                result, expected_result,
-                "{}={} was tolerated/refused against policy",
-                key, val
-            );
-            let levels: Vec<tracing::Level> = events.iter().map(|e| e.level).collect();
-            assert_eq!(
-                levels.as_slice(),
-                expected_levels,
-                "{}={} logged the wrong thing: {:?}",
-                key,
-                val,
-                events
-            );
-
-            if expected_levels != WARNS {
-                continue;
-            }
-            // A warning that fires is only half the contract: it has to name
-            // the key, because the operator's next question is which config
-            // line was ignored.
-            let warning = &events[0];
-            assert_eq!(
-                warning.key,
-                Some(key.to_owned()),
-                "the warning must name the key it is about"
-            );
-            assert!(
-                warning.message.contains("not implemented"),
-                "the warning must say the feature is not implemented: {}",
-                warning.message
-            );
-        }
-    }
-
-    /// One row of the AWG-3 acceptance policy: the key and value as they arrive
-    /// over the UAPI, the answer the transaction gets, and the events the log
-    /// gets, in order.
-    type PolicyRow = (
-        &'static str,
-        &'static str,
-        Result<(), i32>,
-        &'static [tracing::Level],
-    );
-
-    /// One `tracing` event, reduced to the fields the AWG-3 acceptance policy is
-    /// stated in terms of.
-    #[derive(Debug)]
-    struct CapturedEvent {
-        level: tracing::Level,
-        message: String,
-        key: Option<String>,
-        requested_low: Option<u64>,
-        requested_high: Option<u64>,
-    }
-
-    impl tracing::field::Visit for CapturedEvent {
-        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-            match field.name() {
-                "requested_low" => self.requested_low = Some(value),
-                "requested_high" => self.requested_high = Some(value),
-                _ => {}
-            }
-        }
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            match field.name() {
-                "key" => self.key = Some(value.to_owned()),
-                "message" => self.message = value.to_owned(),
-                _ => {}
-            }
-        }
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.message = format!("{:?}", value);
-            }
-        }
-    }
-
-    /// Every event `handle_awg3_device_key` emits for one key/value, in order.
-    ///
-    /// Silence is a claim about behaviour like any other, and a subscriber is
-    /// the only thing that can observe it. Same shape as
-    /// `the_keepalive_warning_reports_the_interval_it_applied`; the default is
-    /// thread-local, so this stays correct under the test harness's threads.
-    fn capture_awg3_key(key: &str, val: &str) -> (Result<(), i32>, Vec<CapturedEvent>) {
-        use std::sync::{Arc, Mutex};
-        use tracing::Subscriber;
-        use tracing_subscriber::layer::{Context, Layer};
-        use tracing_subscriber::prelude::*;
-
-        struct Capture(Arc<Mutex<Vec<CapturedEvent>>>);
-        impl<S: Subscriber> Layer<S> for Capture {
-            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
-                let mut captured = CapturedEvent {
-                    level: *event.metadata().level(),
-                    message: String::new(),
-                    key: None,
-                    requested_low: None,
-                    requested_high: None,
-                };
-                event.record(&mut captured);
-                self.0.lock().unwrap().push(captured);
-            }
-        }
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
-        let result =
-            tracing::subscriber::with_default(subscriber, || handle_awg3_device_key(key, val));
-        let captured = std::mem::take(&mut *events.lock().unwrap());
-        (result, captured)
     }
 }
