@@ -30,7 +30,15 @@
 #     RandomTrailers off; with it on, each implementation's own handshake
 #     messages carry suffixes and, without content padding, its own transport
 #     varies; every datagram within the bounds the configuration allows; and
-#     after the rekey, both directions sending on the new session.
+#     after the rekey, both directions sending on the new session;
+#   * each daemon accepted the configuration's `disable_cookies` and reports
+#     it back in a `get=1` that itself succeeded -- exit 0, a well-formed dump,
+#     `errno=0` -- as `disable_cookies=1` exactly when it was set.
+#
+# The DisableCookies legs run the ordinary profile with the flag on at both
+# ends -- alone, with RandomTrailers, and with everything -- and hold them to
+# every check above: the flag must not disturb the handshake, the traffic, the
+# rekey or the wire.
 #
 # `--self-test` checks the checker and the verdict plumbing against synthetic
 # inputs, including ones that must fail; it needs no root and no binaries.
@@ -42,11 +50,14 @@
 # removed on exit as before.
 #
 # The S sizes are deliberately unequal, so the receive side's candidate
-# readings genuinely differ per packet kind. What this does NOT cover: the
-# cookie reply's trailer, which needs a responder under load and is pinned by
-# the unit tests (`noise::random_trailers_tests`), and WireSock's CPA policy
-# with RandomTrailers off, which cannot be told apart on the wire from inside a
-# single run and is pinned by `amnezia::tests` with concrete values.
+# readings genuinely differ per packet kind. What this does NOT cover:
+# anything that needs a responder under load, because neither implementation
+# can be put there deterministically from outside without flooding it -- the
+# cookie reply's trailer (`noise::random_trailers_tests`) and DisableCookies'
+# actual bypass of the cookie defense (`noise::disable_cookies_tests`, which
+# starve the limiter instead); and WireSock's CPA policy with RandomTrailers
+# off, which cannot be told apart on the wire from inside a single run and is
+# pinned by `amnezia::tests` with concrete values.
 #
 # Requires: root, iproute2, python3 with `cryptography`, ping, a built
 # boringtun-cli, and the amneziawg-go above. Everything lives in throwaway
@@ -88,7 +99,7 @@ readonly INIT_SZ=148 RESP_SZ=92 DATA_MIN=32
 # most it) the checker sees.
 readonly WINDOW=500
 
-awg_block() { # <rt 0|1> <cpa 0|1> <hp 0|1>
+awg_block() { # <rt 0|1> <cpa 0|1> <hp 0|1> <dc 0|1>
   local b
   b=$'jc='"$JC"$'\njmin='"$JMIN"$'\njmax='"$JMAX"$'\ns1='"$S1"$'\ns2='"$S2"$'\ns3='"$S3"$'\ns4='"$S4"$'\nh1='"$H1"$'\nh2='"$H2"$'\nh3='"$H3"$'\nh4='"$H4"$'\n'
   # A short rekey, so each leg sees a second handshake inside its run time.
@@ -96,6 +107,7 @@ awg_block() { # <rt 0|1> <cpa 0|1> <hp 0|1>
   [ "$1" = 1 ] && b+=$'random_trailers=1\n'
   [ "$2" = 1 ] && b+=$'content_padding_addition=8-120\n'
   [ "$3" = 1 ] && b+=$'header_protection_key='"$HP_KEY"$'\n'
+  [ "$4" = 1 ] && b+=$'disable_cookies=1\n'
   printf '%s' "$b"
 }
 
@@ -138,6 +150,70 @@ rekey_verdict() { # <resp before> <resp after> <init before> <init after>
   [ "$2" -gt "$1" ] && [ "$4" -gt "$3" ]
 }
 
+# 0 when one daemon's `get=1` succeeded and reports DisableCookies as it was
+# configured. The response is on stdin; <status> is the exit status of the
+# command that fetched it.
+#
+# The state is read only from a response that proves it is one: the fetch
+# exited 0, every line is `key=value`, the dump carries the `listen_port`
+# every leg sets, and it ends in `errno=0` -- the UAPI's own success marker.
+# Without that, "no `disable_cookies=1`" would read a refused request, an
+# empty reply or a daemon that never answered as DisableCookies being off.
+#
+# Then: on requires the line `disable_cookies=1`; off requires its absence
+# (boringtun omits the key) or `disable_cookies=0` (amneziawg-go prints it
+# unconditionally), and nothing else.
+dc_get_verdict() { # <want 0|1> <status>; get=1 response on stdin
+  local want=$1 status=$2 response
+  response=$(cat)
+  [ "$status" = 0 ] || { echo "the get=1 request failed (exit $status)"; return 1; }
+  [ -n "$response" ] || { echo "empty get=1 response"; return 1; }
+  if printf '%s\n' "$response" | grep -v '^$' | grep -qvE '^[a-z0-9_]+=.*$'; then
+    echo "malformed get=1 response: $(printf '%s\n' "$response" | grep -v '^$' | grep -vE '^[a-z0-9_]+=' | head -1)"
+    return 1
+  fi
+  local last
+  last=$(printf '%s\n' "$response" | grep -v '^$' | tail -1)
+  [ "$last" = errno=0 ] || { echo "get=1 did not end in errno=0 (last line: ${last:-none})"; return 1; }
+  printf '%s\n' "$response" | grep -qE '^listen_port=[0-9]+$' ||
+    { echo "get=1 response carries no listen_port: not an interface dump"; return 1; }
+  local dc_lines
+  dc_lines=$(printf '%s\n' "$response" | grep '^disable_cookies=' || true)
+  if [ "$want" = 1 ]; then
+    [ "$dc_lines" = disable_cookies=1 ] ||
+      { echo "want disable_cookies=1, got: ${dc_lines:-absent}"; return 1; }
+  else
+    [ -z "$dc_lines" ] || [ "$dc_lines" = disable_cookies=0 ] ||
+      { echo "want disable_cookies off, got: $dc_lines"; return 1; }
+  fi
+}
+
+# Fetch one daemon's `get=1` into <out>. Returns the fetch's own exit status
+# -- `uapi`'s, not that of the `printf` feeding it.
+fetch_get() { # <ns> <iface> <out>
+  printf 'get=1\n\n' | uapi "$1" "$2" >"$3" 2>&1
+  return "${PIPESTATUS[1]}"
+}
+
+# Judge BOTH daemons' fetched `get=1` for one leg, each on its own. Prints one
+# `PASS|FAIL<tab>responder|initiator<tab>detail` line per daemon and returns 0
+# only when both pass. The live leg turns each line into its own assertion;
+# the self-test drives the same function, so dropping a daemon from it fails
+# there.
+judge_dc_daemons() { # <want 0|1> <resp status> <resp file> <init status> <init file>
+  local want=$1 rc=0 who status file why
+  for who in responder initiator; do
+    if [ "$who" = responder ]; then status=$2 file=$3; else status=$4 file=$5; fi
+    if why=$(dc_get_verdict "$want" "$status" <"$file"); then
+      printf 'PASS\t%s\t%s\n' "$who" "$(grep '^disable_cookies=' "$file" || echo 'disable_cookies absent'), errno=0"
+    else
+      printf 'FAIL\t%s\t%s\n' "$who" "$why"
+      rc=1
+    fi
+  done
+  return $rc
+}
+
 # Judge a capture with the wire checker. Only its exit status decides: 0 is a
 # pass; a violation (1) or a checker failure (2, an exception or a malformed
 # capture) is not. Output goes to files for the caller to show.
@@ -160,6 +236,7 @@ VETH_R="a31-vr-$RUN"; VETH_I="a31-vi-$RUN"
 readonly RUN NS_R NS_I IF_R IF_I VETH_R VETH_I
 
 PASS=0; FAIL=0
+R_GET=; I_GET=
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 info() { printf '\033[1m==> %s\033[0m\n' "$1"; }
@@ -224,6 +301,52 @@ self_test() {
   expect "a rekey only the initiator recorded fails" fail rekey_verdict 100 100 100 113
   expect "no rekey fails" fail rekey_verdict 100 100 100 100
 
+  # get=1 dumps shaped like each implementation's: amneziawg-go prints both
+  # 3.1 bools unconditionally, boringtun only when on.
+  local go_on go_off bt_on bt_off
+  go_on=$'private_key=aa\nlisten_port=51820\nrandom_trailers=1\ndisable_cookies=1\npublic_key=bb\nerrno=0\n'
+  go_off=$'private_key=aa\nlisten_port=51820\nrandom_trailers=0\ndisable_cookies=0\npublic_key=bb\nerrno=0\n'
+  bt_on=$'own_public_key=cc\nlisten_port=51821\ns1=40\ndisable_cookies=1\npublic_key=dd\nerrno=0\n'
+  bt_off=$'own_public_key=cc\nlisten_port=51821\ns1=40\npublic_key=dd\nerrno=0\n'
+  expect "dc=1: amneziawg-go dump passes" 0 dc_get_verdict 1 0 <<<"$go_on"
+  expect "dc=1: boringtun dump passes" 0 dc_get_verdict 1 0 <<<"$bt_on"
+  expect "dc=0: amneziawg-go dump (=0) passes" 0 dc_get_verdict 0 0 <<<"$go_off"
+  expect "dc=0: boringtun dump (absent) passes" 0 dc_get_verdict 0 0 <<<"$bt_off"
+  expect "dc=1 but the key is missing fails" fail dc_get_verdict 1 0 <<<"$bt_off"
+  expect "dc=1 but reported =0 fails" fail dc_get_verdict 1 0 <<<"$go_off"
+  expect "dc=0 but reported =1 fails" fail dc_get_verdict 0 0 <<<"$bt_on"
+  expect "dc=0 but reported =1 (amneziawg-go) fails" fail dc_get_verdict 0 0 <<<"$go_on"
+  expect "dc=0 with a failed get=1 fails" fail dc_get_verdict 0 1 <<<"$bt_off"
+  expect "dc=0 with an empty response fails" fail dc_get_verdict 0 0 <<<''
+  expect "dc=0 with errno=22 fails" fail dc_get_verdict 0 0 <<<$'errno=22\n'
+  expect "dc=0 with an otherwise good dump ending errno=22 fails" fail dc_get_verdict 0 0 \
+    <<<"${bt_off/errno=0/errno=22}"
+  expect "dc=0 with a truncated dump (no errno) fails" fail dc_get_verdict 0 0 \
+    <<<"${bt_off%errno=0*}"
+  expect "dc=0 with a malformed line fails" fail dc_get_verdict 0 0 \
+    <<<$'listen_port=51820\nno socket for a31r\nerrno=0\n'
+  expect "dc=0 with only errno=0 (no interface dump) fails" fail dc_get_verdict 0 0 <<<$'errno=0\n'
+  expect "dc=1 with a second, contradicting line fails" fail dc_get_verdict 1 0 \
+    <<<"${go_on/public_key=bb/disable_cookies=0}"
+  # The fetch's own status is what reaches the verdict: a daemon with no
+  # socket (here, no namespace at all) is a failed fetch, not a pass.
+  expect "a get=1 fetch that cannot reach the daemon exits nonzero" fail \
+    fetch_get "a31-selftest-no-such-ns" "a31-none" "$WORKDIR/st.get"
+  fetch_get "a31-selftest-no-such-ns" "a31-none" "$WORKDIR/st.get"
+  local fetched=$?
+  expect "that failed fetch fails the leg even for dc=0" fail judge_dc_daemons 0 \
+    "$fetched" "$WORKDIR/st.get" 0 <(printf '%s' "$go_off")
+  # Both daemons are judged, each on its own: one right and one wrong is a
+  # failed leg whichever way round.
+  expect "only the responder right fails the leg" fail judge_dc_daemons 1 \
+    0 <(printf '%s' "$bt_on") 0 <(printf '%s' "$go_off")
+  expect "only the initiator right fails the leg" fail judge_dc_daemons 1 \
+    0 <(printf '%s' "$bt_off") 0 <(printf '%s' "$go_on")
+  expect "only the initiator's fetch failing fails the leg" fail judge_dc_daemons 0 \
+    0 <(printf '%s' "$bt_off") 1 <(printf '%s' "$go_off")
+  expect "both right passes the leg" 0 judge_dc_daemons 1 \
+    0 <(printf '%s' "$bt_on") 0 <(printf '%s' "$go_on")
+
   # The verdict plumbing: a checker that throws, or cannot parse the capture,
   # must fail the leg -- empty output is not a pass.
   printf 'in not-a-number zz\n' >"$WORKDIR/bad.capture"
@@ -284,6 +407,8 @@ keep_leg() { # <slug> <summary line>...
   cp "$WORKDIR/judge.err" "$d/judge.stderr.txt" 2>/dev/null
   cp "$R_LOG" "$d/responder.log" 2>/dev/null
   cp "$I_LOG" "$d/initiator.log" 2>/dev/null
+  cp "$R_GET" "$d/responder.get.txt" 2>/dev/null
+  cp "$I_GET" "$d/initiator.get.txt" 2>/dev/null
   return 0
 }
 
@@ -448,17 +573,33 @@ wait_both_handshakes() { # <resp after> <init after>
   return 1
 }
 
-run_leg() { # <label> <resp impl go|bt> <rt> <cpa> <hp>
-  local label=$1 resp=$2 rt=$3 cpa=$4 hp=$5
+run_leg() { # <label> <resp impl go|bt> <rt> <cpa> <hp> <dc>
+  local label=$1 resp=$2 rt=$3 cpa=$4 hp=$5 dc=$6
   local init=bt; [ "$resp" = bt ] && init=go
   # The names the wire checker attributes each direction to.
   local in_sender=rust out_sender=rust
   [ "$init" = go ] && in_sender=go
   [ "$resp" = go ] && out_sender=go
-  info "$label: $init initiates, $resp responds (rt=$rt cpa=$cpa hp=$hp)"
-  if ! start_leg "$resp" "$(awg_block "$rt" "$cpa" "$hp")"; then
+  info "$label: $init initiates, $resp responds (rt=$rt cpa=$cpa hp=$hp dc=$dc)"
+  if ! start_leg "$resp" "$(awg_block "$rt" "$cpa" "$hp" "$dc")"; then
     bad "$label: setup failed -- not an interop result"; return
   fi
+  # Both daemons took the configuration -- `set=1` answered errno=0 in
+  # `start_leg` -- and each reports DisableCookies as it was set, in a get=1
+  # that itself succeeded. One assertion per daemon.
+  R_GET="$WORKDIR/r.get"; I_GET="$WORKDIR/i.get"
+  local r_status i_status verdict who detail impl dc_line="disable_cookies get=1:"
+  fetch_get "$NS_R" "$IF_R" "$R_GET"; r_status=$?
+  fetch_get "$NS_I" "$IF_I" "$I_GET"; i_status=$?
+  while IFS=$'\t' read -r verdict who detail; do
+    impl=$init; [ "$who" = responder ] && impl=$resp
+    if [ "$verdict" = PASS ]; then
+      ok "$label: $who ($impl) accepted disable_cookies=$dc and reports it ($detail)"
+    else
+      bad "$label: $who ($impl) disable_cookies=$dc: $detail"
+    fi
+    dc_line+=" $who $verdict ($detail);"
+  done < <(judge_dc_daemons "$dc" "$r_status" "$R_GET" "$i_status" "$I_GET")
   # A nudge to start the handshake; its status is not the assertion.
   ip netns exec "$NS_I" ping -c2 -w 10 -q "$RESP_TUN" >/dev/null 2>&1
   if wait_both_handshakes 0 0; then
@@ -510,8 +651,9 @@ run_leg() { # <label> <resp impl go|bt> <rt> <cpa> <hp>
     bad "$label: wire, per sender:"
     sed 's/^/      /' "$jout" "$jerr"
   fi
-  keep_leg "rt$rt-cpa$cpa-hp$hp.$init-initiates" \
+  keep_leg "rt$rt-cpa$cpa-hp$hp-dc$dc.$init-initiates" \
     "leg: $label ($init initiates as $in_sender, $resp responds as $out_sender)" \
+    "$dc_line" \
     "$rekey_line" \
     "wire: $wire_verdict -- $(tail -1 "$jerr")"
 }
@@ -521,11 +663,13 @@ echo "amneziawg-go : $GO ($PINNED_VERSION, vcs.revision $PINNED_COMMIT, verified
 echo "S1..S4       : $S1 $S2 $S3 $S4"
 echo
 
-for cfg in "0 0 0" "0 1 0" "1 0 0" "1 1 0" "1 1 1"; do
+# RandomTrailers/CPA/HP with DisableCookies off, then DisableCookies on alone,
+# with RandomTrailers, and with everything.
+for cfg in "0 0 0 0" "0 1 0 0" "1 0 0 0" "1 1 0 0" "1 1 1 0" "0 0 0 1" "1 0 0 1" "1 1 1 1"; do
   set -- $cfg
-  name="rt=$1 cpa=$2 hp=$3"
-  run_leg "[$name] go->bt" bt "$1" "$2" "$3"
-  run_leg "[$name] bt->go" go "$1" "$2" "$3"
+  name="rt=$1 cpa=$2 hp=$3 dc=$4"
+  run_leg "[$name] go->bt" bt "$1" "$2" "$3" "$4"
+  run_leg "[$name] bt->go" go "$1" "$2" "$3" "$4"
 done
 
 echo

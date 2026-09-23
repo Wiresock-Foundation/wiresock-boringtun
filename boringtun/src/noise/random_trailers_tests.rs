@@ -314,6 +314,7 @@ fn a_response_that_fails_noise_leaves_its_initiation_pending() {
                     None,
                     &message,
                     0,
+                    super::rate_limiter::CookieDefense::Armed,
                     &mut super::rate_limiter::LoadDecision::default()
                 ),
                 super::rate_limiter::HandshakeGate::Pass

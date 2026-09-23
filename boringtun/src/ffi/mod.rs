@@ -1145,6 +1145,21 @@ pub struct wireguard_awg_params {
     /// version of this struct ([`AWG_PARAMS_SIZE_VER1`]); a caller built
     /// against the first leaves it unset, which is off.
     pub random_trailers: u32,
+    /// AmneziaWG 3.1 DisableCookies: `1` on, `0` off. Any other value is
+    /// refused.
+    ///
+    /// On, a handshake message whose mac1 holds skips the whole under-load
+    /// cookie defense -- no load accounting, no mac2 requirement, no cookie
+    /// reply, and no `UnderLoad` refusal for want of a source address, which
+    /// is what `wireguard_read` never has -- and goes straight on to Noise. It
+    /// does not disable mac1, Noise authentication, replay protection, or
+    /// the cookie replies a peer sends this tunnel: those are still accepted
+    /// and used. Local policy; the peer need not agree.
+    ///
+    /// A `uint32_t` for the reason `random_trailers` is. Appended in the third
+    /// published version of this struct ([`AWG_PARAMS_SIZE_VER2`]); a caller
+    /// built against either earlier one leaves it unset, which is off.
+    pub disable_cookies: u32,
 }
 
 impl PartialEq for wireguard_awg_params {
@@ -1194,6 +1209,7 @@ impl PartialEq for wireguard_awg_params {
             max_handshake_attempts,
             header_protection_key,
             random_trailers,
+            disable_cookies,
         } = self;
 
         *size == other.size
@@ -1219,6 +1235,7 @@ impl PartialEq for wireguard_awg_params {
             && *keepalive_timeout == other.keepalive_timeout
             && *max_handshake_attempts == other.max_handshake_attempts
             && *random_trailers == other.random_trailers
+            && *disable_cookies == other.disable_cookies
             && bool::from(header_protection_key.ct_eq(&other.header_protection_key))
     }
 }
@@ -1274,6 +1291,7 @@ impl std::fmt::Debug for wireguard_awg_params {
             max_handshake_attempts,
             header_protection_key,
             random_trailers,
+            disable_cookies,
         } = self;
 
         f.debug_struct("wireguard_awg_params")
@@ -1308,6 +1326,7 @@ impl std::fmt::Debug for wireguard_awg_params {
                 },
             )
             .field("random_trailers", random_trailers)
+            .field("disable_cookies", disable_cookies)
             .finish()
     }
 }
@@ -1323,6 +1342,9 @@ const AWG_PARAMS_SIZE_VER0: usize = 160;
 /// The size of the second published version: version 0 plus `random_trailers`.
 const AWG_PARAMS_SIZE_VER1: usize = 164;
 
+/// The size of the third published version: version 1 plus `disable_cookies`.
+const AWG_PARAMS_SIZE_VER2: usize = 168;
+
 /// Every size of [`wireguard_awg_params`] that has ever been published.
 ///
 /// A caller's `size` must be one of these, or at least this build's own size (a
@@ -1332,7 +1354,11 @@ const AWG_PARAMS_SIZE_VER1: usize = 164;
 /// field's leading bytes and leaves the rest zero. For a key that is a tunnel
 /// mutually unreachable with its peer and no diagnostic anywhere -- exactly the
 /// outcome the zero-tail rule refuses in the other direction.
-const AWG_PARAMS_PUBLISHED_SIZES: [usize; 2] = [AWG_PARAMS_SIZE_VER0, AWG_PARAMS_SIZE_VER1];
+const AWG_PARAMS_PUBLISHED_SIZES: [usize; 3] = [
+    AWG_PARAMS_SIZE_VER0,
+    AWG_PARAMS_SIZE_VER1,
+    AWG_PARAMS_SIZE_VER2,
+];
 
 /// The largest `size` this build will read.
 ///
@@ -1367,7 +1393,8 @@ const _: () = assert!(AWG_PARAMS_SIZE_MAX > std::mem::size_of::<wireguard_awg_pa
 /// short-struct path refuses callers built against the current header. It
 /// stops holding the moment a field is appended -- which is exactly when the
 /// table needs the new size added to it, and the only repair that makes this
-/// compile again. (It did its job when `random_trailers` arrived.)
+/// compile again. (It did its job when `random_trailers` arrived, and again
+/// for `disable_cookies`.)
 const _: () = assert!(awg_params_size_is_published(std::mem::size_of::<
     wireguard_awg_params,
 >()));
@@ -1407,7 +1434,8 @@ fn awg_params_copy_len(caller_size: usize, our_size: usize) -> usize {
 /// Split out for the same reason `awg_params_copy_len` is: it was pinned as a
 /// pure function while no size could be both valid and short. With two
 /// published versions it is load-bearing, and
-/// `a_version_0_caller_reads_as_random_trailers_off` drives it through
+/// `a_version_0_caller_reads_as_random_trailers_off` and
+/// `a_version_1_caller_reads_as_disable_cookies_off` drive it through
 /// [`read_awg_params`] too.
 fn awg_params_size_is_readable(caller_size: usize, our_size: usize) -> bool {
     caller_size >= our_size || AWG_PARAMS_PUBLISHED_SIZES.contains(&caller_size)
@@ -1637,6 +1665,18 @@ fn awg_params_to_config(
         }
     };
 
+    let disable_cookies = match p.disable_cookies {
+        0 => false,
+        1 => true,
+        other => {
+            set_last_error(&format!(
+                "Invalid AmneziaWG parameters: disable_cookies is {}; it must be 0 (off) or 1 (on)",
+                other
+            ));
+            return None;
+        }
+    };
+
     let domain_supplied = imitation_domain.is_some();
 
     let config = AmneziaConfig::new(s1, s2, s3, s4)
@@ -1655,7 +1695,8 @@ fn awg_params_to_config(
             keepalive_timeout: p.keepalive_timeout.into(),
             max_handshake_attempts: p.max_handshake_attempts.into(),
         })
-        .with_random_trailers(random_trailers);
+        .with_random_trailers(random_trailers)
+        .with_disable_cookies(disable_cookies);
 
     // `AmneziaPreHandshakeJunk::new` substitutes silently rather than failing:
     // a Jc above its ceiling becomes 0 -- the burst switched off entirely --
@@ -1879,7 +1920,8 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
     // would decline a profile the reference implementations run and the operator
     // cannot alter from this end. And warning is safe whichever role this tunnel
     // ends up in, because `Tunn::decapsulate` refuses to emit an amplifying
-    // reply at the emit site itself.
+    // reply at the emit site itself. With `disable_cookies` on there is no
+    // complaint to log: this tunnel forms no cookie reply at all.
     if let Some(complaint) = amnezia.cookie_amplification_complaint() {
         tracing::warn!(
             message = "AmneziaWG S sizes make cookie replies larger than the packets \
@@ -2132,7 +2174,7 @@ mod tests {
         assert_eq!(std::mem::size_of_val(&r.lo), 4);
         assert_eq!(std::mem::size_of_val(&r.hi), 4);
 
-        assert_eq!(size_of::<wireguard_awg_params>(), 164);
+        assert_eq!(size_of::<wireguard_awg_params>(), 168);
         assert_eq!(align_of::<wireguard_awg_params>(), 4);
         // This build's size must be a *published* size -- not specifically
         // version 0's.
@@ -2271,6 +2313,11 @@ mod tests {
                 offset(&p.random_trailers as *const u32 as *const u8),
                 160,
             ),
+            (
+                "disable_cookies",
+                offset(&p.disable_cookies as *const u32 as *const u8),
+                164,
+            ),
         ] {
             assert_eq!(
                 actual, expected,
@@ -2285,7 +2332,7 @@ mod tests {
         // every later offset stay put while the member reads fewer bytes. The
         // C guard missed exactly that until a mutation caught it, so both
         // sides check widths now.
-        // All twenty-four, matching `scripts/ffi-layout-check.c` one for one.
+        // All twenty-five, matching `scripts/ffi-layout-check.c` one for one.
         // This list used to hold fourteen while the comment above claimed
         // "both sides check widths now" -- and the nine it omitted included
         // `reject_after_time`, the field every rationale in this commit names
@@ -2314,6 +2361,7 @@ mod tests {
         assert_eq!(std::mem::size_of_val(&p.max_handshake_attempts), 8);
         assert_eq!(std::mem::size_of_val(&p.header_protection_key), 32);
         assert_eq!(std::mem::size_of_val(&p.random_trailers), 4);
+        assert_eq!(std::mem::size_of_val(&p.disable_cookies), 4);
     }
 
     /// The two by-value return structs, pinned against the same answer
@@ -2608,6 +2656,7 @@ mod tests {
             rekey_after_time: wireguard_awg_range { lo: 30, hi: 40 },
             header_protection_key: [0xcd; 32],
             random_trailers: 1,
+            disable_cookies: 1,
             ..Default::default()
         };
 
@@ -2685,6 +2734,7 @@ mod tests {
         assert_eq!(read.s1_init_junk, 120);
         assert_eq!(read.header_protection_key, [0xcd; 32]);
         assert_eq!(read.random_trailers, 1);
+        assert_eq!(read.disable_cookies, 1);
 
         // The same struct with one non-zero byte in the unknown tail: the
         // caller is setting something this build does not implement, and
@@ -2713,6 +2763,7 @@ mod tests {
             size: AWG_PARAMS_SIZE_VER0 as u32,
             s1_init_junk: 120,
             random_trailers: 0xffff_ffff,
+            disable_cookies: 0xffff_ffff,
             ..Default::default()
         };
         unsafe {
@@ -2726,7 +2777,10 @@ mod tests {
             .expect("a published version-0 struct is readable");
         assert_eq!(read.s1_init_junk, 120);
         assert_eq!(read.random_trailers, 0, "the absent tail reads as unset");
-        assert!(!awg_params_to_config(&read, None).unwrap().random_trailers);
+        assert_eq!(read.disable_cookies, 0, "the absent tail reads as unset");
+        let config = awg_params_to_config(&read, None).unwrap();
+        assert!(!config.random_trailers);
+        assert!(!config.disable_cookies);
 
         for between in AWG_PARAMS_SIZE_VER0 + 1..AWG_PARAMS_SIZE_VER1 {
             unsafe {
@@ -2744,6 +2798,106 @@ mod tests {
                 last_error_string()
             );
         }
+    }
+
+    /// A caller built against the 164-byte header -- the second published
+    /// version -- keeps its `random_trailers` and is read with
+    /// `disable_cookies` off, whatever its memory holds past its own struct; a
+    /// size between versions 1 and 2 is refused, since it would copy
+    /// `disable_cookies` in half.
+    #[test]
+    fn a_version_1_caller_reads_as_disable_cookies_off() {
+        last_tunnel_error_free();
+        let mut buffer = [0xffu8; 256];
+        let v1 = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER1 as u32,
+            s1_init_junk: 120,
+            random_trailers: 1,
+            disable_cookies: 0xffff_ffff,
+            ..Default::default()
+        };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                &v1 as *const _ as *const u8,
+                buffer.as_mut_ptr(),
+                AWG_PARAMS_SIZE_VER1,
+            );
+        }
+        let read = unsafe { read_awg_params(buffer.as_ptr() as *const wireguard_awg_params) }
+            .expect("a published version-1 struct is readable");
+        assert_eq!(read.s1_init_junk, 120);
+        assert_eq!(read.random_trailers, 1, "version 1 has random_trailers");
+        assert_eq!(read.disable_cookies, 0, "the absent tail reads as unset");
+        let config = awg_params_to_config(&read, None).unwrap();
+        assert!(config.random_trailers);
+        assert!(!config.disable_cookies);
+
+        for between in AWG_PARAMS_SIZE_VER1 + 1..AWG_PARAMS_SIZE_VER2 {
+            unsafe {
+                ptr::write_unaligned(buffer.as_mut_ptr() as *mut u32, between as u32);
+            }
+            assert!(
+                unsafe { read_awg_params(buffer.as_ptr() as *const wireguard_awg_params) }
+                    .is_none(),
+                "size {} is inside disable_cookies",
+                between
+            );
+            assert!(
+                last_error_string().contains("not a published size"),
+                "{}",
+                last_error_string()
+            );
+        }
+
+        // Every published size is readable, and nothing else below ours is.
+        for size in AWG_PARAMS_SIZE_VER0..=AWG_PARAMS_SIZE_VER2 {
+            let mut buffer = [0u8; 256];
+            unsafe {
+                ptr::write_unaligned(buffer.as_mut_ptr() as *mut u32, size as u32);
+            }
+            assert_eq!(
+                unsafe { read_awg_params(buffer.as_ptr() as *const wireguard_awg_params) }
+                    .is_some(),
+                AWG_PARAMS_PUBLISHED_SIZES.contains(&size),
+                "size {}",
+                size
+            );
+        }
+    }
+
+    /// A version-2 caller sets both 3.1 switches, each independently of the
+    /// other; `disable_cookies` is 0 or 1 and nothing else.
+    #[test]
+    fn disable_cookies_is_zero_or_one_and_independent_of_random_trailers() {
+        last_tunnel_error_free();
+        let with = |random_trailers, disable_cookies| wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER2 as u32,
+            random_trailers,
+            disable_cookies,
+            ..Default::default()
+        };
+        for rt in [0u32, 1] {
+            for dc in [0u32, 1] {
+                let config = awg_params_to_config(&with(rt, dc), None).unwrap();
+                assert_eq!(config.random_trailers, rt == 1);
+                assert_eq!(config.disable_cookies, dc == 1);
+            }
+        }
+        for bad in [2u32, 0x100, u32::MAX] {
+            assert!(
+                awg_params_to_config(&with(0, bad), None).is_none(),
+                "{}",
+                bad
+            );
+            assert!(
+                last_error_string().contains("disable_cookies"),
+                "{}",
+                last_error_string()
+            );
+        }
+        // Equality sees the field, and Debug shows it.
+        assert_ne!(with(0, 0), with(0, 1));
+        assert!(format!("{:?}", with(0, 1)).contains("disable_cookies: 1"));
     }
 
     /// `random_trailers` is 0 or 1 and nothing else; 1 reaches the tunnel.
@@ -3458,7 +3612,7 @@ mod tests {
         type Mutator = (&'static str, fn(&mut wireguard_awg_params));
 
         let one = wireguard_awg_range { lo: 1, hi: 1 };
-        let mutators: [Mutator; 24] = [
+        let mutators: [Mutator; 25] = [
             ("size", |p| p.size += 1),
             ("s1_init_junk", |p| p.s1_init_junk += 1),
             ("s2_response_junk", |p| p.s2_response_junk += 1),
@@ -3489,6 +3643,7 @@ mod tests {
                 p.header_protection_key[31] ^= 1
             }),
             ("random_trailers", |p| p.random_trailers ^= 1),
+            ("disable_cookies", |p| p.disable_cookies ^= 1),
         ];
 
         // A base with every field non-zero, so `hi` cannot be left behind by a
@@ -3519,6 +3674,7 @@ mod tests {
             max_handshake_attempts: one,
             header_protection_key: [7u8; 32],
             random_trailers: 1,
+            disable_cookies: 1,
         };
         assert_eq!(base, base, "a struct must equal itself");
 
@@ -3788,18 +3944,19 @@ mod tests {
         // capture -- which is exactly the state the retry below exists for, so
         // the one assertion that must not fire spuriously was the one that
         // passed for free whenever the race bit.
-        let build = |s3s: &[u32]| -> Vec<Captured> {
+        let build = |profiles: &[(u32, u32)]| -> Vec<Captured> {
             let events: Arc<StdMutex<Vec<Captured>>> = Arc::new(StdMutex::new(Vec::new()));
             {
                 let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
                 tracing::subscriber::with_default(subscriber, || {
-                    for &s3 in s3s {
+                    for &(s3, disable_cookies) in profiles {
                         last_tunnel_error_free();
                         let params = wireguard_awg_params {
-                            size: AWG_PARAMS_SIZE_VER0 as u32,
+                            size: AWG_PARAMS_SIZE_VER2 as u32,
                             s1_init_junk: 65,
                             s2_response_junk: 86,
                             s3_cookie_junk: s3,
+                            disable_cookies,
                             ..Default::default()
                         };
                         let key =
@@ -3859,7 +4016,7 @@ mod tests {
             if attempt > 0 {
                 tracing::callsite::rebuild_interest_cache();
             }
-            captured = build(&[120, 114]);
+            captured = build(&[(120, 0), (114, 0), (120, 1)]);
             hit = captured
                 .iter()
                 .position(|c| c.detail.contains("makes a cookie reply"));
@@ -3889,11 +4046,13 @@ mod tests {
         );
 
         // One byte under the bound says nothing, or the assertion above would
-        // pass on any configuration at all. Counted rather than `all(!..)`:
-        // exactly one complaint across the two builds means the 120 profile
-        // produced it and the 114 profile did not, which is the claim -- and it
-        // cannot be satisfied by an empty capture, because the `hit` above
-        // already proved one event is there.
+        // pass on any configuration at all -- and neither does the amplifying
+        // profile with `disable_cookies` on, which forms no cookie reply to
+        // amplify. Counted rather than `all(!..)`: exactly one complaint across
+        // the three builds means the armed 120 profile produced it and neither
+        // other did, which is the claim -- and it cannot be satisfied by an
+        // empty capture, because the `hit` above already proved one event is
+        // there.
         assert_eq!(
             captured
                 .iter()

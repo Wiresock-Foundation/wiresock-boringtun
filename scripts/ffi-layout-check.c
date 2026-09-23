@@ -61,7 +61,7 @@ WG_STATIC_ASSERT(offsetof(struct wireguard_awg_range, hi) == 4,
 WG_STATIC_ASSERT(sizeof(((struct wireguard_awg_range *)0)->lo) == 4, "lo must be uint32_t");
 WG_STATIC_ASSERT(sizeof(((struct wireguard_awg_range *)0)->hi) == 4, "hi must be uint32_t");
 
-WG_STATIC_ASSERT(sizeof(struct wireguard_awg_params) == 164,
+WG_STATIC_ASSERT(sizeof(struct wireguard_awg_params) == 168,
                  "wireguard_awg_params size is the ABI version anchor; it must "
                  "match the newest AWG_PARAMS_SIZE_VER* and be identical on 32- and 64-bit");
 
@@ -110,6 +110,7 @@ WG_STATIC_ASSERT(WG_OFF(keepalive_timeout) == 112, "keepalive_timeout moved");
 WG_STATIC_ASSERT(WG_OFF(max_handshake_attempts) == 120, "max_handshake_attempts moved");
 WG_STATIC_ASSERT(WG_OFF(header_protection_key) == 128, "header_protection_key moved");
 WG_STATIC_ASSERT(WG_OFF(random_trailers) == 160, "random_trailers moved");
+WG_STATIC_ASSERT(WG_OFF(disable_cookies) == 164, "disable_cookies moved");
 
 // EVERY member's width as well. Offsets and sizeof share a blind spot:
 // narrowing a member to uint16_t is absorbed by the padding that follows it,
@@ -145,6 +146,7 @@ WG_STATIC_ASSERT(WG_FIELD_SIZE(max_handshake_attempts) == 8,
 WG_STATIC_ASSERT(WG_FIELD_SIZE(header_protection_key) == 32,
                  "header_protection_key must be 32 bytes");
 WG_STATIC_ASSERT(WG_FIELD_SIZE(random_trailers) == 4, "random_trailers must be uint32_t");
+WG_STATIC_ASSERT(WG_FIELD_SIZE(disable_cookies) == 4, "disable_cookies must be uint32_t");
 
 // `wireguard_result` and `stats` -- the two structs in this header whose size
 // really does change with the word size (16/88 on LP64, 8/80 on ILP32, because

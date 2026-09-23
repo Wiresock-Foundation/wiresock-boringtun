@@ -16,6 +16,7 @@ use super::{
 };
 use crate::noise::errors::WireGuardError;
 use crate::noise::header_protection::{HeaderProtectionKey, NONCE_SIZE, TYPE_MASK_SIZE};
+use crate::noise::rate_limiter::CookieDefense;
 use rand_core::RngCore;
 use std::convert::{TryFrom, TryInto};
 use std::time::Duration;
@@ -324,6 +325,27 @@ pub struct AmneziaConfig {
     /// A receiver must agree: a peer that is off rejects every trailer-extended
     /// handshake message. It is not negotiated.
     pub(crate) random_trailers: bool,
+    /// AmneziaWG 3.1 `DisableCookies`. Off by default, and off is WireGuard's
+    /// under-load cookie defense exactly as it was.
+    ///
+    /// On, a handshake message whose mac1 holds bypasses the *whole* under-load
+    /// cookie-defense branch: the load decision is never taken (so the message
+    /// is not counted against the handshake budget), mac2 is not checked, no
+    /// source address is needed, and no cookie reply is formed. The message
+    /// goes straight on to Noise. That is amneziawg-go v3.1.20260828's
+    /// `!disableCookies && IsUnderLoad()` (b5928ef, "disable the whole
+    /// underload"). The first 3.1 release only stopped the reply being *sent*,
+    /// and still refused, under load, every handshake whose mac2 it could no
+    /// longer ask for.
+    ///
+    /// Not "disable cookie replies": it leaves mac1, Noise and its static-key
+    /// authentication, the handshake timestamp check, transport replay
+    /// protection and the cookie replies a peer sends *us* exactly as they
+    /// are -- those are still decrypted and stored, and our own handshakes
+    /// still carry the mac2 they earn. It is local responder policy, not
+    /// negotiated, so the two ends need not agree; S3 keeps its meaning,
+    /// because the peer may still send cookie replies.
+    pub(crate) disable_cookies: bool,
 }
 
 /// How much RandomTrailers suffix an outgoing handshake message may carry: the
@@ -687,6 +709,7 @@ impl AmneziaConfig {
             content_padding_mtu: 0,
             timers: AwgTimers::default(),
             random_trailers: false,
+            disable_cookies: false,
         }
     }
 
@@ -738,6 +761,71 @@ impl AmneziaConfig {
     pub fn with_random_trailers(mut self, on: bool) -> Self {
         self.random_trailers = on;
         self
+    }
+
+    /// Enable or disable AmneziaWG 3.1 `DisableCookies`. See the field: `true`
+    /// bypasses the under-load cookie-defense branch after mac1, and nothing
+    /// else.
+    ///
+    /// Local policy; the peer need not agree. Switching it on a live tunnel
+    /// keeps the tunnel's sessions, UDP window and timers; only how a future
+    /// handshake is met under load changes.
+    pub fn with_disable_cookies(mut self, on: bool) -> Self {
+        self.disable_cookies = on;
+        self
+    }
+
+    /// Whether switching from this configuration to `next` changes receive
+    /// policy alone -- today only [`Self::disable_cookies`] -- and so leaves
+    /// every byte this end sends, and the pacing of anything already queued to
+    /// send, exactly as it was. `Tunn::set_obfuscation` keeps in-flight
+    /// outbound work across such a change; see there.
+    ///
+    /// Destructured rather than compared through a copy with the policy field
+    /// overwritten, so a field added later fails to compile here until it is
+    /// classified: send-side (compared) or receive policy (ignored).
+    pub(crate) fn differs_only_in_receive_policy(&self, next: &AmneziaConfig) -> bool {
+        let AmneziaConfig {
+            init_packet_junk_size,
+            response_packet_junk_size,
+            cookie_packet_junk_size,
+            transport_packet_junk_size,
+            pre_handshake_junk,
+            imitation,
+            suppress_pre_handshake,
+            header_protection,
+            content_padding_addition,
+            content_padding_mtu,
+            timers,
+            random_trailers,
+            // Receive policy: which handshake messages this end answers under
+            // load. Nothing it sends depends on it.
+            disable_cookies: _,
+        } = self;
+        *init_packet_junk_size == next.init_packet_junk_size
+            && *response_packet_junk_size == next.response_packet_junk_size
+            && *cookie_packet_junk_size == next.cookie_packet_junk_size
+            && *transport_packet_junk_size == next.transport_packet_junk_size
+            && *pre_handshake_junk == next.pre_handshake_junk
+            && *imitation == next.imitation
+            && *suppress_pre_handshake == next.suppress_pre_handshake
+            && *header_protection == next.header_protection
+            && *content_padding_addition == next.content_padding_addition
+            && *content_padding_mtu == next.content_padding_mtu
+            && *timers == next.timers
+            && *random_trailers == next.random_trailers
+    }
+
+    /// Whether the rate limiter's under-load cookie defense applies to a
+    /// handshake message this configuration receives. The one place the flag
+    /// is turned into the limiter's policy, so every receive path reads it the
+    /// same way.
+    pub(crate) fn cookie_defense(&self) -> CookieDefense {
+        if self.disable_cookies {
+            CookieDefense::Bypassed
+        } else {
+            CookieDefense::Armed
+        }
     }
 
     /// Replace the AmneziaWG 3.0 tunable-timer ranges wholesale.
@@ -1682,6 +1770,15 @@ impl AmneziaConfig {
     /// one: at S1=100, S2=0, S3=185 both are violated, and raising S2 alone
     /// still leaves the initiation a byte short.
     ///
+    /// `None` with [`Self::disable_cookies`] on, whatever the sizes: the only
+    /// thing that forms a cookie reply is the under-load branch it bypasses,
+    /// so this end emits none and there is nothing to reflect. The sizes are
+    /// still judged the moment it goes off again -- `device::api` asks this of
+    /// the whole configuration a `set=1` would leave, so turning cookies back
+    /// on over an amplifying S3 is refused with the same message, and the
+    /// device stays as it was. What stays unconditional is [`Self::validate`]:
+    /// S3 still frames the cookie replies a peer sends us.
+    ///
     /// Gated because the config-time doors are the only callers -- `device::api`
     /// on `set=1`, the C struct constructor's warning -- so without either
     /// feature this is dead code and the crate would carry a `dead_code`
@@ -1691,6 +1788,9 @@ impl AmneziaConfig {
     /// `cargo test`.
     #[cfg(any(test, feature = "device", feature = "ffi-bindings"))]
     pub(crate) fn cookie_amplification_complaint(&self) -> Option<String> {
+        if self.disable_cookies {
+            return None;
+        }
         let bounds = self.cookie_amplification_bounds();
         let &(which, request, _) = bounds.first()?;
         let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
@@ -2659,6 +2759,155 @@ mod tests {
         let on = base.clone().with_random_trailers(true);
         assert!(on.random_trailers);
         assert_eq!(on.clone().with_random_trailers(false), base);
+    }
+
+    /// DisableCookies is off unless asked for, and is its own switch: it moves
+    /// nothing else, and nothing else moves it.
+    #[test]
+    fn disable_cookies_defaults_off_and_toggles_independently() {
+        let base = AmneziaConfig::new(52, 108, 136, 148);
+        assert!(!base.disable_cookies);
+        assert!(!AmneziaConfig::default().disable_cookies);
+        assert_eq!(base.cookie_defense(), CookieDefense::Armed);
+
+        let off = base.clone().with_disable_cookies(true);
+        assert!(off.disable_cookies);
+        assert_eq!(off.cookie_defense(), CookieDefense::Bypassed);
+        assert_eq!(off.clone().with_disable_cookies(false), base);
+
+        // Composes with every other 3.x setting in either order.
+        let full = base
+            .clone()
+            .with_random_trailers(true)
+            .with_header_protection([7; 32])
+            .with_content_padding_addition(8, 24, 1420)
+            .with_tunable_timers(AwgTimers {
+                rekey_after_time: (30, 40),
+                ..AwgTimers::default()
+            });
+        let full_off = full.clone().with_disable_cookies(true);
+        assert!(full_off.random_trailers);
+        assert_eq!(full_off.header_protection, full.header_protection);
+        assert_eq!(full_off.content_padding_addition, (8, 24));
+        assert_eq!(full_off.timers, full.timers);
+        assert_eq!(full_off.clone().with_disable_cookies(false), full);
+        assert!(
+            base.clone()
+                .with_disable_cookies(true)
+                .with_random_trailers(false)
+                .disable_cookies
+        );
+        assert!(full_off.validate().is_ok());
+    }
+
+    /// Only DisableCookies is receive policy. Every other field shapes what
+    /// this end sends -- or when -- so a change to any of them is a reframe,
+    /// and a change to DisableCookies alone is not.
+    #[test]
+    fn only_disable_cookies_is_receive_policy() {
+        let base = AmneziaConfig::new(52, 108, 136, 148).with_pre_handshake_junk(3, 64, 64, 100);
+        assert!(base.differs_only_in_receive_policy(&base));
+        assert!(base.differs_only_in_receive_policy(&base.clone().with_disable_cookies(true)));
+        assert!(base
+            .clone()
+            .with_disable_cookies(true)
+            .differs_only_in_receive_policy(&base));
+
+        let send_side: Vec<(&str, AmneziaConfig)> = vec![
+            ("s1", {
+                let mut c = base.clone();
+                c.init_packet_junk_size += 1;
+                c
+            }),
+            ("s2", {
+                let mut c = base.clone();
+                c.response_packet_junk_size += 1;
+                c
+            }),
+            ("s3", {
+                let mut c = base.clone();
+                c.cookie_packet_junk_size += 1;
+                c
+            }),
+            ("s4", {
+                let mut c = base.clone();
+                c.transport_packet_junk_size += 1;
+                c
+            }),
+            ("junk", base.clone().with_pre_handshake_junk(4, 64, 64, 100)),
+            (
+                "imitation",
+                base.clone()
+                    .with_protocol_imitation(AmneziaImitationProtocol::Dns, None),
+            ),
+            ("responder", base.clone().as_responder()),
+            (
+                "header protection",
+                base.clone().with_header_protection([9; 32]),
+            ),
+            (
+                "padding",
+                base.clone().with_content_padding_addition(8, 24, 0),
+            ),
+            (
+                "padding mtu",
+                base.clone().with_content_padding_addition(0, 0, 1280),
+            ),
+            (
+                "timers",
+                base.clone().with_tunable_timers(AwgTimers {
+                    rekey_after_time: (30, 40),
+                    ..AwgTimers::default()
+                }),
+            ),
+            ("random trailers", base.clone().with_random_trailers(true)),
+        ];
+        for (name, changed) in send_side {
+            assert!(
+                !base.differs_only_in_receive_policy(&changed),
+                "{} was treated as receive policy",
+                name
+            );
+            // Still a send-side change with DisableCookies moving too.
+            assert!(!base.differs_only_in_receive_policy(&changed.with_disable_cookies(true)));
+        }
+    }
+
+    /// The cookie-reflection complaint is about replies this end would emit.
+    /// With DisableCookies on it emits none, so an amplifying S3 draws no
+    /// complaint; the same sizes draw it again the moment cookies are back on.
+    /// `validate` is not the complaint and does not change with the flag.
+    #[test]
+    fn the_cookie_complaint_applies_only_while_cookies_are_on() {
+        let amplifying = AmneziaConfig::new(0, 0, 100, 0);
+        assert!(amplifying.cookie_amplification_complaint().is_some());
+        let off = amplifying.clone().with_disable_cookies(true);
+        assert_eq!(off.cookie_amplification_complaint(), None);
+        assert!(off
+            .clone()
+            .with_disable_cookies(false)
+            .cookie_amplification_complaint()
+            .is_some());
+        // The size arithmetic itself is untouched: the reply would still be
+        // larger than its request, which is what the runtime guard reads.
+        assert!(off.cookie_reply_would_amplify(COOKIE_REPLY_SZ, HANDSHAKE_INIT_SZ));
+
+        // Universal validity is unconditional: an S3 that cannot frame a
+        // cookie reply at all is refused either way, because a peer may still
+        // send us one.
+        let unframable = AmneziaConfig::new(0, 0, u16::MAX, 0);
+        assert!(unframable.validate().is_err());
+        assert!(unframable.with_disable_cookies(true).validate().is_err());
+
+        // And a configuration that does not amplify is clean either way.
+        let clean = AmneziaConfig::new(100, 40, 20, 160);
+        assert_eq!(clean.cookie_amplification_complaint(), None);
+        assert_eq!(
+            clean
+                .with_disable_cookies(true)
+                .cookie_amplification_complaint(),
+            None
+        );
     }
 
     /// `random_below` is amneziawg-go's `fastrandn`: exclusive, and zero for an
