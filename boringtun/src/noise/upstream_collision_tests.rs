@@ -19,6 +19,11 @@
 //! scripted RNG: every candidate's prefix is chosen by the test, and the tag a
 //! control reading sees is planted in prefix bytes past the 12-byte nonce,
 //! where it is raw on the wire and so fully determined by the prefix.
+//! End to end through `Tunn`, whose framing draws from its own `ChaCha8Rng`,
+//! the tests seed that RNG instead, in a layout where a send draws nothing but
+//! its prefixes. Every candidate is then replayed from a clone and checked
+//! against the oracle before the send, and the send's word consumption is
+//! counted exactly.
 
 use super::amnezia::{AmneziaConfig, AmneziaImitationProtocol, TrailerRoom, DEFAULT_UDP_WINDOW};
 use super::handshake::ObfuscationRanges;
@@ -708,45 +713,228 @@ fn ipv4(len: usize, seq: u8) -> Vec<u8> {
     p
 }
 
-/// Layout P: the cookie reading sits in the prefix (S3 = 12, threshold 76,
-/// below every keepalive: S4 + 32 = 80) and H3 covers almost every tag, so a
-/// framing collides unless its tag lands in one of ~0x1ff values -- about
-/// 5e-7 per framing. Sixteen collide with probability above 1 - 1e-5, so
-/// every frame here exhausts the bound: the most retries a send can do.
-const S_P: [usize; 4] = [16, 20, 12, 48];
-const H_P: [(u32, u32); 4] = [
-    (0xffff_fe01, 0xffff_fe40),
-    (0xffff_fe41, 0xffff_fe80),
-    (5, 0xffff_fe00),
-    (0xffff_ff00, 0xffff_ffff),
+/// Layout Q, for exact end-to-end runs. Every control offset sits inside the
+/// 48-byte prefix, past the nonce (S1 = 16, S2 = 20, S3 = 12), so what an
+/// upstream receiver reads for a control kind is a function of the prefix
+/// alone. The cookie threshold (S3 + 64 = 76) is below every transport frame
+/// (at least S4 + 32 = 80), so the cookie reading always applies, and H3
+/// covers every tag but nine.
+///
+/// It is also pinned so that a send draws nothing but its S4 prefixes. H4 is
+/// a single value, so the transport tag costs no draw. The padding range is a
+/// single value, so padding costs no draw. The timer ranges are unset, so the
+/// timer ticks cost none. Each framing candidate is therefore exactly
+/// `WORDS_Q` consecutive words of the tunnel's RNG, and a test that seeds
+/// that RNG knows every candidate before the send happens.
+const S_Q: [usize; 4] = [16, 20, 12, 48];
+const H_Q: [(u32, u32); 4] = [
+    (0xffff_fffc, 0xffff_fffc),
+    (0xffff_fffd, 0xffff_fffd),
+    (5, 0xffff_fffb),
+    (0xffff_ffff, 0xffff_ffff),
 ];
+const PAD_Q: u32 = 16;
+const WORDS_Q: usize = 48 / 4;
+const CANDIDATES: usize = 16;
 
-/// A send that exhausts all sixteen framings advances the tunnel exactly one
-/// send's worth -- one counter, one tx_bytes update, one window observation,
-/// the same session -- and its datagram still decapsulates to what was sent.
+fn config_q() -> AmneziaConfig {
+    config(S_Q, Some(KEY), true).with_content_padding_addition(PAD_Q, PAD_Q, 1420)
+}
+
+/// A handshaken layout-Q pair whose initiator draws from a seeded RNG from the
+/// moment it takes the response. That moment is when it frames the
+/// handshake-confirmation keepalive, so the keepalive's candidates are fixed
+/// too. Returns the initiator, the responder, the confirmation keepalive and
+/// that keepalive's prevalidated candidates (see [`exhausting_candidates`]).
+fn seeded_tunnels(seed: u64) -> (Tunn, Tunn, Vec<u8>, Vec<Vec<u8>>) {
+    let cfg = config_q();
+    let a_secret = x25519::StaticSecret::random_from_rng(OsRng);
+    let b_secret = x25519::StaticSecret::random_from_rng(OsRng);
+    let a_public = x25519::PublicKey::from(&a_secret);
+    let b_public = x25519::PublicKey::from(&b_secret);
+    let obf = ranges(H_Q);
+    let mut a =
+        Tunn::new_with_obfuscation(a_secret, b_public, None, None, 11, None, obf, cfg.clone())
+            .unwrap();
+    let mut b =
+        Tunn::new_with_obfuscation(b_secret, a_public, None, None, 22, None, obf, cfg).unwrap();
+    let (mut abuf, mut bbuf) = (vec![0u8; 4096], vec![0u8; 4096]);
+    let init = match a.format_handshake_initiation(&mut abuf, false) {
+        TunnResult::WriteToNetwork(d) => d.to_vec(),
+        other => panic!("initiation: {:?}", other),
+    };
+    let response = match b.decapsulate(None, &init, &mut bbuf) {
+        TunnResult::WriteToNetwork(d) => d.to_vec(),
+        other => panic!("response: {:?}", other),
+    };
+    a.handshake.rng = ChaCha8Rng::seed_from_u64(seed);
+    let candidates = exhausting_candidates(&a);
+    let before = a.handshake.rng.get_word_pos();
+    let keepalive = match a.decapsulate(None, &response, &mut abuf) {
+        TunnResult::WriteToNetwork(d) => d.to_vec(),
+        other => panic!("confirmation keepalive: {:?}", other),
+    };
+    assert_sent_candidate_sixteen(&a, before, &candidates, &keepalive, "confirmation");
+    (a, b, keepalive, candidates)
+}
+
+/// The first `CANDIDATES` layout-Q framing prefixes `a` will draw from here,
+/// computed from a clone of its RNG as the ordinary filler draws them (one
+/// little-endian `next_u32` per 4 bytes), each checked against the
+/// independent oracle before anything is sent: its cookie reading, under its
+/// own nonce, falls in H3. So all sixteen are known to collide upstream
+/// before the send, for every length a transport frame can have.
+fn exhausting_candidates(a: &Tunn) -> Vec<Vec<u8>> {
+    let mut replay = a.handshake.rng.clone();
+    (1..=CANDIDATES)
+        .map(|n| {
+            let mut prefix = vec![0u8; S_Q[DATA]];
+            for chunk in prefix.chunks_mut(4) {
+                chunk.copy_from_slice(&replay.next_u32().to_le_bytes());
+            }
+            let tag = decoded(&prefix, S_Q[COOKIE], KEY);
+            assert!(
+                H_Q[COOKIE].0 <= tag && tag <= H_Q[COOKIE].1,
+                "fixture: candidate {} of this seed must collide (cookie tag {:#x})",
+                n,
+                tag
+            );
+            prefix
+        })
+        .collect()
+}
+
+/// `wire` is candidate 16 of `candidates` and nothing else was drawn: the
+/// send consumed exactly sixteen prefixes' worth of words from `before` (the
+/// original framing plus fifteen redraws, no seventeenth), and the prefix on
+/// the wire is the sixteenth. Every candidate, framed with the emitted
+/// canonical message, is misread by the independent upstream oracle, so the
+/// sixteenth went out by exhaustion, not because it happened to be clean.
+fn assert_sent_candidate_sixteen(
+    a: &Tunn,
+    before: u128,
+    candidates: &[Vec<u8>],
+    wire: &[u8],
+    what: &str,
+) {
+    assert_eq!(
+        a.handshake.rng.get_word_pos() - before,
+        (CANDIDATES * WORDS_Q) as u128,
+        "{}: exactly 16 framings drawn, the original included",
+        what
+    );
+    assert!(
+        wire.len() >= S_Q[COOKIE] + BASE[COOKIE],
+        "{}: the cookie reading applies",
+        what
+    );
+    assert_eq!(
+        wire[..S_Q[DATA]],
+        candidates[CANDIDATES - 1][..],
+        "{}: candidate 16 is on the wire",
+        what
+    );
+    let mut message = unmasked_header(wire, S_Q[DATA], KEY);
+    message.extend_from_slice(&wire[S_Q[DATA] + 16..]);
+    assert_eq!(
+        wire,
+        &framed(&candidates[CANDIDATES - 1], &message, Some(KEY))[..],
+        "{}: its header masked once, from the canonical header",
+        what
+    );
+    for (n, prefix) in candidates.iter().enumerate() {
+        let candidate = framed(prefix, &message, Some(KEY));
+        assert!(
+            matches!(
+                upstream_first_match(&candidate, S_Q, H_Q, Some(KEY), true),
+                Some(kind) if kind != DATA
+            ),
+            "{}: candidate {} collides upstream",
+            what,
+            n + 1
+        );
+    }
+}
+
+/// The transport counter in a layout-Q datagram's canonical header.
+fn counter_q(wire: &[u8]) -> u64 {
+    let header = unmasked_header(wire, S_Q[DATA], KEY);
+    assert_eq!(
+        u32::from_le_bytes(header[..4].try_into().unwrap()),
+        H_Q[DATA].0,
+        "a transport frame"
+    );
+    u64::from_le_bytes(header[8..16].try_into().unwrap())
+}
+
+/// Every timer a send can touch, and the tunable deadlines it could redraw.
+fn timer_state(t: &Tunn) -> (Vec<std::time::Duration>, [std::time::Duration; 5], u32) {
+    use super::timers::TimerName::*;
+    let named = vec![
+        TimeCurrent,
+        TimeSessionEstablished,
+        TimeLastHandshakeStarted,
+        TimeLastPacketReceived,
+        TimeLastPacketSent,
+        TimeLastDataPacketReceived,
+        TimeLastDataPacketSent,
+        TimeCookieReceived,
+        TimePersistentKeepalive,
+    ];
+    (
+        named.into_iter().map(|n| t.timers[n]).collect(),
+        [
+            t.timers.retransmit_current,
+            t.timers.keepalive_current,
+            t.timers.new_handshake_current,
+            t.timers.rekey_after_current,
+            t.timers.refresh_receive_current,
+        ],
+        t.timers.handshake_attempts,
+    )
+}
+
+/// What one ordinary send does to the timers: `TimeLastPacketSent`, and for
+/// data `TimeLastDataPacketSent`, set to `TimeCurrent`; nothing else moves,
+/// no deadline is redrawn and no handshake attempt is counted.
+fn one_sends_timers(
+    before: &(Vec<std::time::Duration>, [std::time::Duration; 5], u32),
+    data: bool,
+) -> (Vec<std::time::Duration>, [std::time::Duration; 5], u32) {
+    let mut after = before.clone();
+    let now = after.0[0];
+    after.0[4] = now;
+    if data {
+        after.0[6] = now;
+    }
+    after
+}
+
+/// A send whose sixteen framings all collide -- known before the send, not
+/// merely likely -- advances the tunnel exactly one send's worth: one
+/// counter, from the confirmation keepalive's 0 on with no gap, one tx_bytes
+/// update, one window observation, one send's timer ticks, the same session.
+/// Candidate 16 goes out, and the peer decapsulates it to what was sent.
 #[test]
 fn an_exhausted_send_keeps_one_sends_worth_of_state_and_still_decapsulates() {
-    let cfg = config(S_P, Some(KEY), true).with_content_padding_addition(10, 100, 1420);
-    let (mut a, mut b, _) = tunnels(&cfg, H_P);
+    let (mut a, mut b, confirmation, _) = seeded_tunnels(0x5eed_0001);
+    assert_eq!(counter_q(&confirmation), 0, "confirmation keepalive");
     let (mut abuf, mut bbuf) = (vec![0u8; 4096], vec![0u8; 4096]);
-    let mut last_counter = None;
     for (i, len) in [20usize, 84, 300, 700, 1392, 20, 1392, 576]
         .iter()
         .copied()
         .enumerate()
     {
         let packet = ipv4(len, i as u8);
+        let candidates = exhausting_candidates(&a);
         let (tx_before, window_before, current_before) = (a.tx_bytes, a.udp_window(), a.current);
+        let (timers_before, words_before) = (timer_state(&a), a.handshake.rng.get_word_pos());
         let wire = match a.encapsulate(&packet, &mut abuf) {
             TunnResult::WriteToNetwork(d) => d.to_vec(),
             other => panic!("{}: {:?}", len, other),
         };
-        assert_eq!(
-            upstream_first_match(&wire, S_P, H_P, Some(KEY), true),
-            Some(COOKIE),
-            "{}: every framing collided, so this one did",
-            len
-        );
+        assert_sent_candidate_sixteen(&a, words_before, &candidates, &wire, "application");
+        assert_eq!(counter_q(&wire), 1 + i as u64, "{}: the next counter", len);
         assert_eq!(a.tx_bytes, tx_before + len, "{}: tx_bytes once", len);
         assert_eq!(
             a.udp_window(),
@@ -754,13 +942,13 @@ fn an_exhausted_send_keeps_one_sends_worth_of_state_and_still_decapsulates() {
             "{}: one window observation",
             len
         );
+        assert_eq!(
+            timer_state(&a),
+            one_sends_timers(&timers_before, true),
+            "{}: one send's timer ticks",
+            len
+        );
         assert_eq!(a.current, current_before, "{}: same session", len);
-        let header = unmasked_header(&wire, S_P[DATA], KEY);
-        let counter = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        if let Some(prev) = last_counter {
-            assert_eq!(counter, prev + 1, "{}: one counter per send", len);
-        }
-        last_counter = Some(counter);
         match b.decapsulate(None, &wire, &mut bbuf) {
             TunnResult::WriteToTunnelV4(p, _) => assert_eq!(p, &packet[..], "{}", len),
             other => panic!("{}: {:?}", len, other),
@@ -768,33 +956,46 @@ fn an_exhausted_send_keeps_one_sends_worth_of_state_and_still_decapsulates() {
     }
 }
 
-/// Keepalives -- the handshake-confirmation one and a timer one -- go through
-/// the same framing: under layout P they exhaust the bound too, and the peer
-/// still takes them.
+/// Keepalives go through the same framing and exhaust the same way. The
+/// handshake-confirmation keepalive is counter 0, the first application
+/// packet after it is 1, a keepalive after that 2 and the next packet 3: the
+/// retry loop consumes no counter anywhere in that sequence. A keepalive
+/// counts no tx_bytes and no data-sent tick, and the peer takes every one.
 #[test]
 fn keepalives_are_framed_the_same_way_and_still_arrive() {
-    let cfg = config(S_P, Some(KEY), true);
-    let (mut a, mut b, confirmation) = tunnels(&cfg, H_P);
-    assert_eq!(
-        upstream_first_match(&confirmation, S_P, H_P, Some(KEY), true),
-        Some(COOKIE),
-        "the confirmation keepalive is length-eligible and exhausted the bound"
-    );
+    let (mut a, mut b, confirmation, _) = seeded_tunnels(0x5eed_0002);
+    assert_eq!(counter_q(&confirmation), 0, "confirmation keepalive");
     let (mut abuf, mut bbuf) = (vec![0u8; 4096], vec![0u8; 4096]);
-    let tx_before = a.tx_bytes;
-    let keepalive = match a.encapsulate(&[], &mut abuf) {
-        TunnResult::WriteToNetwork(d) => d.to_vec(),
-        other => panic!("keepalive: {:?}", other),
-    };
-    assert_eq!(a.tx_bytes, tx_before);
-    assert_eq!(
-        upstream_first_match(&keepalive, S_P, H_P, Some(KEY), true),
-        Some(COOKIE)
-    );
-    assert!(matches!(
-        b.decapsulate(None, &keepalive, &mut bbuf),
-        TunnResult::Done
-    ));
+
+    for (counter, len) in [(1u64, Some(300usize)), (2, None), (3, Some(84))] {
+        let packet = len.map(|l| ipv4(l, counter as u8)).unwrap_or_default();
+        let what = if len.is_some() {
+            "application"
+        } else {
+            "keepalive"
+        };
+        let candidates = exhausting_candidates(&a);
+        let (tx_before, timers_before) = (a.tx_bytes, timer_state(&a));
+        let words_before = a.handshake.rng.get_word_pos();
+        let wire = match a.encapsulate(&packet, &mut abuf) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("{}: {:?}", what, other),
+        };
+        assert_sent_candidate_sixteen(&a, words_before, &candidates, &wire, what);
+        assert_eq!(counter_q(&wire), counter, "{}: no counter skipped", what);
+        assert_eq!(a.tx_bytes, tx_before + packet.len(), "{}", what);
+        assert_eq!(
+            timer_state(&a),
+            one_sends_timers(&timers_before, len.is_some()),
+            "{}: one send's timer ticks",
+            what
+        );
+        match (len, b.decapsulate(None, &wire, &mut bbuf)) {
+            (Some(_), TunnResult::WriteToTunnelV4(p, _)) => assert_eq!(p, &packet[..]),
+            (None, TunnResult::Done) => {}
+            (_, other) => panic!("{}: {:?}", what, other),
+        }
+    }
 }
 
 /// The stock amneziawg-install profile, both RandomTrailers settings: tiny,

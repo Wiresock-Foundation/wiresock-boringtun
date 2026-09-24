@@ -2059,9 +2059,10 @@ impl AmneziaConfig {
     /// varies mostly in its transaction id, STUN and SIP in a few fields, so a
     /// redraw may not change the nonce, or may cycle through a handful of
     /// them. Each mode needs its own review before it can be included.
-    /// Without header protection a redraw cannot help at all: the misread
-    /// tag is then raw prefix or ciphertext bytes, not bytes seen through a
-    /// nonce-derived mask.
+    /// Header protection off is skipped too, deliberately: with no mask, a
+    /// redraw changes only readings whose offset lies inside the S4 prefix,
+    /// never those in the header or ciphertext, so prefix-only avoidance is
+    /// not generally sufficient there. A broader strategy is out of scope.
     fn upstream_collision_applies(&self, kind: PacketKind, wire_len: usize) -> bool {
         kind == PacketKind::TransportData
             && self.header_protection_enabled()
@@ -2127,9 +2128,10 @@ impl AmneziaConfig {
     /// and the masked header change, and each candidate is masked once from
     /// the canonical header, never over a previous mask. At most
     /// `UPSTREAM_COLLISION_CANDIDATES` framings are tried in total, the
-    /// original included; if every one collides -- possible only with very
-    /// wide H ranges -- the last is sent anyway: it is valid on the wire, and
-    /// sending it is exactly what happened before this existed.
+    /// original included; if every one collides -- extremely unlikely with
+    /// ordinary ranges, but possible with pathological ranges or an unlucky
+    /// sequence of draws -- the last is sent anyway: it is valid on the wire,
+    /// and sending it is exactly what happened before this existed.
     ///
     /// Candidate 1's mask is recovered as the XOR of its canonical and masked
     /// type words rather than derived again, so the check costs no extra
