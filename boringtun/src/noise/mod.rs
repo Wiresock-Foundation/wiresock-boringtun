@@ -2680,9 +2680,10 @@ mod tests {
     /// provoked it, whoever built the tunnel and however it is driven.
     ///
     /// This is the guard at the emit site itself, and it exists because every
-    /// other defence is positional. The config-time complaint is refused only
-    /// on the device's `set=1` door and deliberately *accepted* by the C
-    /// constructors (a client is handed S3 by its server); the device's
+    /// other defence is positional. The config-time complaint refuses nothing
+    /// -- both the device's `set=1` door and the C constructors accept an
+    /// amplification-prone S3 and warn, because a client is handed S3 by its
+    /// server and the stock AmneziaWG installer rolls such values; the device's
     /// `reply_policy::cookie_verdict` runs only on the device's own ingress
     /// path; and the C ABI is safe only because `wireguard_read` passes no
     /// source address. None of that protects a Rust embedder calling
