@@ -618,6 +618,22 @@ enum PacketKind {
     TransportData,
 }
 
+/// The control kinds an upstream receiver tries before transport, each with
+/// its canonical message size, in the order it tries them.
+const UPSTREAM_CONTROL_KINDS: [(PacketKind, usize); 3] = [
+    (PacketKind::HandshakeInit, HANDSHAKE_INIT_SZ),
+    (PacketKind::HandshakeResponse, HANDSHAKE_RESP_SZ),
+    (PacketKind::CookieReply, COOKIE_REPLY_SZ),
+];
+
+/// Framings a transport datagram may get, in total, to avoid an upstream
+/// receiver misreading it (`AmneziaConfig::avoid_upstream_control_collision`):
+/// the ordinary one plus at most fifteen redraws. With the stock installer's H
+/// ranges a single framing collides with probability at most about 7%, so the
+/// cap is essentially never reached; it bounds the work for configurations
+/// whose H ranges are wide enough to collide nearly always.
+const UPSTREAM_COLLISION_CANDIDATES: usize = 16;
+
 /// One way to read an inbound datagram: a packet kind at that kind's S offset.
 ///
 /// Carries everything needed to recover the canonical message from the
@@ -1976,6 +1992,18 @@ impl AmneziaConfig {
         buffer.copy_within(0..packet_size, junk_size);
         self.fill_outbound_junk(&mut buffer[..junk_size], packet_size, rng);
 
+        // The canonical transport header, kept before masking when this frame
+        // is one an upstream receiver could misread (see
+        // `avoid_upstream_control_collision`). Local to the call: every later
+        // framing candidate is masked afresh from it, never from a masked one.
+        let canonical_header = if self.upstream_collision_applies(kind, new_size + trailer) {
+            let mut header = [0u8; DATA_OFFSET_SZ];
+            header.copy_from_slice(&buffer[junk_size..junk_size + DATA_OFFSET_SZ]);
+            Some(header)
+        } else {
+            None
+        };
+
         // Masking comes last: the junk is the nonce, so it has to be final
         // before any keystream is derived from it, and the message has to be
         // sitting at its wire offset.
@@ -2007,10 +2035,137 @@ impl AmneziaConfig {
             });
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
+        if let Some(canonical) = canonical_header {
+            self.avoid_upstream_control_collision(
+                obf,
+                &mut buffer[..new_size],
+                junk_size,
+                &canonical,
+                rng,
+            );
+        }
         // `trailer_len` bounded this by the buffer, so the slice is in range.
         let wire_len = new_size + trailer;
         fill_random(&mut buffer[new_size..wire_len], rng);
         Ok(&mut buffer[..wire_len])
+    }
+
+    /// Whether an outbound frame gets the upstream-collision check at all:
+    /// transport only, with header protection on, no protocol imitation, and
+    /// a final wire length that admits at least one control reading upstream.
+    ///
+    /// Imitation is excluded because it makes the S4 prefix -- which is the
+    /// header-protection nonce -- protocol-shaped rather than random: DNS
+    /// varies mostly in its transaction id, STUN and SIP in a few fields, so a
+    /// redraw may not change the nonce, or may cycle through a handful of
+    /// them. Each mode needs its own review before it can be included.
+    /// Header protection off is skipped too, deliberately: with no mask, a
+    /// redraw changes only readings whose offset lies inside the S4 prefix,
+    /// never those in the header or ciphertext, so prefix-only avoidance is
+    /// not generally sufficient there. A broader strategy is out of scope.
+    fn upstream_collision_applies(&self, kind: PacketKind, wire_len: usize) -> bool {
+        kind == PacketKind::TransportData
+            && self.header_protection_enabled()
+            && self.imitation.protocol == AmneziaImitationProtocol::None
+            && UPSTREAM_CONTROL_KINDS
+                .iter()
+                .any(|&(control, base)| self.upstream_control_length_fits(control, base, wire_len))
+    }
+
+    /// The upstream receivers' length test for one control kind: at least
+    /// `S + base` with RandomTrailers on, exactly `S + base` with it off.
+    fn upstream_control_length_fits(&self, kind: PacketKind, base: usize, wire_len: usize) -> bool {
+        let need = self.inbound_junk_size(kind) + base;
+        if self.random_trailers {
+            wire_len >= need
+        } else {
+            wire_len == need
+        }
+    }
+
+    /// Would an upstream AmneziaWG receiver take this transport datagram for an
+    /// earlier control message?
+    ///
+    /// The AmneziaWG 3.1 kernel module (`awg_determine_type_and_padding`, as of
+    /// amneziawg-linux-kernel-module 4569c4c) and amneziawg-go
+    /// (`DeterminePacketTypeAndPadding`, as of b5928ef) classify a datagram by
+    /// the first kind -- initiation, response, cookie reply, then transport --
+    /// whose length test passes and whose tag, read at that kind's S offset
+    /// and XORed with the same four header-protection mask bytes, falls in its
+    /// H range. They commit to it before authenticating anything and never
+    /// fall through, so a transport frame that also fits an earlier kind is
+    /// dropped. `mask` is those four bytes for this datagram's nonce.
+    ///
+    /// Only the three control kinds are checked: a transport frame always
+    /// passes the transport test, so "some control kind matches" is exactly
+    /// "the receiver does not pick transport". Nothing is parsed, authenticated
+    /// or range-checked beyond that, and every read is length-checked first --
+    /// an offset may lie in the prefix, the transport header or the
+    /// ciphertext, all of which the receiver reads alike.
+    fn upstream_control_collision(
+        &self,
+        obf: ObfuscationRanges,
+        datagram: &[u8],
+        mask: [u8; TYPE_MASK_SIZE],
+    ) -> bool {
+        UPSTREAM_CONTROL_KINDS.iter().any(|&(kind, base)| {
+            self.upstream_control_length_fits(kind, base, datagram.len())
+                && Self::read_tag_masked(datagram, self.inbound_junk_size(kind), mask)
+                    .is_some_and(|tag| Self::tag_matches(obf, kind, tag))
+        })
+    }
+
+    /// An upstream receiver compatibility workaround: re-frame a transport
+    /// datagram that `upstream_control_collision` says an upstream receiver
+    /// would misread, by drawing a new S4 prefix -- a new header-protection
+    /// nonce, so the mask every candidate tag is read through changes -- and
+    /// masking the canonical header under it.
+    ///
+    /// `datagram` is the fully framed candidate 1, masked from `canonical`.
+    /// Everything the protocol authenticates or counts is already final and
+    /// is not touched here: the counter, the padding choice, the UDP-window
+    /// observation, the ciphertext and its tag, the length. Only the prefix
+    /// and the masked header change, and each candidate is masked once from
+    /// the canonical header, never over a previous mask. At most
+    /// `UPSTREAM_COLLISION_CANDIDATES` framings are tried in total, the
+    /// original included; if every one collides -- extremely unlikely with
+    /// ordinary ranges, but possible with pathological ranges or an unlucky
+    /// sequence of draws -- the last is sent anyway: it is valid on the wire,
+    /// and sending it is exactly what happened before this existed.
+    ///
+    /// Candidate 1's mask is recovered as the XOR of its canonical and masked
+    /// type words rather than derived again, so the check costs no extra
+    /// keystream block. The workaround does change the distribution of
+    /// framings a transport datagram can have -- the colliding ones are no
+    /// longer sent -- which a party knowing the S and H values may be able to
+    /// observe statistically.
+    fn avoid_upstream_control_collision(
+        &self,
+        obf: ObfuscationRanges,
+        datagram: &mut [u8],
+        junk_size: usize,
+        canonical: &[u8; DATA_OFFSET_SZ],
+        rng: &mut impl RngCore,
+    ) {
+        for candidate in 1..=UPSTREAM_COLLISION_CANDIDATES {
+            let mut mask = [0u8; TYPE_MASK_SIZE];
+            for (i, m) in mask.iter_mut().enumerate() {
+                *m = canonical[i] ^ datagram[junk_size + i];
+            }
+            if candidate == UPSTREAM_COLLISION_CANDIDATES
+                || !self.upstream_control_collision(obf, datagram, mask)
+            {
+                return;
+            }
+            datagram[junk_size..junk_size + DATA_OFFSET_SZ].copy_from_slice(canonical);
+            let len = datagram.len();
+            self.fill_outbound_junk(&mut datagram[..junk_size], len - junk_size, rng);
+            // Cannot fail: candidate 1 was masked with the same sizes.
+            let masked = self
+                .header_protection
+                .mask_outbound(datagram, junk_size, DATA_OFFSET_SZ);
+            debug_assert!(masked);
+        }
     }
 
     /// How long a RandomTrailers suffix a `kind` message whose mandatory frame

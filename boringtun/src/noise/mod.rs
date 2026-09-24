@@ -22,6 +22,8 @@ pub(crate) mod inbound;
 mod live_reframe_tests;
 #[cfg(test)]
 mod random_trailers_tests;
+#[cfg(test)]
+mod upstream_collision_tests;
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
 pub(crate) mod quic;
 mod session;
