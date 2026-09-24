@@ -188,11 +188,48 @@ dc_get_verdict() { # <want 0|1> <status>; get=1 response on stdin
   fi
 }
 
+# Talk to a daemon's UAPI socket from inside its namespace: request on stdin,
+# response on stdout. Defined up here, with the helpers that call it, because
+# `--self-test` runs before the runtime section below and exercises it --
+# defined after the dispatch, the self-test's "unreachable daemon" case
+# failed with 127, command not found, and passed for the wrong reason.
+uapi() { # <ns> <iface>; request on stdin
+  ip netns exec "$1" python3 -c '
+import socket, sys, os
+iface = sys.argv[1]
+path = next((p for p in ("/var/run/amneziawg/%s.sock" % iface, "/var/run/wireguard/%s.sock" % iface)
+             if os.path.exists(p)), None)
+if path is None:
+    sys.exit("no UAPI socket for " + iface)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(path)
+s.sendall(sys.stdin.read().encode())
+d = b""
+while True:
+    b = s.recv(4096)
+    if not b: break
+    d += b
+    if d.endswith(b"\n\n"): break
+sys.stdout.write(d.decode())
+' "$2"
+}
+
 # Fetch one daemon's `get=1` into <out>. Returns the fetch's own exit status
 # -- `uapi`'s, not that of the `printf` feeding it.
 fetch_get() { # <ns> <iface> <out>
   printf 'get=1\n\n' | uapi "$1" "$2" >"$3" 2>&1
   return "${PIPESTATUS[1]}"
+}
+
+# 0 when a fetch from a daemon that is not there failed inside `uapi` itself:
+# a nonzero status, but not the shell's 127 for a command it could not find,
+# and nothing in what it printed saying so. Paired in the self-test with a
+# check that `uapi` is defined at all, so an undefined helper cannot pass as
+# an unreachable daemon again.
+unreachable_fetch_verdict() { # <status> <output file>
+  [ "$1" -ne 0 ] || { echo "the fetch succeeded"; return 1; }
+  [ "$1" -ne 127 ] || { echo "status 127: a command was not found: $(head -1 "$2")"; return 1; }
+  ! grep -q 'command not found' "$2" || { echo "command not found: $(head -1 "$2")"; return 1; }
 }
 
 # Judge BOTH daemons' fetched `get=1` for one leg, each on its own. Prints one
@@ -329,11 +366,20 @@ self_test() {
   expect "dc=1 with a second, contradicting line fails" fail dc_get_verdict 1 0 \
     <<<"${go_on/public_key=bb/disable_cookies=0}"
   # The fetch's own status is what reaches the verdict: a daemon with no
-  # socket (here, no namespace at all) is a failed fetch, not a pass.
+  # socket (here, no namespace at all) is a failed fetch, not a pass -- and it
+  # fails inside the real `uapi`, which has to exist by now.
+  expect "uapi is defined when the self-test runs" 0 declare -F uapi
   expect "a get=1 fetch that cannot reach the daemon exits nonzero" fail \
     fetch_get "a31-selftest-no-such-ns" "a31-none" "$WORKDIR/st.get"
   fetch_get "a31-selftest-no-such-ns" "a31-none" "$WORKDIR/st.get"
   local fetched=$?
+  expect "that fetch failed inside uapi, not for want of a command" 0 \
+    unreachable_fetch_verdict "$fetched" "$WORKDIR/st.get"
+  printf 'bash: line 1: uapi: command not found\n' >"$WORKDIR/st.cnf"
+  expect "a command-not-found failure is not taken for an unreachable daemon" fail \
+    unreachable_fetch_verdict 127 "$WORKDIR/st.cnf"
+  expect "an unreachable fetch that succeeded is not taken for one" fail \
+    unreachable_fetch_verdict 0 "$WORKDIR/st.get"
   expect "that failed fetch fails the leg even for dc=0" fail judge_dc_daemons 0 \
     "$fetched" "$WORKDIR/st.get" 0 <(printf '%s' "$go_off")
   # Both daemons are judged, each on its own: one right and one wrong is a
@@ -410,27 +456,6 @@ keep_leg() { # <slug> <summary line>...
   cp "$R_GET" "$d/responder.get.txt" 2>/dev/null
   cp "$I_GET" "$d/initiator.get.txt" 2>/dev/null
   return 0
-}
-
-uapi() { # <ns> <iface>; request on stdin
-  ip netns exec "$1" python3 -c '
-import socket, sys, os
-iface = sys.argv[1]
-path = next((p for p in ("/var/run/amneziawg/%s.sock" % iface, "/var/run/wireguard/%s.sock" % iface)
-             if os.path.exists(p)), None)
-if path is None:
-    sys.exit("no UAPI socket for " + iface)
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect(path)
-s.sendall(sys.stdin.read().encode())
-d = b""
-while True:
-    b = s.recv(4096)
-    if not b: break
-    d += b
-    if d.endswith(b"\n\n"): break
-sys.stdout.write(d.decode())
-' "$2"
 }
 
 pubkey() { python3 -c '
