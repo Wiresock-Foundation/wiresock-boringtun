@@ -1576,4 +1576,337 @@ allowed_ip=10.66.66.2/32",
         let (junk, _) = until_initiation(&mut c);
         assert!(junk >= 1, "the rest of C's burst went out");
     }
+
+    /// An amplification-prone AmneziaWG profile loads through the real UAPI
+    /// with cookies on, and the device's ingress still never sends a cookie
+    /// reply larger than the datagram that provoked it.
+    ///
+    /// The profile is the stock amneziawg-install one the live Raspberry Pi
+    /// run was handed -- S1 = 136, S2 = 59, S3 = 149, S4 = 16, the installer's
+    /// H1-H4 ranges, header protection, RandomTrailers on, DisableCookies off.
+    /// Its cookie reply is 213 bytes before any trailer, against a 284-byte
+    /// minimum initiation and a 151-byte minimum response. `set=1` used to
+    /// refuse it with EINVAL; now it loads with a warning, which makes the
+    /// runtime guard (`reply_policy::cookie_verdict` plus the post-framing
+    /// check) the only thing between it and a reflector. So, through the real
+    /// control path and the real anonymous ingress:
+    ///
+    /// * the profile loads (`errno=0`) and `get=1` reports it; a universally
+    ///   invalid S3 still fails with `errno=22` and changes nothing;
+    /// * DisableCookies on -> off over it succeeds, changes only that field on
+    ///   the interface and on an existing peer, and keeps that peer's pending
+    ///   first-handshake burst (the Keep rule for a DisableCookies-only change);
+    /// * under a zero-budget limiter, a **forged minimum response** -- built
+    ///   from nothing but the device's *public* key, exactly as an attacker
+    ///   would -- draws **no reply**, because 213 > 151;
+    /// * the same forgery against S3 = 87 draws a reply of exactly 151 bytes:
+    ///   the control that proves the forgery reaches the cookie gate, and that
+    ///   parity is sent (the bound is strict) with zero trailer room;
+    /// * a **minimum initiation** (284 bytes) draws a cookie reply that the
+    ///   client authenticates, never larger than 284 whatever trailer the draw
+    ///   takes from the 71 bytes of room: the flood defence works for the
+    ///   stock profile.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn an_amplification_prone_profile_loads_and_its_cookie_replies_never_amplify() {
+        use crate::noise::amnezia::AmneziaConfig;
+        use crate::noise::handshake::{b2s_hash, b2s_keyed_mac_16, ObfuscationRanges, LABEL_MAC1};
+        use crate::noise::rate_limiter::RateLimiter;
+
+        const OK: &str = "errno=0\n\n";
+        const EINVAL: &str = "errno=22\n\n";
+        const S: [u16; 4] = [136, 59, 149, 16];
+        const H: [(u32, u32); 4] = [
+            (21806348, 121806347),
+            (880390969, 980390968),
+            (1131164401, 1231164400),
+            (1662290386, 1762290385),
+        ];
+        const HP: [u8; 32] = [0x42; 32];
+        const INIT: usize = 148 + 136;
+        const RESP: usize = 92 + 59;
+        const COOKIE: usize = 64 + 149;
+        let stock_block = format!(
+            "jc=4\njmin=50\njmax=1000\ns1={}\ns2={}\ns3={}\ns4={}\n\
+             h1={}-{}\nh2={}-{}\nh3={}-{}\nh4={}-{}\n\
+             header_protection_key={}\ncontent_padding_addition=10-100\n\
+             random_trailers=true\ndisable_cookies=false",
+            S[0],
+            S[1],
+            S[2],
+            S[3],
+            H[0].0,
+            H[0].1,
+            H[1].0,
+            H[1].1,
+            H[2].0,
+            H[2].1,
+            H[3].0,
+            H[3].1,
+            encode(HP)
+        );
+        let obf = ObfuscationRanges::new(
+            H[0].0, H[0].1, H[1].0, H[1].1, H[2].0, H[2].1, H[3].0, H[3].1,
+        )
+        .unwrap();
+        // What a client of this server is framed with; RandomTrailers off so
+        // each provoking message is exactly its minimum size.
+        let framing = AmneziaConfig::new(S[0], S[1], S[2], S[3]).with_header_protection(HP);
+
+        let port = next_port();
+        let server_secret = StaticSecret::random_from_rng(OsRng);
+        let server_public = PublicKey::from(&server_secret);
+        let wg = WGHandle::init_with_config(
+            next_ip(),
+            next_ip_v6(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: false,
+                use_multi_queue: false,
+                uapi_fd: -1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(wg.wg_set_port(port), OK);
+        assert_eq!(wg.wg_set_key(server_secret), OK);
+        let server: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let interface = || wg._device.device.read().config.amnezia.clone();
+
+        // --- the stock profile loads through the real UAPI, cookies on --------
+        assert_eq!(
+            wg.wg_set(&stock_block),
+            OK,
+            "the stock installer profile must load with DisableCookies off"
+        );
+        let get = wg.wg_get();
+        for line in [
+            "s1=136",
+            "s2=59",
+            "s3=149",
+            "s4=16",
+            "h2=880390969-980390968",
+            "h3=1131164401-1231164400",
+            "random_trailers=1",
+        ] {
+            assert!(
+                get.lines().any(|l| l == line),
+                "get=1 must report {}: {}",
+                line,
+                get
+            );
+        }
+        assert!(
+            !get.lines().any(|l| l == "disable_cookies=1"),
+            "cookies stay on: {}",
+            get
+        );
+        let installed = interface();
+        assert!(!installed.disable_cookies && installed.random_trailers);
+        assert!(installed.header_protection_enabled());
+        assert!(
+            installed.cookie_amplification_complaint().is_some(),
+            "loaded, and still diagnosed on the response bound"
+        );
+
+        // --- universal invalidity is still refused, and applies nothing -------
+        assert_eq!(
+            wg.wg_set("s3=65535"),
+            EINVAL,
+            "an S3 that cannot frame a cookie reply must still fail the transaction"
+        );
+        assert_eq!(
+            interface().cookie_packet_junk_size,
+            149,
+            "and change nothing"
+        );
+
+        // --- DisableCookies on -> off over the profile, with a peer bursting --
+        // A longer Jc burst than the stock 4 (one junk per 250 ms tick), so the
+        // burst is still pending when the toggle lands and is checked.
+        assert_eq!(wg.wg_set("jc=8"), OK);
+        assert_eq!(wg.wg_set("disable_cookies=1"), OK);
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_secret = StaticSecret::random_from_rng(OsRng);
+        let peer_public = PublicKey::from(&peer_secret);
+        assert_eq!(
+            wg.wg_set(&format!(
+                "public_key={}\nendpoint={}\nallowed_ip=10.66.66.2/32",
+                encode(peer_public.as_bytes()),
+                peer_sock.local_addr().unwrap()
+            )),
+            OK
+        );
+        let peer = wg
+            ._device
+            .device
+            .read()
+            .peers
+            .get(&peer_public)
+            .cloned()
+            .unwrap();
+        {
+            // A first payload with no session starts the peer's Jc burst.
+            let mut p = vec![0u8; 60];
+            p[0] = 0x45;
+            p[2..4].copy_from_slice(&60u16.to_be_bytes());
+            p[8] = 64;
+            p[9] = 17;
+            p[12..16].copy_from_slice(&[10, 66, 66, 1]);
+            p[16..20].copy_from_slice(&[10, 66, 66, 2]);
+            let mut buf = vec![0u8; 2048];
+            let mut locked = peer.lock();
+            assert!(matches!(
+                locked.tunnel.encapsulate(&p, &mut buf),
+                TunnResult::WriteToNetwork(_)
+            ));
+            assert!(locked.tunnel.has_pending_burst());
+            assert!(locked.tunnel.amnezia_config().disable_cookies);
+        }
+        let before = interface();
+        assert!(before.disable_cookies);
+
+        assert_eq!(
+            wg.wg_set("disable_cookies=0"),
+            OK,
+            "re-enabling cookies over an amplification-prone S3 must succeed"
+        );
+        let after = interface();
+        assert!(!after.disable_cookies, "the interface's copy is back on");
+        assert_eq!(
+            after,
+            before.clone().with_disable_cookies(false),
+            "and nothing else on the interface changed"
+        );
+        {
+            let locked = peer.lock();
+            assert!(
+                !locked.tunnel.amnezia_config().disable_cookies,
+                "the existing peer's copy is back on"
+            );
+            assert_eq!(locked.tunnel.amnezia_config().cookie_packet_junk_size, 149);
+            assert!(
+                locked.tunnel.has_pending_burst(),
+                "a DisableCookies-only change keeps the pending burst"
+            );
+        }
+
+        // --- the runtime guard, under a deterministic overload ----------------
+        {
+            let mut guard = wg._device.device.read();
+            guard.try_writeable(
+                |d| d.trigger_yield(),
+                |d| {
+                    d.cancel_yield();
+                    d.rate_limiter = Some(Arc::new(RateLimiter::new(&server_public, 0)));
+                },
+            );
+        }
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe
+            .set_read_timeout(Some(Duration::from_millis(1500)))
+            .unwrap();
+        let mut rx = vec![0u8; 2048];
+
+        // A handshake response forged from the device's public key alone: a
+        // tag in H2, random indices and ephemeral, a valid mac1, no mac2. It
+        // names no handshake this device has in flight -- it does not need to:
+        // the under-load gate sits before any index lookup.
+        let forge_response = |amnezia: &AmneziaConfig| -> Vec<u8> {
+            let mut buf = vec![0u8; 2048];
+            SystemRandom::new().fill(&mut buf[4..60]).unwrap();
+            buf[..4].copy_from_slice(&(H[1].0 + 4242).to_le_bytes());
+            let mac1_key = b2s_hash(LABEL_MAC1, server_public.as_bytes());
+            let mac1 = b2s_keyed_mac_16(&mac1_key, &buf[..60]);
+            buf[60..76].copy_from_slice(&mac1);
+            amnezia
+                .prepend_outbound(obf, &mut buf, 92, &mut OsRng)
+                .unwrap()
+                .to_vec()
+        };
+
+        let forged = forge_response(&framing);
+        assert_eq!(forged.len(), RESP, "a minimum-size forged response");
+        probe.send_to(&forged, server).unwrap();
+        if let Ok((n, _)) = probe.recv_from(&mut rx) {
+            panic!(
+                "a {}-byte forged response drew a {}-byte reply: the device reflected \
+                 an amplified cookie ({} > {})",
+                RESP, n, COOKIE, RESP
+            );
+        }
+
+        // The control: at S3 = 87 the reply is exactly as large as the forged
+        // response, so it is sent -- with no trailer, because parity leaves no
+        // room. Proves the forgery reaches the cookie gate, and that the bound
+        // is strict.
+        assert_eq!(wg.wg_set("s3=87"), OK);
+        assert!(interface().cookie_amplification_complaint().is_none());
+        let parity_framing = AmneziaConfig::new(S[0], S[1], 87, S[3]).with_header_protection(HP);
+        let forged = forge_response(&parity_framing);
+        assert_eq!(forged.len(), RESP);
+        probe.send_to(&forged, server).unwrap();
+        let (n, _) = probe
+            .recv_from(&mut rx)
+            .expect("at parity the forged response must draw its cookie reply");
+        assert_eq!(n, RESP, "64 + 87 == 92 + 59, and no trailer room");
+        assert!(
+            parity_framing
+                .clone()
+                .with_random_trailers(true)
+                .inbound_candidates(obf, &rx[..n])
+                .offsets()
+                .contains(&87),
+            "and it is a cookie reply, framed at S3"
+        );
+        assert_eq!(wg.wg_set("s3=149"), OK);
+
+        // Minimum initiations: 213 <= 284, so each draws a cookie reply, which
+        // may take up to the 71 bytes of room parity leaves and no more.
+        for i in 0..8u32 {
+            let secret = StaticSecret::random_from_rng(OsRng);
+            let mut client = Tunn::new_with_obfuscation(
+                secret,
+                server_public,
+                None,
+                None,
+                0x100 + i,
+                None,
+                obf,
+                framing.clone(),
+            )
+            .unwrap();
+            let mut buf = vec![0u8; 2048];
+            let init = match client.format_handshake_initiation(&mut buf, false) {
+                TunnResult::WriteToNetwork(d) => d.to_vec(),
+                other => panic!("expected an initiation, got {:?}", other),
+            };
+            assert_eq!(init.len(), INIT, "a minimum-size initiation");
+            probe.send_to(&init, server).unwrap();
+            let (n, _) = probe
+                .recv_from(&mut rx)
+                .unwrap_or_else(|e| panic!("initiation {}: no cookie reply: {:?}", i, e));
+            assert!(
+                (COOKIE..=INIT).contains(&n),
+                "initiation {}: a {}-byte reply to a {}-byte request",
+                i,
+                n,
+                INIT
+            );
+            // The client runs the full profile to take a reply that may carry
+            // a trailer, and authenticates it: Done is the cookie stored, a
+            // reply that failed its AEAD would be an error.
+            client.set_obfuscation(obf, framing.clone().with_random_trailers(true));
+            assert!(
+                matches!(
+                    client.decapsulate(Some(server.ip()), &rx[..n], &mut buf),
+                    TunnResult::Done
+                ),
+                "initiation {}: the client must accept the cookie reply",
+                i
+            );
+        }
+    }
 }

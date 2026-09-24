@@ -2841,9 +2841,9 @@ mod ingress_tests {
         // rather than quoted, so this is the real edge of the configuration
         // space and not a number someone remembered. S1 and S2 are at their own
         // maxima only so this pair reads as one profile with the S1 = 0 case
-        // below; `validate` stopped applying the amplification rule when the
-        // policy moved out to the responder's door, so these two assertions are
-        // now purely the size rule -- as the `S1 = 0` config below, which
+        // below; `validate` does not apply the amplification rule -- no
+        // configuration door refuses on it any more -- so these two assertions
+        // are purely the size rule, as the `S1 = 0` config below, which
         // `validate` accepts, demonstrates.
         assert!(AmneziaConfig::new(65_359, 65_415, 65_443, 0)
             .validate()
@@ -2852,10 +2852,10 @@ mod ingress_tests {
             .validate()
             .is_err());
 
-        // With S1 = 0 the same S3 earns the complaint that `device::api` turns
-        // into a refused `set=1` transaction -- the config-time door, and the
-        // loud one. `validate` itself stays silent: the reflection question is
-        // a responder's, and universal validation no longer answers it.
+        // With S1 = 0 the same S3 earns the complaint that `device::api` logs
+        // at WARN on `set=1` while loading the configuration. `validate` itself
+        // stays silent: an amplification-prone S3 is a valid configuration,
+        // and the reflection is stopped per datagram, below.
         let amnezia = AmneziaConfig::new(0, 0, 65_443, 0);
         amnezia
             .validate()
@@ -2869,9 +2869,10 @@ mod ingress_tests {
             err
         );
 
-        // And the second door still holds, because it has to: a `DeviceConfig`
-        // supplied at startup never passes through `validate`, so `cookie_verdict`
-        // is the only thing standing between this config and the reflector below.
+        // And the runtime guard holds, because it has to: no configuration
+        // door refuses this profile, and a `DeviceConfig` supplied at startup
+        // never passes through one at all, so `cookie_verdict` is the only
+        // thing standing between this config and the reflector below.
         let (request_len, reply_len) = cookie_exchange_sizes(&amnezia);
 
         assert_eq!(

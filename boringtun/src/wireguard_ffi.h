@@ -660,9 +660,9 @@ struct wireguard_awg_params
 ///   * timers ordered so that keys would be rejected before the rekey replacing
 ///     them completes.
 ///
-/// ONE CLASS IS DELIBERATELY NOT REFUSED HERE, though the UAPI set=1 path does
-/// refuse it: S-value combinations that make the cookie reply larger than the
-/// request it answers, i.e. an amplification reflector (s3_cookie_junk >
+/// ONE CLASS IS DELIBERATELY NOT REFUSED HERE, nor by the UAPI set=1 path:
+/// S-value combinations that make the cookie reply larger than the request it
+/// answers -- an amplification-prone configuration (s3_cookie_junk >
 /// s2_response_junk + 28, or > s1_init_junk + 84). Accepting it is safe
 /// because the reflection is stopped where the packet would be sent, not at
 /// configuration time: the tunnel itself refuses to emit a cookie reply larger
@@ -678,10 +678,10 @@ struct wireguard_awg_params
 /// logged at WARN instead, so it reaches a host that installed a callback
 /// with set_logging_function() and nothing at all otherwise -- it is NOT
 /// reported through last_tunnel_error(), which stays reserved for the NULL
-/// return, and a non-NULL return never means "read the error". A profile this
-/// constructor accepts may therefore still be refused by boringtun-cli, which
-/// is a responder choosing its own reflection ratio; that divergence is
-/// intentional.
+/// return, and a non-NULL return never means "read the error". boringtun-cli's
+/// set=1 accepts and warns the same way. What such a profile can cost is
+/// liveness, never safety: a suppressed cookie reply is one the peer never
+/// learns, so handshakes can fail while that end is overloaded.
 ///
 /// Returns NULL on failure, with the reason in last_tunnel_error().
 struct wireguard_tunnel *new_tunnel_with_awg_params(
