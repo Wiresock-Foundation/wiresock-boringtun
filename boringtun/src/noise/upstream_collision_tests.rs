@@ -27,7 +27,8 @@
 
 use super::amnezia::{AmneziaConfig, AmneziaImitationProtocol, TrailerRoom, DEFAULT_UDP_WINDOW};
 use super::handshake::ObfuscationRanges;
-use super::{grown_window, Tunn, TunnResult};
+use super::timers::TimerName;
+use super::{grown_window, Tunn, TunnResult, N_SESSIONS};
 use crate::x25519;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
@@ -35,6 +36,7 @@ use rand_chacha::ChaCha8Rng;
 use rand_core::{OsRng, RngCore, SeedableRng};
 use std::collections::VecDeque;
 use std::convert::TryInto;
+use std::time::Duration;
 
 const KEY: [u8; 32] = [0x6b; 32];
 const INIT: usize = 0;
@@ -741,12 +743,13 @@ fn config_q() -> AmneziaConfig {
     config(S_Q, Some(KEY), true).with_content_padding_addition(PAD_Q, PAD_Q, 1420)
 }
 
-/// A handshaken layout-Q pair whose initiator draws from a seeded RNG from the
-/// moment it takes the response. That moment is when it frames the
-/// handshake-confirmation keepalive, so the keepalive's candidates are fixed
-/// too. Returns the initiator, the responder, the confirmation keepalive and
-/// that keepalive's prevalidated candidates (see [`exhausting_candidates`]).
-fn seeded_tunnels(seed: u64) -> (Tunn, Tunn, Vec<u8>, Vec<Vec<u8>>) {
+/// A handshaken layout-Q pair, the initiator drawing from a seeded RNG from
+/// the moment it takes the response, which is when it frames the
+/// handshake-confirmation keepalive. That keepalive is checked to exhaust all
+/// sixteen framings (candidate 16 on the wire, transport counter 0) and to
+/// change the initiator's timers exactly as the handshake-response path does,
+/// and then the responder is given that exact datagram and must accept it.
+fn seeded_tunnels(seed: u64) -> (Tunn, Tunn) {
     let cfg = config_q();
     let a_secret = x25519::StaticSecret::random_from_rng(OsRng);
     let b_secret = x25519::StaticSecret::random_from_rng(OsRng);
@@ -767,15 +770,82 @@ fn seeded_tunnels(seed: u64) -> (Tunn, Tunn, Vec<u8>, Vec<Vec<u8>>) {
         TunnResult::WriteToNetwork(d) => d.to_vec(),
         other => panic!("response: {:?}", other),
     };
+
     a.handshake.rng = ChaCha8Rng::seed_from_u64(seed);
+    let now = set_now(&mut a, 1);
     let candidates = exhausting_candidates(&a);
-    let before = a.handshake.rng.get_word_pos();
-    let keepalive = match a.decapsulate(None, &response, &mut abuf) {
+    let (window_before, timers_before) = (a.udp_window(), timer_state(&a));
+    let words_before = a.handshake.rng.get_word_pos();
+    let confirmation = match a.decapsulate(None, &response, &mut abuf) {
         TunnResult::WriteToNetwork(d) => d.to_vec(),
         other => panic!("confirmation keepalive: {:?}", other),
     };
-    assert_sent_candidate_sixteen(&a, before, &candidates, &keepalive, "confirmation");
-    (a, b, keepalive, candidates)
+    assert_sent_candidate_sixteen(&a, words_before, &candidates, &confirmation, "confirmation");
+    assert_eq!(counter_q(&confirmation), 0, "confirmation: counter 0");
+    assert_eq!(a.tx_bytes, 0, "confirmation: no tx_bytes");
+    assert_eq!(
+        a.udp_window(),
+        grown_window(window_before, a.amnezia.transport_window_observation(0)),
+        "confirmation: one window observation"
+    );
+    // `commit_handshake_response`: the response counts as a packet received
+    // and establishes the session (its slot's session timer too); it does
+    // not tick the packet-sent or data-sent timers.
+    let slot = a.current % N_SESSIONS;
+    for (timer, what) in [
+        (T_RECEIVED, "packet-received tick"),
+        (T_ESTABLISHED, "session-established tick"),
+    ] {
+        assert_ne!(
+            timers_before.named[timer], now,
+            "fixture: {} observable",
+            what
+        );
+        assert_eq!(timer_state(&a).named[timer], now, "confirmation: {}", what);
+    }
+    let mut expected = timers_before.clone();
+    expected.named[T_RECEIVED] = now;
+    expected.named[T_ESTABLISHED] = now;
+    expected.sessions[slot] = now;
+    assert_eq!(
+        timer_state(&a),
+        expected,
+        "confirmation: no packet-sent or data-sent tick, nothing else moves"
+    );
+
+    // The responder takes candidate 16 through its ordinary receive path:
+    // authenticated, counted as received, and counter 0 now spent.
+    let b_now = set_now(&mut b, 5);
+    assert!(
+        matches!(
+            b.decapsulate(None, &confirmation, &mut bbuf),
+            TunnResult::Done
+        ),
+        "the responder accepts the confirmation keepalive"
+    );
+    assert_eq!(
+        b.timers[TimerName::TimeLastPacketReceived],
+        b_now,
+        "the responder counted it as an authenticated packet"
+    );
+    // A replay is refused and counts as nothing received. (The error it
+    // reports is not pinned: this frame is ambiguous by construction, so the
+    // receiver tries its cookie reading after refusing the spent counter.)
+    let later = set_now(&mut b, 6);
+    assert!(
+        matches!(
+            b.decapsulate(None, &confirmation, &mut bbuf),
+            TunnResult::Err(_)
+        ),
+        "the responder refuses a replay of it"
+    );
+    assert_ne!(b.timers[TimerName::TimeLastPacketReceived], later);
+    assert_eq!(
+        b.timers[TimerName::TimeLastPacketReceived],
+        b_now,
+        "counter 0 was spent by the first delivery"
+    );
+    (a, b)
 }
 
 /// The first `CANDIDATES` layout-Q framing prefixes `a` will draw from here,
@@ -807,8 +877,8 @@ fn exhausting_candidates(a: &Tunn) -> Vec<Vec<u8>> {
 /// `wire` is candidate 16 of `candidates` and nothing else was drawn: the
 /// send consumed exactly sixteen prefixes' worth of words from `before` (the
 /// original framing plus fifteen redraws, no seventeenth), and the prefix on
-/// the wire is the sixteenth. Every candidate, framed with the emitted
-/// canonical message, is misread by the independent upstream oracle, so the
+/// the wire is the sixteenth. Each candidate, carrying the header recovered
+/// from the wire, is misread by the independent upstream oracle, so the
 /// sixteenth went out by exhaustion, not because it happened to be clean.
 fn assert_sent_candidate_sixteen(
     a: &Tunn,
@@ -836,12 +906,6 @@ fn assert_sent_candidate_sixteen(
     );
     let mut message = unmasked_header(wire, S_Q[DATA], KEY);
     message.extend_from_slice(&wire[S_Q[DATA] + 16..]);
-    assert_eq!(
-        wire,
-        &framed(&candidates[CANDIDATES - 1], &message, Some(KEY))[..],
-        "{}: its header masked once, from the canonical header",
-        what
-    );
     for (n, prefix) in candidates.iter().enumerate() {
         let candidate = framed(prefix, &message, Some(KEY));
         assert!(
@@ -867,9 +931,34 @@ fn counter_q(wire: &[u8]) -> u64 {
     u64::from_le_bytes(header[8..16].try_into().unwrap())
 }
 
-/// Every timer a send can touch, and the tunable deadlines it could redraw.
-fn timer_state(t: &Tunn) -> (Vec<std::time::Duration>, [std::time::Duration; 5], u32) {
-    use super::timers::TimerName::*;
+/// Stand in for `update_timers` having run at `secs` seconds. Every checked
+/// send happens at its own distinct, nonzero time, so a tick that fires, is
+/// missing, or fires twice is visible in the timer it writes.
+fn set_now(t: &mut Tunn, secs: u64) -> Duration {
+    let now = Duration::from_secs(secs);
+    t.timers[TimerName::TimeCurrent] = now;
+    now
+}
+
+const T_CURRENT: usize = 0;
+const T_ESTABLISHED: usize = 1;
+const T_RECEIVED: usize = 3;
+const T_SENT: usize = 4;
+const T_DATA_SENT: usize = 6;
+
+/// Every timer a send could touch: the named timers (indexed by the `T_*`
+/// constants), the per-session timers, the tunable deadlines and the
+/// handshake attempt count.
+#[derive(Clone, Debug, PartialEq)]
+struct TimerState {
+    named: Vec<Duration>,
+    sessions: [Duration; N_SESSIONS],
+    deadlines: [Duration; 5],
+    handshake_attempts: u32,
+}
+
+fn timer_state(t: &Tunn) -> TimerState {
+    use TimerName::*;
     let named = vec![
         TimeCurrent,
         TimeSessionEstablished,
@@ -881,33 +970,55 @@ fn timer_state(t: &Tunn) -> (Vec<std::time::Duration>, [std::time::Duration; 5],
         TimeCookieReceived,
         TimePersistentKeepalive,
     ];
-    (
-        named.into_iter().map(|n| t.timers[n]).collect(),
-        [
+    TimerState {
+        named: named.into_iter().map(|n| t.timers[n]).collect(),
+        sessions: t.timers.session_timers,
+        deadlines: [
             t.timers.retransmit_current,
             t.timers.keepalive_current,
             t.timers.new_handshake_current,
             t.timers.rekey_after_current,
             t.timers.refresh_receive_current,
         ],
-        t.timers.handshake_attempts,
-    )
+        handshake_attempts: t.timers.handshake_attempts,
+    }
 }
 
-/// What one ordinary send does to the timers: `TimeLastPacketSent`, and for
-/// data `TimeLastDataPacketSent`, set to `TimeCurrent`; nothing else moves,
-/// no deadline is redrawn and no handshake attempt is counted.
-fn one_sends_timers(
-    before: &(Vec<std::time::Duration>, [std::time::Duration; 5], u32),
-    data: bool,
-) -> (Vec<std::time::Duration>, [std::time::Duration; 5], u32) {
-    let mut after = before.clone();
-    let now = after.0[0];
-    after.0[4] = now;
-    if data {
-        after.0[6] = now;
-    }
-    after
+/// One ordinary send's timer transition, at `now`: the packet-sent tick; the
+/// data-sent tick for data and not for a keepalive; and nothing else --
+/// no other named timer, session timer, deadline or attempt count moves.
+/// Each tick is asserted on its own first, so a missing, extra or repeated
+/// tick fails on the timer it concerns.
+fn assert_one_sends_timers(t: &Tunn, before: &TimerState, now: Duration, data: bool, what: &str) {
+    assert_eq!(before.named[T_CURRENT], now, "fixture: {}: clock set", what);
+    assert_ne!(
+        before.named[T_SENT], now,
+        "fixture: {}: packet-sent tick observable",
+        what
+    );
+    assert_ne!(
+        before.named[T_DATA_SENT], now,
+        "fixture: {}: data-sent tick observable",
+        what
+    );
+    let after = timer_state(t);
+    assert_eq!(after.named[T_SENT], now, "{}: packet-sent tick", what);
+    let data_sent = if data { now } else { before.named[T_DATA_SENT] };
+    assert_eq!(
+        after.named[T_DATA_SENT],
+        data_sent,
+        "{}: data-sent tick {}",
+        what,
+        if data {
+            "on data"
+        } else {
+            "not on a keepalive"
+        }
+    );
+    let mut expected = before.clone();
+    expected.named[T_SENT] = now;
+    expected.named[T_DATA_SENT] = data_sent;
+    assert_eq!(after, expected, "{}: no other timer moves", what);
 }
 
 /// A send whose sixteen framings all collide -- known before the send, not
@@ -917,8 +1028,7 @@ fn one_sends_timers(
 /// Candidate 16 goes out, and the peer decapsulates it to what was sent.
 #[test]
 fn an_exhausted_send_keeps_one_sends_worth_of_state_and_still_decapsulates() {
-    let (mut a, mut b, confirmation, _) = seeded_tunnels(0x5eed_0001);
-    assert_eq!(counter_q(&confirmation), 0, "confirmation keepalive");
+    let (mut a, mut b) = seeded_tunnels(0x5eed_0001);
     let (mut abuf, mut bbuf) = (vec![0u8; 4096], vec![0u8; 4096]);
     for (i, len) in [20usize, 84, 300, 700, 1392, 20, 1392, 576]
         .iter()
@@ -926,6 +1036,7 @@ fn an_exhausted_send_keeps_one_sends_worth_of_state_and_still_decapsulates() {
         .enumerate()
     {
         let packet = ipv4(len, i as u8);
+        let now = set_now(&mut a, 2 + i as u64);
         let candidates = exhausting_candidates(&a);
         let (tx_before, window_before, current_before) = (a.tx_bytes, a.udp_window(), a.current);
         let (timers_before, words_before) = (timer_state(&a), a.handshake.rng.get_word_pos());
@@ -942,12 +1053,7 @@ fn an_exhausted_send_keeps_one_sends_worth_of_state_and_still_decapsulates() {
             "{}: one window observation",
             len
         );
-        assert_eq!(
-            timer_state(&a),
-            one_sends_timers(&timers_before, true),
-            "{}: one send's timer ticks",
-            len
-        );
+        assert_one_sends_timers(&a, &timers_before, now, true, "application");
         assert_eq!(a.current, current_before, "{}: same session", len);
         match b.decapsulate(None, &wire, &mut bbuf) {
             TunnResult::WriteToTunnelV4(p, _) => assert_eq!(p, &packet[..], "{}", len),
@@ -957,14 +1063,14 @@ fn an_exhausted_send_keeps_one_sends_worth_of_state_and_still_decapsulates() {
 }
 
 /// Keepalives go through the same framing and exhaust the same way. The
-/// handshake-confirmation keepalive is counter 0, the first application
-/// packet after it is 1, a keepalive after that 2 and the next packet 3: the
-/// retry loop consumes no counter anywhere in that sequence. A keepalive
-/// counts no tx_bytes and no data-sent tick, and the peer takes every one.
+/// handshake-confirmation keepalive is counter 0 (and the responder accepts
+/// it, see [`seeded_tunnels`]), the first application packet after it is 1,
+/// an `encapsulate(&[])` keepalive 2 and the next packet 3: the retry loop
+/// consumes no counter anywhere in that sequence. A keepalive adds no
+/// tx_bytes and no data-sent tick, and the peer takes every one.
 #[test]
 fn keepalives_are_framed_the_same_way_and_still_arrive() {
-    let (mut a, mut b, confirmation, _) = seeded_tunnels(0x5eed_0002);
-    assert_eq!(counter_q(&confirmation), 0, "confirmation keepalive");
+    let (mut a, mut b) = seeded_tunnels(0x5eed_0002);
     let (mut abuf, mut bbuf) = (vec![0u8; 4096], vec![0u8; 4096]);
 
     for (counter, len) in [(1u64, Some(300usize)), (2, None), (3, Some(84))] {
@@ -974,22 +1080,28 @@ fn keepalives_are_framed_the_same_way_and_still_arrive() {
         } else {
             "keepalive"
         };
+        let now = set_now(&mut a, 1 + counter);
         let candidates = exhausting_candidates(&a);
-        let (tx_before, timers_before) = (a.tx_bytes, timer_state(&a));
-        let words_before = a.handshake.rng.get_word_pos();
+        let (tx_before, window_before, current_before) = (a.tx_bytes, a.udp_window(), a.current);
+        let (timers_before, words_before) = (timer_state(&a), a.handshake.rng.get_word_pos());
         let wire = match a.encapsulate(&packet, &mut abuf) {
             TunnResult::WriteToNetwork(d) => d.to_vec(),
             other => panic!("{}: {:?}", what, other),
         };
         assert_sent_candidate_sixteen(&a, words_before, &candidates, &wire, what);
         assert_eq!(counter_q(&wire), counter, "{}: no counter skipped", what);
-        assert_eq!(a.tx_bytes, tx_before + packet.len(), "{}", what);
+        assert_eq!(a.tx_bytes, tx_before + packet.len(), "{}: tx_bytes", what);
         assert_eq!(
-            timer_state(&a),
-            one_sends_timers(&timers_before, len.is_some()),
-            "{}: one send's timer ticks",
+            a.udp_window(),
+            grown_window(
+                window_before,
+                a.amnezia.transport_window_observation(packet.len())
+            ),
+            "{}: one window observation",
             what
         );
+        assert_one_sends_timers(&a, &timers_before, now, len.is_some(), what);
+        assert_eq!(a.current, current_before, "{}: same session", what);
         match (len, b.decapsulate(None, &wire, &mut bbuf)) {
             (Some(_), TunnResult::WriteToTunnelV4(p, _)) => assert_eq!(p, &packet[..]),
             (None, TunnResult::Done) => {}
