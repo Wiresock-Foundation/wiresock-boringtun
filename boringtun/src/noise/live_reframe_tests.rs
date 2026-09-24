@@ -22,6 +22,7 @@ use super::handshake::ObfuscationRanges;
 use super::inbound::fixtures::SRC;
 use super::{Packet, Tunn, TunnResult, HANDSHAKE_INIT_SZ};
 use crate::x25519;
+use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
 use rand_core::OsRng;
 use std::convert::TryInto;
 
@@ -231,14 +232,42 @@ fn lengths(datagrams: &[Vec<u8>]) -> Vec<usize> {
 // ---------------------------------------------------------------------------
 // Keep.
 
-/// One Keep-class change: the framing it touches, and whether the old
-/// framing still reads the initiation (it must not, for a framing change).
+/// What the configuration before a change makes of the initiation sent after
+/// it.
+#[derive(Clone, Copy, Debug)]
+enum OldFraming {
+    /// The change does not touch the initiation's framing.
+    Reads,
+    /// It does, on every initiation: S1, the magic headers, the HP key.
+    Rejects,
+    /// RandomTrailers: the suffix is drawn from `[0, headroom)`, and zero is a
+    /// legal draw -- an initiation with no suffix is exactly the RT-off frame.
+    /// So the old framing rejects it exactly when a suffix was drawn.
+    RejectsIffTrailer,
+}
+
+/// One Keep-class change, and what it does to the initiation's framing.
 struct KeepCase {
     name: &'static str,
     obf: ObfuscationRanges,
     cfg: AmneziaConfig,
-    reframes_the_initiation: bool,
+    old_framing: OldFraming,
     junk_len: usize,
+}
+
+/// Whether `init` carries a RandomTrailers suffix past the canonical frame.
+fn has_trailer(init: &[u8]) -> bool {
+    init.len() > S[0] as usize + HANDSHAKE_INIT_SZ
+}
+
+fn check_old_framing(old: OldFraming, init: &[u8], case: &str) {
+    let reads = reads_as_initiation(ObfuscationRanges::default(), &base(), init);
+    let want = match old {
+        OldFraming::Reads => true,
+        OldFraming::Rejects => false,
+        OldFraming::RejectsIffTrailer => !has_trailer(init),
+    };
+    assert_eq!(reads, want, "{}: {:?}, {} bytes", case, old, init.len());
 }
 
 fn keep_cases() -> Vec<KeepCase> {
@@ -248,64 +277,65 @@ fn keep_cases() -> Vec<KeepCase> {
     s1.init_packet_junk_size += 8;
     let mut s4 = b.clone();
     s4.transport_packet_junk_size += 8;
-    let case = |name, obf, cfg, reframes, junk_len| KeepCase {
+    use OldFraming::{Reads, Rejects, RejectsIffTrailer};
+    let case = |name, obf, cfg, old_framing, junk_len| KeepCase {
         name,
         obf,
         cfg,
-        reframes_the_initiation: reframes,
+        old_framing,
         junk_len,
     };
     vec![
-        case("no change", d, b.clone(), false, JUNK),
-        case("s1", d, s1, true, JUNK),
-        case("s4", d, s4, false, JUNK),
+        case("no change", d, b.clone(), Reads, JUNK),
+        case("s1", d, s1, Rejects, JUNK),
+        case("s4", d, s4, Reads, JUNK),
         case(
             "h1-h4",
             ObfuscationRanges::new(100, 199, 200, 299, 300, 399, 400, 499).unwrap(),
             b.clone(),
-            true,
+            Rejects,
             JUNK,
         ),
         case(
             "header protection",
             d,
             b.clone().with_header_protection([0x77; 32]),
-            true,
+            Rejects,
             JUNK,
         ),
         case(
             "random trailers",
             d,
             b.clone().with_random_trailers(true),
-            true,
+            RejectsIffTrailer,
             JUNK,
         ),
         case(
             "jmin/jmax",
             d,
             b.clone().with_pre_handshake_junk(JC, 80, 80, JD as u16),
-            false,
+            Reads,
             80,
         ),
         case(
             "jd",
             d,
             b.clone().with_pre_handshake_junk(JC, 64, 64, 50),
-            false,
+            Reads,
             JUNK,
         ),
         case(
             "padding",
             d,
             b.clone().with_content_padding_addition(8, 24, 1420),
-            false,
+            Reads,
             JUNK,
         ),
         case(
             "padding mtu",
             d,
             b.clone().with_content_padding_addition(0, 0, 1280),
-            false,
+            Reads,
             JUNK,
         ),
         case(
@@ -316,29 +346,29 @@ fn keep_cases() -> Vec<KeepCase> {
                 rekey_timeout: (3, 4),
                 ..AwgTimers::default()
             }),
-            false,
+            Reads,
             JUNK,
         ),
         case(
             "disable cookies",
             d,
             b.clone().with_disable_cookies(true),
-            false,
+            Reads,
             JUNK,
         ),
     ]
 }
 
 /// A Keep-class change mid-burst -- after each of the three junk datagrams,
-/// the last leaving only the initiation due -- keeps the burst: only what was
-/// still owed goes out (junk sized by the new Jmin/Jmax where those changed),
-/// then an initiation framed under the new configuration and unreadable under
-/// the old where the change is to its framing, and the queued payload arrives
-/// once. The UDP window is untouched.
+/// the last leaving only the initiation due -- keeps the burst: the new
+/// configuration is in force at once, only what was still owed goes out
+/// (junk sized by the new Jmin/Jmax where those changed), then an initiation
+/// the new configuration reads -- and the old one does not, where the change
+/// is to its framing (for RandomTrailers, exactly when a suffix was drawn) --
+/// and the queued payload arrives once. The UDP window is untouched.
 #[cfg(feature = "mock-instant")]
 #[test]
 fn a_keep_class_change_keeps_the_burst_and_reframes_what_is_left() {
-    let old_obf = ObfuscationRanges::default();
     for c in keep_cases() {
         for sent in 1..=JC as usize {
             let case = format!("{} after {} junk", c.name, sent);
@@ -349,6 +379,8 @@ fn a_keep_class_change_keeps_the_burst_and_reframes_what_is_left() {
             p.mine.set_udp_window(1234);
 
             p.reconfigure(c.obf, &c.cfg);
+            assert_eq!(p.mine.amnezia, c.cfg, "{}: not applied", case);
+            assert_eq!(p.mine.handshake.obf, c.obf, "{}: not applied", case);
             assert!(p.mine.pending_amnezia_junk.is_some(), "{}: dropped", case);
             assert_eq!(p.mine.udp_window(), 1234, "{}: window moved", case);
 
@@ -361,20 +393,18 @@ fn a_keep_class_change_keeps_the_burst_and_reframes_what_is_left() {
             );
             let init = rest.init.unwrap_or_else(|| panic!("{}: stalled", case));
             assert!(reads_as_initiation(c.obf, &c.cfg, &init), "{}", case);
-            assert_eq!(
-                reads_as_initiation(old_obf, &base(), &init),
-                !c.reframes_the_initiation,
-                "{}: old framing",
-                case
-            );
+            check_old_framing(c.old_framing, &init, &case);
             assert_eq!(complete(&mut p, &init), vec![payload(1)], "{}", case);
         }
     }
 }
 
-/// RandomTrailers both ways mid-burst: kept, window untouched, and the
-/// initiation carries a trailer exactly when it ends up on. Once the session
-/// is up, transport follows the setting in force.
+/// RandomTrailers both ways mid-burst: kept, the new setting in force at once,
+/// the window untouched. Off, the initiation is exactly the canonical frame;
+/// on, it is whatever the draw gives -- any suffix, zero included -- and the
+/// new configuration reads it either way. Once the session is up, transport
+/// goes out under the setting in force. (Whether a suffix is ever drawn is
+/// pinned deterministically below, not left to a draw here.)
 #[cfg(feature = "mock-instant")]
 #[test]
 fn random_trailers_toggled_mid_burst_keeps_the_burst_and_the_window() {
@@ -382,21 +412,22 @@ fn random_trailers_toggled_mid_burst_keeps_the_burst_and_the_window() {
     for on in [true, false] {
         let from = base().with_random_trailers(!on);
         let to = base().with_random_trailers(on);
-        let mut lengths_seen = std::collections::BTreeSet::new();
         for _ in 0..8 {
             let mut p = pair(&from);
             queue(&mut p.mine, &[payload(1)]);
             emit(&mut p.mine, 1);
             p.mine.set_udp_window(900);
             p.reconfigure(obf, &to);
+            assert_eq!(p.mine.amnezia.random_trailers, on);
             let rest = drain(&mut p.mine, 12);
             assert_eq!(lengths(&rest.junk), vec![JUNK], "rt->{}", on);
             assert_eq!(p.mine.udp_window(), 900);
             let init = rest.init.expect("stalled");
             if !on {
-                assert_eq!(init.len(), S[0] as usize + HANDSHAKE_INIT_SZ);
+                assert!(!has_trailer(&init));
             }
-            lengths_seen.insert(init.len());
+            assert!(init.len() < 900, "the suffix is drawn below the window");
+            assert!(reads_as_initiation(obf, &to, &init));
             assert_eq!(complete(&mut p, &init), vec![payload(1)]);
 
             // Transport under the setting in force.
@@ -411,9 +442,123 @@ fn random_trailers_toggled_mid_burst_keeps_the_burst_and_the_window() {
                 TunnResult::WriteToTunnelV4(..)
             ));
         }
-        assert_eq!(lengths_seen.len() > 1, on, "{:?}", lengths_seen);
     }
 }
+
+/// Where the RandomTrailers initiation comes from, for the deterministic
+/// suffix tests: the burst the change kept, or the retransmission after it.
+#[derive(Clone, Copy, Debug)]
+enum RtPath {
+    KeptBurst,
+    Retransmission,
+}
+
+/// A handshake that switched RandomTrailers on along `path`, stopped just
+/// before its RT initiation is formatted -- so a test can pin the draw.
+fn rt_on_before_the_initiation(path: RtPath) -> Pair {
+    let on = base().with_random_trailers(true);
+    let mut p = pair(&base());
+    queue(&mut p.mine, &[payload(1)]);
+    match path {
+        RtPath::KeptBurst => {
+            emit(&mut p.mine, JC as usize - 1);
+            p.reconfigure(ObfuscationRanges::default(), &on);
+            // Every junk datagram is out: only the initiation is still due.
+            assert_eq!(p.mine.pending_amnezia_junk.as_ref().unwrap().remaining, 0);
+        }
+        RtPath::Retransmission => {
+            drain(&mut p.mine, 12).init.expect("the first initiation");
+            p.reconfigure(ObfuscationRanges::default(), &on);
+            pass(5_000);
+            emit(&mut p.mine, JC as usize - 1);
+        }
+    }
+    p
+}
+
+/// Split a trailer-extended initiation: canonical frame, then suffix.
+fn frame_and_suffix(init: &[u8]) -> (&[u8], &[u8]) {
+    init.split_at(S[0] as usize + HANDSHAKE_INIT_SZ)
+}
+
+/// Zero is a legal RandomTrailers draw, on both paths. With one byte of
+/// headroom the draw is from `[0, 1)` -- zero by construction, not by luck --
+/// and the initiation is then exactly the canonical frame: sent, read by the
+/// RT configuration, completing the handshake. A change that made the suffix
+/// at least one byte would break this.
+#[cfg(feature = "mock-instant")]
+#[test]
+fn a_zero_random_trailer_is_a_legal_initiation_on_both_paths() {
+    let on = base().with_random_trailers(true);
+    for path in [RtPath::KeptBurst, RtPath::Retransmission] {
+        let mut p = rt_on_before_the_initiation(path);
+        let frame = S[0] as u32 + HANDSHAKE_INIT_SZ as u32;
+        p.mine.set_udp_window(frame + 1);
+        let init = drain(&mut p.mine, 12).init.expect("stalled");
+        assert_eq!(init.len(), frame as usize, "{:?}", path);
+        assert!(!has_trailer(&init));
+        assert!(reads_as_initiation(
+            ObfuscationRanges::default(),
+            &on,
+            &init
+        ));
+        assert_eq!(complete(&mut p, &init), vec![payload(1)], "{:?}", path);
+    }
+}
+
+/// And a positive suffix is drawn, on both paths -- pinned, not hoped for.
+/// The tunnel's own ChaCha8 RNG is reseeded just before the initiation, so
+/// each seed's draw is fixed; the first seed whose draw is positive is used,
+/// and none being positive fails the test. The suffix sits outside the
+/// canonical frame: the RT-off framing refuses the whole datagram, the RT
+/// configuration reads the frame, a rewritten suffix is still accepted, a
+/// rewritten frame byte is not, and the payload arrives once.
+#[cfg(feature = "mock-instant")]
+#[test]
+fn a_positive_random_trailer_is_drawn_outside_the_canonical_frame_on_both_paths() {
+    let d = ObfuscationRanges::default();
+    let on = base().with_random_trailers(true);
+    for path in [RtPath::KeptBurst, RtPath::Retransmission] {
+        let (mut p, init) = (0u64..32)
+            .find_map(|seed| {
+                let mut p = rt_on_before_the_initiation(path);
+                p.mine.handshake.rng = ChaCha8Rng::seed_from_u64(seed);
+                let init = drain(&mut p.mine, 12).init.expect("stalled");
+                has_trailer(&init).then_some((p, init))
+            })
+            .unwrap_or_else(|| panic!("{:?}: no seed drew a positive suffix", path));
+
+        let (frame, suffix) = frame_and_suffix(&init);
+        assert!(!suffix.is_empty());
+        assert!(init.len() < DEFAULT_WINDOW_FOR_TESTS, "{:?}", path);
+        assert!(!reads_as_initiation(d, &base(), &init), "{:?}", path);
+        assert!(reads_as_initiation(d, &on, &init), "{:?}", path);
+        // The canonical message is the frame alone: the same bytes read the
+        // same with the suffix gone.
+        assert!(reads_as_initiation(d, &on, frame), "{:?}", path);
+
+        // Outside the frame: a rewritten suffix still completes; a rewritten
+        // frame byte does not.
+        let mut buf = vec![0u8; 4096];
+        let mut damaged = init.clone();
+        let last = damaged.len() - 1;
+        damaged[S[0] as usize + 20] ^= 1;
+        assert!(
+            !matches!(
+                p.theirs.decapsulate(SRC, &damaged, &mut buf),
+                TunnResult::WriteToNetwork(_)
+            ),
+            "{:?}: a damaged frame was answered",
+            path
+        );
+        let mut rewritten = init.clone();
+        rewritten[last] ^= 0xff;
+        assert_eq!(complete(&mut p, &rewritten), vec![payload(1)], "{:?}", path);
+    }
+}
+
+/// The UDP window every tunnel starts with, bounding every suffix above.
+const DEFAULT_WINDOW_FOR_TESTS: usize = 500;
 
 /// A new header-protection key mid-burst: the burst holds no masked control
 /// message, so the initiation is masked with the new key only -- the old key
@@ -653,6 +798,55 @@ fn a_new_imitation_restarts_the_sequence_with_nothing_left_of_the_old() {
     }
 }
 
+/// Restarting into an imitation sequence follows the sequence's own timing,
+/// not Jd: after ordinary junk, a change to DNS imitation makes the new
+/// sequence's first datagram due at once -- its protocol delay is zero --
+/// the second likewise, the third 15 ms later; then the new configuration's
+/// Jc junk, first at once and then Jd apart; then the initiation. None of the
+/// old burst's owed junk goes out, and the payload arrives once.
+#[cfg(feature = "mock-instant")]
+#[test]
+fn restarting_into_imitation_follows_the_imitation_schedule() {
+    let dns = base().with_protocol_imitation(AmneziaImitationProtocol::Dns, None);
+    let mut p = pair(&base());
+    queue(&mut p.mine, &[payload(1)]);
+    p.reconfigure(ObfuscationRanges::default(), &dns);
+    let fresh: Vec<Vec<u8>> = p
+        .mine
+        .pending_amnezia_junk
+        .as_ref()
+        .unwrap()
+        .imitation_datagrams
+        .iter()
+        .map(|(_, d)| d.clone())
+        .collect();
+    assert_eq!(fresh.len(), 3, "DNS: A, AAAA, HTTPS");
+    assert_eq!(p.mine.pending_amnezia_junk.as_ref().unwrap().remaining, JC);
+
+    let mut buf = vec![0u8; 4096];
+    let mut next = |p: &mut Pair| match p.mine.update_timers(&mut buf) {
+        TunnResult::WriteToNetwork(d) => Some(d.to_vec()),
+        _ => None,
+    };
+    // No time has passed since the old burst's junk: the first two DNS
+    // datagrams are due at once all the same.
+    assert_eq!(next(&mut p).as_deref(), Some(&fresh[0][..]));
+    assert_eq!(next(&mut p).as_deref(), Some(&fresh[1][..]));
+    // The third waits its 15 ms.
+    assert_eq!(next(&mut p), None);
+    pass(15);
+    assert_eq!(next(&mut p).as_deref(), Some(&fresh[2][..]));
+    // Then Jc junk: the first at once, the rest Jd apart.
+    assert!(next(&mut p).is_some());
+    assert_eq!(next(&mut p), None);
+    let rest = drain(&mut p.mine, 12);
+    assert_eq!(rest.junk.len(), JC as usize - 1);
+    assert_eq!(
+        complete(&mut p, &rest.init.expect("stalled")),
+        vec![payload(1)]
+    );
+}
+
 /// A restarted burst keeps the pacing clock of the one it replaces: the
 /// change itself sends nothing, and the replacement's first junk datagram is
 /// still a full Jd after the last one that went out.
@@ -772,21 +966,29 @@ fn a_change_after_the_initiation_reaches_its_retransmission() {
     let d = ObfuscationRanges::default();
     let mut s1 = base();
     s1.init_packet_junk_size += 8;
-    let cases: Vec<(&str, ObfuscationRanges, AmneziaConfig)> = vec![
-        ("s1", d, s1),
+    use OldFraming::{Rejects, RejectsIffTrailer};
+    let cases: Vec<(&str, ObfuscationRanges, AmneziaConfig, OldFraming)> = vec![
+        ("s1", d, s1, Rejects),
         (
             "h1-h4",
             ObfuscationRanges::new(100, 199, 200, 299, 300, 399, 400, 499).unwrap(),
             base(),
+            Rejects,
         ),
         (
             "header protection",
             d,
             base().with_header_protection([0x44; 32]),
+            Rejects,
         ),
-        ("random trailers", d, base().with_random_trailers(true)),
+        (
+            "random trailers",
+            d,
+            base().with_random_trailers(true),
+            RejectsIffTrailer,
+        ),
     ];
-    for (name, obf, cfg) in cases {
+    for (name, obf, cfg, old_framing) in cases {
         let mut p = pair(&base());
         queue(&mut p.mine, &[payload(1)]);
         let first = drain(&mut p.mine, 12).init.expect("the first initiation");
@@ -795,19 +997,26 @@ fn a_change_after_the_initiation_reaches_its_retransmission() {
         drop(first); // lost
 
         p.reconfigure(obf, &cfg);
+        assert_eq!(p.mine.amnezia, cfg, "{}: not applied", name);
         assert!(
             p.mine.handshake.is_in_progress(),
             "{}: Noise state reset",
             name
         );
         assert_eq!(p.mine.timers.handshake_attempts, 0, "{}", name);
+        let mut buf = vec![0u8; 4096];
+        assert!(
+            matches!(p.mine.update_timers(&mut buf), TunnResult::Done),
+            "{}: the change itself sent something",
+            name
+        );
 
         pass(5_000);
         let retry = drain(&mut p.mine, 12);
         assert_eq!(lengths(&retry.junk), vec![JUNK; JC as usize], "{}", name);
         let init = retry.init.expect("no retransmission");
         assert!(reads_as_initiation(obf, &cfg, &init), "{}", name);
-        assert!(!reads_as_initiation(d, &base(), &init), "{}", name);
+        check_old_framing(old_framing, &init, name);
         assert_eq!(p.mine.timers.handshake_attempts, 1, "{}", name);
         assert_eq!(complete(&mut p, &init), vec![payload(1)], "{}", name);
     }

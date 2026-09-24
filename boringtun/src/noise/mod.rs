@@ -540,8 +540,10 @@ impl Tunn {
     /// * **Restart** -- the change touches what the burst captured when it
     ///   was built: the Jc count, the imitation sequence, or whether there is a
     ///   burst at all. The burst is rebuilt from the new configuration by the
-    ///   same builder a new handshake uses, keeping its pacing clock, so the
-    ///   replacement is spaced from what already went out. A configuration
+    ///   same builder a new handshake uses. It keeps the previous burst's
+    ///   last emission time, so ordinary Jc junk still waits Jd after what
+    ///   already went out; an imitation sequence keeps its own protocol
+    ///   schedule, including a first datagram due at once. A configuration
     ///   with no burst leaves an empty one, which the next timer tick turns
     ///   into the initiation.
     ///
@@ -575,7 +577,9 @@ impl Tunn {
     }
 
     /// Rebuild a pre-handshake burst in flight from the current configuration,
-    /// keeping its pacing clock; nothing to do when none is in flight. Never
+    /// keeping its last emission time (see [`Self::new_pre_handshake_burst`]
+    /// for what that does and does not pace); nothing to do when none is in
+    /// flight. Never
     /// leaves the tunnel without a burst it had: see [`Self::set_obfuscation`].
     fn restart_pending_burst(&mut self) {
         if let Some(old) = self.pending_amnezia_junk.take() {
@@ -1246,8 +1250,11 @@ impl Tunn {
     ///
     /// `last_packet_at` is the pacing clock the burst starts from: `None` for
     /// a burst no datagram has preceded, or the time the previous burst last
-    /// emitted when this one replaces it, so the replacement keeps the same
-    /// spacing from what already went out.
+    /// emitted when this one replaces it. That keeps ordinary Jc junk -- and
+    /// the initiation of an empty burst -- a full Jd after what already went
+    /// out. It does not delay an imitation sequence: each imitation datagram
+    /// carries its own protocol delay, measured from the same clock, and the
+    /// first is deliberately zero.
     fn new_pre_handshake_burst(&mut self, last_packet_at: Option<Instant>) -> PendingAmneziaJunk {
         if !self.amnezia.emits_pre_handshake() {
             return PendingAmneziaJunk {
