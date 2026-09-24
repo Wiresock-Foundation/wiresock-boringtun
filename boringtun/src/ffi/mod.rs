@@ -1812,9 +1812,9 @@ fn awg_params_to_config(
 /// * timers ordered so that keys would be rejected before the rekey replacing
 ///   them completes.
 ///
-/// One class is deliberately **not** refused here, though the UAPI `set=1` path
-/// does refuse it: S-value combinations that make the cookie reply larger than
-/// the request it answers, i.e. an amplification reflector. Accepting it is
+/// One class is deliberately **not** refused here, nor by the UAPI `set=1`
+/// path: S-value combinations that make the cookie reply larger than the
+/// request it answers -- an amplification-prone configuration. Accepting it is
 /// safe because the reflection is stopped where the packet is sent, not at
 /// configuration time: `Tunn::decapsulate` refuses to emit a cookie reply
 /// larger than the datagram that provoked it, for every tunnel however it was
@@ -1826,9 +1826,10 @@ fn awg_params_to_config(
 /// is dictated by the server the caller is connecting to. Refusing would
 /// decline a profile the caller cannot change, that the AmneziaWG kernel module
 /// and amneziawg-go both run, and that the legacy `new_tunnel_with_amnezia*`
-/// constructors accept. It is logged instead. A profile accepted here can
-/// therefore still be refused by `boringtun-cli`, which is a responder choosing
-/// its own reflection ratio; that divergence is intentional.
+/// constructors accept. It is logged instead, at WARN, exactly as `set=1` logs
+/// it; the two doors no longer diverge. What such a profile can cost is
+/// liveness, never safety: a cookie reply the runtime guard suppresses is one
+/// the peer never learns, so handshakes can fail while that end is overloaded.
 ///
 /// Returns NULL on failure, with the reason in `last_tunnel_error()`.
 #[no_mangle]
@@ -1924,9 +1925,9 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
     // complaint to log: this tunnel forms no cookie reply at all.
     if let Some(complaint) = amnezia.cookie_amplification_complaint() {
         tracing::warn!(
-            message = "AmneziaWG S sizes make cookie replies larger than the packets \
-                       that provoke them; harmless for a client, but this port would \
-                       reflect if it ever served handshakes",
+            message = "AmneziaWG S sizes make cookie replies larger than some packets \
+                       that provoke them; to avoid reflection amplification such replies \
+                       are suppressed, so handshakes can fail while this tunnel is under load",
             detail = %complaint
         );
     }

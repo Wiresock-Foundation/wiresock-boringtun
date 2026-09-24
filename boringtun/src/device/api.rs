@@ -292,27 +292,36 @@ impl AwgParams {
             return Err(EINVAL);
         }
 
-        // The cookie-reflection policy, applied here rather than inside
-        // `validate` because it is a responder's question and this is the
-        // responder's door: a device answers handshakes on an unconnected
-        // socket, so its cookie replies are aimed at attacker-chosen sources,
-        // and the operator running `awg set` is the one party who can actually
-        // change S3. The same profile is *accepted* by the C constructors,
-        // where the caller is a client handed S3 by its server -- see
-        // `AmneziaConfig::cookie_amplification_complaint`. Refusing at `set=1`
-        // with the arithmetic in the message is the loud, actionable failure;
-        // the runtime guards (`reply_policy::cookie_verdict` here,
-        // `Tunn::decapsulate`'s emit-site check everywhere) are what actually
-        // stop the reflection, so this is early notice, not the last line.
+        // The cookie-reflection question is a warning here, not a refusal.
+        // An S3 whose cookie reply would outgrow the packet provoking it is a
+        // valid configuration -- the stock amneziawg-install roll produces one
+        // about a third of the time, the kernel module and amneziawg-go run it,
+        // and a device used as a client is handed S3 by its server exactly as
+        // a C-ABI tunnel is. What must never exist is an amplifying *port*,
+        // and that is enforced per datagram where cookie replies leave:
+        // `reply_policy::cookie_verdict` on this device's ingress and
+        // `Tunn::decapsulate`'s emit-site check for every connected peer, each
+        // against the actual length of the datagram in hand, with any
+        // RandomTrailers suffix drawn only from the room parity leaves. Those
+        // guards are the security boundary; this is the operator's advance
+        // notice of what they cost -- handshake liveness while overloaded, per
+        // violated bound, as the message spells out.
         //
         // Silent while DisableCookies is on -- this end then forms no cookie
         // reply at all -- and asked of the merged result, not of the lines
-        // that changed: a transaction turning cookies back on over an
-        // amplifying S3 is refused here, before anything is applied, and the
-        // device keeps cookies off.
+        // that changed, so a transaction turning cookies back on over such an
+        // S3 is applied and warned about in one step. Logged on every `set=1`
+        // whose result earns it, and never per packet. It changes nothing in
+        // what is applied: the staged configuration below is exactly what the
+        // transaction said.
         if let Some(complaint) = amnezia.cookie_amplification_complaint() {
-            tracing::error!(message = "rejecting AmneziaWG parameters", error = %complaint);
-            return Err(EINVAL);
+            tracing::warn!(
+                message = "AmneziaWG S sizes make cookie replies larger than some packets \
+                           that provoke them; to avoid reflection amplification such \
+                           replies are suppressed, so handshakes can fail while this \
+                           device is under load",
+                detail = %complaint
+            );
         }
 
         Ok((obf, amnezia))
@@ -1195,8 +1204,8 @@ mod tests {
         params.set_size("s1", 120);
         params.set_size("s2", 130);
         // 64 + 1 = 65 <= 92 + 130, so the untouched S3 keeps this clear of the
-        // reflection rule; see the test below, which is the one that exercises
-        // it here.
+        // reflection complaint; see the test below, which is the one that
+        // exercises it here.
 
         let (_, merged) = params
             .merged(ObfuscationRanges::default(), &current, 1420)
@@ -1213,47 +1222,64 @@ mod tests {
         assert_eq!(merged.transport_packet_junk_size, 1, "s4 untouched");
     }
 
-    /// The responder path keeps refusing what the C constructor now accepts.
+    /// The `set=1` door accepts what the C constructor accepts, and warns the
+    /// same way.
     ///
     /// `new_tunnel_with_awg_params` builds S1=65/S2=86/S3=120 deliberately: S3
-    /// is symmetric and interface-wide, so a client is handed it by whichever
-    /// server it dials and cannot lower it without losing the ability to parse
-    /// that server's cookie replies. A device is the other party to exactly
-    /// that arrangement -- a responder on an unconnected socket, whose replies
-    /// go to an attacker-chosen source -- so here the operator both owns the
-    /// value and is the one who would reflect. This is the divergence stated in
-    /// `wireguard_ffi.h`, pinned from the side that still refuses.
+    /// is symmetric and interface-wide, so whoever dials a server is handed it
+    /// and cannot lower it without losing the ability to parse that server's
+    /// cookie replies -- and a device is exactly as often that client. Neither
+    /// door is the reflection guard: `reply_policy::cookie_verdict` and
+    /// `Tunn::decapsulate` suppress, per datagram, any cookie reply larger than
+    /// the datagram that provoked it (pinned end to end by the privileged
+    /// `an_amplification_prone_profile_loads_and_its_cookie_replies_never_amplify`).
+    /// So both doors now load it and warn; the divergence `wireguard_ffi.h`
+    /// used to state is gone.
+    ///
+    /// Distinguishes "complaint exists" from "configuration rejected": the
+    /// complaint is still there, the transaction still succeeds, and the
+    /// parity profile beside it earns no complaint at all.
     #[test]
-    fn a_set_transaction_still_refuses_the_s3_the_ffi_constructor_now_accepts() {
+    fn a_set_transaction_accepts_and_warns_on_the_s3_the_ffi_constructor_accepts() {
         let mut params = AwgParams::default();
         params.set_size("s1", 65);
         params.set_size("s2", 86);
         params.set_size("s3", 120);
 
+        let (_, loaded) = params
+            .merged(
+                ObfuscationRanges::default(),
+                &AmneziaConfig::default(),
+                1420,
+            )
+            .expect("an amplification-prone S3 must load, as it does through the C constructor");
         assert_eq!(
-            params
-                .merged(
-                    ObfuscationRanges::default(),
-                    &AmneziaConfig::default(),
-                    1420
-                )
-                .expect_err("an amplifying S3 must not load on a responder"),
-            libc::EINVAL,
-            "and must fail the transaction, not warn"
+            (
+                loaded.init_packet_junk_size,
+                loaded.response_packet_junk_size,
+                loaded.cookie_packet_junk_size
+            ),
+            (65, 86, 120),
+            "and load as staged"
+        );
+        assert!(
+            loaded.cookie_amplification_complaint().is_some(),
+            "64 + 120 > 92 + 86: still diagnosed, only no longer refused"
         );
 
-        // One byte under the S2 bound loads, so the refusal above is the rule
-        // firing rather than the transaction failing for some other reason.
-        let mut ok = AwgParams::default();
-        ok.set_size("s1", 65);
-        ok.set_size("s2", 86);
-        ok.set_size("s3", 114);
-        ok.merged(
-            ObfuscationRanges::default(),
-            &AmneziaConfig::default(),
-            1420,
-        )
-        .expect("64 + 114 == 92 + 86 is parity, not amplification");
+        // Parity: loads, and nothing to complain about.
+        let mut parity = AwgParams::default();
+        parity.set_size("s1", 65);
+        parity.set_size("s2", 86);
+        parity.set_size("s3", 114);
+        let (_, clean) = parity
+            .merged(
+                ObfuscationRanges::default(),
+                &AmneziaConfig::default(),
+                1420,
+            )
+            .expect("64 + 114 == 92 + 86 is parity, not amplification");
+        assert_eq!(clean.cookie_amplification_complaint(), None);
     }
 
     #[test]
@@ -1637,74 +1663,328 @@ mod tests {
         assert_eq!(from_go, current);
     }
 
-    /// The reflection policy is judged on the configuration a transaction
-    /// would leave, so turning cookies back on cannot arm a reflector.
+    /// Turning cookies back on over an amplification-prone S3 is applied, in
+    /// one step, with nothing else disturbed.
     ///
-    /// An amplifying S3 is acceptable while cookies are off -- this end forms
-    /// no cookie reply -- and refused the moment a transaction would turn
-    /// them back on over it, leaving the device exactly as it was: cookies
-    /// still off. Changing S3 is judged the same way against whichever
-    /// setting the result carries, and a transaction that changes both is
-    /// judged once, on the result, whatever order its lines came in.
+    /// The complaint is judged on the configuration a transaction would leave
+    /// and only ever warns: the per-datagram guards are what keep a cookie
+    /// reply from outgrowing its request, whatever the configuration. So
+    /// re-enabling cookies over such an S3 yields exactly the staged result --
+    /// cookies on, every other field as it was -- and raising S3 into that
+    /// range with cookies on does too. What still fails the transaction is
+    /// universal invalidity, with cookies on or off.
     #[test]
-    fn cookies_cannot_be_turned_back_on_over_an_amplifying_s3() {
+    fn cookies_can_be_turned_back_on_over_an_amplification_prone_s3() {
         let obf = ObfuscationRanges::default();
-        // S1 = S2 = 0, S3 = 100: a 164-byte cookie reply to a 148-byte
-        // initiation.
-        let amplifying = AmneziaConfig::new(0, 0, 100, 0).with_content_padding_addition(0, 0, 1420);
-        assert!(amplifying.cookie_amplification_complaint().is_some());
+        // S1 = S2 = S4 = 12 (the header-protection nonce minimum), S3 = 100: a
+        // 164-byte cookie reply to a 160-byte initiation and a 104-byte
+        // response.
+        let amplifying = AmneziaConfig::new(12, 12, 100, 12)
+            .with_content_padding_addition(0, 0, 1420)
+            .with_random_trailers(true)
+            .with_header_protection([0x5a; 32]);
         let dc_on = amplifying.clone().with_disable_cookies(true);
+        assert_eq!(dc_on.cookie_amplification_complaint(), None);
 
-        // Re-enable alone: refused, and `merged` produced nothing to apply.
+        // Re-enable alone: applied. The result is the old configuration with
+        // exactly one field changed -- the complaint changes nothing staged.
         let mut reenable = AwgParams::default();
         reenable.set_disable_cookies(false);
-        assert_eq!(reenable.merged(obf, &dc_on, 1420), Err(EINVAL));
+        let (merged_obf, reenabled) = reenable
+            .merged(obf, &dc_on, 1420)
+            .expect("an amplification-prone S3 must not block re-enabling cookies");
+        assert_eq!(merged_obf, obf);
+        assert!(
+            !reenabled.disable_cookies,
+            "cookies must actually be back on"
+        );
+        assert_eq!(
+            reenabled, amplifying,
+            "nothing but DisableCookies may change: S sizes, header protection, \
+             RandomTrailers and padding stay as staged"
+        );
+        assert!(
+            reenabled.cookie_amplification_complaint().is_some(),
+            "and it is still diagnosed -- accepted is not the same as unreported"
+        );
 
-        // An unrelated key over the same device is fine: cookies stay off.
+        // An unrelated key over the same device: cookies stay off.
         let mut unrelated = AwgParams::default();
-        unrelated.set_random_trailers(true);
+        unrelated.set_random_trailers(false);
         let (_, still_off) = unrelated.merged(obf, &dc_on, 1420).expect("valid");
         assert!(still_off.disable_cookies);
 
-        // S3 raised into amplification: accepted with cookies off, refused
-        // with them on.
+        // S3 raised into the amplification-prone range: accepted with cookies
+        // off and with them on alike.
         let safe = AmneziaConfig::new(0, 0, 20, 0).with_content_padding_addition(0, 0, 1420);
         let mut raise = AwgParams::default();
         raise.set_size("s3", 100);
-        let (_, raised) = raise
-            .merged(obf, &safe.clone().with_disable_cookies(true), 1420)
-            .expect("valid while cookies are off");
-        assert_eq!(raised.cookie_packet_junk_size, 100);
-        assert_eq!(raise.merged(obf, &safe, 1420), Err(EINVAL));
+        for base in [safe.clone().with_disable_cookies(true), safe.clone()] {
+            let (_, raised) = raise
+                .merged(obf, &base, 1420)
+                .expect("an amplification-prone S3 loads, cookies on or off");
+            assert_eq!(raised.cookie_packet_junk_size, 100);
+            assert_eq!(raised.disable_cookies, base.disable_cookies);
+        }
 
-        // One transaction turning cookies off and raising S3: accepted,
-        // because the result is judged, not the order the lines came in.
+        // One transaction touching both is judged once, on the result,
+        // whatever order its lines came in.
         let mut both = AwgParams::default();
         both.set_size("s3", 100);
-        both.set_disable_cookies(true);
-        let (_, both_applied) = both.merged(obf, &safe, 1420).expect("valid");
-        assert!(both_applied.disable_cookies);
+        both.set_disable_cookies(false);
+        let (_, both_applied) = both.merged(obf, &dc_on, 1420).expect("valid");
+        assert!(!both_applied.disable_cookies);
         let mut both_reordered = AwgParams::default();
-        both_reordered.set_disable_cookies(true);
+        both_reordered.set_disable_cookies(false);
         both_reordered.set_size("s3", 100);
         assert_eq!(
-            both_reordered.merged(obf, &safe, 1420),
+            both_reordered.merged(obf, &dc_on, 1420),
             Ok((obf, both_applied))
         );
 
-        // Re-enabling together with a fix to S3: accepted.
-        let mut fix = AwgParams::default();
-        fix.set_disable_cookies(false);
-        fix.set_size("s3", 20);
-        let (_, fixed) = fix.merged(obf, &dc_on, 1420).expect("valid");
-        assert!(!fixed.disable_cookies);
-        assert_eq!(fixed.cookie_packet_junk_size, 20);
-
-        // Universal validity does not relax with cookies off: an S3 that
-        // cannot frame a cookie reply is refused either way.
+        // Universal validity does not relax, with cookies on or off: an S3
+        // that cannot frame a cookie reply still fails the transaction. This
+        // is the guard against turning *every* refusal into a warning.
         let mut unframable = AwgParams::default();
         unframable.set_size("s3", u16::MAX);
         assert_eq!(unframable.merged(obf, &dc_on, 1420), Err(EINVAL));
+        assert_eq!(unframable.merged(obf, &safe, 1420), Err(EINVAL));
+        let mut unframable_reenable = AwgParams::default();
+        unframable_reenable.set_size("s3", u16::MAX);
+        unframable_reenable.set_disable_cookies(false);
+        assert_eq!(unframable_reenable.merged(obf, &dc_on, 1420), Err(EINVAL));
+    }
+
+    /// Accepting an amplification-prone profile is not silent: `merged` logs
+    /// the complaint at WARN, once per application, and only while cookies are
+    /// on.
+    ///
+    /// Having stopped refusing, the WARN is the whole operator-visible signal
+    /// at `set=1`, so it is pinned the way the C door's is
+    /// (`ffi::tests::an_amplifying_s3_warns_and_leaves_the_error_slot_empty`):
+    /// deleting the `warn!` must turn this red. Three applications share one
+    /// subscriber scope -- the stock profile with cookies on, the same with
+    /// DisableCookies on, and a parity profile -- and exactly one warning may
+    /// result, so the silent two are proved against a capture that demonstrably
+    /// works. The bounded retry is the C door's, for the same reason: tracing's
+    /// process-global interest cache can drop an event under test churn, which
+    /// can only lose a warning, never invent one.
+    #[test]
+    fn an_amplification_prone_set_warns_with_the_complaint_and_only_then() {
+        let _serialized = crate::tracing_test_lock();
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Default)]
+        struct Captured {
+            level: String,
+            message: String,
+            detail: String,
+        }
+        impl Visit for Captured {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "message" => self.message = value.to_owned(),
+                    "detail" => self.detail = value.to_owned(),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let slot = match field.name() {
+                    "message" => &mut self.message,
+                    "detail" => &mut self.detail,
+                    _ => return,
+                };
+                if slot.is_empty() {
+                    *slot = format!("{:?}", value);
+                }
+            }
+        }
+        struct Capture(Arc<StdMutex<Vec<Captured>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let mut c = Captured {
+                    level: event.metadata().level().to_string(),
+                    ..Default::default()
+                };
+                event.record(&mut c);
+                self.0.lock().unwrap().push(c);
+            }
+        }
+
+        let apply = |s2: u16, s3: u16, disable_cookies: bool| {
+            let mut p = AwgParams::default();
+            p.set_size("s1", 136);
+            p.set_size("s2", s2);
+            p.set_size("s3", s3);
+            p.set_size("s4", 16);
+            p.set_disable_cookies(disable_cookies);
+            p.merged(
+                ObfuscationRanges::default(),
+                &AmneziaConfig::default(),
+                1420,
+            )
+            .expect("every one of these loads")
+        };
+        let run = || -> Vec<Captured> {
+            let events: Arc<StdMutex<Vec<Captured>>> = Arc::new(StdMutex::new(Vec::new()));
+            {
+                let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+                tracing::subscriber::with_default(subscriber, || {
+                    apply(59, 149, false); // stock, cookies on: warns
+                    apply(59, 149, true); // stock, cookies off: silent
+                    apply(59, 87, false); // parity: silent
+                });
+            }
+            let captured = std::mem::take(&mut *events.lock().unwrap());
+            captured
+        };
+
+        let mut captured = Vec::new();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tracing::callsite::rebuild_interest_cache();
+            }
+            captured = run();
+            if captured
+                .iter()
+                .any(|c| c.detail.contains("makes a cookie reply"))
+            {
+                break;
+            }
+        }
+        let complaints: Vec<&Captured> = captured
+            .iter()
+            .filter(|c| c.detail.contains("makes a cookie reply"))
+            .collect();
+        assert_eq!(
+            complaints.len(),
+            1,
+            "exactly the cookies-on stock application warns; captured: {:?}",
+            captured
+                .iter()
+                .map(|c| (&c.level, &c.message, &c.detail))
+                .collect::<Vec<_>>()
+        );
+        let warned = complaints[0];
+        assert_eq!(
+            warned.level, "WARN",
+            "a warning, not an error: nothing was rejected"
+        );
+        assert!(
+            warned.message.contains("suppressed") && warned.message.contains("reflection"),
+            "the message says replies are suppressed, not sent: {}",
+            warned.message
+        );
+        assert!(
+            warned.detail.contains("S2 = 59") && warned.detail.contains("151"),
+            "and carries the arithmetic: {}",
+            warned.detail
+        );
+        assert!(
+            !captured.iter().any(|c| c.level == "ERROR"),
+            "no rejection may be logged for a configuration that loads"
+        );
+    }
+
+    /// The stock amneziawg-install profile loads with cookies on, and the
+    /// complaint boundaries it sits beside are still diagnosed exactly --
+    /// diagnosed, not refused.
+    ///
+    /// S1 = 136, S2 = 59, S3 = 149, S4 = 16 is what the installer generated for
+    /// the live Raspberry Pi run: a 213-byte cookie reply against a 151-byte
+    /// response and a 284-byte initiation. The kernel module runs it; this
+    /// device used to fail the whole `set=1` with EINVAL unless DisableCookies
+    /// was on, which removed the cookie defence altogether. The boundaries are
+    /// the ones the complaint advises: S3 = 87 is parity against the 151-byte
+    /// response, 88 one byte over; with S3 = 149, S2 = 121 is parity and 120
+    /// one under. Every one of them now loads; the complaint alone tells them
+    /// apart.
+    #[test]
+    fn the_stock_installer_profile_and_its_complaint_boundaries_load_with_cookies_on() {
+        let stock_obf = ObfuscationRanges::new(
+            21806348, 121806347, 880390969, 980390968, 1131164401, 1231164400, 1662290386,
+            1762290385,
+        )
+        .expect("the installer's H ranges are disjoint");
+        let stock = |s1: u16, s2: u16, s3: u16| {
+            let mut p = AwgParams::default();
+            for (k, v) in [
+                ("jc", 4),
+                ("jmin", 50),
+                ("jmax", 1000),
+                ("s1", s1),
+                ("s2", s2),
+            ] {
+                p.set_size(k, v);
+            }
+            p.set_size("s3", s3);
+            p.set_size("s4", 16);
+            p.set_header("h1", (21806348, 121806347));
+            p.set_header("h2", (880390969, 980390968));
+            p.set_header("h3", (1131164401, 1231164400));
+            p.set_header("h4", (1662290386, 1762290385));
+            p.set_header_protection([0x42; 32]);
+            p.set_content_padding((10, 100));
+            p.set_random_trailers(true);
+            p.set_disable_cookies(false);
+            p
+        };
+
+        let (obf, loaded) = stock(136, 59, 149)
+            .merged(
+                ObfuscationRanges::default(),
+                &AmneziaConfig::default(),
+                1420,
+            )
+            .expect("the stock installer profile must load with DisableCookies off");
+        assert_eq!(obf, stock_obf);
+        assert_eq!(
+            (
+                loaded.init_packet_junk_size,
+                loaded.response_packet_junk_size,
+                loaded.cookie_packet_junk_size,
+                loaded.transport_packet_junk_size,
+            ),
+            (136, 59, 149, 16)
+        );
+        assert!(!loaded.disable_cookies && loaded.random_trailers);
+        assert!(loaded.header_protection_enabled());
+        assert!(
+            loaded
+                .cookie_amplification_complaint()
+                .is_some_and(|c| c.contains("handshake response (151 bytes)")),
+            "loaded, and diagnosed on the response bound"
+        );
+
+        // (s2, s3, complaint expected). Each is loaded; the complaint decides
+        // nothing about that.
+        for (s2, s3, complains) in [
+            (59, 87, false),
+            (59, 88, true),
+            (121, 149, false),
+            (120, 149, true),
+        ] {
+            let (_, cfg) = stock(136, s2, s3)
+                .merged(
+                    ObfuscationRanges::default(),
+                    &AmneziaConfig::default(),
+                    1420,
+                )
+                .unwrap_or_else(|e| panic!("S2={} S3={}: must load, got errno {}", s2, s3, e));
+            assert_eq!(
+                cfg.cookie_amplification_complaint().is_some(),
+                complains,
+                "S2={} S3={}: 64 + S3 vs 92 + S2 = {} vs {}",
+                s2,
+                s3,
+                64 + s3 as usize,
+                92 + s2 as usize
+            );
+        }
     }
 
     /// The `get=1` emit grammar, pinned against a plain buffer.
