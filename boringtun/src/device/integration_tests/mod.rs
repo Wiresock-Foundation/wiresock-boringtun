@@ -1273,4 +1273,289 @@ allowed_ip=10.66.66.2/32",
             datagrams, attempts
         );
     }
+
+    /// DisableCookies through the real control path, both ways.
+    ///
+    /// Every change here is a `set=1` on the live UAPI socket: `api_set` ->
+    /// `AwgParams::apply` -> `Device::set_obfuscation`, which writes the
+    /// interface's copy -- the one the anonymous ingress reads -- and pushes to
+    /// every peer's tunnel; peers added later are built from the interface's
+    /// copy by `update_peer`. Nothing is patched by hand. The only fixture
+    /// reach-in is the overload: the device's rate limiter is replaced with a
+    /// zero-budget one, so it is under load from the first counted message
+    /// without any flooding.
+    ///
+    /// Off -> on, with peer A's first payload queued behind its pre-handshake
+    /// burst: the interface and A carry the new policy at once, A's burst
+    /// survives, A's remaining junk and initiation reach A over UDP, A's
+    /// response is let in by the starved ingress without a cookie, the queued
+    /// payload arrives exactly once, and the limiter never counts a message. A
+    /// peer B added afterwards inherits the policy and is answered under load.
+    ///
+    /// On -> off, with peer C's burst pending: every copy carries the old
+    /// policy again, C's burst survives and still reaches C with its
+    /// initiation, A's endpoint, window, session and RandomTrailers setting are
+    /// untouched, and B's next initiation is met with a cookie.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn disable_cookies_propagates_through_the_uapi_to_the_ingress_and_every_peer() {
+        use crate::device::peer::Peer;
+        use crate::noise::amnezia::AmneziaConfig;
+        use crate::noise::handshake::ObfuscationRanges;
+        use crate::noise::rate_limiter::RateLimiter;
+        use parking_lot::Mutex;
+
+        const OK: &str = "errno=0\n\n";
+        // Every kind at its own size, and no RandomTrailers, so a reply's
+        // length names it: a response is S2 + 92, a cookie reply S3 + 64.
+        const S: [u16; 4] = [40, 24, 32, 160];
+        const RESPONSE: usize = 24 + 92;
+        const COOKIE: usize = 32 + 64;
+        // A burst long enough to toggle inside: six junk datagrams, one per
+        // 250 ms timer tick.
+        let framing = AmneziaConfig::new(S[0], S[1], S[2], S[3]);
+        let amnezia = framing.clone().with_pre_handshake_junk(6, 64, 64, 200);
+
+        let port = next_port();
+        let server_secret = StaticSecret::random_from_rng(OsRng);
+        let server_public = PublicKey::from(&server_secret);
+        let wg = WGHandle::init_with_config(
+            next_ip(),
+            next_ip_v6(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: false,
+                use_multi_queue: false,
+                uapi_fd: -1,
+                amnezia: amnezia.clone(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(wg.wg_set_port(port), OK);
+        assert_eq!(wg.wg_set_key(server_secret), OK);
+        assert_eq!(wg.wg_set("disable_cookies=0"), OK);
+        let server: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+        // The deterministic overload: a zero budget is under load from the
+        // first message it counts, whatever the once-a-second reset does.
+        {
+            let mut guard = wg._device.device.read();
+            guard.try_writeable(
+                |d| d.trigger_yield(),
+                |d| {
+                    d.cancel_yield();
+                    d.rate_limiter = Some(Arc::new(RateLimiter::new(&server_public, 0)));
+                },
+            );
+        }
+        let limiter = wg._device.device.read().rate_limiter.clone().unwrap();
+
+        struct Client {
+            sock: UdpSocket,
+            tunn: Tunn,
+            public: PublicKey,
+        }
+        let add_client = |index: u32, allowed_ip: &str| -> Client {
+            let secret = StaticSecret::random_from_rng(OsRng);
+            let public = PublicKey::from(&secret);
+            let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(1500)))
+                .unwrap();
+            assert_eq!(
+                wg.wg_set(&format!(
+                    "public_key={}\nendpoint={}\nallowed_ip={}",
+                    encode(public.as_bytes()),
+                    sock.local_addr().unwrap(),
+                    allowed_ip
+                )),
+                OK
+            );
+            let tunn = Tunn::new_with_obfuscation(
+                secret,
+                server_public,
+                None,
+                None,
+                index,
+                None,
+                ObfuscationRanges::default(),
+                // The same framing; the burst is the device's alone, so a
+                // client's initiation is an initiation.
+                framing.clone(),
+            )
+            .unwrap();
+            Client { sock, tunn, public }
+        };
+        let peer = |c: &Client| -> Arc<Mutex<Peer>> {
+            wg._device
+                .device
+                .read()
+                .peers
+                .get(&c.public)
+                .cloned()
+                .unwrap()
+        };
+        let payload = |tag: u8| {
+            let mut p = vec![0u8; 60];
+            p[0] = 0x45;
+            p[2..4].copy_from_slice(&60u16.to_be_bytes());
+            p[8] = 64;
+            p[9] = 17;
+            p[12..16].copy_from_slice(&[10, 66, 66, 1]);
+            p[16..20].copy_from_slice(&[10, 66, 66, 2]);
+            p[20] = tag;
+            p
+        };
+        // Queue a first payload on a device peer with no session: it starts the
+        // peer's pre-handshake burst, whose first junk comes back here (the
+        // device's timer sends the rest to the peer's endpoint).
+        let queue_first_payload = |c: &Client, p: &[u8]| {
+            let mut buf = vec![0u8; 2048];
+            match peer(c).lock().tunnel.encapsulate(p, &mut buf) {
+                TunnResult::WriteToNetwork(d) => assert_eq!(d.len(), 64, "the burst's first junk"),
+                other => panic!("expected the burst to start, got {:?}", other),
+            }
+            assert!(peer(c).lock().tunnel.has_pending_burst());
+        };
+        let everywhere = |clients: &[&Client], want: bool| {
+            assert_eq!(
+                wg._device.device.read().config.amnezia.disable_cookies,
+                want,
+                "the interface's copy"
+            );
+            for c in clients {
+                assert_eq!(
+                    peer(c).lock().tunnel.amnezia_config().disable_cookies,
+                    want,
+                    "a peer's copy"
+                );
+            }
+        };
+        // What arrives at `c` until its client reads a handshake initiation:
+        // the junk count, and the client's answer to the initiation.
+        let until_initiation = |c: &mut Client| -> (usize, Vec<u8>) {
+            let mut junk = 0;
+            let mut rx = vec![0u8; 2048];
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let (n, _) = c
+                    .sock
+                    .recv_from(&mut rx)
+                    .unwrap_or_else(|e| panic!("the burst stalled after {} junk: {:?}", junk, e));
+                match c.tunn.decapsulate(Some(server.ip()), &rx[..n], &mut buf) {
+                    TunnResult::WriteToNetwork(response) => return (junk, response.to_vec()),
+                    _ => junk += 1,
+                }
+            }
+        };
+
+        // --- off -> on, with a burst pending ------------------------------------
+        let mut a = add_client(0x10, "10.66.66.2/32");
+        everywhere(&[&a], false);
+        let first = payload(1);
+        queue_first_payload(&a, &first);
+
+        assert_eq!(wg.wg_set("disable_cookies=1"), OK);
+        everywhere(&[&a], true);
+        assert!(
+            peer(&a).lock().tunnel.has_pending_burst(),
+            "the DisableCookies change cancelled the pending burst"
+        );
+
+        let (junk, response) = until_initiation(&mut a);
+        assert!(junk >= 1, "the rest of the burst went out");
+        // The starved ingress lets the response in -- cookies off -- and the
+        // device then sends the payload it had queued.
+        a.sock.send_to(&response, server).unwrap();
+        let mut rx = vec![0u8; 2048];
+        let mut buf = vec![0u8; 2048];
+        let mut delivered = 0;
+        while let Ok((n, _)) = a.sock.recv_from(&mut rx) {
+            if let TunnResult::WriteToTunnelV4(p, _) =
+                a.tunn.decapsulate(Some(server.ip()), &rx[..n], &mut buf)
+            {
+                assert_eq!(p, &first[..]);
+                delivered += 1;
+            }
+        }
+        assert_eq!(delivered, 1, "the first payload, exactly once");
+        assert_eq!(limiter.load_events(), 0, "nothing was counted");
+
+        // A peer added now is built from the interface's copy.
+        let mut b = add_client(0x20, "10.66.66.3/32");
+        everywhere(&[&a, &b], true);
+        let init = match b.tunn.format_handshake_initiation(&mut buf, true) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("{:?}", other),
+        };
+        b.sock.send_to(&init, server).unwrap();
+        let (n, _) = b.sock.recv_from(&mut rx).expect("no reply to B");
+        assert_eq!(n, RESPONSE, "B is answered under load with cookies off");
+        assert_eq!(limiter.load_events(), 0);
+
+        // --- on -> off, with another burst pending ------------------------------
+        let mut c = add_client(0x30, "10.66.66.4/32");
+        everywhere(&[&a, &b, &c], true);
+        queue_first_payload(&c, &payload(3));
+        let before = {
+            let p = peer(&a);
+            let p = p.lock();
+            let addr = p.endpoint().addr;
+            let snapshot = (
+                addr,
+                p.tunnel.udp_window(),
+                p.tunnel.time_since_last_handshake().is_some(),
+                p.tunnel.amnezia_config().random_trailers,
+            );
+            snapshot
+        };
+
+        assert_eq!(wg.wg_set("disable_cookies=0"), OK);
+        everywhere(&[&a, &b, &c], false);
+        assert!(
+            peer(&c).lock().tunnel.has_pending_burst(),
+            "the DisableCookies change cancelled the pending burst"
+        );
+        let after = {
+            let p = peer(&a);
+            let p = p.lock();
+            let addr = p.endpoint().addr;
+            let snapshot = (
+                addr,
+                p.tunnel.udp_window(),
+                p.tunnel.time_since_last_handshake().is_some(),
+                p.tunnel.amnezia_config().random_trailers,
+            );
+            snapshot
+        };
+        assert_eq!(before, after, "A's endpoint, window, session and RT");
+        assert!(after.2, "A's session survived");
+        // ...and still carries traffic.
+        let wire = match peer(&a).lock().tunnel.encapsulate(&payload(2), &mut buf) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("{:?}", other),
+        };
+        assert!(matches!(
+            a.tunn.decapsulate(Some(server.ip()), &wire, &mut rx),
+            TunnResult::WriteToTunnelV4(..)
+        ));
+
+        // Cookies armed again under the same load: B's next initiation earns a
+        // cookie, and is counted.
+        thread::sleep(Duration::from_millis(20));
+        let init = match b.tunn.format_handshake_initiation(&mut buf, true) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("{:?}", other),
+        };
+        b.sock.send_to(&init, server).unwrap();
+        let (n, _) = b.sock.recv_from(&mut rx).expect("no reply to B");
+        assert_eq!(n, COOKIE, "B is sent a cookie now cookies are armed");
+        assert!(limiter.load_events() >= 1);
+
+        // C's burst went on to its initiation.
+        let (junk, _) = until_initiation(&mut c);
+        assert!(junk >= 1, "the rest of C's burst went out");
+    }
 }

@@ -624,6 +624,13 @@ impl Tunn {
         self.pending_amnezia_junk.is_some()
     }
 
+    /// This tunnel's AmneziaWG configuration. For the device tests, which
+    /// cannot see the field.
+    #[cfg(all(test, feature = "device"))]
+    pub(crate) fn amnezia_config(&self) -> &AmneziaConfig {
+        &self.amnezia
+    }
+
     #[cfg(test)]
     pub(crate) fn udp_window(&self) -> u32 {
         self.udp_window.load(AtomicOrdering::Relaxed)
