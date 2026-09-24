@@ -1283,19 +1283,24 @@ allowed_ip=10.66.66.2/32",
     /// copy by `update_peer`. Nothing is patched by hand. The only fixture
     /// reach-in is the overload: the device's rate limiter is replaced with a
     /// zero-budget one, so it is under load from the first counted message
-    /// without any flooding.
+    /// without any flooding. The policy is read off the wire, not off that
+    /// limiter's counter: the device resets the counter every second, so a
+    /// sample of it races the reset. Exact load accounting is pinned by the
+    /// deterministic tests in `noise::disable_cookies_tests`.
     ///
     /// Off -> on, with peer A's first payload queued behind its pre-handshake
     /// burst: the interface and A carry the new policy at once, A's burst
-    /// survives, A's remaining junk and initiation reach A over UDP, A's
-    /// response is let in by the starved ingress without a cookie, the queued
-    /// payload arrives exactly once, and the limiter never counts a message. A
-    /// peer B added afterwards inherits the policy and is answered under load.
+    /// survives, A's remaining junk and initiation reach A over UDP, the
+    /// starved ingress takes A's response without sending a cookie, and the
+    /// queued payload arrives exactly once. A peer B added afterwards inherits
+    /// the policy: under load its initiation is answered with a response,
+    /// which B takes, not a cookie.
     ///
     /// On -> off, with peer C's burst pending: every copy carries the old
     /// policy again, C's burst survives and still reaches C with its
     /// initiation, A's endpoint, window, session and RandomTrailers setting are
-    /// untouched, and B's next initiation is met with a cookie.
+    /// untouched, and B's next initiation is met with a cookie reply, which B
+    /// stores, not a response.
     ///
     /// Needs root and a TUN interface, hence `#[ignore]`.
     #[test]
@@ -1351,8 +1356,6 @@ allowed_ip=10.66.66.2/32",
                 },
             );
         }
-        let limiter = wg._device.device.read().rate_limiter.clone().unwrap();
-
         struct Client {
             sock: UdpSocket,
             tunn: Tunn,
@@ -1473,6 +1476,7 @@ allowed_ip=10.66.66.2/32",
         let mut buf = vec![0u8; 2048];
         let mut delivered = 0;
         while let Ok((n, _)) = a.sock.recv_from(&mut rx) {
+            assert_ne!(n, COOKIE, "A's response drew a cookie reply");
             if let TunnResult::WriteToTunnelV4(p, _) =
                 a.tunn.decapsulate(Some(server.ip()), &rx[..n], &mut buf)
             {
@@ -1481,7 +1485,6 @@ allowed_ip=10.66.66.2/32",
             }
         }
         assert_eq!(delivered, 1, "the first payload, exactly once");
-        assert_eq!(limiter.load_events(), 0, "nothing was counted");
 
         // A peer added now is built from the interface's copy.
         let mut b = add_client(0x20, "10.66.66.3/32");
@@ -1493,7 +1496,15 @@ allowed_ip=10.66.66.2/32",
         b.sock.send_to(&init, server).unwrap();
         let (n, _) = b.sock.recv_from(&mut rx).expect("no reply to B");
         assert_eq!(n, RESPONSE, "B is answered under load with cookies off");
-        assert_eq!(limiter.load_events(), 0);
+        // ...and it is a response: B takes it and the handshake completes.
+        assert!(
+            matches!(
+                b.tunn.decapsulate(Some(server.ip()), &rx[..n], &mut buf),
+                TunnResult::WriteToNetwork(_)
+            ),
+            "B did not take the reply as a response"
+        );
+        assert!(b.tunn.time_since_last_handshake().is_some());
 
         // --- on -> off, with another burst pending ------------------------------
         let mut c = add_client(0x30, "10.66.66.4/32");
@@ -1543,7 +1554,7 @@ allowed_ip=10.66.66.2/32",
         ));
 
         // Cookies armed again under the same load: B's next initiation earns a
-        // cookie, and is counted.
+        // cookie reply.
         thread::sleep(Duration::from_millis(20));
         let init = match b.tunn.format_handshake_initiation(&mut buf, true) {
             TunnResult::WriteToNetwork(d) => d.to_vec(),
@@ -1552,7 +1563,14 @@ allowed_ip=10.66.66.2/32",
         b.sock.send_to(&init, server).unwrap();
         let (n, _) = b.sock.recv_from(&mut rx).expect("no reply to B");
         assert_eq!(n, COOKIE, "B is sent a cookie now cookies are armed");
-        assert!(limiter.load_events() >= 1);
+        // ...and it is a cookie reply: B stores it and answers nothing.
+        assert!(
+            matches!(
+                b.tunn.decapsulate(Some(server.ip()), &rx[..n], &mut buf),
+                TunnResult::Done
+            ),
+            "B did not take the reply as a cookie"
+        );
 
         // C's burst went on to its initiation.
         let (junk, _) = until_initiation(&mut c);
