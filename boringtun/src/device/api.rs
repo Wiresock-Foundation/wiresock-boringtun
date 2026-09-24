@@ -494,9 +494,9 @@ impl Device {
     /// sets the MTU *after* `wg setconf`, so the snapshot a `set=1` takes is
     /// stale from the first second in the most common bring-up order. Push the
     /// refreshed value into the configs here. Not via `set_obfuscation`: the
-    /// MTU is plumbing, not configuration -- that path drops every peer's
-    /// queued pre-handshake junk and logs "parameters updated", both wrong for
-    /// a value the operator did not change. Gated on inequality so the steady
+    /// MTU is plumbing, not configuration -- that path is the operator's, and
+    /// logs "parameters updated", wrong for a value the operator did not
+    /// change. Gated on inequality so the steady
     /// state stays read-only and the write-lock upgrade is paid only when the
     /// MTU actually moved.
     pub(crate) fn register_mtu_monitor(&self) -> Result<(), Error> {

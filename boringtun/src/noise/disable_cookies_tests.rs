@@ -997,29 +997,3 @@ fn a_toggle_with_the_first_handshake_pending_applies_at_the_next_message() {
         }
     }
 }
-
-/// The distinction is DisableCookies alone. A change that reframes what this
-/// end sends -- here S1 -- still drops a pending burst, exactly as before: the
-/// behaviour of every other field is left as it was.
-#[test]
-fn a_send_side_change_still_drops_the_pending_burst() {
-    let cfg = bursting(false, false);
-    let mut e = ends(&cfg, &cfg, None, None);
-    let obf = e.mine.handshake.obf;
-    first_payload_behind(&mut e.mine, &ipv4_packet(60), 1);
-    let mut s1 = cfg.clone().with_disable_cookies(true);
-    s1.init_packet_junk_size += 4;
-    e.mine.set_obfuscation(obf, s1);
-    assert!(e.mine.pending_amnezia_junk.is_none());
-
-    // And identical settings keep it: nothing was reframed.
-    let mut e = ends(&cfg, &cfg, None, None);
-    first_payload_behind(&mut e.mine, &ipv4_packet(60), 1);
-    e.mine.set_obfuscation(obf, cfg.clone());
-    assert!(e.mine.pending_amnezia_junk.is_some());
-    // Nor does a change of magic headers count as policy.
-    let moved = ObfuscationRanges::new(5, 5, 6, 6, 7, 7, 8, 8).unwrap();
-    e.mine
-        .set_obfuscation(moved, cfg.clone().with_disable_cookies(true));
-    assert!(e.mine.pending_amnezia_junk.is_none());
-}
