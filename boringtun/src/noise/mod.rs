@@ -2770,6 +2770,158 @@ mod tests {
         }
     }
 
+    /// The stock amneziawg-install profile, which every configuration door now
+    /// loads with cookies on, never draws an amplifying cookie reply from a
+    /// `Tunn` -- the path every connected-socket peer, FFI caller and Rust
+    /// embedder takes.
+    ///
+    /// S1 = 136, S2 = 59, S3 = 149, S4 = 16, the installer's H1-H4 ranges,
+    /// header protection and RandomTrailers on, DisableCookies off: exactly
+    /// what the live Raspberry Pi run was handed. Its cookie reply is 213 bytes
+    /// before any trailer. Both message kinds that reach the under-load gate
+    /// are driven at their minimum wire size, each sent with RandomTrailers
+    /// off so the size is exact. RandomTrailers must match on both peers -- an
+    /// RT-off receiver takes only exact-size handshake messages -- so the
+    /// provoking side is built RT-off, sends its exact message, and is then
+    /// switched to the stock profile with `set_obfuscation` (which keeps the
+    /// in-flight handshake) before the reply arrives:
+    ///
+    /// * a 151-byte **response** (92 + S2) to a starved initiator: 213 > 151,
+    ///   so no reply at all -- this is the path the old `set=1` refusal was
+    ///   worried about, now held by the emit-site guard alone;
+    /// * a 284-byte **initiation** (148 + S1) to a starved responder:
+    ///   213 <= 284, so the cookie goes out, never larger than the request
+    ///   however much trailer room the draw uses (zero included), and the
+    ///   initiator authenticates it and stores the cookie -- the flood defence
+    ///   still works for the stock profile, which is what refusing it cost.
+    ///
+    /// With the configuration refusal gone, this and the device-level
+    /// `an_amplification_prone_profile_loads_and_its_cookie_replies_never_amplify`
+    /// are what stand between an accepted profile and a reflector.
+    #[test]
+    fn the_stock_installer_profile_never_draws_an_amplifying_cookie_reply() {
+        const INIT_WIRE: usize = HANDSHAKE_INIT_SZ + 136;
+        const RESP_WIRE: usize = HANDSHAKE_RESP_SZ + 59;
+        const COOKIE_WIRE: usize = COOKIE_REPLY_SZ + 149;
+        assert_eq!((INIT_WIRE, RESP_WIRE, COOKIE_WIRE), (284, 151, 213));
+
+        let obf = ObfuscationRanges::new(
+            21806348, 121806347, 880390969, 980390968, 1131164401, 1231164400, 1662290386,
+            1762290385,
+        )
+        .unwrap();
+        let stock = AmneziaConfig::new(136, 59, 149, 16)
+            .with_header_protection([0x42; 32])
+            .with_random_trailers(true);
+        assert!(!stock.disable_cookies);
+        assert!(
+            stock.cookie_amplification_complaint().is_some(),
+            "sanity: the profile is amplification-prone on the response bound"
+        );
+        // The sender of each provoking message: same framing, RandomTrailers
+        // off, so its message is exactly the minimum size on the wire.
+        let exact = stock.clone().with_random_trailers(false);
+
+        let build = |secret: x25519::StaticSecret,
+                     peer: x25519::PublicKey,
+                     index: u32,
+                     budget: Option<u64>,
+                     amnezia: &AmneziaConfig| {
+            let public = x25519::PublicKey::from(&secret);
+            Tunn::new_with_obfuscation(
+                secret,
+                peer,
+                None,
+                None,
+                index,
+                budget.map(|b| Arc::new(RateLimiter::new(&public, b))),
+                obf,
+                amnezia.clone(),
+            )
+            .unwrap()
+        };
+        let src = Some(std::net::IpAddr::from([10, 0, 0, 1]));
+
+        // --- a minimum response to a starved initiator: suppressed -----------
+        for _ in 0..16 {
+            let i_secret = x25519::StaticSecret::random_from_rng(OsRng);
+            let r_secret = x25519::StaticSecret::random_from_rng(OsRng);
+            let i_public = x25519::PublicKey::from(&i_secret);
+            let r_public = x25519::PublicKey::from(&r_secret);
+            let mut initiator = build(i_secret, r_public, 200, Some(0), &exact);
+            let mut responder = build(r_secret, i_public, 201, None, &exact);
+
+            let mut buf = vec![0u8; 2048];
+            let init =
+                unwrap_network_packet(initiator.format_handshake_initiation(&mut buf, false))
+                    .to_vec();
+            let mut rbuf = vec![0u8; 2048];
+            let response =
+                unwrap_network_packet(responder.decapsulate(src, &init, &mut rbuf)).to_vec();
+            assert_eq!(response.len(), RESP_WIRE, "a minimum-size response");
+            // The receiving end runs the full stock profile, trailers on.
+            initiator.set_obfuscation(obf, stock.clone());
+
+            let mut out = vec![0u8; 2048];
+            match initiator.decapsulate(src, &response, &mut out) {
+                TunnResult::Done => {}
+                other => panic!(
+                    "a {}-byte cookie reply to a {}-byte response must be suppressed, got {:?}",
+                    COOKIE_WIRE, RESP_WIRE, other
+                ),
+            }
+        }
+
+        // --- a minimum initiation to a starved responder: sent, bounded -------
+        for _ in 0..64 {
+            let i_secret = x25519::StaticSecret::random_from_rng(OsRng);
+            let r_secret = x25519::StaticSecret::random_from_rng(OsRng);
+            let i_public = x25519::PublicKey::from(&i_secret);
+            let r_public = x25519::PublicKey::from(&r_secret);
+            let mut initiator = build(i_secret, r_public, 300, None, &exact);
+            let mut responder = build(r_secret, i_public, 301, Some(0), &stock);
+
+            let mut buf = vec![0u8; 2048];
+            let init =
+                unwrap_network_packet(initiator.format_handshake_initiation(&mut buf, false))
+                    .to_vec();
+            assert_eq!(init.len(), INIT_WIRE, "a minimum-size initiation");
+            // To take a cookie reply that may carry a trailer, the initiator
+            // must run the stock profile too.
+            initiator.set_obfuscation(obf, stock.clone());
+
+            let mut rbuf = vec![0u8; 2048];
+            let cookie = match responder.decapsulate(src, &init, &mut rbuf) {
+                TunnResult::WriteToNetwork(c) => c.to_vec(),
+                other => panic!(
+                    "a {}-byte cookie reply to a {}-byte initiation must be sent, got {:?}",
+                    COOKIE_WIRE, INIT_WIRE, other
+                ),
+            };
+            assert!(
+                (COOKIE_WIRE..=INIT_WIRE).contains(&cookie.len()),
+                "a {}-byte cookie reply to a {}-byte initiation: its trailer may use the \
+                 room parity leaves, and no more",
+                cookie.len(),
+                INIT_WIRE
+            );
+
+            assert!(!initiator.handshake.has_cookie());
+            let mut out = vec![0u8; 2048];
+            assert!(
+                matches!(
+                    initiator.decapsulate(src, &cookie, &mut out),
+                    TunnResult::Done
+                ),
+                "the initiator must accept the cookie reply"
+            );
+            assert!(
+                initiator.handshake.has_cookie(),
+                "and store the cookie: the flood defence works for the stock profile"
+            );
+        }
+    }
+
     /// A cookie reply must round-trip masked too.
     ///
     /// It is the fourth packet kind and the one the handshake round-trip above
