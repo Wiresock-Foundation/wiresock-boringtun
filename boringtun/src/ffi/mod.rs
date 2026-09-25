@@ -4956,6 +4956,8 @@ mod tests {
     /// test refuses to run anywhere else rather than compare against the wrong
     /// byte order.
     fn awg_params_corpus() -> String {
+        // (name, accept, domain, image)
+        type CorpusCase<'a> = (&'a str, bool, Option<&'a str>, Option<Vec<u8>>);
         const V0: usize = AWG_PARAMS_SIZE_VER0;
         const V1: usize = AWG_PARAMS_SIZE_VER1;
         const V2: usize = AWG_PARAMS_SIZE_VER2;
@@ -5012,8 +5014,7 @@ mod tests {
             p.header_protection_key = [0; 32];
         });
 
-        // (name, accept, domain, image)
-        let cases: Vec<(&str, bool, Option<&str>, Option<Vec<u8>>)> = vec![
+        let cases: Vec<CorpusCase> = vec![
             ("null-params", true, None, None),
             (
                 "v2-full-awg31",
@@ -5162,11 +5163,11 @@ mod tests {
     /// reaches every verdict in it. The JVM harness holds the JNI door to the
     /// same file.
     #[test]
+    #[cfg_attr(
+        target_endian = "big",
+        ignore = "the corpus is little-endian; regenerate it for this target"
+    )]
     fn the_awg_params_corpus_is_current_and_the_c_door_agrees_with_it() {
-        assert!(
-            cfg!(target_endian = "little"),
-            "the corpus is little-endian; regenerate it for this target"
-        );
         let expected = awg_params_corpus();
         let file = include_str!("../../tests/jni/awg_params_corpus.txt").replace("\r\n", "\n");
         assert!(
