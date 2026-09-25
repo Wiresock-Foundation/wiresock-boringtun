@@ -4637,4 +4637,302 @@ mod tests {
         assert!(!h.is_null());
         unsafe { x25519_key_to_str_free(h) };
     }
+
+    /// A fresh keypair per peer, as the base64 strings the constructors take.
+    fn awg31_keys() -> (CString, CString, CString, CString) {
+        let secret = |k: &x25519_key| x25519_key { key: k.key };
+        let b64 = |k: x25519_key| unsafe {
+            let p = x25519_key_to_base64(k);
+            let s = CStr::from_ptr(p).to_owned();
+            x25519_key_to_str_free(p);
+            s
+        };
+        let a = x25519_secret_key();
+        let b = x25519_secret_key();
+        let (a_pub, b_pub) = (x25519_public_key(secret(&a)), x25519_public_key(secret(&b)));
+        (b64(a), b64(a_pub), b64(b), b64(b_pub))
+    }
+
+    /// RandomTrailers and DisableCookies arrive in the tunnel the constructor
+    /// builds, from every published size of the struct.
+    ///
+    /// `random_trailers_is_zero_or_one` and friends stop at
+    /// `awg_params_to_config`; nothing checked the `Tunn` that
+    /// `new_tunnel_with_awg_params` hands back, so the constructor could have
+    /// dropped or overridden either switch between the adapter and
+    /// `new_tunnel_with_amnezia_config` with every test green. Each caller's
+    /// allocation continues with `0xff` past its own `size`, so a field a
+    /// shorter version does not have can only read as off if the constructor
+    /// really stopped at `size`.
+    #[test]
+    fn the_constructor_carries_random_trailers_and_disable_cookies_into_the_tunnel() {
+        last_tunnel_error_free();
+        let (a_sec, _, _, b_pub) = awg31_keys();
+        let v0 = AWG_PARAMS_SIZE_VER0 as u32;
+        let v1 = AWG_PARAMS_SIZE_VER1 as u32;
+        let v2 = AWG_PARAMS_SIZE_VER2 as u32;
+        let all = u32::MAX;
+        // (declared size, random_trailers, disable_cookies, expected rt, expected dc)
+        for (size, rt, dc, want_rt, want_dc) in [
+            (v2, 1, 1, true, true),
+            (v2, 1, 0, true, false),
+            (v2, 0, 1, false, true),
+            (v2, 0, 0, false, false),
+            (v1, 1, all, true, false),
+            (v1, 0, all, false, false),
+            (v0, all, all, false, false),
+        ] {
+            let params = wireguard_awg_params {
+                size,
+                random_trailers: rt,
+                disable_cookies: dc,
+                ..Default::default()
+            };
+            let mut buffer = [0xffu8; 256];
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    &params as *const _ as *const u8,
+                    buffer.as_mut_ptr(),
+                    size as usize,
+                );
+            }
+            let t = unsafe {
+                new_tunnel_with_awg_params(
+                    a_sec.as_ptr(),
+                    b_pub.as_ptr(),
+                    ptr::null(),
+                    0,
+                    1,
+                    buffer.as_ptr() as *const wireguard_awg_params,
+                    ptr::null(),
+                )
+            };
+            assert!(!t.is_null(), "size {}: {}", size, last_error_string());
+            let (got_rt, got_dc) = {
+                let tunn = unsafe { (*t).lock() };
+                let config = tunn.amnezia_config();
+                (config.random_trailers, config.disable_cookies)
+            };
+            assert_eq!(
+                (got_rt, got_dc),
+                (want_rt, want_dc),
+                "size {}, random_trailers {:#x}, disable_cookies {:#x}",
+                size,
+                rt,
+                dc
+            );
+            unsafe { tunnel_free(t) };
+        }
+
+        // The constructor itself refuses a switch that is neither 0 nor 1 --
+        // including from a version-1 caller, whose `random_trailers` it reads.
+        for (size, rt, dc, field) in [
+            (v2, 2, 0, "random_trailers"),
+            (v2, 0, 2, "disable_cookies"),
+            (v1, 2, 0, "random_trailers"),
+        ] {
+            last_tunnel_error_free();
+            let params = wireguard_awg_params {
+                size,
+                random_trailers: rt,
+                disable_cookies: dc,
+                ..Default::default()
+            };
+            let t = unsafe {
+                new_tunnel_with_awg_params(
+                    a_sec.as_ptr(),
+                    b_pub.as_ptr(),
+                    ptr::null(),
+                    0,
+                    1,
+                    &params,
+                    ptr::null(),
+                )
+            };
+            assert!(
+                t.is_null(),
+                "size {} with {} = 2 must be refused",
+                size,
+                field
+            );
+            assert!(
+                last_error_string().contains(field),
+                "{}",
+                last_error_string()
+            );
+        }
+    }
+
+    /// A complete AmneziaWG 3.1 profile, built through the constructor on both
+    /// ends, forms a session and carries a packet -- and every part of it
+    /// observably reached the tunnel.
+    ///
+    /// Header protection, distinct S1-S4, H ranges, content padding with its
+    /// MTU, a 3.0 timer, RandomTrailers on both ends and DisableCookies on one
+    /// (it is local policy; the peer need not agree). What is checked on the
+    /// wire is only what is deterministic: every message is at least its S
+    /// prefix plus its WireGuard size (RandomTrailers may add nothing), and the
+    /// data frame's length is exactly the one the configured padding range
+    /// allows -- a 60-byte packet with no range would be rounded to 64 instead.
+    #[test]
+    fn a_full_awg31_struct_builds_a_pair_that_carries_traffic() {
+        last_tunnel_error_free();
+        let (a_sec, a_pub, b_sec, b_pub) = awg31_keys();
+        let key: [u8; 32] = std::array::from_fn(|i| 0x40 + i as u8);
+        let profile = |disable_cookies| wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER2 as u32,
+            s1_init_junk: 40,
+            s2_response_junk: 36,
+            s3_cookie_junk: 28,
+            s4_transport_junk: 20,
+            h1_init: wireguard_awg_range {
+                lo: 100_000,
+                hi: 199_999,
+            },
+            h2_resp: wireguard_awg_range {
+                lo: 200_000,
+                hi: 299_999,
+            },
+            h3_cookie: wireguard_awg_range {
+                lo: 300_000,
+                hi: 399_999,
+            },
+            h4_data: wireguard_awg_range {
+                lo: 400_000,
+                hi: 499_999,
+            },
+            content_padding_addition: wireguard_awg_range { lo: 8, hi: 24 },
+            content_padding_mtu: 1420,
+            keepalive_timeout: wireguard_awg_range { lo: 20, hi: 25 },
+            header_protection_key: key,
+            random_trailers: 1,
+            disable_cookies,
+            ..Default::default()
+        };
+        let (pa, pb) = (profile(1), profile(0));
+        let build = |private: &CString, public: &CString, index: u32, p: &wireguard_awg_params| unsafe {
+            let t = new_tunnel_with_awg_params(
+                private.as_ptr(),
+                public.as_ptr(),
+                ptr::null(),
+                0,
+                index,
+                p,
+                ptr::null(),
+            );
+            assert!(!t.is_null(), "{}", last_error_string());
+            t
+        };
+        let a = build(&a_sec, &b_pub, 1, &pa);
+        let b = build(&b_sec, &a_pub, 2, &pb);
+
+        for (t, dc) in [(a, true), (b, false)] {
+            let tunn = unsafe { (*t).lock() };
+            let c = tunn.amnezia_config();
+            assert_eq!(
+                (
+                    c.init_packet_junk_size,
+                    c.response_packet_junk_size,
+                    c.cookie_packet_junk_size,
+                    c.transport_packet_junk_size
+                ),
+                (40, 36, 28, 20)
+            );
+            assert_eq!(
+                c.header_protection_key_hex().as_deref(),
+                Some("404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f")
+            );
+            assert_eq!(c.content_padding_addition, (8, 24));
+            assert_eq!(c.content_padding_mtu, 1420);
+            assert_eq!(c.timers.keepalive_timeout, (20, 25));
+            assert!(c.random_trailers);
+            assert_eq!(c.disable_cookies, dc);
+        }
+
+        let mut abuf = vec![0u8; 65536 + 64];
+        let mut bbuf = vec![0u8; 65536 + 64];
+        let r = unsafe { wireguard_force_handshake(a, abuf.as_mut_ptr(), abuf.len() as u32) };
+        assert!(matches!(r.op, result_type::WRITE_TO_NETWORK));
+        assert!(r.size >= 40 + 148, "initiation of {} bytes", r.size);
+        let init = abuf[..r.size].to_vec();
+
+        let r = unsafe {
+            wireguard_read(
+                b,
+                init.as_ptr(),
+                init.len() as u32,
+                bbuf.as_mut_ptr(),
+                bbuf.len() as u32,
+            )
+        };
+        assert!(matches!(r.op, result_type::WRITE_TO_NETWORK));
+        assert!(r.size >= 36 + 92, "response of {} bytes", r.size);
+        let resp = bbuf[..r.size].to_vec();
+
+        let r = unsafe {
+            wireguard_read(
+                a,
+                resp.as_ptr(),
+                resp.len() as u32,
+                abuf.as_mut_ptr(),
+                abuf.len() as u32,
+            )
+        };
+        assert!(matches!(r.op, result_type::WRITE_TO_NETWORK));
+        let keepalive = abuf[..r.size].to_vec();
+        let r = unsafe {
+            wireguard_read(
+                b,
+                keepalive.as_ptr(),
+                keepalive.len() as u32,
+                bbuf.as_mut_ptr(),
+                bbuf.len() as u32,
+            )
+        };
+        assert!(
+            matches!(r.op, result_type::WIREGUARD_DONE),
+            "the confirmation keepalive is accepted"
+        );
+
+        let mut pkt = [0u8; 60];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&60u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        let r = unsafe {
+            wireguard_write(
+                a,
+                pkt.as_ptr(),
+                pkt.len() as u32,
+                abuf.as_mut_ptr(),
+                abuf.len() as u32,
+            )
+        };
+        assert!(matches!(r.op, result_type::WRITE_TO_NETWORK));
+        let base = 20 + 32 + pkt.len();
+        assert!(
+            (base + 8..=base + 24).contains(&r.size),
+            "a {}-byte data frame is not S4 + 32 + 60 + a draw from 8..=24",
+            r.size
+        );
+        let data = abuf[..r.size].to_vec();
+        let r = unsafe {
+            wireguard_read(
+                b,
+                data.as_ptr(),
+                data.len() as u32,
+                bbuf.as_mut_ptr(),
+                bbuf.len() as u32,
+            )
+        };
+        assert!(matches!(r.op, result_type::WRITE_TO_TUNNEL_IPV4));
+        assert_eq!(&bbuf[..r.size], &pkt[..], "the payload round-trips intact");
+
+        unsafe {
+            tunnel_free(a);
+            tunnel_free(b);
+        }
+    }
 }
