@@ -580,11 +580,13 @@ struct wireguard_awg_params
     /// offending S value. A struct carrying only a key -- the obvious first
     /// use -- is therefore refused; set the four S sizes as well.
     ///
-    /// A key combined with a non-zero imitation_protocol is ACCEPTED but
-    /// weakens the masking: the imitation prefix is the nonce, so it repeats
-    /// and an observer who collects two datagrams can undo the masking.
-    /// Traffic is unaffected. The warning is emitted through the tracing log
-    /// (see set_logging_function), not through last_tunnel_error().
+    /// With a non-zero imitation_protocol the imitation prefix is the nonce,
+    /// so the protocol decides what is left of it. QUIC is ACCEPTED silently.
+    /// STUN (about 2^32 nonces) and DNS (65,536) are ACCEPTED with a warning
+    /// that header-protection masks repeat, emitted through the tracing log
+    /// (see set_logging_function), not through last_tunnel_error(). SIP with
+    /// any S value of 31 or more is REFUSED (NULL): its request line leaves
+    /// the masking effectively absent. Payload encryption is unaffected.
     uint8_t header_protection_key[32];
 
     /// AmneziaWG 3.1 RandomTrailers: 1 turns it on, 0 (the default) leaves it
@@ -654,7 +656,8 @@ struct wireguard_awg_params
 ///     a transposition is the slip it was created to make impossible. Note that
 ///     {n, 0} is a fixed value ONLY for h1_init..h4_data;
 ///   * header_protection_key set while any of s1_init_junk..s4_transport_junk
-///     is below 12, the header-protection nonce length. See that field;
+///     is below 12, the header-protection nonce length, or set with SIP
+///     imitation while any of them is 31 or more. See that field;
 ///   * content_padding_addition set while content_padding_mtu is 0, which would
 ///     disable the clamp that keeps a padded packet inside the tunnel MTU;
 ///   * timers ordered so that keys would be rejected before the rekey replacing

@@ -26,21 +26,21 @@
 //! prefix -- which is why AmneziaWG requires every configured S size to be at
 //! least [`NONCE_SIZE`] once a key is set. It is not a counter and nothing
 //! guarantees it is unique; it is random only because the prefix normally is.
-//! Under protocol imitation the prefix is protocol-shaped instead, and that
-//! entropy drops sharply (a DNS header varies only in its transaction id). See
-//! [`AmneziaConfig::validate`](super::amnezia::AmneziaConfig::validate), which
-//! warns about the combination rather than refusing it.
+//! Under protocol imitation the prefix is protocol-shaped instead, and the
+//! protocol decides what is left: QUIC is effectively random, STUN varies in
+//! about 2^32 nonces, DNS in 65,536, and a SIP request line in a handful. One
+//! classifier, `AmneziaConfig::header_protection_nonce`, turns that into the
+//! policy every configuration door applies: QUIC loads silently, STUN and DNS
+//! load with a warning, and SIP with any S of 31 bytes or more is refused.
 //!
 //! # What can turn this on
 //!
-//! Rust callers, via [`AmneziaConfig::with_header_protection`](super::amnezia::AmneziaConfig::with_header_protection),
-//! and the device UAPI, via `header_protection_key`. **Not** the C or JNI
-//! bindings: `ffi::new_tunnel_with_amnezia` and its siblings take S1-S4, H1-H4
-//! and the junk parameters but no key, and `jni.rs` exposes no AmneziaWG
-//! configuration at all. The unmasking below is reachable from those paths --
-//! `Tunn::decapsulate` is where it happens for them -- but nothing there can
-//! set a key, so in practice they run unprotected. Exposing it means a new
-//! constructor, which is an API change rather than part of this one.
+//! Rust callers, via [`AmneziaConfig::with_header_protection`](super::amnezia::AmneziaConfig::with_header_protection);
+//! the device UAPI, via `header_protection_key`; and the C and JNI bindings,
+//! via `header_protection_key` in the versioned `wireguard_awg_params` taken
+//! by `ffi::new_tunnel_with_awg_params` and its JNI wrapper. The legacy
+//! `ffi::new_tunnel_with_amnezia*` constructors take no key, so tunnels built
+//! with them run unprotected; `Tunn::decapsulate` still unmasks for all.
 //!
 //! # Wire compatibility
 //!

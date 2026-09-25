@@ -1909,4 +1909,56 @@ allowed_ip=10.66.66.2/32",
             );
         }
     }
+
+    /// Header protection over protocol imitation through the live UAPI socket,
+    /// in boringtun-cli's order: imitation and the stock S sizes fixed at
+    /// startup (`--imitate-protocol` has no UAPI key), the key sent later in a
+    /// `set=1`. Under SIP the stock sizes put a request line in every prefix
+    /// but S4's, so the key is refused with EINVAL and not installed -- `get`
+    /// reports none -- while the same transaction loads under DNS, STUN and
+    /// QUIC.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    fn header_protection_over_shaped_sip_imitation_is_refused_over_the_uapi() {
+        use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationProtocol as P};
+
+        const OK: &str = "errno=0\n\n";
+        const EINVAL: &str = "errno=22\n\n";
+        let key = format!("header_protection_key={}", encode([0x6b; 32]));
+        for (protocol, accepted) in [
+            (P::Sip, false),
+            (P::Dns, true),
+            (P::Stun, true),
+            (P::Quic, true),
+        ] {
+            let wg = WGHandle::init_with_config(
+                next_ip(),
+                next_ip_v6(),
+                DeviceConfig {
+                    n_threads: 2,
+                    use_connected_socket: false,
+                    use_multi_queue: false,
+                    uapi_fd: -1,
+                    amnezia: AmneziaConfig::new(136, 59, 149, 16)
+                        .with_protocol_imitation(protocol, None),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(wg.wg_set_port(next_port()), OK);
+            assert_eq!(
+                wg.wg_set(&key),
+                if accepted { OK } else { EINVAL },
+                "{:?}",
+                protocol
+            );
+            assert_eq!(
+                wg.wg_get().contains("header_protection_key="),
+                accepted,
+                "{:?}: the key is installed exactly when accepted",
+                protocol
+            );
+        }
+    }
 }
