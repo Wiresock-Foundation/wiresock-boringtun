@@ -361,6 +361,54 @@ fn checked_awg_params(env: &mut Env<'_>, params: &[u8]) -> jni::errors::Result<(
     Ok(())
 }
 
+/// Why a Java string cannot become a C string.
+#[derive(Debug, PartialEq)]
+enum JavaStrError {
+    /// It contains U+0000, which would end the C string early.
+    Nul,
+    /// It contains an unpaired surrogate (or bytes no JVM produces), which
+    /// has no UTF-8 form at all.
+    NotUnicode,
+}
+
+/// A Java string's modified-UTF-8 bytes, as standard UTF-8 -- strictly.
+///
+/// jni's `JNIStr::to_str` is not strict: when its decoder fails it falls back
+/// to `String::from_utf8_lossy`. The failure it meets is an unpaired
+/// surrogate, which a Java string may hold and UTF-8 cannot, and the fallback
+/// then rewrites modified UTF-8's `C0 80` -- its spelling of U+0000, invalid
+/// as UTF-8 -- to U+FFFD as well, so a NUL beside such a surrogate never
+/// reaches a later NUL check. Decoding to UTF-16 here, refusing U+0000 before
+/// anything is converted, and letting `String::from_utf16` refuse unpaired
+/// surrogates keeps both failures visible.
+fn strict_java_string(mutf8: &[u8]) -> Result<String, JavaStrError> {
+    let continuation = |i: usize| mutf8.get(i).is_some_and(|&b| b & 0xc0 == 0x80);
+    let mut units = Vec::with_capacity(mutf8.len());
+    let mut i = 0;
+    while i < mutf8.len() {
+        let b = mutf8[i] as u16;
+        let (unit, len) = match mutf8[i] {
+            0x01..=0x7f => (b, 1),
+            0xc0..=0xdf if continuation(i + 1) => {
+                (((b & 0x1f) << 6) | (mutf8[i + 1] as u16 & 0x3f), 2)
+            }
+            0xe0..=0xef if continuation(i + 1) && continuation(i + 2) => (
+                ((b & 0x0f) << 12)
+                    | ((mutf8[i + 1] as u16 & 0x3f) << 6)
+                    | (mutf8[i + 2] as u16 & 0x3f),
+                3,
+            ),
+            _ => return Err(JavaStrError::NotUnicode),
+        };
+        units.push(unit);
+        i += len;
+    }
+    if units.contains(&0) {
+        return Err(JavaStrError::Nul);
+    }
+    String::from_utf16(&units).map_err(|_| JavaStrError::NotUnicode)
+}
+
 /// Creates a new tunnel from a versioned `wireguard_awg_params` image: the
 /// JNI door to [`new_tunnel_with_awg_params`], and the only one that can
 /// configure AmneziaWG. [`create_new_tunnel`] builds a plain WireGuard tunnel
@@ -380,8 +428,8 @@ fn checked_awg_params(env: &mut Env<'_>, params: &[u8]) -> jni::errors::Result<(
 /// * a handle, or `0` when the library refuses the configuration or a key --
 ///   the same contract as `new_tunnel`;
 /// * `IllegalArgumentException` when `awg_params` is shorter than four bytes or
-///   than its own `size`, or `imitation_domain` contains U+0000, which a C
-///   string cannot carry;
+///   than its own `size`, or when `imitation_domain` contains U+0000, which a
+///   C string cannot carry, or an unpaired surrogate, which UTF-8 cannot;
 /// * a JVM exception, left pending, if reading a Java argument fails.
 #[export_name = "Java_com_cloudflare_app_boringtun_BoringTunJNI_new_1tunnel_1with_1awg_1params"]
 #[allow(clippy::too_many_arguments)]
@@ -420,18 +468,27 @@ pub extern "C" fn create_new_tunnel_with_awg_params<'local>(
         // Converted to standard UTF-8, which is what the C constructor decodes:
         // modified UTF-8 spells U+0000 and every code point above U+FFFF
         // differently, and passing those bytes through would make the two doors
-        // disagree about the same domain.
+        // disagree about the same domain. Strictly -- see `strict_java_string`.
         let imitation_domain = if arg_imitation_domain.is_null() {
             None
         } else {
             let chars = arg_imitation_domain.mutf8_chars(env)?;
-            match CString::new(chars.to_str().as_bytes()) {
+            // `CString::new` cannot fail once the decoder has refused U+0000,
+            // but its own check stays in the path: a NUL must never be passed
+            // on, whatever the decoder does.
+            let domain = strict_java_string(chars.to_bytes())
+                .and_then(|d| CString::new(d).map_err(|_| JavaStrError::Nul));
+            match domain {
                 Ok(domain) => Some(domain),
-                Err(_) => {
-                    let _ = env.throw_new(
-                        jni_str!("java/lang/IllegalArgumentException"),
-                        jni_str!("imitationDomain must not contain U+0000"),
-                    );
+                Err(e) => {
+                    let message = match e {
+                        JavaStrError::Nul => jni_str!("imitationDomain must not contain U+0000"),
+                        JavaStrError::NotUnicode => jni_str!(
+                            "imitationDomain contains an unpaired surrogate, which UTF-8 cannot \
+                             represent"
+                        ),
+                    };
+                    let _ = env.throw_new(jni_str!("java/lang/IllegalArgumentException"), message);
                     return Err(jni::errors::Error::JavaException);
                 }
             }
@@ -580,4 +637,57 @@ pub extern "C" fn run_periodic_task<'local>(
         Ok(output.size as jint)
     })
     .resolve::<LogErrorAndDefault>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{strict_java_string, JavaStrError};
+
+    /// The exact modified-UTF-8 byte sequences a JVM hands over, decoded
+    /// strictly. The real-JVM harness covers the same inputs end to end; this
+    /// pins the decoder itself, byte by byte.
+    #[test]
+    fn java_strings_become_utf8_strictly() {
+        // ASCII, a two-byte BMP character, and U+1F600 as modified UTF-8
+        // spells it: a surrogate pair, three bytes per half.
+        assert_eq!(strict_java_string(b"example.com").unwrap(), "example.com");
+        assert_eq!(strict_java_string(&[0xc3, 0xa9]).unwrap(), "\u{e9}");
+        assert_eq!(
+            strict_java_string(&[0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80]).unwrap(),
+            "\u{1f600}"
+        );
+        assert_eq!(strict_java_string(b"").unwrap(), "");
+
+        // U+0000, which modified UTF-8 spells C0 80.
+        assert_eq!(
+            strict_java_string(&[b'a', 0xc0, 0x80, b'b']),
+            Err(JavaStrError::Nul)
+        );
+        // An unpaired high surrogate, an unpaired low one, and a pair in the
+        // wrong order.
+        let high = [0xed, 0xa0, 0x80];
+        let low = [0xed, 0xb0, 0x80];
+        assert_eq!(strict_java_string(&high), Err(JavaStrError::NotUnicode));
+        assert_eq!(strict_java_string(&low), Err(JavaStrError::NotUnicode));
+        assert_eq!(
+            strict_java_string(&[low, high].concat()),
+            Err(JavaStrError::NotUnicode)
+        );
+        // The reviewed defect: U+0000 beside an unpaired surrogate is still
+        // U+0000. The lossy fallback this replaced rewrote both to U+FFFD.
+        assert_eq!(
+            strict_java_string(&[&high[..], &[0xc0, 0x80], b".example"].concat()),
+            Err(JavaStrError::Nul)
+        );
+        // Bytes no JVM produces: a truncated sequence, and a four-byte UTF-8
+        // lead, which modified UTF-8 never uses.
+        assert_eq!(
+            strict_java_string(&[0xe2, 0x82]),
+            Err(JavaStrError::NotUnicode)
+        );
+        assert_eq!(
+            strict_java_string(&[0xf0, 0x9f, 0x98, 0x80]),
+            Err(JavaStrError::NotUnicode)
+        );
+    }
 }

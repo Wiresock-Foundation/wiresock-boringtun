@@ -5013,6 +5013,14 @@ mod tests {
             p.imitation_protocol = AmneziaImitationProtocol::Dns as u32;
             p.header_protection_key = [0; 32];
         });
+        // QUIC's SNI check takes any non-control UTF-8, so a non-ASCII domain
+        // is accepted here -- which makes it the case that shows the JNI door
+        // hands over real UTF-8: the modified-UTF-8 spelling of a supplementary
+        // character (a CESU-8 surrogate pair) is not UTF-8 and would be refused.
+        let quic = with(&|p| {
+            p.imitation_protocol = AmneziaImitationProtocol::Quic as u32;
+            p.header_protection_key = [0; 32];
+        });
 
         let cases: Vec<CorpusCase> = vec![
             ("null-params", true, None, None),
@@ -5138,6 +5146,24 @@ mod tests {
                 "dns-empty-domain",
                 true,
                 Some(""),
+                Some(image(&dns, V2, V2, &[])),
+            ),
+            (
+                "quic-bmp-domain",
+                true,
+                Some("\u{e9}xample.com"),
+                Some(image(&quic, V2, V2, &[])),
+            ),
+            (
+                "quic-supplementary-domain",
+                true,
+                Some("\u{1f600}.example"),
+                Some(image(&quic, V2, V2, &[])),
+            ),
+            (
+                "dns-supplementary-domain",
+                false,
+                Some("\u{1f600}.example"),
                 Some(image(&dns, V2, V2, &[])),
             ),
         ];

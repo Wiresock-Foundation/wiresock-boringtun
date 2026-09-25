@@ -630,6 +630,20 @@ public class BoringTunJNI {
               "size 1025 is over the library's ceiling: refused with 0, not read");
         check(throwsIAE(() -> awgTunnel(sa, pb, null, "exa\u0000mple.com", 51)),
               "an imitation domain containing U+0000 throws IllegalArgumentException");
+        // An unpaired surrogate has no UTF-8 form at all. A lossy conversion
+        // would turn it into U+FFFD -- and, because modified UTF-8 spells U+0000
+        // as C0 80, which is not valid UTF-8 either, turn a NUL beside it into
+        // U+FFFD too, so the NUL check above would never see it.
+        check(throwsIAE(() -> awgTunnel(sa, pb, null, "\uD800\u0000.example", 51)),
+              "U+0000 next to an unpaired surrogate still throws IllegalArgumentException");
+        check(throwsIAE(() -> awgTunnel(sa, pb, null, "\uD800.example", 51)),
+              "an unpaired high surrogate throws IllegalArgumentException");
+        check(throwsIAE(() -> awgTunnel(sa, pb, null, "example\uDC00", 51)),
+              "an unpaired low surrogate throws IllegalArgumentException");
+        check(throwsIAE(() -> awgTunnel(sa, pb, null, "\uDC00\uD800.example", 51)),
+              "a reversed surrogate pair throws IllegalArgumentException");
+        check(awgTunnel(sa, pb, null, "😀.example", 51) != 0,
+              "a proper surrogate pair (U+1F600) is valid Unicode and is not a marshalling error");
 
         System.out.println("== AWG params: the JNI door reaches the C door's verdict on the shared corpus ==");
         String corpusPath = System.getProperty("awg.corpus");
@@ -660,7 +674,7 @@ public class BoringTunJNI {
                             + ", the C door " + (accept ? "accepts" : "refuses") + ")");
                     }
                 }
-                check(cases == 19 && agreed == cases,
+                check(cases == 22 && agreed == cases,
                       "all " + cases + " corpus cases reach the C door's verdict (" + agreed + " agreed)");
                 // The corpus is generated from the Rust struct; the builder above
                 // is hand-written from the header. Equal bytes pin the builder's
