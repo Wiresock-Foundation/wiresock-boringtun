@@ -21,9 +21,10 @@
 //! where it is raw on the wire and so fully determined by the prefix.
 //! End to end through `Tunn`, whose framing draws from its own `ChaCha8Rng`,
 //! the tests seed that RNG instead, in a layout where a send draws nothing but
-//! its prefixes. Every candidate is then replayed from a clone and checked
-//! against the oracle before the send, and the send's word consumption is
-//! counted exactly.
+//! its prefixes and every control reading lies in the prefix -- so the
+//! session's `OsRng` keys and ciphertext never decide a verdict. Every
+//! candidate is then replayed from a clone and checked against the oracle,
+//! and the send's word consumption is counted exactly.
 
 use super::amnezia::{AmneziaConfig, AmneziaImitationProtocol, TrailerRoom, DEFAULT_UDP_WINDOW};
 use super::handshake::ObfuscationRanges;
@@ -602,8 +603,10 @@ const REDRAWN: [AmneziaImitationProtocol; 3] = [
 
 /// Layout I: S4 = 48, which holds a full DNS header, a STUN header and a SIP
 /// request line (so SIP is SIP-shaped, not random), and every control
-/// reading lies past the prefix and the masked header -- in ciphertext -- so
-/// what a reading sees is decided by the candidate's nonce alone.
+/// reading lies past the prefix and the masked header -- in the fixed
+/// stand-in ciphertext of `canonical` -- so what a reading sees is decided by
+/// the candidate's nonce alone. Framing tests only: under a real session that
+/// ciphertext is random, so the end-to-end test uses layout Q instead.
 const S_I: [usize; 4] = [120, 80, 100, 48];
 /// The transport tag, a single value so a send draws none for it.
 const TAG_I: u32 = 0xffff_ffff;
@@ -614,7 +617,8 @@ fn h_resp(resp: u32) -> [(u32, u32); 4] {
 }
 
 /// H2 covers almost every tag: a response reading in ciphertext collides for
-/// all but ~2^-23 of framings.
+/// all but ~2^-23 of framings. With the fixed `canonical` message and a fixed
+/// seed that is a fixed outcome, which the tests assert as a fixture.
 const H_WIDE: [(u32, u32); 4] = [
     (0xffff_fffc, 0xffff_fffc),
     (5, 0xffff_fffb),
@@ -1358,19 +1362,41 @@ fn the_stock_installer_profile_emits_no_upstream_collisions() {
 /// seeded RNG, replayed from a clone through `replay`, names every candidate
 /// a send drew, and the send's word consumption is exact.
 ///
-/// For a redrawn mode, H2 covers almost every tag, so each send exhausts:
-/// sixteen candidates, all misread upstream, candidate 16 on the wire, no
-/// seventeenth drawn. For SIP, one candidate is drawn and sent colliding.
-/// Either way the peer decapsulates every frame to what was sent, counters
-/// run on with no gap, `tx_bytes` and the session move exactly as for one
-/// send, and a replayed frame is refused.
+/// The layout is layout Q, and that is what makes the collisions exact. The
+/// session comes from `OsRng` -- its keys, so its ciphertext, and its
+/// receiver index -- and none of it may decide whether a candidate collides.
+/// In layout Q it cannot: every control reading (S1 = 16, S2 = 20, S3 = 12,
+/// four bytes each) lies inside the 48-byte S4 prefix, past its 12-byte
+/// nonce. A reading is prefix bytes XOR the header-protection mask, and the
+/// mask is keyed by `KEY` over the nonce, which is prefix too. So what an
+/// upstream receiver reads from a candidate is a function of that
+/// candidate's prefix alone, every prefix is drawn from the initiator's
+/// seeded RNG, and the length tests depend only on the packet sizes. The
+/// test asserts both: the readings sit in the prefix, and each candidate's
+/// upstream verdict is unchanged when every byte past its prefix is
+/// replaced.
+///
+/// For a redrawn mode, all sixteen candidates of every send are misread
+/// upstream (H3 admits all but nine tags; the seeds are fixed, so this is a
+/// fixed outcome the test checks, not a likelihood), candidate 16 is on the
+/// wire, and no seventeenth is drawn. For SIP, one candidate is drawn and
+/// sent colliding. Either way the peer decapsulates every frame to what was
+/// sent, counters run on with no gap, `tx_bytes` and the session move exactly
+/// as for one send, and a replayed frame is refused.
 fn imitated_session_keeps_one_sends_worth_of_state(
     protocol: AmneziaImitationProtocol,
     redrawn: bool,
 ) {
-    let base = config(S_I, Some(KEY), true).with_content_padding_addition(16, 16, 1420);
-    let (mut a, mut b, confirmation) = tunnels(&base, H_WIDE);
-    let s4 = S_I[DATA];
+    let s4 = S_Q[DATA];
+    for kind in [INIT, RESP, COOKIE] {
+        assert!(
+            S_Q[kind] >= 12 && S_Q[kind] + 4 <= s4,
+            "fixture: control reading {} lies in the prefix, past the nonce",
+            kind
+        );
+    }
+    let base = config_q();
+    let (mut a, mut b, confirmation) = tunnels(&base, H_Q);
     let counter_of = |wire: &[u8]| {
         let h = unmasked_header(wire, s4, KEY);
         u64::from_le_bytes(h[8..16].try_into().unwrap())
@@ -1378,8 +1404,10 @@ fn imitated_session_keeps_one_sends_worth_of_state(
     assert_eq!(counter_of(&confirmation), 0, "the confirmation keepalive");
 
     let imitated = base.with_protocol_imitation(protocol, None);
-    a.set_obfuscation(ranges(H_WIDE), imitated.clone());
-    b.set_obfuscation(ranges(H_WIDE), imitated);
+    a.set_obfuscation(ranges(H_Q), imitated.clone());
+    b.set_obfuscation(ranges(H_Q), imitated);
+    // Seeds every prefix the sends below draw; with the readings in the
+    // prefix, that decides every candidate's upstream verdict.
     a.handshake.rng = ChaCha8Rng::seed_from_u64(0xe2e0 + protocol as u64);
 
     let (mut abuf, mut bbuf) = (vec![0u8; 4096], vec![0u8; 4096]);
@@ -1397,14 +1425,42 @@ fn imitated_session_keeps_one_sends_worth_of_state(
         let n = if redrawn { 16 } else { 1 };
         let (cands, pos) = replay(protocol, Some(KEY), s4, &message, &before, n);
         for (k, c) in cands.iter().enumerate() {
+            let verdict = upstream_first_match(c, S_Q, H_Q, Some(KEY), true);
             assert_ne!(
-                upstream_first_match(c, S_I, H_WIDE, Some(KEY), true),
+                verdict,
                 Some(DATA),
                 "{:?} {}: candidate {} is misread upstream",
                 protocol,
                 len,
                 k + 1
             );
+            // Every byte past the prefix -- masked header, ciphertext, AEAD
+            // tag, trailer -- is the session's. Replace them with constants,
+            // and with bytes that make any control reading taken there decode
+            // to 0, a tag outside every range (in layout Q there is none, so
+            // this last one changes nothing -- were a reading ever moved past
+            // the prefix, it would be forced out of range): the verdict holds.
+            let mask = keystream(KEY, c, 4);
+            let mut out_of_range = c.clone();
+            for kind in [INIT, RESP, COOKIE] {
+                for i in (0..4).filter(|&i| S_Q[kind] + i >= s4) {
+                    out_of_range[S_Q[kind] + i] = mask[i];
+                }
+            }
+            let mut zeros = c.clone();
+            zeros[s4..].fill(0x00);
+            let mut ones = c.clone();
+            ones[s4..].fill(0xff);
+            for sessionless in [zeros, ones, out_of_range] {
+                assert_eq!(
+                    upstream_first_match(&sessionless, S_Q, H_Q, Some(KEY), true),
+                    verdict,
+                    "{:?} {}: candidate {}'s verdict depends on its prefix alone",
+                    protocol,
+                    len,
+                    k + 1
+                );
+            }
         }
         assert_eq!(
             wire,
