@@ -19,8 +19,16 @@ package com.cloudflare.app.boringtun;
 
 import java.io.File;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.List;
+import javax.crypto.Cipher;
+import javax.crypto.spec.ChaCha20ParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 
 public class BoringTunJNI {
     static { System.loadLibrary("boringtun"); }
@@ -31,6 +39,9 @@ public class BoringTunJNI {
     public static native String x25519_key_to_base64(byte[] key);
     public static native long new_tunnel(
         String secretKey, String publicKey, String presharedKey, short keepAlive, int index);
+    public static native long new_tunnel_with_awg_params(
+        String secretKey, String publicKey, String presharedKey, short keepAlive, int index,
+        byte[] awgParams, String imitationDomain);
     public static native int wireguard_write(
         long tunnel, byte[] src, int srcSize, ByteBuffer dst, int dstSize, ByteBuffer op);
     public static native int wireguard_read(
@@ -311,9 +322,12 @@ public class BoringTunJNI {
         }
         check(roundTripped, "a packet written by A arrives at B byte-for-byte identical");
 
+        awgParamsChecks();
+
         System.out.println("== inputs that used to kill the JVM ==");
         check(fatalInputChildSurvives(),
-              "a zero handle and a too-small dst are errors, not process death");
+              "a zero handle, a too-small dst, and an awgParams array shorter than its size"
+                  + " are errors, not process death");
 
         System.out.println();
         if (failures == 0) {
@@ -397,12 +411,332 @@ public class BoringTunJNI {
             if (opOf(opA) == WIREGUARD_ERROR) survived++;
         }
 
+        // 3. An awgParams array shorter than the 4-byte size field, or than the
+        //    size it declares. jni.rs must throw before the FFI call: the C
+        //    constructor trusts `size` as the length of the caller's
+        //    allocation, so an unguarded call reads past the copied array.
+        String sa = x25519_key_to_base64(x25519_secret_key());
+        String pb = x25519_key_to_base64(x25519_public_key(x25519_secret_key()));
+        byte[][] short_ = {
+            new byte[0],
+            new byte[3],
+            awg31Profile(1).image(AwgParams.SIZE_V2, 100),
+            awg31Profile(1).image(AwgParams.SIZE_V2 + 1, AwgParams.SIZE_V2),
+            awg31Profile(1).image(0xffffffffL, AwgParams.SIZE_V2),
+            awg31Profile(1).image(1000, 999),
+        };
+        String[] what = {
+            "an empty array", "a 3-byte array", "size 168 in 100 bytes",
+            "size 169 in 168 bytes", "size 0xffffffff in 168 bytes", "size 1000 in 999 bytes",
+        };
+        int awgSurvived = 0;
+        for (int i = 0; i < short_.length; i++) {
+            byte[] params = short_[i];
+            if (throwsIAE(() -> awgTunnel(sa, pb, params, null, 34))) {
+                awgSurvived++;
+            } else {
+                System.out.println("awgParams " + what[i] + " did not throw IllegalArgumentException");
+            }
+        }
+
         // Reaching this line at all is most of the point.
-        if (survived == 6) {
+        if (survived == 6 && awgSurvived == short_.length) {
             System.out.println("FATAL_INPUTS_SURVIVED");
         } else {
-            System.out.println("only " + survived + " of 6 survived");
+            System.out.println("only " + survived + " of 6 and " + awgSurvived + " of "
+                + short_.length + " awgParams cases survived");
         }
+    }
+
+    /**
+     * {@code struct wireguard_awg_params}, as the native byte image
+     * {@code new_tunnel_with_awg_params} reads -- a test helper, not API.
+     *
+     * Every offset below is the one boringtun/src/wireguard_ffi.h declares and
+     * scripts/ffi-layout-check.c pins, kept in this one table. The byte order is
+     * {@code ByteOrder.nativeOrder()} because the array IS the C struct, not a
+     * second serialization of it; the shared corpus is little-endian, like every
+     * target the library is built for.
+     */
+    static final class AwgParams {
+        static final int SIZE_V0 = 160;   // the first published version
+        static final int SIZE_V1 = 164;   // + random_trailers
+        static final int SIZE_V2 = 168;   // + disable_cookies
+
+        static final int SIZE = 0;
+        static final int S1_INIT_JUNK = 4;
+        static final int S2_RESPONSE_JUNK = 8;
+        static final int S3_COOKIE_JUNK = 12;
+        static final int S4_TRANSPORT_JUNK = 16;
+        static final int JUNK_PACKET_COUNT = 20;
+        static final int JUNK_PACKET_SIZE_MIN = 24;
+        static final int JUNK_PACKET_SIZE_MAX = 28;
+        static final int JUNK_PACKET_DELAY_MS = 32;
+        static final int H1_INIT = 36;                // wireguard_awg_range: lo, hi
+        static final int H2_RESP = 44;
+        static final int H3_COOKIE = 52;
+        static final int H4_DATA = 60;
+        static final int IMITATION_PROTOCOL = 68;
+        static final int IMITATION_BROWSER = 72;
+        static final int CONTENT_PADDING_ADDITION = 76;
+        static final int CONTENT_PADDING_MTU = 84;
+        static final int REKEY_AFTER_TIME = 88;
+        static final int REKEY_TIMEOUT = 96;
+        static final int REJECT_AFTER_TIME = 104;
+        static final int KEEPALIVE_TIMEOUT = 112;
+        static final int MAX_HANDSHAKE_ATTEMPTS = 120;
+        static final int HEADER_PROTECTION_KEY = 128; // uint8_t[32]
+        static final int RANDOM_TRAILERS = 160;
+        static final int DISABLE_COOKIES = 164;
+
+        private final ByteBuffer b = ByteBuffer.allocate(SIZE_V2).order(ByteOrder.nativeOrder());
+
+        AwgParams u32(int offset, long value) {
+            b.putInt(offset, (int) value);
+            return this;
+        }
+
+        AwgParams range(int offset, long lo, long hi) {
+            return u32(offset, lo).u32(offset + 4, hi);
+        }
+
+        AwgParams key(byte[] key) {
+            for (int i = 0; i < 32; i++) b.put(HEADER_PROTECTION_KEY + i, key[i]);
+            return this;
+        }
+
+        /** The struct in an array of {@code arrayLen} bytes (zero past the struct), declaring {@code size}. */
+        byte[] image(long size, int arrayLen) {
+            byte[] out = Arrays.copyOf(b.array(), arrayLen);
+            ByteBuffer.wrap(out).order(ByteOrder.nativeOrder()).putInt(SIZE, (int) size);
+            return out;
+        }
+
+        byte[] image(int size) {
+            return image(size, size);
+        }
+    }
+
+    static final byte[] AWG_HP_KEY = new byte[32];
+    static { for (int i = 0; i < 32; i++) AWG_HP_KEY[i] = (byte) (0x40 + i); }
+    static final int S1 = 40, S2 = 36, S3 = 28, S4 = 20;
+    static final long[][] H = {
+        {100_000, 199_999}, {200_000, 299_999}, {300_000, 399_999}, {400_000, 499_999}};
+
+    /** The AWG 3.1 profile the corpus's v2-full-awg31 case carries, with DisableCookies as given. */
+    static AwgParams awg31Profile(long disableCookies) {
+        return new AwgParams()
+            .u32(AwgParams.S1_INIT_JUNK, S1)
+            .u32(AwgParams.S2_RESPONSE_JUNK, S2)
+            .u32(AwgParams.S3_COOKIE_JUNK, S3)
+            .u32(AwgParams.S4_TRANSPORT_JUNK, S4)
+            .range(AwgParams.H1_INIT, H[0][0], H[0][1])
+            .range(AwgParams.H2_RESP, H[1][0], H[1][1])
+            .range(AwgParams.H3_COOKIE, H[2][0], H[2][1])
+            .range(AwgParams.H4_DATA, H[3][0], H[3][1])
+            .range(AwgParams.CONTENT_PADDING_ADDITION, 8, 24)
+            .u32(AwgParams.CONTENT_PADDING_MTU, 1420)
+            .range(AwgParams.KEEPALIVE_TIMEOUT, 20, 25)
+            .key(AWG_HP_KEY)
+            .u32(AwgParams.RANDOM_TRAILERS, 1)
+            .u32(AwgParams.DISABLE_COOKIES, disableCookies);
+    }
+
+    /**
+     * The message-type tag an AmneziaWG receiver reads at {@code offset}: the
+     * four bytes there, XORed with the first four bytes of the header-protection
+     * keystream (ChaCha20, block 0, the datagram's first 12 bytes as nonce).
+     * Computed with the JDK's own ChaCha20, independently of the library.
+     */
+    static long decodedTag(byte[] datagram, int offset) {
+        try {
+            Cipher c = Cipher.getInstance("ChaCha20");
+            c.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(AWG_HP_KEY, "ChaCha20"),
+                   new ChaCha20ParameterSpec(Arrays.copyOf(datagram, 12), 0));
+            byte[] ks = c.doFinal(new byte[4]);
+            long tag = 0;
+            for (int i = 3; i >= 0; i--) {
+                tag = (tag << 8) | ((datagram[offset + i] ^ ks[i]) & 0xff);
+            }
+            return tag;
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    static boolean tagIn(byte[] datagram, int offset, int kind) {
+        long tag = decodedTag(datagram, offset);
+        return tag >= H[kind][0] && tag <= H[kind][1];
+    }
+
+    private static long awgTunnel(String secret, String peer, byte[] params, String domain, int index) {
+        return new_tunnel_with_awg_params(secret, peer, null, (short) 0, index, params, domain);
+    }
+
+    private static byte[] unhex(String s) {
+        return HexFormat.of().parseHex(s);
+    }
+
+    /**
+     * {@code new_tunnel_with_awg_params} over JNI: every published struct
+     * version, the RandomTrailers/DisableCookies parsers, the params-array
+     * marshalling guard, the corpus shared with the C door, and a real AWG 3.1
+     * session between two JNI-built peers.
+     */
+    private static void awgParamsChecks() {
+        String sa = x25519_key_to_base64(x25519_secret_key());
+        byte[] sbRaw = x25519_secret_key();
+        String pb = x25519_key_to_base64(x25519_public_key(sbRaw));
+
+        System.out.println("== AWG params: every published struct version ==");
+        // Each shorter version sits in a 168-byte array whose absent fields are
+        // 0xffffffff -- a value both switches refuse -- so acceptance proves the
+        // bytes past `size` were not read, i.e. the fields defaulted to off.
+        byte[] v0 = awg31Profile(0xffffffffL).u32(AwgParams.RANDOM_TRAILERS, 0xffffffffL)
+            .image(AwgParams.SIZE_V0, AwgParams.SIZE_V2);
+        check(awgTunnel(sa, pb, v0, null, 40) != 0,
+              "the 160-byte version is accepted, random_trailers and disable_cookies unread (off)");
+        byte[] v1 = awg31Profile(0xffffffffL).image(AwgParams.SIZE_V1, AwgParams.SIZE_V2);
+        check(awgTunnel(sa, pb, v1, null, 41) != 0,
+              "the 164-byte version with random_trailers=1 is accepted, disable_cookies unread (off)");
+        check(awgTunnel(sa, pb, awg31Profile(1).image(AwgParams.SIZE_V2), null, 42) != 0,
+              "the 168-byte version with random_trailers=1, disable_cookies=1 is accepted");
+        check(awgTunnel(sa, pb, null, null, 43) != 0,
+              "null awgParams builds a plain WireGuard tunnel, as NULL params does in C");
+
+        System.out.println("== AWG params: RandomTrailers and DisableCookies are 0 or 1 ==");
+        for (long v : new long[] {0, 1}) {
+            check(awgTunnel(sa, pb, awg31Profile(0).u32(AwgParams.RANDOM_TRAILERS, v)
+                                        .image(AwgParams.SIZE_V2), null, 44) != 0,
+                  "random_trailers=" + v + " is accepted");
+            check(awgTunnel(sa, pb, awg31Profile(v).image(AwgParams.SIZE_V2), null, 45) != 0,
+                  "disable_cookies=" + v + " is accepted");
+        }
+        check(awgTunnel(sa, pb, awg31Profile(0).u32(AwgParams.RANDOM_TRAILERS, 2)
+                                    .image(AwgParams.SIZE_V2), null, 46) == 0,
+              "random_trailers=2 is refused (0, not an exception)");
+        check(awgTunnel(sa, pb, awg31Profile(2).image(AwgParams.SIZE_V2), null, 47) == 0,
+              "disable_cookies=2 is refused (0, not an exception)");
+
+        System.out.println("== AWG params: the array must hold what it declares ==");
+        // Marshalling mistakes throw; everything the array can actually carry is
+        // the library's to judge and comes back as 0. The arrays SHORTER than
+        // their own `size` run in the fatal-inputs child below: without the
+        // guard in jni.rs they are an out-of-bounds read inside an extern "C"
+        // function, which kills the process rather than failing a check.
+        check(awgTunnel(sa, pb, awg31Profile(1).image(1000, 1000), null, 49) != 0,
+              "size 1000 in a 1000-byte array with a zero tail is a newer caller, accepted");
+        check(awgTunnel(sa, pb, awg31Profile(1).image(1025, 1025), null, 50) == 0,
+              "size 1025 is over the library's ceiling: refused with 0, not read");
+        check(throwsIAE(() -> awgTunnel(sa, pb, null, "exa\u0000mple.com", 51)),
+              "an imitation domain containing U+0000 throws IllegalArgumentException");
+
+        System.out.println("== AWG params: the JNI door reaches the C door's verdict on the shared corpus ==");
+        String corpusPath = System.getProperty("awg.corpus");
+        check(corpusPath != null, "the corpus path is passed in (-Dawg.corpus)");
+        check(ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN,
+              "this JVM is little-endian, like the corpus");
+        if (corpusPath != null) {
+            try {
+                List<String> lines = Files.readAllLines(Path.of(corpusPath), StandardCharsets.UTF_8);
+                int cases = 0, agreed = 0;
+                byte[] full = null, rtOnly = null, base = null;
+                for (String line : lines) {
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    String[] f = line.split(" ");
+                    boolean accept = f[1].equals("accept");
+                    String domain = f[2].equals("-") ? null
+                        : new String(unhex(f[2].substring(2)), StandardCharsets.UTF_8);
+                    byte[] image = f[3].equals("-") ? null : unhex(f[3]);
+                    if (f[0].equals("v2-full-awg31")) full = image;
+                    if (f[0].equals("v1-rt-only")) rtOnly = image;
+                    if (f[0].equals("v0-base")) base = image;
+                    long t = awgTunnel(sa, pb, image, domain, 60 + cases);
+                    cases++;
+                    if ((t != 0) == accept) {
+                        agreed++;
+                    } else {
+                        System.out.println("        (" + f[0] + ": JNI " + (t != 0 ? "accepted" : "refused")
+                            + ", the C door " + (accept ? "accepts" : "refuses") + ")");
+                    }
+                }
+                check(cases == 19 && agreed == cases,
+                      "all " + cases + " corpus cases reach the C door's verdict (" + agreed + " agreed)");
+                // The corpus is generated from the Rust struct; the builder above
+                // is hand-written from the header. Equal bytes pin the builder's
+                // offsets to the real layout.
+                check(Arrays.equals(full, awg31Profile(1).image(AwgParams.SIZE_V2)),
+                      "the Java builder's 168-byte image equals the Rust struct's (v2-full-awg31)");
+                check(Arrays.equals(rtOnly, awg31Profile(0).image(AwgParams.SIZE_V1)),
+                      "the Java builder's 164-byte image equals the Rust struct's (v1-rt-only)");
+                check(Arrays.equals(base, awg31Profile(0).u32(AwgParams.RANDOM_TRAILERS, 0)
+                                                     .image(AwgParams.SIZE_V0)),
+                      "the Java builder's 160-byte image equals the Rust struct's (v0-base)");
+            } catch (java.io.IOException e) {
+                check(false, "the corpus is readable (" + e + ")");
+            }
+        }
+
+        System.out.println("== AWG 3.1 session between two JNI-built peers ==");
+        byte[] secretA = x25519_secret_key();
+        byte[] secretB = x25519_secret_key();
+        String aSec = x25519_key_to_base64(secretA), aPub = x25519_key_to_base64(x25519_public_key(secretA));
+        String bSec = x25519_key_to_base64(secretB), bPub = x25519_key_to_base64(x25519_public_key(secretB));
+        // DisableCookies is local policy, so the two ends differ on purpose.
+        long tunA = awgTunnel(aSec, bPub, awg31Profile(1).image(AwgParams.SIZE_V2), null, 90);
+        long tunB = awgTunnel(bSec, aPub, awg31Profile(0).image(AwgParams.SIZE_V2), null, 91);
+        check(tunA != 0 && tunB != 0, "two AWG 3.1 peers (A: disable_cookies=1, B: 0) were created");
+        if (tunA == 0 || tunB == 0) return;
+
+        ByteBuffer netA = ByteBuffer.allocateDirect(2048);
+        ByteBuffer netB = ByteBuffer.allocateDirect(2048);
+        ByteBuffer opA = ByteBuffer.allocateDirect(1);
+        ByteBuffer opB = ByteBuffer.allocateDirect(1);
+        byte[] payload = ipv4Packet(64);
+
+        armOp(opA);
+        int n = wireguard_write(tunA, payload, payload.length, netA, netA.capacity(), opA);
+        byte[] init = taken(netA, Math.max(n, 0));
+        check(opOf(opA) == WRITE_TO_NETWORK && n >= S1 + 148,
+              "the initiation is at least S1 + 148 bytes (got " + n + ")");
+        check(n >= S1 + 148 && tagIn(init, S1, 0),
+              "under the header-protection key, the tag at S1 is in H1");
+
+        armOp(opB);
+        n = wireguard_read(tunB, init, init.length, netB, netB.capacity(), opB);
+        byte[] resp = taken(netB, Math.max(n, 0));
+        check(opOf(opB) == WRITE_TO_NETWORK && n >= S2 + 92,
+              "B answers with a response of at least S2 + 92 bytes (got " + n + ")");
+        check(n >= S2 + 92 && tagIn(resp, S2, 1),
+              "under the header-protection key, the tag at S2 is in H2");
+
+        armOp(opA);
+        n = wireguard_read(tunA, resp, resp.length, netA, netA.capacity(), opA);
+        byte[] keepalive = taken(netA, Math.max(n, 0));
+        // A keepalive is padded like data: S4 + 32 + a draw from the 8..24 range.
+        check(opOf(opA) == WRITE_TO_NETWORK && n >= S4 + 32 + 8 && n <= S4 + 32 + 24,
+              "A confirms with a keepalive of S4 + 32 + 8..24 bytes (got " + n + ")");
+        check(n >= S4 + 32 && tagIn(keepalive, S4, 3),
+              "under the header-protection key, the keepalive's tag at S4 is in H4");
+
+        armOp(opB);
+        wireguard_read(tunB, keepalive, keepalive.length, netB, netB.capacity(), opB);
+        check(opOf(opB) == WIREGUARD_DONE, "B accepts the confirmation keepalive");
+
+        armOp(opA);
+        n = wireguard_write(tunA, payload, payload.length, netA, netA.capacity(), opA);
+        byte[] data = taken(netA, Math.max(n, 0));
+        int base = S4 + 32 + payload.length;
+        check(opOf(opA) == WRITE_TO_NETWORK && n >= base + 8 && n <= base + 24,
+              "the data frame is S4 + 32 + 64 + a draw from the configured 8..24 padding (got " + n + ")");
+        check(n >= S4 + 32 && tagIn(data, S4, 3),
+              "under the header-protection key, the data frame's tag at S4 is in H4");
+
+        armOp(opB);
+        n = wireguard_read(tunB, data, data.length, netB, netB.capacity(), opB);
+        check(opOf(opB) == WRITE_TO_TUNNEL_IPV4 && n == payload.length
+                  && Arrays.equals(payload, taken(netB, n)),
+              "B decrypts the original 64-byte IPv4 packet, byte-for-byte");
     }
 
     /** A pair of tunnels configured as each other's peer, as raw handles. */

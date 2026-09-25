@@ -4935,4 +4935,284 @@ mod tests {
             tunnel_free(b);
         }
     }
+
+    /// The parameter images both doors are held to, as the text of
+    /// `tests/jni/awg_params_corpus.txt`.
+    ///
+    /// Each case is the native `wireguard_awg_params` byte image a C caller or
+    /// a Java caller (`ByteOrder.nativeOrder()`) would hand over -- built here
+    /// from the Rust struct, so the file cannot drift from the real layout --
+    /// its imitation domain, and the verdict the C constructor must reach.
+    /// The JVM harness (`tests/jni/.../BoringTunJNI.java`, run by
+    /// `scripts/jni-smoke.sh`) feeds the very same bytes through
+    /// `new_tunnel_with_awg_params` over JNI and must reach the same verdict,
+    /// which is what "Java config semantics == C config semantics" means in a
+    /// form a test can hold. Every image's array is exactly `len` bytes -- the
+    /// allocation a C caller promises -- so no case here over-reads; the
+    /// shorter-than-declared arrays only JNI can be handed are the harness's
+    /// own negative checks.
+    ///
+    /// Little-endian, like every target this crate is built for; the corpus
+    /// test refuses to run anywhere else rather than compare against the wrong
+    /// byte order.
+    fn awg_params_corpus() -> String {
+        const V0: usize = AWG_PARAMS_SIZE_VER0;
+        const V1: usize = AWG_PARAMS_SIZE_VER1;
+        const V2: usize = AWG_PARAMS_SIZE_VER2;
+        let range = |lo, hi| wireguard_awg_range { lo, hi };
+        let key: [u8; 32] = std::array::from_fn(|i| 0x40 + i as u8);
+        let awg31 = wireguard_awg_params {
+            size: V2 as u32,
+            s1_init_junk: 40,
+            s2_response_junk: 36,
+            s3_cookie_junk: 28,
+            s4_transport_junk: 20,
+            h1_init: range(100_000, 199_999),
+            h2_resp: range(200_000, 299_999),
+            h3_cookie: range(300_000, 399_999),
+            h4_data: range(400_000, 499_999),
+            content_padding_addition: range(8, 24),
+            content_padding_mtu: 1420,
+            keepalive_timeout: range(20, 25),
+            header_protection_key: key,
+            random_trailers: 1,
+            disable_cookies: 1,
+            ..Default::default()
+        };
+        let with = |f: &dyn Fn(&mut wireguard_awg_params)| {
+            let mut p = awg31;
+            f(&mut p);
+            p
+        };
+        // The struct's bytes, cut or zero-extended to `len`, `size` rewritten to
+        // `declared`, and optional bytes planted past the struct.
+        let image =
+            |p: &wireguard_awg_params, declared: usize, len: usize, plant: &[(usize, u8)]| {
+                let raw = unsafe {
+                    slice::from_raw_parts(p as *const _ as *const u8, std::mem::size_of_val(p))
+                };
+                let mut bytes = raw.to_vec();
+                bytes.resize(len, 0);
+                bytes[..4].copy_from_slice(&(declared as u32).to_le_bytes());
+                for &(at, value) in plant {
+                    bytes[at] = value;
+                }
+                bytes
+            };
+        let domain = |d: Option<&str>| match d {
+            None => "-".to_owned(),
+            Some(d) => format!(
+                "d:{}",
+                d.bytes().map(|b| format!("{:02x}", b)).collect::<String>()
+            ),
+        };
+        let hex = |b: &[u8]| b.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let dns = with(&|p| {
+            p.imitation_protocol = AmneziaImitationProtocol::Dns as u32;
+            p.header_protection_key = [0; 32];
+        });
+
+        // (name, accept, domain, image)
+        let cases: Vec<(&str, bool, Option<&str>, Option<Vec<u8>>)> = vec![
+            ("null-params", true, None, None),
+            (
+                "v2-full-awg31",
+                true,
+                None,
+                Some(image(&awg31, V2, V2, &[])),
+            ),
+            (
+                "v2-rt0-dc0",
+                true,
+                None,
+                Some(image(
+                    &with(&|p| {
+                        p.random_trailers = 0;
+                        p.disable_cookies = 0;
+                    }),
+                    V2,
+                    V2,
+                    &[],
+                )),
+            ),
+            (
+                "v1-rt-only",
+                true,
+                None,
+                Some(image(&with(&|p| p.disable_cookies = 0), V1, V1, &[])),
+            ),
+            (
+                "v0-base",
+                true,
+                None,
+                Some(image(
+                    &with(&|p| {
+                        p.random_trailers = 0;
+                        p.disable_cookies = 0;
+                    }),
+                    V0,
+                    V0,
+                    &[],
+                )),
+            ),
+            (
+                "v2-rt-2",
+                false,
+                None,
+                Some(image(&with(&|p| p.random_trailers = 2), V2, V2, &[])),
+            ),
+            (
+                "v2-dc-2",
+                false,
+                None,
+                Some(image(&with(&|p| p.disable_cookies = 2), V2, V2, &[])),
+            ),
+            (
+                "v1-rt-2",
+                false,
+                None,
+                Some(image(&with(&|p| p.random_trailers = 2), V1, V1, &[])),
+            ),
+            (
+                "size-162-inside-rt",
+                false,
+                None,
+                Some(image(&awg31, V0 + 2, V0 + 2, &[])),
+            ),
+            (
+                "size-166-inside-dc",
+                false,
+                None,
+                Some(image(&awg31, V1 + 2, V1 + 2, &[])),
+            ),
+            (
+                "size-100-below-v0",
+                false,
+                None,
+                Some(image(&awg31, 100, 100, &[])),
+            ),
+            (
+                "size-2000-over-ceiling",
+                false,
+                None,
+                Some(image(&awg31, 2000, 2000, &[])),
+            ),
+            (
+                "future-176-zero-tail",
+                true,
+                None,
+                Some(image(&awg31, V2 + 8, V2 + 8, &[])),
+            ),
+            (
+                "future-176-nonzero-tail",
+                false,
+                None,
+                Some(image(&awg31, V2 + 8, V2 + 8, &[(V2 + 4, 1)])),
+            ),
+            (
+                "hp-with-s1-below-12",
+                false,
+                None,
+                Some(image(&with(&|p| p.s1_init_junk = 8), V2, V2, &[])),
+            ),
+            (
+                "padding-without-mtu",
+                false,
+                None,
+                Some(image(&with(&|p| p.content_padding_mtu = 0), V2, V2, &[])),
+            ),
+            (
+                "dns-valid-domain",
+                true,
+                Some("example.com"),
+                Some(image(&dns, V2, V2, &[])),
+            ),
+            (
+                "dns-invalid-domain",
+                false,
+                Some("bad_host!"),
+                Some(image(&dns, V2, V2, &[])),
+            ),
+            (
+                "dns-empty-domain",
+                true,
+                Some(""),
+                Some(image(&dns, V2, V2, &[])),
+            ),
+        ];
+
+        let mut out = String::from(
+            "# Generated by ffi::tests::awg_params_corpus (src/ffi/mod.rs); do not edit by hand.\n\
+             # name verdict domain image -- image is the native little-endian\n\
+             # struct wireguard_awg_params, exactly the array handed over; - is NULL.\n",
+        );
+        for (name, accept, d, img) in cases {
+            out += &format!(
+                "{} {} {} {}\n",
+                name,
+                if accept { "accept" } else { "reject" },
+                domain(d),
+                img.as_deref().map_or("-".to_owned(), hex)
+            );
+        }
+        out
+    }
+
+    /// The corpus file is exactly what the struct produces, and the C door
+    /// reaches every verdict in it. The JVM harness holds the JNI door to the
+    /// same file.
+    #[test]
+    fn the_awg_params_corpus_is_current_and_the_c_door_agrees_with_it() {
+        assert!(
+            cfg!(target_endian = "little"),
+            "the corpus is little-endian; regenerate it for this target"
+        );
+        let expected = awg_params_corpus();
+        let file = include_str!("../../tests/jni/awg_params_corpus.txt").replace("\r\n", "\n");
+        assert!(
+            file == expected,
+            "tests/jni/awg_params_corpus.txt is stale; replace it with:\n{}",
+            expected
+        );
+
+        let (a_sec, _, _, b_pub) = awg31_keys();
+        for line in file.lines().filter(|l| !l.starts_with('#')) {
+            let f: Vec<&str> = line.split(' ').collect();
+            let (name, accept) = (f[0], f[1] == "accept");
+            let domain = f[2].strip_prefix("d:").map(|h| {
+                let bytes: Vec<u8> = (0..h.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
+                    .collect();
+                CString::new(bytes).unwrap()
+            });
+            let image: Option<Vec<u8>> = (f[3] != "-").then(|| {
+                (0..f[3].len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&f[3][i..i + 2], 16).unwrap())
+                    .collect()
+            });
+            last_tunnel_error_free();
+            let t = unsafe {
+                new_tunnel_with_awg_params(
+                    a_sec.as_ptr(),
+                    b_pub.as_ptr(),
+                    ptr::null(),
+                    0,
+                    1,
+                    image
+                        .as_ref()
+                        .map_or(ptr::null(), |b| b.as_ptr() as *const wireguard_awg_params),
+                    domain.as_ref().map_or(ptr::null(), |d| d.as_ptr()),
+                )
+            };
+            let why = if t.is_null() {
+                last_error_string()
+            } else {
+                String::new()
+            };
+            assert_eq!(!t.is_null(), accept, "{}: {}", name, why);
+            unsafe { tunnel_free(t) };
+        }
+    }
 }
