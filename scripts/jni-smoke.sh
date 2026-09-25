@@ -47,7 +47,12 @@ javac -d "$OUT" "$ROOT/boringtun/tests/jni/com/cloudflare/app/boringtun/BoringTu
 echo "==> running against $(java -version 2>&1 | head -1)"
 # -Xcheck:jni makes the JVM validate every JNI call this library makes, which
 # is the point of running it here rather than trusting a compile.
+#
+# The params corpus is shared with the C door: ffi::tests generates it from the
+# Rust struct and holds new_tunnel_with_awg_params to its verdicts; the harness
+# holds the JNI door to the same bytes and verdicts.
 java -Xcheck:jni \
      -Djava.library.path="$LIBDIR" \
+     -Dawg.corpus="$ROOT/boringtun/tests/jni/awg_params_corpus.txt" \
      -cp "$OUT" \
      com.cloudflare.app.boringtun.BoringTunJNI

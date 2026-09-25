@@ -35,7 +35,7 @@
 //! have turned a thrown exception into a silent `null`. [`read_key_region`]
 //! re-throws it. See its comment.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteArray, JByteBuffer, JClass, JString};
@@ -45,6 +45,8 @@ use parking_lot::Mutex;
 use std::os::raw::c_char;
 
 use crate::ffi::new_tunnel;
+use crate::ffi::new_tunnel_with_awg_params;
+use crate::ffi::wireguard_awg_params;
 use crate::ffi::wireguard_read;
 use crate::ffi::wireguard_result;
 use crate::ffi::wireguard_tick;
@@ -321,6 +323,200 @@ pub extern "C" fn create_new_tunnel<'local>(
     .resolve::<LogErrorAndDefault>()
 }
 
+/// A caller-supplied `wireguard_awg_params` image, checked against the Java
+/// array that carries it.
+///
+/// The FFI trusts the leading `size` field as the length of the caller's
+/// allocation: `read_awg_params` copies up to that many bytes, and for a newer
+/// caller scans everything past its own struct for non-zero bytes. A C caller
+/// owns that contract. Here the allocation is a copy of a Java array, so this
+/// is the one place that can prove it: the array must hold the four-byte `size`
+/// and at least `size` bytes in total. Everything else about `size` -- the
+/// published versions, the ceiling, the unknown-tail rule -- stays the FFI's to
+/// decide, so the two doors cannot disagree about it.
+///
+/// `size` is read in native byte order from possibly unaligned storage, exactly
+/// as `read_awg_params` reads it: the array *is* the native C layout, not a
+/// second serialization of it.
+///
+/// Throws `IllegalArgumentException`: an array shorter than it claims is a
+/// marshalling mistake on the Java side, not a configuration the library
+/// refused, and a silent `0` would conflate the two.
+fn checked_awg_params(env: &mut Env<'_>, params: &[u8]) -> jni::errors::Result<()> {
+    let Some(size) = params.get(..4) else {
+        let _ = env.throw_new(
+            jni_str!("java/lang/IllegalArgumentException"),
+            jni_str!("awgParams must hold at least the 4-byte size field"),
+        );
+        return Err(jni::errors::Error::JavaException);
+    };
+    let size = u32::from_ne_bytes([size[0], size[1], size[2], size[3]]) as usize;
+    if size > params.len() {
+        let _ = env.throw_new(
+            jni_str!("java/lang/IllegalArgumentException"),
+            jni_str!("awgParams declares a size larger than the array"),
+        );
+        return Err(jni::errors::Error::JavaException);
+    }
+    Ok(())
+}
+
+/// Why a Java string cannot become a C string.
+#[derive(Debug, PartialEq)]
+enum JavaStrError {
+    /// It contains U+0000, which would end the C string early.
+    Nul,
+    /// It contains an unpaired surrogate (or bytes no JVM produces), which
+    /// has no UTF-8 form at all.
+    NotUnicode,
+}
+
+/// A Java string's modified-UTF-8 bytes, as standard UTF-8 -- strictly.
+///
+/// jni's `JNIStr::to_str` is not strict: when its decoder fails it falls back
+/// to `String::from_utf8_lossy`. The failure it meets is an unpaired
+/// surrogate, which a Java string may hold and UTF-8 cannot, and the fallback
+/// then rewrites modified UTF-8's `C0 80` -- its spelling of U+0000, invalid
+/// as UTF-8 -- to U+FFFD as well, so a NUL beside such a surrogate never
+/// reaches a later NUL check. Decoding to UTF-16 here, refusing U+0000 before
+/// anything is converted, and letting `String::from_utf16` refuse unpaired
+/// surrogates keeps both failures visible.
+fn strict_java_string(mutf8: &[u8]) -> Result<String, JavaStrError> {
+    let continuation = |i: usize| mutf8.get(i).is_some_and(|&b| b & 0xc0 == 0x80);
+    let mut units = Vec::with_capacity(mutf8.len());
+    let mut i = 0;
+    while i < mutf8.len() {
+        let b = mutf8[i] as u16;
+        let (unit, len) = match mutf8[i] {
+            0x01..=0x7f => (b, 1),
+            0xc0..=0xdf if continuation(i + 1) => {
+                (((b & 0x1f) << 6) | (mutf8[i + 1] as u16 & 0x3f), 2)
+            }
+            0xe0..=0xef if continuation(i + 1) && continuation(i + 2) => (
+                ((b & 0x0f) << 12)
+                    | ((mutf8[i + 1] as u16 & 0x3f) << 6)
+                    | (mutf8[i + 2] as u16 & 0x3f),
+                3,
+            ),
+            _ => return Err(JavaStrError::NotUnicode),
+        };
+        units.push(unit);
+        i += len;
+    }
+    if units.contains(&0) {
+        return Err(JavaStrError::Nul);
+    }
+    String::from_utf16(&units).map_err(|_| JavaStrError::NotUnicode)
+}
+
+/// Creates a new tunnel from a versioned `wireguard_awg_params` image: the
+/// JNI door to [`new_tunnel_with_awg_params`], and the only one that can
+/// configure AmneziaWG. [`create_new_tunnel`] builds a plain WireGuard tunnel
+/// and is unchanged.
+///
+/// `awg_params` is the native `struct wireguard_awg_params` from
+/// `wireguard_ffi.h`, byte for byte: the published offsets, native byte order
+/// (`ByteOrder.nativeOrder()` in Java), and `size` in its first four bytes set
+/// to the version the caller built against. It is not a second encoding --
+/// versions, defaults, validation and every refusal are the C constructor's,
+/// because the bytes are handed to it unchanged. `null` means what a NULL
+/// `params` means there: a plain WireGuard tunnel. `imitation_domain` may be
+/// `null` or empty, as for the C constructor.
+///
+/// What Java sees:
+///
+/// * a handle, or `0` when the library refuses the configuration or a key --
+///   the same contract as `new_tunnel`;
+/// * `IllegalArgumentException` when `awg_params` is shorter than four bytes or
+///   than its own `size`, or when `imitation_domain` contains U+0000, which a
+///   C string cannot carry, or an unpaired surrogate, which UTF-8 cannot;
+/// * a JVM exception, left pending, if reading a Java argument fails.
+#[export_name = "Java_com_cloudflare_app_boringtun_BoringTunJNI_new_1tunnel_1with_1awg_1params"]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn create_new_tunnel_with_awg_params<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    arg_secret_key: JString<'local>,
+    arg_public_key: JString<'local>,
+    arg_preshared_key: JString<'local>,
+    keep_alive: jshort,
+    index: jint,
+    arg_awg_params: JByteArray<'local>,
+    arg_imitation_domain: JString<'local>,
+) -> jlong {
+    env.with_env(|env| -> jni::errors::Result<_> {
+        // Every pointer handed to the constructor below borrows from one of
+        // these locals, which all live until the call returns.
+        let secret_key = arg_secret_key.mutf8_chars(env)?;
+        let public_key = arg_public_key.mutf8_chars(env)?;
+        let preshared_key = if arg_preshared_key.is_null() {
+            None
+        } else {
+            Some(arg_preshared_key.mutf8_chars(env)?)
+        };
+
+        // A copy, not a pinned view: tunnel creation is not a hot path, and a
+        // `Vec` needs no release on any exit path.
+        let awg_params = if arg_awg_params.is_null() {
+            None
+        } else {
+            let bytes = env.convert_byte_array(&arg_awg_params)?;
+            checked_awg_params(env, &bytes)?;
+            Some(bytes)
+        };
+
+        // Converted to standard UTF-8, which is what the C constructor decodes:
+        // modified UTF-8 spells U+0000 and every code point above U+FFFF
+        // differently, and passing those bytes through would make the two doors
+        // disagree about the same domain. Strictly -- see `strict_java_string`.
+        let imitation_domain = if arg_imitation_domain.is_null() {
+            None
+        } else {
+            let chars = arg_imitation_domain.mutf8_chars(env)?;
+            // `CString::new` cannot fail once the decoder has refused U+0000,
+            // but its own check stays in the path: a NUL must never be passed
+            // on, whatever the decoder does.
+            let domain = strict_java_string(chars.to_bytes())
+                .and_then(|d| CString::new(d).map_err(|_| JavaStrError::Nul));
+            match domain {
+                Ok(domain) => Some(domain),
+                Err(e) => {
+                    let message = match e {
+                        JavaStrError::Nul => jni_str!("imitationDomain must not contain U+0000"),
+                        JavaStrError::NotUnicode => jni_str!(
+                            "imitationDomain contains an unpaired surrogate, which UTF-8 cannot \
+                             represent"
+                        ),
+                    };
+                    let _ = env.throw_new(jni_str!("java/lang/IllegalArgumentException"), message);
+                    return Err(jni::errors::Error::JavaException);
+                }
+            }
+        };
+
+        let tunnel = unsafe {
+            new_tunnel_with_awg_params(
+                secret_key.as_ptr(),
+                public_key.as_ptr(),
+                preshared_key
+                    .as_ref()
+                    .map_or(std::ptr::null(), |k| k.as_ptr()),
+                keep_alive as u16,
+                index as u32,
+                awg_params.as_ref().map_or(std::ptr::null(), |p| {
+                    p.as_ptr() as *const wireguard_awg_params
+                }),
+                imitation_domain
+                    .as_ref()
+                    .map_or(std::ptr::null(), |d| d.as_ptr()),
+            )
+        };
+
+        Ok(if tunnel.is_null() { 0 } else { tunnel as jlong })
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// Encrypts raw IP packets into WG formatted packets.
 #[export_name = "Java_com_cloudflare_app_boringtun_BoringTunJNI_wireguard_1write"]
 pub extern "C" fn encrypt_raw_packet<'local>(
@@ -441,4 +637,57 @@ pub extern "C" fn run_periodic_task<'local>(
         Ok(output.size as jint)
     })
     .resolve::<LogErrorAndDefault>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{strict_java_string, JavaStrError};
+
+    /// The exact modified-UTF-8 byte sequences a JVM hands over, decoded
+    /// strictly. The real-JVM harness covers the same inputs end to end; this
+    /// pins the decoder itself, byte by byte.
+    #[test]
+    fn java_strings_become_utf8_strictly() {
+        // ASCII, a two-byte BMP character, and U+1F600 as modified UTF-8
+        // spells it: a surrogate pair, three bytes per half.
+        assert_eq!(strict_java_string(b"example.com").unwrap(), "example.com");
+        assert_eq!(strict_java_string(&[0xc3, 0xa9]).unwrap(), "\u{e9}");
+        assert_eq!(
+            strict_java_string(&[0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80]).unwrap(),
+            "\u{1f600}"
+        );
+        assert_eq!(strict_java_string(b"").unwrap(), "");
+
+        // U+0000, which modified UTF-8 spells C0 80.
+        assert_eq!(
+            strict_java_string(&[b'a', 0xc0, 0x80, b'b']),
+            Err(JavaStrError::Nul)
+        );
+        // An unpaired high surrogate, an unpaired low one, and a pair in the
+        // wrong order.
+        let high = [0xed, 0xa0, 0x80];
+        let low = [0xed, 0xb0, 0x80];
+        assert_eq!(strict_java_string(&high), Err(JavaStrError::NotUnicode));
+        assert_eq!(strict_java_string(&low), Err(JavaStrError::NotUnicode));
+        assert_eq!(
+            strict_java_string(&[low, high].concat()),
+            Err(JavaStrError::NotUnicode)
+        );
+        // The reviewed defect: U+0000 beside an unpaired surrogate is still
+        // U+0000. The lossy fallback this replaced rewrote both to U+FFFD.
+        assert_eq!(
+            strict_java_string(&[&high[..], &[0xc0, 0x80], b".example"].concat()),
+            Err(JavaStrError::Nul)
+        );
+        // Bytes no JVM produces: a truncated sequence, and a four-byte UTF-8
+        // lead, which modified UTF-8 never uses.
+        assert_eq!(
+            strict_java_string(&[0xe2, 0x82]),
+            Err(JavaStrError::NotUnicode)
+        );
+        assert_eq!(
+            strict_java_string(&[0xf0, 0x9f, 0x98, 0x80]),
+            Err(JavaStrError::NotUnicode)
+        );
+    }
 }
