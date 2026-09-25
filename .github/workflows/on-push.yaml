@@ -207,6 +207,12 @@ jobs:
       - name: Check Windows
         run: cargo check -p boringtun
 
+      # The only Windows compile of the JNI bindings: the steps here otherwise
+      # use default features, and win7-msrv stays FFI-only because the jni
+      # dependency needs a newer Rust than 1.75.
+      - name: Build JNI bindings on Windows
+        run: cargo build --locked -p boringtun --features ffi-bindings,jni-bindings
+
       - name: Test Windows
         run: cargo test -p boringtun
 
