@@ -256,31 +256,6 @@ impl RngCore for Script {
     }
 }
 
-/// Counts 32-bit words drawn from an inner RNG.
-struct Counting<R> {
-    inner: R,
-    words: usize,
-}
-
-impl<R: RngCore> RngCore for Counting<R> {
-    fn next_u32(&mut self) -> u32 {
-        self.words += 1;
-        self.inner.next_u32()
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.words += 2;
-        self.inner.next_u64()
-    }
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        self.words += dest.len().div_ceil(4);
-        self.inner.fill_bytes(dest)
-    }
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
-        Ok(())
-    }
-}
-
 /// Frame `message` for the wire as the transport send path does.
 fn frame(
     cfg: &AmneziaConfig,
@@ -612,57 +587,282 @@ fn no_redraw_when_no_control_kind_fits_the_length() {
     assert_eq!(drawn, WORDS_A);
 }
 
-/// Protocol imitation, every mode: the framing is exactly what it would be
-/// with ranges that cannot collide, draw for draw, even though upstream would
-/// misread it. Imitation prefixes carry little nonce entropy, so they are out
-/// of scope until reviewed mode by mode.
+// ---------------------------------------------------------------------------
+// Protocol imitation.
+// ---------------------------------------------------------------------------
+
+/// The imitation modes whose redraws the avoidance uses, and the one it does
+/// not. `imitation_redraw_avoids_upstream_collisions` in amnezia.rs records
+/// the measurement behind each.
+const REDRAWN: [AmneziaImitationProtocol; 3] = [
+    AmneziaImitationProtocol::Dns,
+    AmneziaImitationProtocol::Quic,
+    AmneziaImitationProtocol::Stun,
+];
+
+/// Layout I: S4 = 48, which holds a full DNS header, a STUN header and a SIP
+/// request line (so SIP is SIP-shaped, not random), and every control
+/// reading lies past the prefix and the masked header -- in ciphertext -- so
+/// what a reading sees is decided by the candidate's nonce alone.
+const S_I: [usize; 4] = [120, 80, 100, 48];
+/// The transport tag, a single value so a send draws none for it.
+const TAG_I: u32 = 0xffff_ffff;
+
+/// Ranges with H2 exactly `resp`, everything else out of the way.
+fn h_resp(resp: u32) -> [(u32, u32); 4] {
+    [(10, 10), (resp, resp), (20, 20), (TAG_I, TAG_I)]
+}
+
+/// H2 covers almost every tag: a response reading in ciphertext collides for
+/// all but ~2^-23 of framings.
+const H_WIDE: [(u32, u32); 4] = [
+    (0xffff_fffc, 0xffff_fffc),
+    (5, 0xffff_fffb),
+    (0xffff_fffd, 0xffff_fffd),
+    (TAG_I, TAG_I),
+];
+
+/// The candidate framings of `message` the production filler draws from
+/// `rng` under `protocol` with prefix `s4`, and the RNG word position after
+/// each. Framed one at a time through a config with the same prefix and
+/// imitation but control thresholds no frame here reaches, so no retry can
+/// happen and each call is exactly one candidate -- the same draws, in the
+/// same order, that a retrying send makes.
+fn replay(
+    protocol: AmneziaImitationProtocol,
+    key: Option<[u8; 32]>,
+    s4: usize,
+    message: &[u8],
+    rng: &ChaCha8Rng,
+    n: usize,
+) -> (Vec<Vec<u8>>, Vec<u128>) {
+    let cfg = config([2000, 2000, 2000, s4], key, true).with_protocol_imitation(protocol, None);
+    let mut r = rng.clone();
+    let mut out = (Vec::new(), Vec::new());
+    for _ in 0..n {
+        out.0.push(frame(&cfg, ranges(h_resp(1)), message, &mut r));
+        out.1.push(r.get_word_pos());
+    }
+    out
+}
+
+/// The prefix is a well-formed instance of `protocol`'s shape.
+fn assert_shape(protocol: AmneziaImitationProtocol, prefix: &[u8]) {
+    match protocol {
+        AmneziaImitationProtocol::Dns => assert_eq!(
+            prefix[2..10],
+            [0x01, 0x20, 0x00, 0x01, 0, 0, 0, 0],
+            "DNS: flags, one question, no answer or authority records"
+        ),
+        AmneziaImitationProtocol::Stun => {
+            assert_eq!(prefix[..2], [0x00, 0x01], "STUN: Binding Request");
+            assert_eq!(prefix[4..8], [0x21, 0x12, 0xa4, 0x42], "STUN: magic cookie");
+        }
+        AmneziaImitationProtocol::Quic => {
+            assert_eq!(prefix[0] & 0xc0, 0x40, "QUIC: a 1-RTT short header")
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Each redrawn imitation mode: a candidate 1 that collides upstream is
+/// redrawn once into candidate 2 -- a fresh, well-formed prefix of the same
+/// protocol -- and the datagram is otherwise the same one: length, canonical
+/// header (counter, index, tag), ciphertext and AEAD tag. Only the prefix and
+/// the masked header differ, and exactly two candidates' randomness is drawn.
 #[test]
-fn no_redraw_under_any_protocol_imitation() {
-    // H1 covers almost the whole tag space, so a random tag at S1 collides.
-    let wide = [
-        (5, 0xffff_fe00),
-        (0xffff_fe01, 0xffff_fe80),
-        (0xffff_fe81, 0xffff_feff),
-        (0xffff_ff00, 0xffff_ffff),
-    ];
-    let narrow = [
-        (5, 5),
-        (0xffff_fe01, 0xffff_fe80),
-        (0xffff_fe81, 0xffff_feff),
-        (0xffff_ff00, 0xffff_ffff),
-    ];
-    let s = [20, 28, 36, 200];
-    let message = canonical(600, 0xffff_ff10);
-    for protocol in [
-        AmneziaImitationProtocol::Dns,
-        AmneziaImitationProtocol::Quic,
-        AmneziaImitationProtocol::Sip,
-        AmneziaImitationProtocol::Stun,
-    ] {
-        let cfg = config(s, Some(KEY), true).with_protocol_imitation(protocol, None);
-        let run = |h: [(u32, u32); 4]| {
-            let mut rng = Counting {
-                inner: ChaCha8Rng::seed_from_u64(77),
-                words: 0,
-            };
-            let wire = frame(&cfg, ranges(h), &message, &mut rng);
-            (wire, rng.words)
-        };
-        let (with_wide, words_wide) = run(wide);
-        let (with_narrow, words_narrow) = run(narrow);
+fn a_colliding_imitated_frame_is_redrawn_within_its_protocol() {
+    for protocol in REDRAWN {
+        let message = canonical(600 - S_I[DATA], TAG_I);
+        let rng = ChaCha8Rng::seed_from_u64(0x1317 + protocol as u64);
+        let (cands, pos) = replay(protocol, Some(KEY), S_I[DATA], &message, &rng, 2);
+        let resp1 = decoded(&cands[0], S_I[RESP], KEY);
+        let h = h_resp(resp1);
         assert_eq!(
-            upstream_first_match(&with_wide, s, wide, Some(KEY), true),
-            Some(INIT),
-            "{:?}: an avoiding sender would have redrawn this",
+            upstream_first_match(&cands[0], S_I, h, Some(KEY), true),
+            Some(RESP)
+        );
+        assert_eq!(
+            upstream_first_match(&cands[1], S_I, h, Some(KEY), true),
+            Some(DATA),
+            "{:?}: fixture -- candidate 2 reads as transport",
             protocol
         );
-        assert_eq!(with_wide, with_narrow, "{:?}: the same framing", protocol);
+
+        let mut r = rng.clone();
+        let wire = frame(
+            &config(S_I, Some(KEY), true).with_protocol_imitation(protocol, None),
+            ranges(h),
+            &message,
+            &mut r,
+        );
+        assert_eq!(wire, cands[1], "{:?}: candidate 2 went out", protocol);
         assert_eq!(
-            words_wide, words_narrow,
-            "{:?}: the same randomness",
+            r.get_word_pos(),
+            pos[1],
+            "{:?}: two candidates drawn, no more",
+            protocol
+        );
+        assert_shape(protocol, &cands[0][..S_I[DATA]]);
+        assert_shape(protocol, &wire[..S_I[DATA]]);
+        assert_ne!(wire[..12], cands[0][..12], "{:?}: a new nonce", protocol);
+        if protocol == AmneziaImitationProtocol::Dns {
+            assert_eq!(
+                wire[2..12],
+                cands[0][2..12],
+                "DNS: only the transaction ID moves the nonce"
+            );
+        }
+
+        let s4 = S_I[DATA];
+        assert_eq!(wire.len(), cands[0].len(), "{:?}: same length", protocol);
+        assert_eq!(
+            unmasked_header(&wire, s4, KEY),
+            message[..16],
+            "{:?}: same header",
+            protocol
+        );
+        assert_eq!(
+            wire[s4 + 16..],
+            message[16..],
+            "{:?}: same ciphertext and tag",
+            protocol
+        );
+        assert!(
+            (0..wire.len())
+                .filter(|&i| wire[i] != cands[0][i])
+                .all(|i| i < s4 + 16),
+            "{:?}: only prefix and masked-header bytes differ",
             protocol
         );
     }
+}
+
+/// Each redrawn imitation mode: sixteen colliding framings send the
+/// sixteenth, and a seventeenth is never drawn.
+#[test]
+fn sixteen_colliding_imitated_framings_send_the_sixteenth() {
+    for protocol in REDRAWN {
+        let message = canonical(600 - S_I[DATA], TAG_I);
+        let rng = ChaCha8Rng::seed_from_u64(0x1616 + protocol as u64);
+        let (cands, pos) = replay(protocol, Some(KEY), S_I[DATA], &message, &rng, 16);
+        for (n, c) in cands.iter().enumerate() {
+            assert_eq!(
+                upstream_first_match(c, S_I, H_WIDE, Some(KEY), true),
+                Some(RESP),
+                "{:?}: fixture -- candidate {} collides",
+                protocol,
+                n + 1
+            );
+        }
+        let mut r = rng.clone();
+        let cfg = config(S_I, Some(KEY), true).with_protocol_imitation(protocol, None);
+        let wire = frame(&cfg, ranges(H_WIDE), &message, &mut r);
+        assert_eq!(wire, cands[15], "{:?}: candidate 16 is sent", protocol);
+        assert_eq!(
+            r.get_word_pos(),
+            pos[15],
+            "{:?}: sixteen candidates drawn, no seventeenth",
+            protocol
+        );
+        assert_eq!(unmasked_header(&wire, S_I[DATA], KEY), message[..16]);
+        assert_eq!(wire[S_I[DATA] + 16..], message[16..]);
+    }
+}
+
+/// The upstream length test decides eligibility under imitation exactly as it
+/// does without: `>=` with RandomTrailers, `==` without, one byte either side
+/// of the response threshold S2 + 92.
+#[test]
+fn imitated_frames_follow_the_upstream_length_test() {
+    let need = S_I[RESP] + BASE[RESP];
+    for protocol in REDRAWN {
+        for (rt, len, redrawn) in [
+            (true, need - 1, false),
+            (true, need, true),
+            (true, need + 7, true),
+            (false, need - 1, false),
+            (false, need, true),
+            (false, need + 1, false),
+        ] {
+            let message = canonical(len - S_I[DATA], TAG_I);
+            let rng = ChaCha8Rng::seed_from_u64(0x9000 + len as u64 + protocol as u64);
+            let (cands, pos) = replay(protocol, Some(KEY), S_I[DATA], &message, &rng, 2);
+            let h = h_resp(decoded(&cands[0], S_I[RESP], KEY));
+            assert_ne!(decoded(&cands[1], S_I[RESP], KEY), h[RESP].0, "fixture");
+            let mut r = rng.clone();
+            let cfg = config(S_I, Some(KEY), rt).with_protocol_imitation(protocol, None);
+            let wire = frame(&cfg, ranges(h), &message, &mut r);
+            let (expect, words) = if redrawn {
+                (&cands[1], pos[1])
+            } else {
+                (&cands[0], pos[0])
+            };
+            assert_eq!(&wire, expect, "{:?} rt={} len={}", protocol, rt, len);
+            assert_eq!(
+                r.get_word_pos(),
+                words,
+                "{:?} rt={} len={}",
+                protocol,
+                rt,
+                len
+            );
+        }
+    }
+}
+
+/// Header protection off stays excluded under imitation: the colliding first
+/// framing is sent as it is, with one candidate's randomness drawn.
+#[test]
+fn imitated_frames_are_not_redrawn_without_header_protection() {
+    for protocol in REDRAWN {
+        let message = canonical(600 - S_I[DATA], TAG_I);
+        let rng = ChaCha8Rng::seed_from_u64(0x4e4f + protocol as u64);
+        let (cands, pos) = replay(protocol, None, S_I[DATA], &message, &rng, 1);
+        let o = S_I[RESP];
+        let raw = u32::from_le_bytes(cands[0][o..o + 4].try_into().unwrap());
+        let h = h_resp(raw);
+        assert_eq!(
+            upstream_first_match(&cands[0], S_I, h, None, true),
+            Some(RESP)
+        );
+        let mut r = rng.clone();
+        let cfg = config(S_I, None, true).with_protocol_imitation(protocol, None);
+        let wire = frame(&cfg, ranges(h), &message, &mut r);
+        assert_eq!(wire, cands[0], "{:?}", protocol);
+        assert_eq!(
+            r.get_word_pos(),
+            pos[0],
+            "{:?}: one candidate drawn",
+            protocol
+        );
+    }
+}
+
+/// SIP stays excluded. With a prefix long enough for a request line its nonce
+/// is one of three fixed strings, and a measured fraction of frames has no
+/// framing an upstream receiver reads as transport -- so a colliding SIP
+/// frame is sent as the filler first drew it, with no retry.
+#[test]
+fn sip_imitation_is_not_redrawn() {
+    let protocol = AmneziaImitationProtocol::Sip;
+    let message = canonical(600 - S_I[DATA], TAG_I);
+    let rng = ChaCha8Rng::seed_from_u64(0x5195);
+    let (cands, pos) = replay(protocol, Some(KEY), S_I[DATA], &message, &rng, 1);
+    assert!(
+        [&b"OPTIONS sip:"[..], b"REGISTER sip", b"MESSAGE sip:"].contains(&&cands[0][..12]),
+        "fixture: a SIP-shaped prefix"
+    );
+    let h = h_resp(decoded(&cands[0], S_I[RESP], KEY));
+    assert_eq!(
+        upstream_first_match(&cands[0], S_I, h, Some(KEY), true),
+        Some(RESP)
+    );
+    let mut r = rng.clone();
+    let cfg = config(S_I, Some(KEY), true).with_protocol_imitation(protocol, None);
+    let wire = frame(&cfg, ranges(h), &message, &mut r);
+    assert_eq!(wire, cands[0], "sent as first drawn, still colliding");
+    assert_eq!(r.get_word_pos(), pos[0], "one candidate drawn");
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,6 +1344,171 @@ fn the_stock_installer_profile_emits_no_upstream_collisions() {
             match b.decapsulate(None, &wire, &mut bbuf) {
                 TunnResult::WriteToTunnelV4(p, _) => assert_eq!(p, &packet[..]),
                 other => panic!("rt={} len={}: {:?}", rt, len, other),
+            }
+        }
+    }
+}
+
+/// Imitation end to end through `Tunn`, for every mode.
+///
+/// Both peers handshake without imitation, then switch to the imitation
+/// profile (`set_obfuscation`), so every transport frame checked here is
+/// framed by the imitation filler. The layout draws nothing per send but the
+/// prefixes -- single-value padding and H4, unset timers -- so the initiator's
+/// seeded RNG, replayed from a clone through `replay`, names every candidate
+/// a send drew, and the send's word consumption is exact.
+///
+/// For a redrawn mode, H2 covers almost every tag, so each send exhausts:
+/// sixteen candidates, all misread upstream, candidate 16 on the wire, no
+/// seventeenth drawn. For SIP, one candidate is drawn and sent colliding.
+/// Either way the peer decapsulates every frame to what was sent, counters
+/// run on with no gap, `tx_bytes` and the session move exactly as for one
+/// send, and a replayed frame is refused.
+fn imitated_session_keeps_one_sends_worth_of_state(
+    protocol: AmneziaImitationProtocol,
+    redrawn: bool,
+) {
+    let base = config(S_I, Some(KEY), true).with_content_padding_addition(16, 16, 1420);
+    let (mut a, mut b, confirmation) = tunnels(&base, H_WIDE);
+    let s4 = S_I[DATA];
+    let counter_of = |wire: &[u8]| {
+        let h = unmasked_header(wire, s4, KEY);
+        u64::from_le_bytes(h[8..16].try_into().unwrap())
+    };
+    assert_eq!(counter_of(&confirmation), 0, "the confirmation keepalive");
+
+    let imitated = base.with_protocol_imitation(protocol, None);
+    a.set_obfuscation(ranges(H_WIDE), imitated.clone());
+    b.set_obfuscation(ranges(H_WIDE), imitated);
+    a.handshake.rng = ChaCha8Rng::seed_from_u64(0xe2e0 + protocol as u64);
+
+    let (mut abuf, mut bbuf) = (vec![0u8; 4096], vec![0u8; 4096]);
+    let mut last = Vec::new();
+    for (i, len) in [300usize, 700, 1200, 84].iter().copied().enumerate() {
+        let packet = ipv4(len, i as u8);
+        let before = a.handshake.rng.clone();
+        let (tx_before, current_before) = (a.tx_bytes, a.current);
+        let wire = match a.encapsulate(&packet, &mut abuf) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("{:?} {}: {:?}", protocol, len, other),
+        };
+        let mut message = unmasked_header(&wire, s4, KEY);
+        message.extend_from_slice(&wire[s4 + 16..]);
+        let n = if redrawn { 16 } else { 1 };
+        let (cands, pos) = replay(protocol, Some(KEY), s4, &message, &before, n);
+        for (k, c) in cands.iter().enumerate() {
+            assert_ne!(
+                upstream_first_match(c, S_I, H_WIDE, Some(KEY), true),
+                Some(DATA),
+                "{:?} {}: candidate {} is misread upstream",
+                protocol,
+                len,
+                k + 1
+            );
+        }
+        assert_eq!(
+            wire,
+            cands[n - 1],
+            "{:?} {}: candidate {} is on the wire",
+            protocol,
+            len,
+            n
+        );
+        assert_eq!(
+            a.handshake.rng.get_word_pos(),
+            pos[n - 1],
+            "{:?} {}: exactly {} candidate(s) drawn",
+            protocol,
+            len,
+            n
+        );
+        assert_eq!(
+            counter_of(&wire),
+            1 + i as u64,
+            "{:?} {}: the next counter",
+            protocol,
+            len
+        );
+        assert_eq!(
+            a.tx_bytes,
+            tx_before + len,
+            "{:?} {}: tx_bytes once",
+            protocol,
+            len
+        );
+        assert_eq!(
+            a.current, current_before,
+            "{:?} {}: same session",
+            protocol, len
+        );
+        match b.decapsulate(None, &wire, &mut bbuf) {
+            TunnResult::WriteToTunnelV4(p, _) => {
+                assert_eq!(p, &packet[..], "{:?} {}", protocol, len)
+            }
+            other => panic!("{:?} {}: {:?}", protocol, len, other),
+        }
+        last = wire;
+    }
+    assert!(
+        matches!(b.decapsulate(None, &last, &mut bbuf), TunnResult::Err(_)),
+        "{:?}: a replayed frame is refused",
+        protocol
+    );
+}
+
+#[test]
+fn redrawn_imitation_keeps_one_sends_worth_of_state_end_to_end() {
+    for protocol in REDRAWN {
+        imitated_session_keeps_one_sends_worth_of_state(protocol, true);
+    }
+}
+
+#[test]
+fn sip_imitation_is_sent_as_drawn_end_to_end() {
+    imitated_session_keeps_one_sends_worth_of_state(AmneziaImitationProtocol::Sip, false);
+}
+
+/// The live installer profile under each redrawn mode, RandomTrailers on and
+/// off: across tiny, medium and near-MTU packets no emitted frame is misread
+/// upstream, and the peer takes every one. (At ~5% per framing, sixteen
+/// framings all colliding has probability below 1e-18.)
+#[test]
+fn the_stock_installer_profile_under_imitation_emits_no_upstream_collisions() {
+    let s = [136, 59, 149, 16];
+    let h = [
+        (21806348, 121806347),
+        (880390969, 980390968),
+        (1131164401, 1231164400),
+        (1662290386, 1762290385),
+    ];
+    for protocol in REDRAWN {
+        for rt in [true, false] {
+            let base = config(s, Some(KEY), rt).with_content_padding_addition(10, 100, 1420);
+            let (mut a, mut b, _) = tunnels(&base, h);
+            let imitated = base.with_protocol_imitation(protocol, None);
+            a.set_obfuscation(ranges(h), imitated.clone());
+            b.set_obfuscation(ranges(h), imitated);
+            a.handshake.rng = ChaCha8Rng::seed_from_u64(0x57c0 + protocol as u64);
+            let (mut abuf, mut bbuf) = (vec![0u8; 4096], vec![0u8; 4096]);
+            for i in 0..1000usize {
+                let len = [20, 84, 300, 1000, 1392][i % 5];
+                let packet = ipv4(len, i as u8);
+                let wire = match a.encapsulate(&packet, &mut abuf) {
+                    TunnResult::WriteToNetwork(d) => d.to_vec(),
+                    other => panic!("{:?}", other),
+                };
+                assert_eq!(
+                    upstream_first_match(&wire, s, h, Some(KEY), rt),
+                    Some(DATA),
+                    "{:?} rt={} len={}: upstream would misread this frame",
+                    protocol,
+                    rt,
+                    len
+                );
+                match b.decapsulate(None, &wire, &mut bbuf) {
+                    TunnResult::WriteToTunnelV4(p, _) => assert_eq!(p, &packet[..]),
+                    other => panic!("{:?} rt={} len={}: {:?}", protocol, rt, len, other),
+                }
             }
         }
     }
