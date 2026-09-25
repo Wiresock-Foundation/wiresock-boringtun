@@ -626,9 +626,10 @@ impl Tunn {
         self.pending_amnezia_junk.is_some()
     }
 
-    /// This tunnel's AmneziaWG configuration. For the device tests, which
-    /// cannot see the field.
-    #[cfg(all(test, feature = "device"))]
+    /// This tunnel's AmneziaWG configuration. For the device and FFI tests,
+    /// which cannot see the field -- the FFI ones to check what a constructor
+    /// actually built, not just what its parameter adapter returned.
+    #[cfg(all(test, any(feature = "device", feature = "ffi-bindings")))]
     pub(crate) fn amnezia_config(&self) -> &AmneziaConfig {
         &self.amnezia
     }
