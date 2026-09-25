@@ -35,7 +35,7 @@
 //! have turned a thrown exception into a silent `null`. [`read_key_region`]
 //! re-throws it. See its comment.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteArray, JByteBuffer, JClass, JString};
@@ -45,6 +45,8 @@ use parking_lot::Mutex;
 use std::os::raw::c_char;
 
 use crate::ffi::new_tunnel;
+use crate::ffi::new_tunnel_with_awg_params;
+use crate::ffi::wireguard_awg_params;
 use crate::ffi::wireguard_read;
 use crate::ffi::wireguard_result;
 use crate::ffi::wireguard_tick;
@@ -313,6 +315,143 @@ pub extern "C" fn create_new_tunnel<'local>(
                 0,
                 0,
                 0,
+            )
+        };
+
+        Ok(if tunnel.is_null() { 0 } else { tunnel as jlong })
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// A caller-supplied `wireguard_awg_params` image, checked against the Java
+/// array that carries it.
+///
+/// The FFI trusts the leading `size` field as the length of the caller's
+/// allocation: `read_awg_params` copies up to that many bytes, and for a newer
+/// caller scans everything past its own struct for non-zero bytes. A C caller
+/// owns that contract. Here the allocation is a copy of a Java array, so this
+/// is the one place that can prove it: the array must hold the four-byte `size`
+/// and at least `size` bytes in total. Everything else about `size` -- the
+/// published versions, the ceiling, the unknown-tail rule -- stays the FFI's to
+/// decide, so the two doors cannot disagree about it.
+///
+/// `size` is read in native byte order from possibly unaligned storage, exactly
+/// as `read_awg_params` reads it: the array *is* the native C layout, not a
+/// second serialization of it.
+///
+/// Throws `IllegalArgumentException`: an array shorter than it claims is a
+/// marshalling mistake on the Java side, not a configuration the library
+/// refused, and a silent `0` would conflate the two.
+fn checked_awg_params(env: &mut Env<'_>, params: &[u8]) -> jni::errors::Result<()> {
+    let Some(size) = params.get(..4) else {
+        let _ = env.throw_new(
+            jni_str!("java/lang/IllegalArgumentException"),
+            jni_str!("awgParams must hold at least the 4-byte size field"),
+        );
+        return Err(jni::errors::Error::JavaException);
+    };
+    let size = u32::from_ne_bytes([size[0], size[1], size[2], size[3]]) as usize;
+    if size > params.len() {
+        let _ = env.throw_new(
+            jni_str!("java/lang/IllegalArgumentException"),
+            jni_str!("awgParams declares a size larger than the array"),
+        );
+        return Err(jni::errors::Error::JavaException);
+    }
+    Ok(())
+}
+
+/// Creates a new tunnel from a versioned `wireguard_awg_params` image: the
+/// JNI door to [`new_tunnel_with_awg_params`], and the only one that can
+/// configure AmneziaWG. [`create_new_tunnel`] builds a plain WireGuard tunnel
+/// and is unchanged.
+///
+/// `awg_params` is the native `struct wireguard_awg_params` from
+/// `wireguard_ffi.h`, byte for byte: the published offsets, native byte order
+/// (`ByteOrder.nativeOrder()` in Java), and `size` in its first four bytes set
+/// to the version the caller built against. It is not a second encoding --
+/// versions, defaults, validation and every refusal are the C constructor's,
+/// because the bytes are handed to it unchanged. `null` means what a NULL
+/// `params` means there: a plain WireGuard tunnel. `imitation_domain` may be
+/// `null` or empty, as for the C constructor.
+///
+/// What Java sees:
+///
+/// * a handle, or `0` when the library refuses the configuration or a key --
+///   the same contract as `new_tunnel`;
+/// * `IllegalArgumentException` when `awg_params` is shorter than four bytes or
+///   than its own `size`, or `imitation_domain` contains U+0000, which a C
+///   string cannot carry;
+/// * a JVM exception, left pending, if reading a Java argument fails.
+#[export_name = "Java_com_cloudflare_app_boringtun_BoringTunJNI_new_1tunnel_1with_1awg_1params"]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn create_new_tunnel_with_awg_params<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    arg_secret_key: JString<'local>,
+    arg_public_key: JString<'local>,
+    arg_preshared_key: JString<'local>,
+    keep_alive: jshort,
+    index: jint,
+    arg_awg_params: JByteArray<'local>,
+    arg_imitation_domain: JString<'local>,
+) -> jlong {
+    env.with_env(|env| -> jni::errors::Result<_> {
+        // Every pointer handed to the constructor below borrows from one of
+        // these locals, which all live until the call returns.
+        let secret_key = arg_secret_key.mutf8_chars(env)?;
+        let public_key = arg_public_key.mutf8_chars(env)?;
+        let preshared_key = if arg_preshared_key.is_null() {
+            None
+        } else {
+            Some(arg_preshared_key.mutf8_chars(env)?)
+        };
+
+        // A copy, not a pinned view: tunnel creation is not a hot path, and a
+        // `Vec` needs no release on any exit path.
+        let awg_params = if arg_awg_params.is_null() {
+            None
+        } else {
+            let bytes = env.convert_byte_array(&arg_awg_params)?;
+            checked_awg_params(env, &bytes)?;
+            Some(bytes)
+        };
+
+        // Converted to standard UTF-8, which is what the C constructor decodes:
+        // modified UTF-8 spells U+0000 and every code point above U+FFFF
+        // differently, and passing those bytes through would make the two doors
+        // disagree about the same domain.
+        let imitation_domain = if arg_imitation_domain.is_null() {
+            None
+        } else {
+            let chars = arg_imitation_domain.mutf8_chars(env)?;
+            match CString::new(chars.to_str().as_bytes()) {
+                Ok(domain) => Some(domain),
+                Err(_) => {
+                    let _ = env.throw_new(
+                        jni_str!("java/lang/IllegalArgumentException"),
+                        jni_str!("imitationDomain must not contain U+0000"),
+                    );
+                    return Err(jni::errors::Error::JavaException);
+                }
+            }
+        };
+
+        let tunnel = unsafe {
+            new_tunnel_with_awg_params(
+                secret_key.as_ptr(),
+                public_key.as_ptr(),
+                preshared_key
+                    .as_ref()
+                    .map_or(std::ptr::null(), |k| k.as_ptr()),
+                keep_alive as u16,
+                index as u32,
+                awg_params.as_ref().map_or(std::ptr::null(), |p| {
+                    p.as_ptr() as *const wireguard_awg_params
+                }),
+                imitation_domain
+                    .as_ref()
+                    .map_or(std::ptr::null(), |d| d.as_ptr()),
             )
         };
 
