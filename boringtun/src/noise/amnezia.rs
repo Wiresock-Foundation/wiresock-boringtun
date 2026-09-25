@@ -2051,22 +2051,19 @@ impl AmneziaConfig {
     }
 
     /// Whether an outbound frame gets the upstream-collision check at all:
-    /// transport only, with header protection on, no protocol imitation, and
-    /// a final wire length that admits at least one control reading upstream.
+    /// transport only, with header protection on, an imitation protocol whose
+    /// redraws are known to steer clear (see
+    /// [`imitation_redraw_avoids_upstream_collisions`]), and a final wire
+    /// length that admits at least one control reading upstream.
     ///
-    /// Imitation is excluded because it makes the S4 prefix -- which is the
-    /// header-protection nonce -- protocol-shaped rather than random: DNS
-    /// varies mostly in its transaction id, STUN and SIP in a few fields, so a
-    /// redraw may not change the nonce, or may cycle through a handful of
-    /// them. Each mode needs its own review before it can be included.
-    /// Header protection off is skipped too, deliberately: with no mask, a
-    /// redraw changes only readings whose offset lies inside the S4 prefix,
-    /// never those in the header or ciphertext, so prefix-only avoidance is
-    /// not generally sufficient there. A broader strategy is out of scope.
+    /// Header protection off is skipped, deliberately: with no mask, a redraw
+    /// changes only readings whose offset lies inside the S4 prefix, never
+    /// those in the header or ciphertext, so prefix-only avoidance is not
+    /// generally sufficient there. A broader strategy is out of scope.
     fn upstream_collision_applies(&self, kind: PacketKind, wire_len: usize) -> bool {
         kind == PacketKind::TransportData
             && self.header_protection_enabled()
-            && self.imitation.protocol == AmneziaImitationProtocol::None
+            && imitation_redraw_avoids_upstream_collisions(self.imitation.protocol)
             && UPSTREAM_CONTROL_KINDS
                 .iter()
                 .any(|&(control, base)| self.upstream_control_length_fits(control, base, wire_len))
@@ -2119,7 +2116,9 @@ impl AmneziaConfig {
     /// datagram that `upstream_control_collision` says an upstream receiver
     /// would misread, by drawing a new S4 prefix -- a new header-protection
     /// nonce, so the mask every candidate tag is read through changes -- and
-    /// masking the canonical header under it.
+    /// masking the canonical header under it. The new prefix comes from the
+    /// same filler as the first, so under protocol imitation every candidate
+    /// is a fresh, equally valid instance of that protocol's prefix.
     ///
     /// `datagram` is the fully framed candidate 1, masked from `canonical`.
     /// Everything the protocol authenticates or counts is already final and
@@ -2254,6 +2253,45 @@ impl AmneziaConfig {
                 fill_protocol_like(protocol, self.imitation.domain(), dst, trailing_size, rng)
             }
         }
+    }
+}
+
+/// Whether redrawing a transport frame's S4 prefix under `protocol` reliably
+/// moves it off an upstream control reading, so the upstream-collision
+/// avoidance may retry it.
+///
+/// Decided per protocol from measurement of the production filler, not from
+/// its shape alone, and matched exhaustively so that a new protocol cannot
+/// become eligible without its own decision. A redraw helps only through the
+/// header-protection nonce -- the prefix's first 12 bytes -- and whatever
+/// else of the prefix a control reading covers:
+///
+/// * `None`: the prefix is uniformly random.
+/// * `Quic`: a short header whose first byte takes 16 values and whose next
+///   11 bytes are random, for every S4.
+/// * `Stun`: bytes 8..12 are transaction-ID bytes, so 2^32 nonces.
+/// * `Dns`: bytes 0..2 are the transaction ID, the rest of the header fixed,
+///   so 65,536 nonces -- each a different mask, enough that sixteen framings
+///   essentially never all collide, including when a control reading covers
+///   the fixed query bytes.
+/// * `Sip`: excluded. Once the prefix holds a request line (31 bytes or
+///   more) its first 12 bytes are one of three -- `OPTIONS sip:`,
+///   `REGISTER sip`, `MESSAGE sip:` -- and a control reading may cover the
+///   fixed request text itself, so some frames have no framing an upstream
+///   receiver reads as transport; measured, 16 framings exhausted for
+///   roughly 0.16% of eligible frames across installer-style profiles.
+///
+/// Eligibility says only that the redraw fixes the upstream first-match
+/// misreading. It says nothing about header-protection strength: a 16- or
+/// 32-bit nonce space repeats the header mask far sooner than a random
+/// prefix does, which is a separate property of those imitation modes.
+fn imitation_redraw_avoids_upstream_collisions(protocol: AmneziaImitationProtocol) -> bool {
+    match protocol {
+        AmneziaImitationProtocol::None
+        | AmneziaImitationProtocol::Quic
+        | AmneziaImitationProtocol::Stun
+        | AmneziaImitationProtocol::Dns => true,
+        AmneziaImitationProtocol::Sip => false,
     }
 }
 
