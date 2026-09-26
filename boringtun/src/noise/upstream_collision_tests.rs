@@ -1383,19 +1383,25 @@ fn the_stock_installer_profile_emits_no_upstream_collisions() {
 /// sent colliding. Either way the peer decapsulates every frame to what was
 /// sent, counters run on with no gap, `tx_bytes` and the session move exactly
 /// as for one send, and a replayed frame is refused.
+///
+/// `s` is layout Q's S sizes, or for SIP [`S_QS`]: layout Q with S4 cut to 28,
+/// every S below the SIP request-line threshold, because header protection
+/// refuses SIP imitation with any longer prefix. The readings stay in the
+/// prefix either way.
 fn imitated_session_keeps_one_sends_worth_of_state(
     protocol: AmneziaImitationProtocol,
     redrawn: bool,
+    s: [usize; 4],
 ) {
-    let s4 = S_Q[DATA];
+    let s4 = s[DATA];
     for kind in [INIT, RESP, COOKIE] {
         assert!(
-            S_Q[kind] >= 12 && S_Q[kind] + 4 <= s4,
+            s[kind] >= 12 && s[kind] + 4 <= s4,
             "fixture: control reading {} lies in the prefix, past the nonce",
             kind
         );
     }
-    let base = config_q();
+    let base = config(s, Some(KEY), true).with_content_padding_addition(PAD_Q, PAD_Q, 1420);
     let (mut a, mut b, confirmation) = tunnels(&base, H_Q);
     let counter_of = |wire: &[u8]| {
         let h = unmasked_header(wire, s4, KEY);
@@ -1404,8 +1410,12 @@ fn imitated_session_keeps_one_sends_worth_of_state(
     assert_eq!(counter_of(&confirmation), 0, "the confirmation keepalive");
 
     let imitated = base.with_protocol_imitation(protocol, None);
-    a.set_obfuscation(ranges(H_Q), imitated.clone());
-    b.set_obfuscation(ranges(H_Q), imitated);
+    // `try_`, so a refused configuration fails here instead of leaving both
+    // tunnels on the non-imitated one.
+    a.try_set_obfuscation(ranges(H_Q), imitated.clone())
+        .expect("header protection accepts this imitation layout");
+    b.try_set_obfuscation(ranges(H_Q), imitated)
+        .expect("header protection accepts this imitation layout");
     // Seeds every prefix the sends below draw; with the readings in the
     // prefix, that decides every candidate's upstream verdict.
     a.handshake.rng = ChaCha8Rng::seed_from_u64(0xe2e0 + protocol as u64);
@@ -1425,7 +1435,7 @@ fn imitated_session_keeps_one_sends_worth_of_state(
         let n = if redrawn { 16 } else { 1 };
         let (cands, pos) = replay(protocol, Some(KEY), s4, &message, &before, n);
         for (k, c) in cands.iter().enumerate() {
-            let verdict = upstream_first_match(c, S_Q, H_Q, Some(KEY), true);
+            let verdict = upstream_first_match(c, s, H_Q, Some(KEY), true);
             assert_ne!(
                 verdict,
                 Some(DATA),
@@ -1443,8 +1453,8 @@ fn imitated_session_keeps_one_sends_worth_of_state(
             let mask = keystream(KEY, c, 4);
             let mut out_of_range = c.clone();
             for kind in [INIT, RESP, COOKIE] {
-                for i in (0..4).filter(|&i| S_Q[kind] + i >= s4) {
-                    out_of_range[S_Q[kind] + i] = mask[i];
+                for i in (0..4).filter(|&i| s[kind] + i >= s4) {
+                    out_of_range[s[kind] + i] = mask[i];
                 }
             }
             let mut zeros = c.clone();
@@ -1453,7 +1463,7 @@ fn imitated_session_keeps_one_sends_worth_of_state(
             ones[s4..].fill(0xff);
             for sessionless in [zeros, ones, out_of_range] {
                 assert_eq!(
-                    upstream_first_match(&sessionless, S_Q, H_Q, Some(KEY), true),
+                    upstream_first_match(&sessionless, s, H_Q, Some(KEY), true),
                     verdict,
                     "{:?} {}: candidate {}'s verdict depends on its prefix alone",
                     protocol,
@@ -1515,13 +1525,22 @@ fn imitated_session_keeps_one_sends_worth_of_state(
 #[test]
 fn redrawn_imitation_keeps_one_sends_worth_of_state_end_to_end() {
     for protocol in REDRAWN {
-        imitated_session_keeps_one_sends_worth_of_state(protocol, true);
+        imitated_session_keeps_one_sends_worth_of_state(protocol, true, S_Q);
     }
 }
 
+/// Layout Q with S4 = 28: every S below the SIP request-line threshold (31),
+/// the only SIP layout header protection accepts, and still long enough to
+/// hold every control reading (the last ends at byte 24).
+const S_QS: [usize; 4] = [16, 20, 12, 28];
+
+/// SIP stays outside the upstream-collision redraw whatever its prefix looks
+/// like: the eligibility decision is per protocol, and the header-protection
+/// policy -- which admits SIP with header protection only below the
+/// request-line threshold, where its prefix is random -- does not change it.
 #[test]
 fn sip_imitation_is_sent_as_drawn_end_to_end() {
-    imitated_session_keeps_one_sends_worth_of_state(AmneziaImitationProtocol::Sip, false);
+    imitated_session_keeps_one_sends_worth_of_state(AmneziaImitationProtocol::Sip, false, S_QS);
 }
 
 /// The live installer profile under each redrawn mode, RandomTrailers on and

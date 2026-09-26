@@ -62,6 +62,12 @@ const QUIC_JUNK_SIZE_MIN: usize = 1200;
 const QUIC_JUNK_SIZE_MAX: usize = 1252;
 const SIP_JUNK_SIZE_MIN: usize = 200;
 const SIP_JUNK_SIZE_MAX: usize = 1200;
+/// The shortest S prefix `fill_sip` writes a SIP request line into. Below it
+/// the prefix stays random; from it up, the prefix's first 12 bytes -- the
+/// header-protection nonce -- are the start of one of a few fixed request
+/// lines. One constant for the generator and for the header-protection policy
+/// that refuses what the generator does to the nonce.
+const SIP_REQUEST_LINE_MIN: usize = 31;
 const STUN_JUNK_SIZE_MIN: usize = 28;
 const STUN_JUNK_SIZE_MAX: usize = 100;
 // RFC 5389 STUN magic cookie, present at bytes 4..8 of every STUN message.
@@ -143,6 +149,38 @@ impl std::str::FromStr for AmneziaImitationProtocol {
             .find(|p| p.as_str() == s)
             .ok_or(())
     }
+}
+
+/// What protocol imitation leaves of the header-protection nonce.
+///
+/// Header protection nonces each datagram with the first 12 bytes of its own
+/// S prefix, and imitation shapes that prefix, so the imitation protocol
+/// decides how many distinct nonces -- and so distinct header-protection masks
+/// -- one key sees. A repeated nonce repeats the mask, which lets an observer
+/// compare the masked headers of those datagrams: weaker header masking and
+/// easier traffic fingerprinting. The WireGuard payload's encryption and
+/// authentication do not depend on it. Measured on the production fillers,
+/// and derived only by [`AmneziaConfig::header_protection_nonce`], the one
+/// classifier every configuration door consults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeaderProtectionNonce {
+    /// Random, or all but a few fixed bits: no imitation (12 random bytes),
+    /// QUIC (a short-header first byte taking 16 values, then 11 random
+    /// bytes), and SIP while every S is below [`SIP_REQUEST_LINE_MIN`], where
+    /// the SIP filler leaves the prefix random.
+    Full,
+    /// STUN: the message type, length and magic cookie are fixed, so only the
+    /// four transaction-ID bytes 8..12 vary -- a nonce space of about 2^32.
+    /// A repeat becomes likely after roughly 77,000 datagrams under one key.
+    Bounded32,
+    /// DNS: only the 16-bit transaction ID varies -- 65,536 nonces. A repeat
+    /// is likely within about 300 datagrams, and on a long-lived key most
+    /// datagrams share their mask with an earlier one.
+    Weak16,
+    /// SIP with any S at [`SIP_REQUEST_LINE_MIN`] or more: that prefix starts
+    /// with one of a few fixed request lines, so its nonce takes a handful of
+    /// values and nearly every datagram repeats a mask. Refused.
+    Degenerate,
 }
 
 /// Browser fingerprint for QUIC protocol imitation. All variants emit a full
@@ -1074,6 +1112,106 @@ impl AmneziaConfig {
         self.header_protection.is_set()
     }
 
+    /// S1..S4 with their names, in packet-kind order.
+    fn labelled_junk_sizes(&self) -> [(&'static str, u16); 4] {
+        [
+            ("S1", self.init_packet_junk_size),
+            ("S2", self.response_packet_junk_size),
+            ("S3", self.cookie_packet_junk_size),
+            ("S4", self.transport_packet_junk_size),
+        ]
+    }
+
+    /// The header-protection nonce this configuration's imitation leaves, or
+    /// `None` without a header-protection key, where there is no nonce.
+    ///
+    /// The single source of the header-protection policy under imitation:
+    /// [`Self::check_header_protection_nonce`] refuses
+    /// [`HeaderProtectionNonce::Degenerate`] for every door, and
+    /// `header_protection_nonce_complaint` words the warnings the doors log.
+    /// Decided by the key, the imitation protocol and -- for SIP only -- the S
+    /// sizes, since the imitation filler shapes every packet kind's prefix.
+    /// An exhaustive match: a new imitation protocol does not compile until
+    /// it has a classification of its own.
+    pub(crate) fn header_protection_nonce(&self) -> Option<HeaderProtectionNonce> {
+        if !self.header_protection_enabled() {
+            return None;
+        }
+        Some(match self.imitation.protocol {
+            AmneziaImitationProtocol::None | AmneziaImitationProtocol::Quic => {
+                HeaderProtectionNonce::Full
+            }
+            AmneziaImitationProtocol::Stun => HeaderProtectionNonce::Bounded32,
+            AmneziaImitationProtocol::Dns => HeaderProtectionNonce::Weak16,
+            AmneziaImitationProtocol::Sip => match self.sip_request_line_prefix() {
+                Some(_) => HeaderProtectionNonce::Degenerate,
+                None => HeaderProtectionNonce::Full,
+            },
+        })
+    }
+
+    /// The first S size long enough for the SIP filler to write a request
+    /// line into, as `(name, size)`; `None` while every S is below
+    /// [`SIP_REQUEST_LINE_MIN`].
+    fn sip_request_line_prefix(&self) -> Option<(&'static str, u16)> {
+        self.labelled_junk_sizes()
+            .iter()
+            .copied()
+            .find(|&(_, size)| size as usize >= SIP_REQUEST_LINE_MIN)
+    }
+
+    /// The warning a configuration door logs for an accepted header-protection
+    /// nonce weaker than random, or `None` when there is nothing to say --
+    /// no key, a random nonce, or a SIP request line (refused, not warned).
+    ///
+    /// Gated like [`Self::cookie_amplification_complaint`], for the same
+    /// reason: the doors that log it are `device::api` and the C struct
+    /// constructor, so without either feature it would be dead code.
+    #[cfg(any(test, feature = "device", feature = "ffi-bindings"))]
+    pub(crate) fn header_protection_nonce_complaint(&self) -> Option<String> {
+        match self.header_protection_nonce()? {
+            HeaderProtectionNonce::Full | HeaderProtectionNonce::Degenerate => None,
+            HeaderProtectionNonce::Bounded32 => Some(
+                "STUN imitation shapes the header-protection nonce (the first 12 bytes \
+                 of each S prefix): only the 4 transaction-ID bytes vary, a bounded \
+                 nonce space of about 2^32, so on a long-lived key nonces repeat -- a \
+                 repeat becomes likely after roughly 77,000 datagrams -- and each nonce \
+                 reuse repeats the header-protection mask. Repeated masks weaken header \
+                 masking and make traffic easier to fingerprint; payload encryption \
+                 and authentication are unaffected."
+                    .to_owned(),
+            ),
+            HeaderProtectionNonce::Weak16 => Some(
+                "DNS imitation shapes the header-protection nonce (the first 12 bytes \
+                 of each S prefix): only the 16-bit DNS transaction ID varies, so there \
+                 are just 65,536 nonces. Nonce reuse is quick -- a repeat is likely \
+                 within about 300 datagrams, and on a long-lived key most datagrams \
+                 repeat an earlier header-protection mask -- which substantially \
+                 weakens header masking and makes traffic easier to fingerprint. \
+                 Payload encryption and authentication are unaffected. Prefer QUIC \
+                 imitation where header masking matters."
+                    .to_owned(),
+            ),
+        }
+    }
+
+    /// Log [`Self::header_protection_nonce_complaint`] at WARN, if there is
+    /// one. The one reporter the configuration doors share, so the wording and
+    /// the fields live here rather than in each door. Called once per
+    /// accepted configuration by the door that accepted it, not by `Tunn`,
+    /// which a device builds and reconfigures once per peer.
+    #[cfg(any(feature = "device", feature = "ffi-bindings"))]
+    pub(crate) fn warn_header_protection_nonce(&self) {
+        if let Some(complaint) = self.header_protection_nonce_complaint() {
+            tracing::warn!(
+                message = "protocol imitation weakens AmneziaWG header protection: \
+                           the header-protection nonce space is small, so masks repeat",
+                protocol = self.imitation.protocol.as_str(),
+                detail = %complaint
+            );
+        }
+    }
+
     /// The header-protection key as lowercase hex, or `None` when unset.
     ///
     /// Deliberately the only way out of [`HeaderProtectionKey`]: it exists so
@@ -1103,8 +1241,9 @@ impl AmneziaConfig {
         self
     }
 
-    /// The header-protection nonce rule on its own: every S size must be able to
-    /// supply the 12 nonce bytes once a key is set.
+    /// The header-protection nonce rules on their own: every S size must be
+    /// able to supply the 12 nonce bytes once a key is set, and the imitation
+    /// must leave those bytes more than a few fixed values (below).
     ///
     /// Header protection nonces every datagram with its own first 12 bytes, so a
     /// prefix shorter than that cannot supply one. Refused rather than silently
@@ -1131,16 +1270,25 @@ impl AmneziaConfig {
     ///
     /// Parity with amneziawg-go, which refuses the same four sizes in
     /// `mergeWithDevice` against its own `HeaderCipherNonceSize = 12`.
+    ///
+    /// The second rule is the header-protection policy's one refusal: SIP
+    /// imitation with any S at [`SIP_REQUEST_LINE_MIN`] or more
+    /// ([`HeaderProtectionNonce::Degenerate`]). The SIP filler writes a
+    /// request line into such a prefix, so its nonce is one of a few fixed
+    /// strings and nearly every datagram repeats a mask: the key is configured
+    /// and the masking it stands for is effectively absent, which an operator
+    /// could not tell from a working setup. Every other imitation loads -- the
+    /// weaker STUN and DNS nonces with a warning from the door that accepts
+    /// them (`header_protection_nonce_complaint`). Here rather than in
+    /// [`Self::validate`] alone because this is the check every door runs:
+    /// the `Tunn` constructors, `Tunn::set_obfuscation`, and through
+    /// `validate` the UAPI `set=1` and the C struct constructor behind JNI.
+    /// Not an amneziawg-go rule -- its S bytes are always random.
     pub(crate) fn check_header_protection_nonce(&self) -> Result<(), String> {
         if !self.header_protection_enabled() {
             return Ok(());
         }
-        for (label, junk) in [
-            ("S1", self.init_packet_junk_size),
-            ("S2", self.response_packet_junk_size),
-            ("S3", self.cookie_packet_junk_size),
-            ("S4", self.transport_packet_junk_size),
-        ] {
+        for (label, junk) in self.labelled_junk_sizes() {
             if (junk as usize) < NONCE_SIZE {
                 return Err(format!(
                     "{} is {} bytes, but header protection needs at least {} \
@@ -1148,6 +1296,23 @@ impl AmneziaConfig {
                     label, junk, NONCE_SIZE, label
                 ));
             }
+        }
+        if self.header_protection_nonce() == Some(HeaderProtectionNonce::Degenerate) {
+            let (label, size) = self
+                .sip_request_line_prefix()
+                .expect("a degenerate nonce is a SIP request-line prefix");
+            return Err(format!(
+                "SIP imitation with header protection: {} is {} bytes, and from {} bytes \
+                 the SIP imitation writes a request line into the S prefix, so the \
+                 header-protection nonce (its first 12 bytes) takes only a few fixed \
+                 values and header protection's masking is effectively absent. Keep \
+                 S1-S4 at {} or below, choose another imitation protocol, or disable \
+                 header protection",
+                label,
+                size,
+                SIP_REQUEST_LINE_MIN,
+                SIP_REQUEST_LINE_MIN - 1
+            ));
         }
         Ok(())
     }
@@ -1192,6 +1357,13 @@ impl AmneziaConfig {
     /// `cookie_amplification_complaint`; not linked, because a `pub` doc cannot
     /// link a `pub(crate)` item.
     ///
+    /// The header-protection policy under protocol imitation follows the same
+    /// split. QUIC loads silently; STUN and DNS load, and the doors warn that
+    /// their header-protection nonce space is small; SIP with any S of 31 bytes
+    /// or more is refused -- through the header-protection check this runs
+    /// first -- because the SIP request line leaves header protection's
+    /// masking effectively absent.
+    ///
     /// [`Tunn::decapsulate`]: crate::noise::Tunn::decapsulate
     pub fn validate(&self) -> Result<(), String> {
         // First, and as its own pass rather than interleaved with the size rule
@@ -1211,32 +1383,14 @@ impl AmneziaConfig {
             }
         }
 
-        // Header protection and protocol imitation both want the first bytes of
-        // the datagram, for incompatible reasons: the first wants them random
-        // because it uses them as a nonce, the second wants them protocol-shaped
-        // because that is the disguise. Imitation wins on the wire, so the nonce
-        // repeats -- a DNS header varies only in its transaction id, and a SIP
-        // request line hardly at all.
-        //
-        // Warned, not refused, and the distinction is the point. Nothing under
-        // the keystream is secret: a handshake carries the message type, sender
-        // index, the unencrypted ephemeral key and two AEAD ciphertexts, all of
-        // which vanilla WireGuard sends in the clear, so a repeated nonce leaks
-        // no plaintext and no key material. What it loses is unmasking
-        // resistance -- and under imitation the datagram already presents as
-        // DNS or SIP, so that was doing little of the work anyway. An operator
-        // with a reason to run both should be allowed to.
-        if self.header_protection_enabled()
-            && self.imitation.protocol != AmneziaImitationProtocol::None
-        {
-            tracing::warn!(
-                message = "header protection and protocol imitation are both enabled; \
-                           the imitation prefix is the header-protection nonce, so it \
-                           repeats and the masking can be undone by an observer who \
-                           collects two datagrams. Traffic is unaffected.",
-                protocol = ?self.imitation.protocol
-            );
-        }
+        // Header protection under protocol imitation is judged per protocol by
+        // `header_protection_nonce`, not here: its one refusal (a SIP request
+        // line in the prefix) is in `check_header_protection_nonce` above, and
+        // the weaker-but-working STUN and DNS nonces are warnings the accepting
+        // door logs through `warn_header_protection_nonce` -- `validate` stays
+        // silent and says only what is valid. Nothing under the mask is
+        // secret: a repeated nonce repeats the mask, which weakens header
+        // masking, and leaks no payload plaintext or key material.
 
         // Timer floors. These are OURS, deliberately: neither amneziawg-go's
         // UAPI nor the kernel module's netlink validates timer values at all,
@@ -2457,7 +2611,7 @@ fn fill_stun(dst: &mut [u8], rng: &mut impl RngCore) {
 
 fn fill_sip(dst: &mut [u8], domain: Option<&str>, rng: &mut impl RngCore) {
     fill_random(dst, rng);
-    if dst.len() < 31 {
+    if dst.len() < SIP_REQUEST_LINE_MIN {
         return;
     }
 

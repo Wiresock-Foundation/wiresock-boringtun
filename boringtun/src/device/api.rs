@@ -324,6 +324,14 @@ impl AwgParams {
             );
         }
 
+        // Header protection under protocol imitation: `validate` above has
+        // already refused the one combination that leaves the masking
+        // effectively absent (SIP with a request line in the prefix); STUN and
+        // DNS load, and their smaller nonce space is warned about here, once
+        // per `set=1` whose merged result earns it -- including a transaction
+        // that only sets the key, since imitation arrives at startup.
+        amnezia.warn_header_protection_nonce();
+
         Ok((obf, amnezia))
     }
 }
@@ -2368,5 +2376,159 @@ mod tests {
         // Non-zero starts are unaffected.
         assert_eq!(parse_tag_range("1"), Some((1, 1)));
         assert_eq!(parse_tag_range("1-5"), Some((1, 5)));
+    }
+
+    /// `set=1` applies the header-protection policy under protocol imitation.
+    /// Imitation reaches a device only at startup (boringtun-cli's
+    /// `--imitate-protocol`) and the key only over the UAPI, so the merge is
+    /// what first sees the two together: shaped SIP is EINVAL whether the
+    /// transaction carries the sizes or only the key; any single S at 31 is
+    /// enough and every S at 30 is not; QUIC, STUN and DNS load, imitation
+    /// intact.
+    #[test]
+    fn set_refuses_header_protection_over_shaped_sip_and_loads_the_rest() {
+        use crate::noise::amnezia::AmneziaImitationProtocol as P;
+        const KEY: [u8; 32] = [0x6b; 32];
+        let startup = |protocol| AmneziaConfig::default().with_protocol_imitation(protocol, None);
+        let merge = |protocol, s: [u16; 4]| {
+            let mut p = AwgParams::default();
+            for (key, size) in ["s1", "s2", "s3", "s4"].iter().zip(s.iter()) {
+                p.set_size(key, *size);
+            }
+            p.set_header_protection(KEY);
+            p.merged(ObfuscationRanges::default(), &startup(protocol), 1420)
+        };
+
+        assert_eq!(merge(P::Sip, [136, 59, 149, 16]).map(|_| ()), Err(EINVAL));
+        for field in 0..4 {
+            let mut s = [30; 4];
+            s[field] = 31;
+            assert_eq!(merge(P::Sip, s).map(|_| ()), Err(EINVAL), "{:?}", s);
+        }
+        merge(P::Sip, [30; 4]).expect("every S at 30: a random SIP prefix");
+
+        // The CLI's order: sizes already set, then a transaction with the key.
+        let running = AmneziaConfig::new(136, 59, 149, 16).with_protocol_imitation(P::Sip, None);
+        let mut key_only = AwgParams::default();
+        key_only.set_header_protection(KEY);
+        assert_eq!(
+            key_only
+                .merged(ObfuscationRanges::default(), &running, 1420)
+                .map(|_| ()),
+            Err(EINVAL)
+        );
+
+        for protocol in [P::None, P::Quic, P::Stun, P::Dns] {
+            let (_, loaded) = merge(protocol, [136, 59, 149, 16])
+                .unwrap_or_else(|e| panic!("{:?} must load: errno {}", protocol, e));
+            assert_eq!(loaded.imitation.protocol, protocol);
+            assert!(loaded.header_protection_enabled());
+        }
+    }
+
+    /// The warnings reach the log from `set=1`: STUN's and DNS's, each naming
+    /// its protocol, at WARN, and nothing for QUIC. All three applications
+    /// share one subscriber scope, so the warned two prove the capture worked
+    /// for the silent one; the retry is the tracing-cache one of
+    /// `an_amplification_prone_set_warns_with_the_complaint_and_only_then`.
+    #[test]
+    fn set_warns_about_stun_and_dns_header_protection_and_not_quic() {
+        let _serialized = crate::tracing_test_lock();
+        use crate::noise::amnezia::AmneziaImitationProtocol as P;
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Default)]
+        struct Captured {
+            level: String,
+            fields: String,
+        }
+        impl Visit for Captured {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.fields += &format!("{}={} ", field.name(), value);
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.fields += &format!("{}={:?} ", field.name(), value);
+            }
+        }
+        struct Capture(Arc<StdMutex<Vec<Captured>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let mut c = Captured {
+                    level: event.metadata().level().to_string(),
+                    ..Default::default()
+                };
+                event.record(&mut c);
+                self.0.lock().unwrap().push(c);
+            }
+        }
+
+        let apply = |protocol| {
+            let mut p = AwgParams::default();
+            // Parity sizes (64 + 88 = 152 <= 92 + 60), so no cookie warning
+            // shares the capture.
+            for (key, size) in [("s1", 88), ("s2", 60), ("s3", 88), ("s4", 16)] {
+                p.set_size(key, size);
+            }
+            p.set_header_protection([0x6b; 32]);
+            p.merged(
+                ObfuscationRanges::default(),
+                &AmneziaConfig::default().with_protocol_imitation(protocol, None),
+                1420,
+            )
+            .expect("loads")
+        };
+        let run = || -> Vec<Captured> {
+            let events: Arc<StdMutex<Vec<Captured>>> = Arc::new(StdMutex::new(Vec::new()));
+            {
+                let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+                tracing::subscriber::with_default(subscriber, || {
+                    apply(P::Quic);
+                    apply(P::Stun);
+                    apply(P::Dns);
+                });
+            }
+            let captured = std::mem::take(&mut *events.lock().unwrap());
+            captured
+        };
+        let warned = |c: &[Captured], protocol: &str| {
+            c.iter()
+                .filter(|c| c.fields.contains("header-protection nonce"))
+                .filter(|c| c.fields.contains(&format!("protocol={}", protocol)))
+                .count()
+        };
+
+        let mut captured = Vec::new();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tracing::callsite::rebuild_interest_cache();
+            }
+            captured = run();
+            if warned(&captured, "stun") == 1 && warned(&captured, "dns") == 1 {
+                break;
+            }
+        }
+        let all: Vec<(&String, &String)> = captured.iter().map(|c| (&c.level, &c.fields)).collect();
+        assert_eq!(warned(&captured, "stun"), 1, "STUN warns once: {:?}", all);
+        assert_eq!(warned(&captured, "dns"), 1, "DNS warns once: {:?}", all);
+        assert_eq!(warned(&captured, "quic"), 0, "QUIC does not: {:?}", all);
+        assert!(
+            captured
+                .iter()
+                .filter(|c| c.fields.contains("header-protection nonce"))
+                .all(|c| c.level == "WARN"),
+            "warnings, not errors: {:?}",
+            all
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|c| c.fields.contains("protocol=dns") && c.fields.contains("16-bit")),
+            "the DNS warning carries its detail: {:?}",
+            all
+        );
     }
 }

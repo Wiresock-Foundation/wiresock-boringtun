@@ -674,7 +674,10 @@ public class BoringTunJNI {
                             + ", the C door " + (accept ? "accepts" : "refuses") + ")");
                     }
                 }
-                check(cases == 22 && agreed == cases,
+                // 27: the 22 original cases and the five header-protection
+                // policy cases (hp-sip-s1-40 refused, hp-sip-all-s-30, hp-dns,
+                // hp-stun, hp-quic accepted).
+                check(cases == 27 && agreed == cases,
                       "all " + cases + " corpus cases reach the C door's verdict (" + agreed + " agreed)");
                 // The corpus is generated from the Rust struct; the builder above
                 // is hand-written from the header. Equal bytes pin the builder's
