@@ -17,6 +17,8 @@ pub mod header_protection;
 // because the device's anonymous ingress drives it too.
 #[cfg(test)]
 mod disable_cookies_tests;
+#[cfg(test)]
+mod hp_imitation_policy_tests;
 pub(crate) mod inbound;
 #[cfg(test)]
 mod live_reframe_tests;
@@ -411,7 +413,7 @@ impl Tunn {
     ///
     /// # Errors
     ///
-    /// Two. Seeding the per-tunnel RNG from OS entropy, which is real but rare.
+    /// Three. Seeding the per-tunnel RNG from OS entropy, which is real but rare.
     /// And, when `amnezia` carries a header-protection key, any of S1..S4 below
     /// `NONCE_SIZE`: header protection takes each datagram's nonce from its own
     /// junk prefix, so a prefix shorter than that cannot supply one and the
@@ -421,6 +423,12 @@ impl Tunn {
     /// completes one; S3 costs cookie replies under load; S4 means the
     /// handshake completes and then no data crosses. The error names the
     /// offending size. Configurations without a key are unaffected.
+    ///
+    /// With a key, also SIP protocol imitation with any of S1..S4 at 31 bytes
+    /// or more: the SIP imitation writes a request line into such a prefix, so
+    /// its first 12 bytes -- the header-protection nonce -- take only a few
+    /// fixed values and the masking is effectively absent. The error names the
+    /// size and the remedies. Every other imitation is accepted here.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_obfuscation(
         static_private: x25519::StaticSecret,
@@ -565,7 +573,48 @@ impl Tunn {
     /// deadline and replace the in-flight cycle's retransmission budget, which
     /// is precisely the per-session and per-cycle latching the caches exist to
     /// provide.
+    ///
+    /// The header-protection rules the constructors enforce apply here too:
+    /// a configuration they would refuse -- an S size below the 12-byte
+    /// header-protection nonce, or SIP imitation whose request line would
+    /// leave header protection's masking effectively absent -- is not
+    /// installed. This method cannot report that, so it logs the refusal at
+    /// ERROR and the tunnel keeps its previous configuration whole: nothing
+    /// of the refused one is applied. Use [`Self::try_set_obfuscation`] to
+    /// be told.
     pub fn set_obfuscation(&mut self, obf: ObfuscationRanges, amnezia: AmneziaConfig) {
+        if let Err(e) = self.try_set_obfuscation(obf, amnezia) {
+            tracing::error!(
+                message = "refusing AmneziaWG parameters; the tunnel keeps its previous ones",
+                error = %e
+            );
+        }
+    }
+
+    /// As [`Self::set_obfuscation`], but reporting a refusal instead of
+    /// logging it.
+    ///
+    /// # Errors
+    ///
+    /// The header-protection refusals of [`Self::new_with_obfuscation`], named
+    /// the same way. On an error nothing is changed.
+    pub fn try_set_obfuscation(
+        &mut self,
+        obf: ObfuscationRanges,
+        amnezia: AmneziaConfig,
+    ) -> Result<(), String> {
+        // The same check, and the only one, the constructors run: without it
+        // this would be the one door into a configuration they refuse.
+        amnezia.check_header_protection_nonce()?;
+        self.apply_obfuscation(obf, amnezia);
+        Ok(())
+    }
+
+    /// Install `obf` and `amnezia` unchecked -- see [`Self::set_obfuscation`]
+    /// for what is kept and what is rebuilt. Only through
+    /// [`Self::try_set_obfuscation`], and directly in tests that need a
+    /// configuration no door lets in, to pin the send-time backstops.
+    fn apply_obfuscation(&mut self, obf: ObfuscationRanges, amnezia: AmneziaConfig) {
         let timers_changed = self.amnezia.timers != amnezia.timers;
         let burst = self.amnezia.pending_burst_change(&amnezia);
         self.handshake.set_obfuscation(obf);
@@ -3087,12 +3136,13 @@ mod tests {
     /// no way to notice.
     /// A zero S size with header protection on must not emit in the clear.
     ///
-    /// The constructors now refuse this configuration outright, so the only door
-    /// left into it is `set_obfuscation`, which is public and infallible -- it
-    /// takes an already-built `AmneziaConfig` and cannot report a problem. This
-    /// is the backstop for that door. Refusing to send is the only safe answer:
-    /// emitting unmasked is precisely what setting a key is meant to prevent,
-    /// and the caller cannot tell it happened.
+    /// Every door refuses this configuration now -- the constructors, and
+    /// `set_obfuscation`, which keeps the previous configuration instead. What
+    /// is left is the send-time backstop, for a configuration no door lets in:
+    /// installed here through the unchecked `apply_obfuscation`. Refusing to
+    /// send is the only safe answer: emitting unmasked is precisely what
+    /// setting a key is meant to prevent, and the caller could not tell it
+    /// happened.
     #[test]
     fn a_zero_prefix_with_header_protection_refuses_rather_than_emitting_cleartext() {
         // S1 = 0, so the very first packet -- the handshake initiation -- has no
@@ -3106,11 +3156,21 @@ mod tests {
              about the path that bypasses it"
         );
 
-        // Built valid, then switched to the broken config the way a live device
-        // would -- this is the path no `Result` guards.
         let (mut my_tun, _their_tun) =
             create_two_tuns_with_amnezia(AmneziaConfig::new(120, 130, 110, 80));
-        my_tun.set_obfuscation(Default::default(), broken);
+        let before = my_tun.amnezia.clone();
+        assert!(
+            my_tun
+                .try_set_obfuscation(Default::default(), broken.clone())
+                .expect_err("the live setter refuses it too")
+                .contains("S1 is 0 bytes"),
+            "and names the size"
+        );
+        my_tun.set_obfuscation(Default::default(), broken.clone());
+        assert_eq!(my_tun.amnezia, before, "refused, so nothing was applied");
+
+        // Past every door, to reach the backstop.
+        my_tun.apply_obfuscation(Default::default(), broken);
 
         let packet = create_ipv4_udp_packet();
         let mut dst = vec![0u8; 2048];
