@@ -1128,12 +1128,13 @@ pub struct wireguard_awg_params {
     /// point exists to expose -- is therefore refused. Pinned by
     /// `ffi::tests::awg_params_header_protection_needs_twelve_byte_s_prefixes`.
     ///
-    /// A key combined with a non-zero `imitation_protocol` is *accepted* and
-    /// weakens the masking: the imitation prefix is the nonce, so it repeats
-    /// and an observer with two datagrams can undo the masking. Traffic is
-    /// unaffected. That warning goes to `tracing`, not to
-    /// `last_tunnel_error()`, so a C caller sees it only through
-    /// `set_logging_function`.
+    /// With a non-zero `imitation_protocol` the imitation prefix is the nonce,
+    /// so the protocol decides what is left of it. QUIC is accepted silently.
+    /// STUN (about 2^32 nonces) and DNS (65,536) are accepted with a warning
+    /// that masks repeat -- to `tracing`, not to `last_tunnel_error()`, so a C
+    /// caller sees it only through `set_logging_function`. SIP with any S of
+    /// 31 or more is refused (NULL): its request line leaves the masking
+    /// effectively absent. Payload encryption is unaffected either way.
     pub header_protection_key: [u8; 32],
     /// AmneziaWG 3.1 RandomTrailers: `1` on, `0` off. Any other value is
     /// refused, so a caller that meant something else is told rather than
@@ -1807,7 +1808,9 @@ fn awg_params_to_config(
 ///   `{n, 0}` is a fixed value only for `h1_init`..`h4_data`;
 /// * a `header_protection_key` set while any of `s1_init_junk`..
 ///   `s4_transport_junk` is below 12, the header-protection nonce length --
-///   which makes a struct carrying *only* a key a refused call;
+///   which makes a struct carrying *only* a key a refused call -- or set with
+///   SIP imitation while any of them is 31 or more, where the SIP request line
+///   leaves the header-protection nonce a few fixed values;
 /// * `content_padding_addition` set while `content_padding_mtu` is 0;
 /// * timers ordered so that keys would be rejected before the rekey replacing
 ///   them completes.
@@ -1931,6 +1934,12 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
             detail = %complaint
         );
     }
+
+    // Header protection under protocol imitation, as `set=1` judges it:
+    // `validate` above refused SIP with a request line in the prefix; STUN
+    // and DNS are accepted and warned about through the same reporter, at
+    // WARN, never through `last_tunnel_error()`.
+    amnezia.warn_header_protection_nonce();
 
     new_tunnel_with_amnezia_config(
         static_private,
@@ -5021,6 +5030,10 @@ mod tests {
             p.imitation_protocol = AmneziaImitationProtocol::Quic as u32;
             p.header_protection_key = [0; 32];
         });
+        // The base image -- header protection on, S1..S4 = 40/36/28/20 --
+        // imitating `protocol`.
+        let hp_imitating =
+            |protocol: AmneziaImitationProtocol| with(&|p| p.imitation_protocol = protocol as u32);
 
         let cases: Vec<CorpusCase> = vec![
             ("null-params", true, None, None),
@@ -5166,6 +5179,69 @@ mod tests {
                 Some("\u{1f600}.example"),
                 Some(image(&dns, V2, V2, &[])),
             ),
+            // Header protection under imitation: the base image carries a key
+            // and S1 = 40, so SIP on it is the refused, request-line case.
+            (
+                "hp-sip-s1-40",
+                false,
+                None,
+                Some(image(
+                    &hp_imitating(AmneziaImitationProtocol::Sip),
+                    V2,
+                    V2,
+                    &[],
+                )),
+            ),
+            (
+                "hp-sip-all-s-30",
+                true,
+                None,
+                Some(image(
+                    &with(&|p| {
+                        p.imitation_protocol = AmneziaImitationProtocol::Sip as u32;
+                        p.s1_init_junk = 30;
+                        p.s2_response_junk = 30;
+                        p.s3_cookie_junk = 28;
+                        p.s4_transport_junk = 20;
+                    }),
+                    V2,
+                    V2,
+                    &[],
+                )),
+            ),
+            (
+                "hp-dns",
+                true,
+                None,
+                Some(image(
+                    &hp_imitating(AmneziaImitationProtocol::Dns),
+                    V2,
+                    V2,
+                    &[],
+                )),
+            ),
+            (
+                "hp-stun",
+                true,
+                None,
+                Some(image(
+                    &hp_imitating(AmneziaImitationProtocol::Stun),
+                    V2,
+                    V2,
+                    &[],
+                )),
+            ),
+            (
+                "hp-quic",
+                true,
+                None,
+                Some(image(
+                    &hp_imitating(AmneziaImitationProtocol::Quic),
+                    V2,
+                    V2,
+                    &[],
+                )),
+            ),
         ];
 
         let mut out = String::from(
@@ -5241,5 +5317,162 @@ mod tests {
             assert_eq!(!t.is_null(), accept, "{}: {}", name, why);
             unsafe { tunnel_free(t) };
         }
+    }
+
+    /// Build through `new_tunnel_with_awg_params` with header protection, the
+    /// given sizes and imitation; the error string on NULL.
+    fn hp_imitation_tunnel(
+        protocol: AmneziaImitationProtocol,
+        s: [u32; 4],
+    ) -> Result<*mut Mutex<Tunn>, String> {
+        let (a_sec, _, _, b_pub) = awg31_keys();
+        let params = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER2 as u32,
+            s1_init_junk: s[0],
+            s2_response_junk: s[1],
+            s3_cookie_junk: s[2],
+            s4_transport_junk: s[3],
+            imitation_protocol: protocol as u32,
+            header_protection_key: [0x6b; 32],
+            ..Default::default()
+        };
+        last_tunnel_error_free();
+        let t = unsafe {
+            new_tunnel_with_awg_params(
+                a_sec.as_ptr(),
+                b_pub.as_ptr(),
+                ptr::null(),
+                0,
+                1,
+                &params,
+                ptr::null(),
+            )
+        };
+        if t.is_null() {
+            Err(last_error_string())
+        } else {
+            assert!(
+                last_tunnel_error().is_null(),
+                "a non-NULL return must leave the error slot empty"
+            );
+            Ok(t)
+        }
+    }
+
+    /// The C door refuses header protection over shaped SIP -- NULL, with the
+    /// policy's reason in `last_tunnel_error()` -- from 31 bytes in any S, and
+    /// builds random-prefix SIP, QUIC, STUN and DNS.
+    #[test]
+    fn awg_params_refuse_header_protection_over_shaped_sip() {
+        use AmneziaImitationProtocol as P;
+        let err = hp_imitation_tunnel(P::Sip, [40, 36, 28, 20])
+            .expect_err("shaped SIP with header protection is refused");
+        assert!(
+            err.starts_with("Invalid AmneziaWG parameters: SIP imitation with header protection"),
+            "{}",
+            err
+        );
+        assert!(err.contains("S1 is 40 bytes"), "{}", err);
+        for field in 0..4 {
+            let mut s = [30; 4];
+            s[field] = 31;
+            assert!(hp_imitation_tunnel(P::Sip, s).is_err(), "{:?}", s);
+        }
+        for (protocol, s) in [
+            (P::Sip, [30, 30, 30, 30]),
+            (P::Quic, [40, 36, 28, 20]),
+            (P::Stun, [40, 36, 28, 20]),
+            (P::Dns, [40, 36, 28, 20]),
+        ] {
+            let t = hp_imitation_tunnel(protocol, s)
+                .unwrap_or_else(|e| panic!("{:?} {:?} must build: {}", protocol, s, e));
+            unsafe { tunnel_free(t) };
+        }
+    }
+
+    /// The C door logs STUN's and DNS's header-protection warning at WARN and
+    /// none for QUIC, and a warned build still leaves the error slot empty.
+    /// One subscriber scope, the warned two proving the capture for QUIC, with
+    /// the tracing-cache retry of
+    /// `an_amplifying_s3_warns_and_leaves_the_error_slot_empty`.
+    #[test]
+    fn awg_params_warn_about_stun_and_dns_header_protection_and_not_quic() {
+        let _serialized = crate::tracing_test_lock();
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+        use AmneziaImitationProtocol as P;
+
+        #[derive(Default)]
+        struct Captured {
+            level: String,
+            fields: String,
+        }
+        impl Visit for Captured {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.fields += &format!("{}={} ", field.name(), value);
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.fields += &format!("{}={:?} ", field.name(), value);
+            }
+        }
+        struct Capture(Arc<StdMutex<Vec<Captured>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let mut c = Captured {
+                    level: event.metadata().level().to_string(),
+                    ..Default::default()
+                };
+                event.record(&mut c);
+                self.0.lock().unwrap().push(c);
+            }
+        }
+
+        let run = || -> Vec<Captured> {
+            let events: Arc<StdMutex<Vec<Captured>>> = Arc::new(StdMutex::new(Vec::new()));
+            {
+                let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+                tracing::subscriber::with_default(subscriber, || {
+                    for protocol in [P::Quic, P::Stun, P::Dns] {
+                        let t = hp_imitation_tunnel(protocol, [40, 36, 28, 20])
+                            .unwrap_or_else(|e| panic!("{:?}: {}", protocol, e));
+                        unsafe { tunnel_free(t) };
+                    }
+                });
+            }
+            let captured = std::mem::take(&mut *events.lock().unwrap());
+            captured
+        };
+        let warned = |c: &[Captured], protocol: &str| {
+            c.iter()
+                .filter(|c| c.fields.contains("header-protection nonce"))
+                .filter(|c| c.fields.contains(&format!("protocol={}", protocol)))
+                .count()
+        };
+
+        let mut captured = Vec::new();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tracing::callsite::rebuild_interest_cache();
+            }
+            captured = run();
+            if warned(&captured, "stun") == 1 && warned(&captured, "dns") == 1 {
+                break;
+            }
+        }
+        let all: Vec<(&String, &String)> = captured.iter().map(|c| (&c.level, &c.fields)).collect();
+        assert_eq!(warned(&captured, "stun"), 1, "STUN warns once: {:?}", all);
+        assert_eq!(warned(&captured, "dns"), 1, "DNS warns once: {:?}", all);
+        assert_eq!(warned(&captured, "quic"), 0, "QUIC does not: {:?}", all);
+        assert!(
+            captured
+                .iter()
+                .filter(|c| c.fields.contains("header-protection nonce"))
+                .all(|c| c.level == "WARN"),
+            "{:?}",
+            all
+        );
     }
 }
