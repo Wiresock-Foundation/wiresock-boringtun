@@ -2486,4 +2486,71 @@ allowed_ip=10.66.66.2/32",
         assert_eq!(bindable(fresh), HELD, "fresh port {}", fresh);
         assert_eq!(conn_fd(&wg, &key), None, "a real rebind shuts it down");
     }
+
+    /// A UAPI request that fails instead of blocking if no worker serves it
+    /// within `timeout`.
+    #[cfg(target_os = "linux")]
+    fn uapi_within(wg: &WGHandle, request: &str, timeout: Duration) -> std::io::Result<String> {
+        let path = format!("/var/run/wireguard/{}.sock", wg.name);
+        let mut socket = UnixStream::connect(path)?;
+        socket.set_read_timeout(Some(timeout))?;
+        write!(socket, "{}\n\n", request)?;
+        let mut reply = String::new();
+        socket.read_to_string(&mut reply)?;
+        Ok(reply)
+    }
+
+    /// A panic inside a device write leaves the device working.
+    ///
+    /// `try_writeable` raises the device's write intent before its closures
+    /// run, and each worker's next `Lock::read` waits for the intent to drop.
+    /// It used to be dropped only on return, so a panic in a write -- the
+    /// listener-rebind panic fixed in #65 was one -- left it raised for good,
+    /// and every worker, the UAPI included, waited forever. Driven here
+    /// through the device lock the way `set=1` drives it, yield included,
+    /// rather than by planting a panic in production code.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_panic_in_a_device_write_leaves_the_device_working() {
+        const SERVED: Duration = Duration::from_secs(10);
+        let wg = single_queue_device();
+        let (old, new) = (free_port(), free_port());
+        assert_eq!(wg.wg_set_port(old), UAPI_OK);
+
+        {
+            let mut device = wg._device.device.read();
+            // `AssertUnwindSafe`: the closure borrows the guard mutably, and
+            // looking at the device after a write unwound is the point.
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                device.try_writeable(
+                    |d| d.trigger_yield(),
+                    |d| {
+                        d.cancel_yield();
+                        panic!("in a device write")
+                    },
+                )
+            }))
+            .unwrap_err();
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"in a device write"),
+                "the panic propagates as is"
+            );
+        }
+
+        // The workers yielded to that write; they must get the device back.
+        let get = uapi_within(&wg, "get=1", SERVED)
+            .expect("no worker served get=1: the device is frozen");
+        assert!(get.contains(&format!("listen_port={}\n", old)), "{:?}", get);
+        assert!(get.ends_with(UAPI_OK));
+        // And a later write goes through.
+        let set = uapi_within(&wg, &format!("set=1\nlisten_port={}", new), SERVED)
+            .expect("no worker served set=1: the device is frozen");
+        assert_eq!(set, UAPI_OK);
+        assert_eq!(listen_port(&wg), new);
+        assert!(workers_alive(&wg));
+    }
 }
