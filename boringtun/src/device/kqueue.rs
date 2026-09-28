@@ -329,7 +329,21 @@ impl<H: Send + Sync> EventPoll<H> {
 }
 
 impl<H> EventPoll<H> {
-    // This function is only safe to call when the event loop is not running
+    /// Disable and remove the event and associated handler, using the fd (or,
+    /// negative, the custom-event index) that was used to register it.
+    ///
+    /// # Safety
+    ///
+    /// The handler is freed here, so the caller must guarantee that no
+    /// dispatch of this event is in progress or can begin -- that no
+    /// `EventGuard` for it is live, nor a `wait` about to hand one out.
+    /// Stopping the event loop guarantees that; so does any external
+    /// quiescence mechanism that keeps every waiting thread from dispatching
+    /// until this call returns. Otherwise the handler may be freed while in
+    /// use.
+    ///
+    /// `index` must be one this poll registered and has not cleared since:
+    /// every such index lies inside its table.
     pub unsafe fn clear_event_by_fd(&self, index: RawFd) {
         // Same shape as `register_event`: the handler leaves the lock scope
         // before it is destroyed. See the note there.

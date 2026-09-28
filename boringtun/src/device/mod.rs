@@ -850,62 +850,99 @@ impl Device {
         Ok(device)
     }
 
-    fn open_listen_socket(&mut self, mut port: u16) -> Result<(), Error> {
-        // Binds the network facing interfaces
-        // First remove the existing listeners from the event loop, then close
-        // the sockets.
+    /// Bind the network-facing listener pair to `port` (0: one the OS picks),
+    /// replacing the current pair.
+    ///
+    /// Transactional: on any error the device keeps exactly the listeners it
+    /// had -- sockets, registered events, `listen_port` and peers' connected
+    /// sockets -- and nothing of the attempt survives. A `listen_port=` that
+    /// cannot be applied is refused; it does not take a working tunnel down.
+    fn open_listen_socket(&mut self, port: u16) -> Result<(), Error> {
+        // `awg syncconf` resends an unchanged ListenPort on every run, and
+        // rebinding would not change anything here -- same port, same
+        // options -- except to disconnect every peer's connected socket for
+        // nothing. So an explicit, already-held port is a no-op. Not 0: that
+        // asks the OS for a port, and a fresh one is what it gets.
+        if port != 0
+            && port == self.listen_port
+            && self.udp4.is_some()
+            && self.udp6.is_some()
+            && self.udp_listener_fds.len() == 2
+        {
+            return Ok(());
+        }
+
+        // PREPARE. Bind and clone the replacement pair before registering
+        // anything or touching the current one, so every failure up to here
+        // leaves the device as it was: the candidate sockets just close.
+        let (udp4, udp6, port) = Self::bind_listen_pair(port)?;
+        let (clone4, clone6) = (udp4.try_clone()?, udp6.try_clone()?);
+
+        // Register the pair, under the clones' descriptors -- the ones the
+        // events are keyed by, and so the ones to remove them by. A refused
+        // registration undoes itself inside `register_event`; when the second
+        // is refused, the first -- already live -- is removed here, so no
+        // candidate event outlives the failed attempt.
         //
-        // By the descriptors their events were registered under, which are the
-        // clones `register_udp_handler` owns -- not `udp4`/`udp6`, which were
-        // never registered. Clearing by those left the previous listeners
-        // registered and bound to the old port, and panicked when the original
-        // descriptor lay past the end of the events table (`dup` hands out the
-        // lowest free number, so the clone can sit below the original when
-        // another thread has just freed a lower one). On a live device this
-        // runs inside a `set=1` write lock, where such a panic kills the worker
-        // with the lock's write intent still set, and every other thread then
-        // waits for the device forever.
-        //
-        // Safe with the event loop running: this is only reached with the
-        // device write-locked (from `set=1`) or before the loop starts
-        // (`DeviceHandle::new`), and every handler runs under the read lock,
-        // so none of them can be using the events removed here.
-        for fd in self.udp_listener_fds.drain(..) {
+        // Removing an event with the loop running is safe only with no
+        // dispatch of it in flight or able to start (see
+        // `EventPoll::clear_event_by_fd`). The device supplies that: this is
+        // reached either before the loop starts (`DeviceHandle::new`) or from
+        // `set=1` inside the device's write closure, and a worker dispatches
+        // only while holding the device read lock, which the write excludes.
+        let fd4 = self.register_udp_handler(clone4)?;
+        let fd6 = match self.register_udp_handler(clone6) {
+            Ok(fd) => fd,
+            Err(e) => {
+                unsafe { self.queue.clear_event_by_fd(fd4) };
+                return Err(e);
+            }
+        };
+
+        // COMMIT: nothing below can fail. Remove the previous pair's events by
+        // the descriptors they were registered under (their clones', not
+        // `udp4`/`udp6`'s own, which were never registered), then close the
+        // previous sockets by replacing them.
+        for fd in std::mem::replace(&mut self.udp_listener_fds, vec![fd4, fd6]) {
             unsafe { self.queue.clear_event_by_fd(fd) };
         }
-        self.udp4 = None;
-        self.udp6 = None;
+        self.udp4 = Some(udp4);
+        self.udp6 = Some(udp6);
+        self.listen_port = port;
 
+        // Peers' connected sockets are bound to the port just given up, so
+        // they go with it -- only now, so a refused change leaves them alone.
         for peer in self.peers.values() {
             peer.lock().shutdown_endpoint();
         }
 
-        // Then open new sockets and bind to the port
-        let udp_sock4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        udp_sock4.set_reuse_address(true)?;
-        udp_sock4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
-        udp_sock4.set_nonblocking(true)?;
+        Ok(())
+    }
+
+    /// Create, configure and bind a nonblocking IPv4/IPv6 listener pair on
+    /// `port`, or on the port the OS picks for the IPv4 socket when `port` is
+    /// 0. Returns the pair and the port bound. Registers nothing.
+    fn bind_listen_pair(mut port: u16) -> Result<(socket2::Socket, socket2::Socket, u16), Error> {
+        let udp4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        udp4.set_reuse_address(true)?;
+        udp4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
+        udp4.set_nonblocking(true)?;
 
         if port == 0 {
             // Random port was assigned
-            port = udp_sock4.local_addr()?.as_socket().unwrap().port();
+            port = udp4
+                .local_addr()?
+                .as_socket()
+                .ok_or_else(|| io::Error::other("listener has no inet address"))?
+                .port();
         }
 
-        let udp_sock6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-        udp_sock6.set_reuse_address(true)?;
-        udp_sock6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
-        udp_sock6.set_nonblocking(true)?;
+        let udp6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        udp6.set_reuse_address(true)?;
+        udp6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
+        udp6.set_nonblocking(true)?;
 
-        let fd4 = self.register_udp_handler(udp_sock4.try_clone()?)?;
-        self.udp_listener_fds.push(fd4);
-        let fd6 = self.register_udp_handler(udp_sock6.try_clone()?)?;
-        self.udp_listener_fds.push(fd6);
-        self.udp4 = Some(udp_sock4);
-        self.udp6 = Some(udp_sock6);
-
-        self.listen_port = port;
-
-        Ok(())
+        Ok((udp4, udp6, port))
     }
 
     fn set_key(&mut self, private_key: x25519::StaticSecret) {
@@ -1138,12 +1175,12 @@ impl Device {
         // exists for.
         //
         // Recovering the optimisation therefore means a new listener socket:
-        // in practice, a restart. A `listen_port=` rebind does rearm the flag
-        // when it succeeds, but `open_listen_socket` leaves `udp4`/`udp6` as
-        // `None` when it fails, and the iface handler's `expect("Not
-        // connected")` turns that into a panicked worker per thread -- and out
-        // of watches is exactly when that rebind fails. Do not treat it as the
-        // recovery until that is fixed.
+        // in practice, a restart. A `listen_port=` rebind to a new port rearms
+        // the flag when it succeeds, but out of watches is exactly when it
+        // fails: `open_listen_socket` then keeps the current listeners, and
+        // with them this latched flag, and reports the error. It is safe to
+        // attempt, not a recovery to rely on. (A rebind to the port already
+        // held is a no-op and rearms nothing.)
         //
         // Not conditioned on the errno either. On the fresh UDP socket
         // `Peer::connect_endpoint` hands to `register_conn_handler` below,
