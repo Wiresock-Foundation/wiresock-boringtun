@@ -37,6 +37,12 @@ pub struct EventPoll<H: Sized> {
     /// upgrade is not retried per datagram.
     #[cfg(test)]
     add_attempts: std::sync::atomic::AtomicUsize,
+    /// A one-shot fault a given number of registrations ahead: `n` means let
+    /// the next `n` `EPOLL_CTL_ADD`s through and fail the one after.
+    /// `usize::MAX` is disarmed. For failing one registration in the middle of
+    /// a sequence -- the second of a listener pair, say.
+    #[cfg(test)]
+    fail_after_adds: std::sync::atomic::AtomicUsize,
 }
 
 /// A type that hold a reference to a triggered Event
@@ -251,6 +257,8 @@ impl<H: Sync + Send> EventPoll<H> {
             fail_all_adds: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             add_attempts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_after_adds: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -462,14 +470,21 @@ impl<H: Sync + Send> EventPoll<H> {
         // breaking every other epoll user on the host.
         #[cfg(test)]
         let epoll_fd = {
-            self.add_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if self
-                .fail_next_add
-                .swap(false, std::sync::atomic::Ordering::Relaxed)
-                || self
-                    .fail_all_adds
-                    .load(std::sync::atomic::Ordering::Relaxed)
+            use std::sync::atomic::Ordering::Relaxed;
+            self.add_attempts.fetch_add(1, Relaxed);
+            // Counts down the armed `fail_after_adds`; true exactly once, on
+            // the registration it was armed to fail, which also disarms it.
+            let scheduled = self
+                .fail_after_adds
+                .fetch_update(Relaxed, Relaxed, |n| match n {
+                    usize::MAX => None,
+                    0 => Some(usize::MAX),
+                    n => Some(n - 1),
+                })
+                == Ok(0);
+            if self.fail_next_add.swap(false, Relaxed)
+                || self.fail_all_adds.load(Relaxed)
+                || scheduled
             {
                 -1
             } else {
@@ -528,7 +543,7 @@ impl<H: Sync + Send> EventPoll<H> {
     }
 
     #[cfg(test)]
-    fn registered_count(&self) -> usize {
+    pub(crate) fn registered_count(&self) -> usize {
         self.events.lock().iter().filter(|e| e.is_some()).count()
     }
 
@@ -548,6 +563,15 @@ impl<H: Sync + Send> EventPoll<H> {
     pub(crate) fn fail_all_registrations(&self) {
         self.fail_all_adds
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Let the next `allowed` registrations on this poll succeed and fail the
+    /// one after, once -- the way `fail_next_registration` fails it, with a
+    /// real `epoll_ctl` error and the real rollback.
+    #[cfg(test)]
+    pub(crate) fn fail_registration_after(&self, allowed: usize) {
+        self.fail_after_adds
+            .store(allowed, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// How many `EPOLL_CTL_ADD` calls this poll has attempted.
@@ -639,8 +663,16 @@ impl<H> EventPoll<H> {
     ///
     /// # Safety
     ///
-    /// This function is only safe to call when the event loop is not running,
-    /// otherwise the memory of the handler may get freed while in use.
+    /// The handler is freed here, so the caller must guarantee that no
+    /// dispatch of this event is in progress or can begin -- that no
+    /// `EventGuard` for it is live, nor a `wait` about to hand one out.
+    /// Stopping the event loop guarantees that; so does any external
+    /// quiescence mechanism that keeps every waiting thread from dispatching
+    /// until this call returns. Otherwise the handler may be freed while in
+    /// use.
+    ///
+    /// `index` must be a descriptor this poll registered and has not cleared
+    /// since: every such index lies inside the events table.
     pub unsafe fn clear_event_by_fd(&self, index: RawFd) {
         assert!(index >= 0);
         // Same shape as `insert_at`: the handler leaves the lock scope before it

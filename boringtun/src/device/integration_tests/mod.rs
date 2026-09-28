@@ -19,6 +19,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::net::UdpSocket;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::io::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -76,13 +78,11 @@ mod tests {
     impl Drop for Peer {
         fn drop(&mut self) {
             if let Some(name) = &self.container_name {
-                Command::new("docker")
-                    .args([
-                        "stop", // Run docker
-                        &name[5..],
-                    ])
-                    .status()
-                    .ok();
+                run(Command::new("docker").args([
+                    "stop", // Run docker
+                    &name[5..],
+                ]))
+                .ok();
 
                 std::fs::remove_file(name).ok();
                 std::fs::remove_file(format!("{}.ngx", name)).ok();
@@ -155,29 +155,27 @@ mod tests {
             let nginx_config_file = format!("{}.ngx", peer_config_file);
             std::fs::write(&nginx_config_file, nginx_config).unwrap();
 
-            Command::new("docker")
-                .args([
-                    "run",                 // Run docker
-                    "-d",                  // In detached mode
-                    "--cap-add=NET_ADMIN", // Grant permissions to open a tunnel
-                    "--device=/dev/net/tun",
-                    "--sysctl", // Enable ipv6
-                    "net.ipv6.conf.all.disable_ipv6=0",
-                    "--sysctl",
-                    "net.ipv6.conf.default.disable_ipv6=0",
-                    "-p", // Open port for the endpoint
-                    &format!("{0}:{0}/udp", self.endpoint.port()),
-                    "-v", // Map the generated WireGuard config file
-                    &format!("{}:/wireguard/wg.conf", peer_config_file),
-                    "-v", // Map the nginx config file
-                    &format!("{}:/etc/nginx/conf.d/default.conf", nginx_config_file),
-                    "--rm", // Cleanup
-                    "--name",
-                    &peer_config_file[5..],
-                    "vkrasnov/wireguard-test",
-                ])
-                .status()
-                .expect("Failed to run docker");
+            run(Command::new("docker").args([
+                "run",                 // Run docker
+                "-d",                  // In detached mode
+                "--cap-add=NET_ADMIN", // Grant permissions to open a tunnel
+                "--device=/dev/net/tun",
+                "--sysctl", // Enable ipv6
+                "net.ipv6.conf.all.disable_ipv6=0",
+                "--sysctl",
+                "net.ipv6.conf.default.disable_ipv6=0",
+                "-p", // Open port for the endpoint
+                &format!("{0}:{0}/udp", self.endpoint.port()),
+                "-v", // Map the generated WireGuard config file
+                &format!("{}:/wireguard/wg.conf", peer_config_file),
+                "-v", // Map the nginx config file
+                &format!("{}:/etc/nginx/conf.d/default.conf", nginx_config_file),
+                "--rm", // Cleanup
+                "--name",
+                &peer_config_file[5..],
+                "vkrasnov/wireguard-test",
+            ]))
+            .expect("Failed to run docker");
 
             self.container_name = Some(peer_config_file);
         }
@@ -358,32 +356,26 @@ mod tests {
         #[cfg(target_os = "linux")]
         /// Starts the tunnel
         fn start(&mut self) {
-            Command::new("ip")
-                .args([
-                    "address",
-                    "add",
-                    &self.addr_v4.to_string(),
-                    "dev",
-                    &self.name,
-                ])
-                .status()
-                .expect("failed to assign ip to tunnel");
+            run(Command::new("ip").args([
+                "address",
+                "add",
+                &self.addr_v4.to_string(),
+                "dev",
+                &self.name,
+            ]))
+            .expect("failed to assign ip to tunnel");
 
-            Command::new("ip")
-                .args([
-                    "address",
-                    "add",
-                    &self.addr_v6.to_string(),
-                    "dev",
-                    &self.name,
-                ])
-                .status()
-                .expect("failed to assign ipv6 to tunnel");
+            run(Command::new("ip").args([
+                "address",
+                "add",
+                &self.addr_v6.to_string(),
+                "dev",
+                &self.name,
+            ]))
+            .expect("failed to assign ipv6 to tunnel");
 
             // Start the tunnel
-            Command::new("ip")
-                .args(["link", "set", "mtu", "1400", "up", "dev", &self.name])
-                .status()
+            run(Command::new("ip").args(["link", "set", "mtu", "1400", "up", "dev", &self.name]))
                 .expect("failed to start the tunnel");
 
             self.started = true;
@@ -391,16 +383,14 @@ mod tests {
             // Add each peer to the routing table
             for p in &self.peers {
                 for r in &p.allowed_ips {
-                    Command::new("ip")
-                        .args([
-                            "route",
-                            "add",
-                            &format!("{}/{}", r.ip, r.cidr),
-                            "dev",
-                            &self.name,
-                        ])
-                        .status()
-                        .expect("failed to add route");
+                    run(Command::new("ip").args([
+                        "route",
+                        "add",
+                        &format!("{}/{}", r.ip, r.cidr),
+                        "dev",
+                        &self.name,
+                    ]))
+                    .expect("failed to add route");
                 }
             }
         }
@@ -452,6 +442,17 @@ mod tests {
         #[cfg(target_os = "linux")]
         fn fail_all_event_registrations(&self) {
             self._device.device.read().queue.fail_all_registrations();
+        }
+
+        /// As `fail_next_event_registration`, but `allowed` registrations
+        /// later: those go through and the one after them fails, once.
+        #[cfg(target_os = "linux")]
+        fn fail_event_registration_after(&self, allowed: usize) {
+            self._device
+                .device
+                .read()
+                .queue
+                .fail_registration_after(allowed);
         }
 
         /// How many `EPOLL_CTL_ADD` calls this device has attempted.
@@ -515,6 +516,27 @@ mod tests {
             );
             self.peers.push(peer);
         }
+    }
+
+    /// Held shared for the life of every child process the tests run, and
+    /// exclusively by any check of whether a port is free.
+    ///
+    /// A child starts with a copy of every descriptor this process has open,
+    /// CLOEXEC or not, so a socket the device has just closed can stay bound
+    /// while a parallel test is spawning `ip` or `docker` -- and a
+    /// port-release check that lands then fails spuriously. Measured: 31 of
+    /// 600 released ports looked held with a concurrent spawner, none
+    /// without. Not the spawn alone: `Command::spawn` can return before the
+    /// child has closed its CLOEXEC copies (1 of 300 still looked held), so
+    /// the gate is held until the child has exited.
+    static SPAWN_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// `cmd.status()`, under `SPAWN_GATE`.
+    fn run(cmd: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+        let _gate = SPAWN_GATE
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cmd.status()
     }
 
     /// Create a new filename in the /tmp dir
@@ -1960,5 +1982,508 @@ allowed_ip=10.66.66.2/32",
                 protocol
             );
         }
+    }
+
+    /// A listen-port change over `set=1` replaces the listening sockets:
+    /// their events leave the poll and the old port is released, so the
+    /// event count holds steady and a plain socket can bind the old port.
+    ///
+    /// `open_listen_socket` registers a `try_clone` of each socket and used to
+    /// clear by the original's descriptor, which was never registered. The
+    /// previous listeners then stayed registered and bound -- two more events
+    /// and a held port per change, which this pins deterministically -- and,
+    /// when `dup` had handed the clone a lower number than the original, the
+    /// clear indexed past the events table and panicked inside the `set=1`
+    /// write lock, killing the worker with the lock's write intent set and
+    /// leaving every other thread of the device waiting for it forever.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_listen_port_change_releases_the_previous_listeners() {
+        const OK: &str = "errno=0\n\n";
+        // Single-queue, so no worker registers a TUN queue of its own while
+        // starting up: the only registrations that come and go below are the
+        // ones `set=1` makes, and the count is exact.
+        let wg = WGHandle::init_with_config(
+            next_ip(),
+            next_ip_v6(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: true,
+                use_multi_queue: false,
+                uapi_fd: -1,
+                ..Default::default()
+            },
+        );
+        let registered = || wg._device.device.read().queue.registered_count();
+
+        let (a, b, c) = (next_port(), next_port(), next_port());
+        assert_eq!(wg.wg_set_port(a), OK);
+        let steady = registered();
+        for port in [b, c] {
+            assert_eq!(wg.wg_set_port(port), OK, "listen_port={}", port);
+            assert_eq!(
+                registered(),
+                steady,
+                "listen_port={}: the previous listeners' events are removed, not kept beside the new ones",
+                port
+            );
+        }
+        assert!(wg.wg_get().contains(&format!("listen_port={}", c)));
+
+        // `a` and `b` are no longer this device's: a socket without
+        // SO_REUSEADDR binds each, in both families. Under `SPAWN_GATE`, so no
+        // child of a parallel test holds a copy of a released socket.
+        let _gate = SPAWN_GATE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for port in [a, b] {
+            UdpSocket::bind(("0.0.0.0", port))
+                .unwrap_or_else(|e| panic!("IPv4 port {} is still held: {}", port, e));
+            UdpSocket::bind(("::", port))
+                .unwrap_or_else(|e| panic!("IPv6 port {} is still held: {}", port, e));
+        }
+    }
+
+    // Listen-port rebinding is a transaction: a refused `listen_port=` leaves
+    // the device exactly as it was, and only a successful one replaces the
+    // listeners, the port and the peers' connected sockets. The helpers below
+    // are shared by the tests that pin that.
+
+    #[cfg(target_os = "linux")]
+    const UAPI_OK: &str = "errno=0\n\n";
+
+    /// `bindable` of a port nothing holds, and of one held in both families.
+    #[cfg(target_os = "linux")]
+    const FREE: (bool, bool) = (true, true);
+    #[cfg(target_os = "linux")]
+    const HELD: (bool, bool) = (false, false);
+
+    /// Single-queue, so no worker registers a TUN queue of its own while
+    /// starting up: the registrations that come and go are exactly the ones
+    /// `set=1` makes, and event counts are exact.
+    #[cfg(target_os = "linux")]
+    fn single_queue_device() -> WGHandle {
+        WGHandle::init_with_config(
+            next_ip(),
+            next_ip_v6(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: true,
+                use_multi_queue: false,
+                uapi_fd: -1,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// `(IPv4, IPv6)`: whether a socket without SO_REUSEADDR binds `port` in
+    /// each family. Such a bind fails while any socket holds the port -- the
+    /// device's SO_REUSEADDR listeners included. Tried one after the other,
+    /// as the IPv6 wildcard is dual-stack and would collide with the IPv4
+    /// probe; under `SPAWN_GATE`, so a released socket is not still held by
+    /// a parallel test's half-spawned child.
+    #[cfg(target_os = "linux")]
+    fn bindable(port: u16) -> (bool, bool) {
+        let _gate = SPAWN_GATE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let v4 = UdpSocket::bind(("0.0.0.0", port)).is_ok();
+        let v6 = UdpSocket::bind(("::", port)).is_ok();
+        (v4, v6)
+    }
+
+    /// As `bindable`, for sockets made the way the device makes its
+    /// listeners: with SO_REUSEADDR, IPv6 dual-stack.
+    #[cfg(target_os = "linux")]
+    fn listener_bindable(port: u16) -> (bool, bool) {
+        use socket2::{Domain, Socket, Type};
+        let _gate = SPAWN_GATE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bind = |domain, addr: SocketAddr| {
+            let s = Socket::new(domain, Type::DGRAM, None).unwrap();
+            s.set_reuse_address(true).unwrap();
+            s.bind(&addr.into()).is_ok()
+        };
+        let v4 = bind(
+            Domain::IPV4,
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+        );
+        let v6 = bind(
+            Domain::IPV6,
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+        );
+        (v4, v6)
+    }
+
+    /// A test port nothing holds.
+    #[cfg(target_os = "linux")]
+    fn free_port() -> u16 {
+        loop {
+            let port = next_port();
+            if bindable(port) == FREE {
+                return port;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn listen_port(wg: &WGHandle) -> u16 {
+        let get = wg.wg_get();
+        get.lines()
+            .find_map(|l| l.strip_prefix("listen_port="))
+            .unwrap_or_else(|| panic!("no listen_port in {:?}", get))
+            .parse()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn registered_events(wg: &WGHandle) -> usize {
+        wg._device.device.read().queue.registered_count()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn listener_fds(wg: &WGHandle) -> Vec<RawFd> {
+        wg._device.device.read().udp_listener_fds.clone()
+    }
+
+    /// Every worker is still running: none has panicked or exited.
+    #[cfg(target_os = "linux")]
+    fn workers_alive(wg: &WGHandle) -> bool {
+        let threads = &wg._device.threads;
+        !threads.is_empty() && threads.iter().all(|t| !t.is_finished())
+    }
+
+    /// Give the peer a connected socket, as a completed handshake would, and
+    /// return its descriptor. It is not registered with the poll: the tests
+    /// only ask whether a rebind keeps it or shuts it down, which
+    /// `Endpoint::conn` shows.
+    #[cfg(target_os = "linux")]
+    fn plant_conn(wg: &WGHandle, key: &PublicKey) -> RawFd {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.connect("127.0.0.1:9").unwrap();
+        let sock = socket2::Socket::from(sock);
+        let fd = sock.as_raw_fd();
+        let device = wg._device.device.read();
+        device.peers[key].lock().endpoint_mut().conn = Some(sock);
+        fd
+    }
+
+    #[cfg(target_os = "linux")]
+    fn conn_fd(wg: &WGHandle, key: &PublicKey) -> Option<RawFd> {
+        let device = wg._device.device.read();
+        let peer = device.peers[key].lock();
+        let fd = peer.endpoint().conn.as_ref().map(|c| c.as_raw_fd());
+        fd
+    }
+
+    #[cfg(target_os = "linux")]
+    fn drop_conn(wg: &WGHandle, key: &PublicKey) {
+        let device = wg._device.device.read();
+        let conn = device.peers[key].lock().endpoint_mut().conn.take();
+        assert!(conn.is_some());
+    }
+
+    /// A peer of the device under test, reached through its TUN: a packet
+    /// routed to `ip` is encapsulated for it, and the handshake initiation
+    /// that starts goes to `endpoint`, a socket the test reads.
+    #[cfg(target_os = "linux")]
+    struct TunPeer {
+        key: PublicKey,
+        ip: IpAddr,
+        endpoint: UdpSocket,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TunPeer {
+        /// Adds a peer over `set=1` and routes its address into the device's
+        /// TUN, which must be up (`WGHandle::start`).
+        fn add(wg: &WGHandle) -> TunPeer {
+            let key = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+            let ip = next_ip();
+            let endpoint = UdpSocket::bind("127.0.0.1:0").unwrap();
+            endpoint
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let allowed = [AllowedIp { ip, cidr: 32 }];
+            let reply = wg.wg_set_peer(&key, &endpoint.local_addr().unwrap(), &allowed);
+            assert_eq!(reply, UAPI_OK, "adding a peer");
+            let status = run(Command::new("ip").args([
+                "route",
+                "add",
+                &format!("{}/32", ip),
+                "dev",
+                &wg.name,
+            ]))
+            .expect("failed to run ip");
+            assert!(status.success(), "route {} via {}", ip, wg.name);
+            TunPeer { key, ip, endpoint }
+        }
+
+        /// Send a packet into the TUN towards this peer and return where the
+        /// handshake initiation the device sends for it came from.
+        ///
+        /// This is the iface handler, end to end: it reads the packet, finds
+        /// the peer and, the peer having no connected socket, sends through
+        /// `udp4` -- which it `expect`s to be present, so a worker without
+        /// listeners panics there and nothing arrives. Once per peer: the
+        /// handshake is then in progress, and a second packet waits for it.
+        fn dispatch(&self) -> SocketAddr {
+            UdpSocket::bind("0.0.0.0:0")
+                .unwrap()
+                .send_to(b"through the tunnel", (self.ip, 9))
+                .unwrap();
+            let mut buf = [0u8; 256];
+            let (n, from) = self
+                .endpoint
+                .recv_from(&mut buf)
+                .expect("no handshake initiation reached the peer's endpoint");
+            assert_eq!(n, 148, "a vanilla handshake initiation");
+            assert_eq!(&buf[..4], &[1, 0, 0, 0], "message type 1");
+            from
+        }
+    }
+
+    /// The device's IPv4 listener on `port`, as seen from loopback.
+    #[cfg(target_os = "linux")]
+    fn listener(port: u16) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+    }
+
+    /// A rebind that fails after registering half of the new listener pair
+    /// changes nothing. The IPv4 candidate, already live in the poll when the
+    /// IPv6 one is refused, is removed again; both candidates close and
+    /// release the new port; the device keeps its listeners, its port, its
+    /// peers' connected sockets and its event count -- and keeps working, a
+    /// later rebind included.
+    ///
+    /// The refusal is a real failing `epoll_ctl`, injected into this device's
+    /// poll alone. `open_listen_socket` used to tear the current listeners
+    /// down first, so this left the device with no `udp4`/`udp6`, and the
+    /// next packet from the TUN panicked a worker in the iface handler's
+    /// `expect("Not connected")`.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_rebind_refused_halfway_through_registration_changes_nothing() {
+        let mut wg = single_queue_device();
+        let old = free_port();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        assert_eq!(wg.wg_set_port(old), UAPI_OK);
+        wg.start();
+        let first = TunPeer::add(&wg);
+        let conn = plant_conn(&wg, &first.key);
+
+        // What the refused attempt must leave exactly as it is.
+        let get_before = wg.wg_get();
+        assert!(get_before.contains(&format!("listen_port={}\n", old)));
+        let events_before = registered_events(&wg);
+        let listeners_before = listener_fds(&wg);
+        let attempts_before = wg.event_registration_attempts();
+
+        // The IPv4 candidate's registration goes through, the IPv6 one's is
+        // refused.
+        let new = free_port();
+        wg.fail_event_registration_after(1);
+        let reply = wg.wg_set_port(new);
+        assert!(
+            reply.starts_with("errno=") && reply != UAPI_OK,
+            "listen_port={} is refused, got {:?}",
+            new,
+            reply
+        );
+        assert_eq!(
+            wg.event_registration_attempts() - attempts_before,
+            2,
+            "both candidates reached registration: the IPv4 one was live when the IPv6 one was refused"
+        );
+
+        // 1. The UAPI still reports the old state, the old port included.
+        assert_eq!(wg.wg_get(), get_before);
+        // 2. The live IPv4 candidate's event was removed again.
+        assert_eq!(registered_events(&wg), events_before);
+        assert_eq!(listener_fds(&wg), listeners_before);
+        // 3. The old port is still the device's, in both families.
+        assert_eq!(bindable(old), HELD, "old port {}", old);
+        // 4. The candidates are gone: the new port is free in both families.
+        assert_eq!(bindable(new), FREE, "new port {}", new);
+        // Peers keep their connected sockets.
+        assert_eq!(conn_fd(&wg, &first.key), Some(conn));
+        drop_conn(&wg, &first.key); // so the dispatch below uses the listener
+
+        // 5. Ordinary UAPI operations still work.
+        let second = TunPeer::add(&wg);
+        assert!(wg.wg_get().ends_with(UAPI_OK));
+        // 6. A packet from the TUN is encapsulated and sent from the old port.
+        assert_eq!(first.dispatch(), listener(old));
+        // 7. No worker panicked or exited.
+        assert!(workers_alive(&wg));
+
+        // 8. A later rebind succeeds...
+        plant_conn(&wg, &first.key);
+        let later = free_port();
+        assert_eq!(wg.wg_set_port(later), UAPI_OK);
+        assert_eq!(listen_port(&wg), later);
+        // 9. ...and replaces the old listeners outright.
+        assert_eq!(bindable(old), FREE, "old port {}", old);
+        assert_eq!(bindable(later), HELD, "later port {}", later);
+        assert_eq!(bindable(new), FREE, "new port {}", new);
+        assert_eq!(registered_events(&wg), events_before);
+        assert_eq!(
+            conn_fd(&wg, &first.key),
+            None,
+            "a successful rebind shuts the peers' connected sockets down"
+        );
+        assert_eq!(second.dispatch(), listener(later));
+        assert!(workers_alive(&wg));
+    }
+
+    /// A rebind to a port someone else holds fails at the bind, before any
+    /// registration, and changes nothing either. Both binds are covered: an
+    /// IPv4 holder fails the first; an IPv6-only holder lets the IPv4
+    /// candidate bind and fails the second, and that candidate must then
+    /// release the port too. Once the port is free the same rebind succeeds.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_rebind_to_a_port_in_use_changes_nothing() {
+        let mut wg = single_queue_device();
+        let old = free_port();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        assert_eq!(wg.wg_set_port(old), UAPI_OK);
+        wg.start();
+        let first = TunPeer::add(&wg);
+        let conn = plant_conn(&wg, &first.key);
+
+        let get_before = wg.wg_get();
+        let events_before = registered_events(&wg);
+        let listeners_before = listener_fds(&wg);
+        let attempts_before = wg.event_registration_attempts();
+
+        let new = free_port();
+        let hold_v4 = || socket2::Socket::from(UdpSocket::bind(("0.0.0.0", new)).unwrap());
+        let hold_v6_only = || {
+            use socket2::{Domain, Socket, Type};
+            let s = Socket::new(Domain::IPV6, Type::DGRAM, None).unwrap();
+            s.set_only_v6(true).unwrap();
+            s.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, new)).into())
+                .unwrap();
+            s
+        };
+        // With each holder, which of the candidates' binds (SO_REUSEADDR, as
+        // `bind_listen_pair` makes them) succeed: none, or the IPv4 one only.
+        type Hold<'a> = &'a dyn Fn() -> socket2::Socket;
+        let holders: [(&str, Hold, (bool, bool)); 2] = [
+            ("IPv4", &hold_v4, (false, false)),
+            ("IPv6-only", &hold_v6_only, (true, false)),
+        ];
+        for (family, hold, candidates) in holders {
+            let holder = hold();
+            assert_eq!(listener_bindable(new), candidates, "{}", family);
+            let reply = wg.wg_set_port(new);
+            assert!(
+                reply.starts_with("errno=") && reply != UAPI_OK,
+                "listen_port={} with an {} holder is refused, got {:?}",
+                new,
+                family,
+                reply
+            );
+            assert_eq!(
+                wg.event_registration_attempts(),
+                attempts_before,
+                "{}: a failed bind comes before any registration",
+                family
+            );
+            assert_eq!(wg.wg_get(), get_before, "{}", family);
+            assert_eq!(registered_events(&wg), events_before, "{}", family);
+            assert_eq!(listener_fds(&wg), listeners_before, "{}", family);
+            assert_eq!(bindable(old), HELD, "{}: old port {}", family, old);
+            assert_eq!(conn_fd(&wg, &first.key), Some(conn), "{}", family);
+            drop(holder);
+            assert_eq!(
+                bindable(new),
+                FREE,
+                "{}: no candidate outlives the attempt",
+                family
+            );
+        }
+
+        // The device is unharmed: the UAPI works, a packet from the TUN goes
+        // out from the old port, and no worker died.
+        drop_conn(&wg, &first.key);
+        let second = TunPeer::add(&wg);
+        assert_eq!(first.dispatch(), listener(old));
+        assert!(workers_alive(&wg));
+
+        // With the port released, the same rebind succeeds.
+        plant_conn(&wg, &first.key);
+        assert_eq!(wg.wg_set_port(new), UAPI_OK);
+        assert_eq!(listen_port(&wg), new);
+        assert_eq!(bindable(old), FREE, "old port {}", old);
+        assert_eq!(bindable(new), HELD, "new port {}", new);
+        assert_eq!(registered_events(&wg), events_before);
+        assert_eq!(conn_fd(&wg, &first.key), None);
+        assert_eq!(second.dispatch(), listener(new));
+        assert!(workers_alive(&wg));
+    }
+
+    /// `listen_port=` naming the port already held is a no-op: `awg
+    /// syncconf` resends an unchanged ListenPort on every run, and rebinding
+    /// would only disconnect every peer's connected socket for nothing. The
+    /// listeners, their events and the peers' sockets all stay. `listen_port=0`
+    /// is not "the same port" -- it asks for a fresh one, and gets it.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn setting_the_held_port_again_is_a_no_op_but_port_0_rebinds() {
+        let wg = single_queue_device();
+        let old = free_port();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        assert_eq!(wg.wg_set_port(old), UAPI_OK);
+        let key = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let allowed = [AllowedIp {
+            ip: next_ip(),
+            cidr: 32,
+        }];
+        assert_eq!(wg.wg_set_peer(&key, &endpoint, &allowed), UAPI_OK);
+        let conn = plant_conn(&wg, &key);
+
+        let events_before = registered_events(&wg);
+        let listeners_before = listener_fds(&wg);
+        let attempts_before = wg.event_registration_attempts();
+
+        assert_eq!(wg.wg_set_port(old), UAPI_OK);
+        assert_eq!(listen_port(&wg), old);
+        assert_eq!(wg.event_registration_attempts(), attempts_before);
+        assert_eq!(listener_fds(&wg), listeners_before);
+        assert_eq!(registered_events(&wg), events_before);
+        assert_eq!(bindable(old), HELD, "old port {}", old);
+        assert_eq!(conn_fd(&wg, &key), Some(conn), "the peer keeps its socket");
+
+        assert_eq!(wg.wg_set_port(0), UAPI_OK);
+        let fresh = listen_port(&wg);
+        // `next_port` hands out ports above Linux's default ephemeral range,
+        // so the OS cannot pick `old` back.
+        assert_ne!(fresh, old);
+        assert_eq!(wg.event_registration_attempts() - attempts_before, 2);
+        let listeners_after = listener_fds(&wg);
+        assert_eq!(listeners_after.len(), 2);
+        assert!(listeners_after
+            .iter()
+            .all(|fd| !listeners_before.contains(fd)));
+        assert_eq!(registered_events(&wg), events_before);
+        assert_eq!(bindable(old), FREE, "old port {}", old);
+        assert_eq!(bindable(fresh), HELD, "fresh port {}", fresh);
+        assert_eq!(conn_fd(&wg, &key), None, "a real rebind shuts it down");
     }
 }
