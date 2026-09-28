@@ -159,6 +159,7 @@ dependencies = [
  "mock_instant",
  "nix",
  "parking_lot",
+ "parking_lot_core",
  "portable-atomic",
  "rand_chacha",
  "rand_core",
