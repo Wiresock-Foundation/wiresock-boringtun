@@ -528,7 +528,7 @@ impl<H: Sync + Send> EventPoll<H> {
     }
 
     #[cfg(test)]
-    fn registered_count(&self) -> usize {
+    pub(crate) fn registered_count(&self) -> usize {
         self.events.lock().iter().filter(|e| e.is_some()).count()
     }
 

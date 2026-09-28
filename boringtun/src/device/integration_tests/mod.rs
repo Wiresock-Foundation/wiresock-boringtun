@@ -1961,4 +1961,63 @@ allowed_ip=10.66.66.2/32",
             );
         }
     }
+
+    /// A listen-port change over `set=1` replaces the listening sockets:
+    /// their events leave the poll and the old port is released, so the
+    /// event count holds steady and a plain socket can bind the old port.
+    ///
+    /// `open_listen_socket` registers a `try_clone` of each socket and used to
+    /// clear by the original's descriptor, which was never registered. The
+    /// previous listeners then stayed registered and bound -- two more events
+    /// and a held port per change, which this pins deterministically -- and,
+    /// when `dup` had handed the clone a lower number than the original, the
+    /// clear indexed past the events table and panicked inside the `set=1`
+    /// write lock, killing the worker with the lock's write intent set and
+    /// leaving every other thread of the device waiting for it forever.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_listen_port_change_releases_the_previous_listeners() {
+        const OK: &str = "errno=0\n\n";
+        // Single-queue, so no worker registers a TUN queue of its own while
+        // starting up: the only registrations that come and go below are the
+        // ones `set=1` makes, and the count is exact.
+        let wg = WGHandle::init_with_config(
+            next_ip(),
+            next_ip_v6(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: true,
+                use_multi_queue: false,
+                uapi_fd: -1,
+                ..Default::default()
+            },
+        );
+        let registered = || wg._device.device.read().queue.registered_count();
+
+        let (a, b, c) = (next_port(), next_port(), next_port());
+        assert_eq!(wg.wg_set_port(a), OK);
+        let steady = registered();
+        for port in [b, c] {
+            assert_eq!(wg.wg_set_port(port), OK, "listen_port={}", port);
+            assert_eq!(
+                registered(),
+                steady,
+                "listen_port={}: the previous listeners' events are removed, not kept beside the new ones",
+                port
+            );
+        }
+        assert!(wg.wg_get().contains(&format!("listen_port={}", c)));
+
+        // `a` and `b` are no longer this device's: a socket without
+        // SO_REUSEADDR binds each, in both families.
+        for port in [a, b] {
+            UdpSocket::bind(("0.0.0.0", port))
+                .unwrap_or_else(|e| panic!("IPv4 port {} is still held: {}", port, e));
+            UdpSocket::bind(("::", port))
+                .unwrap_or_else(|e| panic!("IPv6 port {} is still held: {}", port, e));
+        }
+    }
 }

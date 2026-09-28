@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::io::{self, Write as _};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -252,6 +252,10 @@ pub struct Device {
     iface: Arc<TunSocket>,
     udp4: Option<socket2::Socket>,
     udp6: Option<socket2::Socket>,
+    /// The descriptors the listening sockets' events are registered under:
+    /// the `try_clone` each `register_udp_handler` call owns, not `udp4` or
+    /// `udp6` themselves. `open_listen_socket` removes exactly these.
+    udp_listener_fds: Vec<RawFd>,
 
     yield_notice: Option<EventRef>,
     exit_notice: Option<EventRef>,
@@ -810,6 +814,7 @@ impl Device {
             peers_by_ip: AllowedIps::new(),
             udp4: Default::default(),
             udp6: Default::default(),
+            udp_listener_fds: Vec::new(),
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
@@ -847,17 +852,29 @@ impl Device {
 
     fn open_listen_socket(&mut self, mut port: u16) -> Result<(), Error> {
         // Binds the network facing interfaces
-        // First close any existing open socket, and remove them from the event loop
-        if let Some(s) = self.udp4.take() {
-            unsafe {
-                // This is safe because the event loop is not running yet
-                self.queue.clear_event_by_fd(s.as_raw_fd())
-            }
-        };
-
-        if let Some(s) = self.udp6.take() {
-            unsafe { self.queue.clear_event_by_fd(s.as_raw_fd()) };
+        // First remove the existing listeners from the event loop, then close
+        // the sockets.
+        //
+        // By the descriptors their events were registered under, which are the
+        // clones `register_udp_handler` owns -- not `udp4`/`udp6`, which were
+        // never registered. Clearing by those left the previous listeners
+        // registered and bound to the old port, and panicked when the original
+        // descriptor lay past the end of the events table (`dup` hands out the
+        // lowest free number, so the clone can sit below the original when
+        // another thread has just freed a lower one). On a live device this
+        // runs inside a `set=1` write lock, where such a panic kills the worker
+        // with the lock's write intent still set, and every other thread then
+        // waits for the device forever.
+        //
+        // Safe with the event loop running: this is only reached with the
+        // device write-locked (from `set=1`) or before the loop starts
+        // (`DeviceHandle::new`), and every handler runs under the read lock,
+        // so none of them can be using the events removed here.
+        for fd in self.udp_listener_fds.drain(..) {
+            unsafe { self.queue.clear_event_by_fd(fd) };
         }
+        self.udp4 = None;
+        self.udp6 = None;
 
         for peer in self.peers.values() {
             peer.lock().shutdown_endpoint();
@@ -879,8 +896,10 @@ impl Device {
         udp_sock6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
         udp_sock6.set_nonblocking(true)?;
 
-        self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
-        self.register_udp_handler(udp_sock6.try_clone().unwrap())?;
+        let fd4 = self.register_udp_handler(udp_sock4.try_clone()?)?;
+        self.udp_listener_fds.push(fd4);
+        let fd6 = self.register_udp_handler(udp_sock6.try_clone()?)?;
+        self.udp_listener_fds.push(fd6);
         self.udp4 = Some(udp_sock4);
         self.udp6 = Some(udp_sock6);
 
@@ -1069,7 +1088,11 @@ impl Device {
             .stop_notification(self.yield_notice.as_ref().unwrap())
     }
 
-    fn register_udp_handler(&self, udp: socket2::Socket) -> Result<(), Error> {
+    /// Registers the listener event for `udp`, which the handler takes
+    /// ownership of, and returns the descriptor it is registered under --
+    /// what `open_listen_socket` must later clear it by.
+    fn register_udp_handler(&self, udp: socket2::Socket) -> Result<RawFd, Error> {
+        let fd = udp.as_raw_fd();
         // Logged at most once per socket. The keyless path is re-dispatched
         // for every batch of arriving datagrams, and a daemon that is never
         // given a key stays on it indefinitely, so logging per dispatch would
@@ -1152,7 +1175,7 @@ impl Device {
         const NEVER_WARNED: usize = usize::MAX;
         let warned_cookie_amplifier = AtomicUsize::new(NEVER_WARNED);
         self.queue.new_event(
-            udp.as_raw_fd(),
+            fd,
             Box::new(move |d, t| {
                 // Handler that handles anonymous packets over UDP
                 let mut iter = MAX_ITR;
@@ -1511,7 +1534,7 @@ impl Device {
                 Action::Continue
             }),
         )?;
-        Ok(())
+        Ok(fd)
     }
 
     fn register_conn_handler(
