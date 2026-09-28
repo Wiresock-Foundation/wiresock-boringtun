@@ -57,6 +57,26 @@ mod tests {
         cidr: u8,
     }
 
+    /// How `Peer::try_connect` reaches a peer's HTTP server through the tunnel.
+    ///
+    /// Measured on the suite (10 runs, 10,050 connects): a test's first
+    /// connect takes about 5.2 s, as the container's WireGuard misses the
+    /// first handshake initiation and the retry comes after REKEY_TIMEOUT
+    /// (5 s). Every later one takes milliseconds. The only failures were
+    /// single `ConnectionRefused`s, each followed by a success. So an attempt
+    /// waits 8 s -- the first connect, with headroom -- and three attempts
+    /// cover a refusal twice over, or a container slow enough to miss
+    /// several handshakes: a later attempt's SYN is queued until one lands.
+    const CONNECT_ATTEMPTS: u32 = 3;
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+    const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+    /// The most `try_connect` can take, scheduling aside: 24.2 s. A plain
+    /// `connect` could take about two minutes per attempt.
+    const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_millis(
+        CONNECT_ATTEMPTS as u64 * CONNECT_TIMEOUT.as_millis() as u64
+            + (CONNECT_ATTEMPTS as u64 - 1) * CONNECT_RETRY_DELAY.as_millis() as u64,
+    );
+
     /// Represents a single peer running in a container
     struct Peer {
         key: StaticSecret,
@@ -180,20 +200,40 @@ mod tests {
             self.container_name = Some(peer_config_file);
         }
 
-        fn connect(&self) -> std::net::TcpStream {
+        /// Connect to the peer's HTTP server through the tunnel, or return
+        /// the last attempt's error once `CONNECT_ATTEMPTS` have failed.
+        ///
+        /// Every attempt is bounded. A plain `TcpStream::connect` waits out
+        /// the kernel's SYN retries when the tunnel is down -- about two
+        /// minutes on Linux, per attempt -- so retrying it bounded nothing,
+        /// and a dead tunnel looked like a hung suite.
+        fn try_connect(&self) -> std::io::Result<std::net::TcpStream> {
             let http_addr = SocketAddr::new(self.allowed_ips[0].ip, 80);
-            for _i in 0..5 {
-                let res = std::net::TcpStream::connect(http_addr);
-                if let Err(err) = res {
-                    println!("failed to connect: {:?}", err);
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    continue;
+            let mut attempt = 1;
+            loop {
+                match std::net::TcpStream::connect_timeout(&http_addr, CONNECT_TIMEOUT) {
+                    Ok(stream) => return Ok(stream),
+                    Err(err) if attempt == CONNECT_ATTEMPTS => return Err(err),
+                    Err(err) => println!(
+                        "connect to {} failed, attempt {}/{}: {}",
+                        http_addr, attempt, CONNECT_ATTEMPTS, err
+                    ),
                 }
-
-                return res.unwrap();
+                attempt += 1;
+                std::thread::sleep(CONNECT_RETRY_DELAY);
             }
+        }
 
-            panic!("failed to connect");
+        fn connect(&self) -> std::net::TcpStream {
+            self.try_connect().unwrap_or_else(|err| {
+                panic!(
+                    "failed to connect to {} through the tunnel: {} attempts, {:?} budget; last error: {}",
+                    SocketAddr::new(self.allowed_ips[0].ip, 80),
+                    CONNECT_ATTEMPTS,
+                    CONNECT_BUDGET,
+                    err
+                )
+            })
         }
 
         fn get_request(&self) -> String {
@@ -994,6 +1034,60 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
+    }
+
+    /// A connect through a tunnel nobody answers gives up within
+    /// `CONNECT_BUDGET`, instead of waiting out the kernel's SYN retries
+    /// once per attempt.
+    ///
+    /// The peer has no container: its endpoint is a local port nothing
+    /// listens on, so the handshake is never answered and the SYN, routed
+    /// into this test's own TUN, is never delivered -- a dead tunnel, with no
+    /// change to the host's network. Every attempt waits its full timeout.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_connect_through_a_silent_tunnel_gives_up_within_its_budget() {
+        let port = next_port();
+        let private_key = StaticSecret::random_from_rng(OsRng);
+        let mut wg = WGHandle::init(next_ip(), next_ip_v6());
+        assert_eq!(wg.wg_set_port(port), "errno=0\n\n");
+        assert_eq!(wg.wg_set_key(private_key), "errno=0\n\n");
+
+        let peer = Arc::new(Peer::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), next_port()),
+            vec![AllowedIp {
+                ip: next_ip(),
+                cidr: 32,
+            }],
+        ));
+        wg.add_peer(Arc::clone(&peer));
+        wg.start();
+
+        let started = Instant::now();
+        let err = peer
+            .try_connect()
+            .expect_err("nothing answers through this tunnel");
+        let took = started.elapsed();
+        println!(
+            "gave up after {:?} ({} attempts, {:?} budget): {}",
+            took, CONNECT_ATTEMPTS, CONNECT_BUDGET, err
+        );
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{}", err);
+        assert!(
+            took >= CONNECT_TIMEOUT * CONNECT_ATTEMPTS,
+            "every attempt waits its timeout: {:?}",
+            took
+        );
+        assert!(
+            took <= CONNECT_BUDGET + Duration::from_secs(2),
+            "{:?} is over the {:?} budget",
+            took,
+            CONNECT_BUDGET
+        );
     }
 
     /// A refused connected-socket registration must return the peer to the
