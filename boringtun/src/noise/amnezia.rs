@@ -2205,8 +2205,8 @@ impl AmneziaConfig {
     }
 
     /// Whether an outbound frame gets the upstream-collision check at all:
-    /// transport only, with header protection on, an imitation protocol whose
-    /// redraws are known to steer clear (see
+    /// transport only, with header protection on, an imitation whose redraws
+    /// are known to steer clear (see
     /// [`imitation_redraw_avoids_upstream_collisions`]), and a final wire
     /// length that admits at least one control reading upstream.
     ///
@@ -2217,7 +2217,7 @@ impl AmneziaConfig {
     fn upstream_collision_applies(&self, kind: PacketKind, wire_len: usize) -> bool {
         kind == PacketKind::TransportData
             && self.header_protection_enabled()
-            && imitation_redraw_avoids_upstream_collisions(self.imitation.protocol)
+            && imitation_redraw_avoids_upstream_collisions(self)
             && UPSTREAM_CONTROL_KINDS
                 .iter()
                 .any(|&(control, base)| self.upstream_control_length_fits(control, base, wire_len))
@@ -2410,9 +2410,9 @@ impl AmneziaConfig {
     }
 }
 
-/// Whether redrawing a transport frame's S4 prefix under `protocol` reliably
-/// moves it off an upstream control reading, so the upstream-collision
-/// avoidance may retry it.
+/// Whether redrawing a transport frame's S4 prefix under `cfg`'s imitation
+/// reliably moves it off an upstream control reading, so the
+/// upstream-collision avoidance may retry it.
 ///
 /// Decided per protocol from measurement of the production filler, not from
 /// its shape alone, and matched exhaustively so that a new protocol cannot
@@ -2428,24 +2428,34 @@ impl AmneziaConfig {
 ///   so 65,536 nonces -- each a different mask, enough that sixteen framings
 ///   essentially never all collide, including when a control reading covers
 ///   the fixed query bytes.
-/// * `Sip`: excluded. Once the prefix holds a request line (31 bytes or
-///   more) its first 12 bytes are one of three -- `OPTIONS sip:`,
-///   `REGISTER sip`, `MESSAGE sip:` -- and a control reading may cover the
-///   fixed request text itself, so some frames have no framing an upstream
-///   receiver reads as transport; measured, 16 framings exhausted for
-///   roughly 0.16% of eligible frames across installer-style profiles.
+/// * `Sip`, while every S is below [`SIP_REQUEST_LINE_MIN`]: `fill_sip`
+///   leaves such a prefix random -- the same `fill_random` call, drawing the
+///   same words, as no imitation -- so every candidate is exactly the one
+///   `None` would draw, and the redraw works as it does there. These are
+///   the only SIP layouts header protection accepts.
+/// * `Sip` with any S at [`SIP_REQUEST_LINE_MIN`] or more: excluded. Once the
+///   prefix holds a request line its first 12 bytes are one of three --
+///   `OPTIONS sip:`, `REGISTER sip`, `MESSAGE sip:` -- and a control reading
+///   may cover the fixed request text itself, so some frames have no
+///   framing an upstream receiver reads as transport; measured, 16 framings
+///   exhausted for roughly 0.16% of eligible frames across installer-style
+///   profiles. Header protection refuses these layouts
+///   ([`AmneziaConfig::check_header_protection_nonce`]), and the redraw
+///   needs header protection, so this arm is reached only by framing a
+///   configuration no door lets in. Judged on all four S, like that refusal,
+///   so the two cannot come apart.
 ///
 /// Eligibility says only that the redraw fixes the upstream first-match
 /// misreading. It says nothing about header-protection strength: a 16- or
 /// 32-bit nonce space repeats the header mask far sooner than a random
 /// prefix does, which is a separate property of those imitation modes.
-fn imitation_redraw_avoids_upstream_collisions(protocol: AmneziaImitationProtocol) -> bool {
-    match protocol {
+fn imitation_redraw_avoids_upstream_collisions(cfg: &AmneziaConfig) -> bool {
+    match cfg.imitation.protocol {
         AmneziaImitationProtocol::None
         | AmneziaImitationProtocol::Quic
         | AmneziaImitationProtocol::Stun
         | AmneziaImitationProtocol::Dns => true,
-        AmneziaImitationProtocol::Sip => false,
+        AmneziaImitationProtocol::Sip => cfg.sip_request_line_prefix().is_none(),
     }
 }
 
