@@ -288,6 +288,15 @@ pub struct Device {
 
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
+
+    /// Test-only, one shot: fail the next IPv6 candidate listener's
+    /// `mark_listener`, after the IPv4 one has been marked -- a rebind that
+    /// fails halfway through PREPARE.
+    #[cfg(all(
+        test,
+        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
+    ))]
+    fail_ipv6_listener_mark: AtomicBool,
 }
 
 struct ThreadData {
@@ -821,6 +830,11 @@ impl Device {
             probe_responder,
             #[cfg(target_os = "linux")]
             uapi_fd,
+            #[cfg(all(
+                test,
+                any(target_os = "android", target_os = "fuchsia", target_os = "linux")
+            ))]
+            fail_ipv6_listener_mark: AtomicBool::new(false),
         };
 
         if uapi_fd >= 0 {
@@ -872,10 +886,21 @@ impl Device {
             return Ok(());
         }
 
-        // PREPARE. Bind and clone the replacement pair before registering
-        // anything or touching the current one, so every failure up to here
-        // leaves the device as it was: the candidate sockets just close.
+        // PREPARE. Bind, mark and clone the replacement pair before
+        // registering anything or touching the current one, so every failure
+        // up to here leaves the device as it was: the candidate sockets just
+        // close.
         let (udp4, udp6, port) = Self::bind_listen_pair(port)?;
+        // The replacements inherit the device's fwmark: `set_fwmark` marks
+        // the listeners it finds, and these are about to be them. Marked
+        // here, not after the commit, because it can fail (EPERM without
+        // CAP_NET_ADMIN), and failing here costs only the candidates. Before
+        // the clone only for clarity: SO_MARK belongs to the socket, which a
+        // clone shares, so the registered descriptor carries it either way.
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        for listener in [&udp4, &udp6] {
+            self.mark_listener(listener)?;
+        }
         let (clone4, clone6) = (udp4.try_clone()?, udp6.try_clone()?);
 
         // Register the pair, under the clones' descriptors -- the ones the
@@ -1002,6 +1027,23 @@ impl Device {
         }
 
         true
+    }
+
+    /// Give a candidate listener the device's fwmark, if one is set. An
+    /// explicit `fwmark=0` is `Some(0)` and is applied as the value it is.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    fn mark_listener(&self, listener: &socket2::Socket) -> io::Result<()> {
+        let Some(mark) = self.fwmark else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        if listener.domain()? == Domain::IPV6
+            && self.fail_ipv6_listener_mark.swap(false, Ordering::Relaxed)
+        {
+            // What `set_mark` returns without CAP_NET_ADMIN.
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+        listener.set_mark(mark)
     }
 
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]

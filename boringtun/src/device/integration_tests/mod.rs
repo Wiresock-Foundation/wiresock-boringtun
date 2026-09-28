@@ -2647,4 +2647,268 @@ allowed_ip=10.66.66.2/32",
         assert_eq!(listen_port(&wg), new);
         assert!(workers_alive(&wg));
     }
+
+    /// A mark no test socket would carry by accident.
+    #[cfg(target_os = "linux")]
+    const MARK: u32 = 0x00c0_ffee;
+
+    /// The SO_MARK the kernel holds on the device's two listeners, read back
+    /// from the sockets -- not `Device::fwmark`, which is only what they are
+    /// supposed to hold.
+    #[cfg(target_os = "linux")]
+    fn listener_marks(wg: &WGHandle) -> (u32, u32) {
+        let device = wg._device.device.read();
+        let mark = |s: &Option<socket2::Socket>| s.as_ref().unwrap().mark().unwrap();
+        (mark(&device.udp4), mark(&device.udp6))
+    }
+
+    /// The `fwmark=` line of `get=1`, if any.
+    #[cfg(target_os = "linux")]
+    fn reported_fwmark(wg: &WGHandle) -> Option<u32> {
+        wg.wg_get()
+            .lines()
+            .find_map(|l| l.strip_prefix("fwmark="))
+            .map(|v| v.parse().unwrap())
+    }
+
+    /// A connected socket for the peer made the way the device makes one on a
+    /// handshake -- `connect_endpoint` with the device's listen port and
+    /// fwmark -- and the SO_MARK and local port it came out with.
+    #[cfg(target_os = "linux")]
+    fn connect_peer(wg: &WGHandle, key: &PublicKey) -> (u32, u16) {
+        let device = wg._device.device.read();
+        let conn = device.peers[key]
+            .lock()
+            .connect_endpoint(device.listen_port, device.fwmark)
+            .unwrap();
+        let port = conn.local_addr().unwrap().as_socket().unwrap().port();
+        (conn.mark().unwrap(), port)
+    }
+
+    /// The device's fwmark stays on its listeners across every kind of
+    /// `listen_port=`: an explicit new port, port 0, and the held port.
+    ///
+    /// `set_fwmark` marks the listeners it finds, but a rebind replaces them,
+    /// and the replacements used to come out unmarked: the device went on
+    /// reporting `fwmark=` while sending from sockets that ignored it, so its
+    /// traffic left the policy routing the mark selects. Peers' connected
+    /// sockets never lost it -- `connect_endpoint` takes the mark itself --
+    /// which left the two out of step.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn the_fwmark_survives_listener_rebinds() {
+        let wg = single_queue_device();
+        let first = free_port();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        assert_eq!(wg.wg_set_port(first), UAPI_OK);
+        let key = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let allowed = [AllowedIp {
+            ip: next_ip(),
+            cidr: 32,
+        }];
+        assert_eq!(wg.wg_set_peer(&key, &endpoint, &allowed), UAPI_OK);
+
+        assert_eq!(wg.wg_set(&format!("fwmark={}", MARK)), UAPI_OK);
+        assert_eq!(
+            listener_marks(&wg),
+            (MARK, MARK),
+            "fwmark= marks the listeners"
+        );
+        assert_eq!(reported_fwmark(&wg), Some(MARK));
+        assert_eq!(connect_peer(&wg, &key), (MARK, first));
+        let events = registered_events(&wg);
+
+        // An explicit new port.
+        let fds = listener_fds(&wg);
+        let second = free_port();
+        assert_eq!(wg.wg_set_port(second), UAPI_OK);
+        assert_eq!(listen_port(&wg), second);
+        assert_ne!(listener_fds(&wg), fds, "a new listener pair");
+        assert_eq!(registered_events(&wg), events);
+        assert_eq!(bindable(first), FREE, "first port {}", first);
+        assert_eq!(bindable(second), HELD, "second port {}", second);
+        assert_eq!(listener_marks(&wg), (MARK, MARK), "listen_port={}", second);
+        assert_eq!(reported_fwmark(&wg), Some(MARK));
+        assert_eq!(conn_fd(&wg, &key), None, "the rebind shut the old one");
+        assert_eq!(connect_peer(&wg, &key), (MARK, second));
+
+        // Port 0: a fresh pair on a port the OS picks.
+        let fds = listener_fds(&wg);
+        assert_eq!(wg.wg_set_port(0), UAPI_OK);
+        let fresh = listen_port(&wg);
+        assert_ne!(fresh, second);
+        assert_ne!(listener_fds(&wg), fds, "a new listener pair");
+        assert_eq!(registered_events(&wg), events);
+        assert_eq!(bindable(second), FREE, "second port {}", second);
+        assert_eq!(listener_marks(&wg), (MARK, MARK), "listen_port=0");
+        assert_eq!(reported_fwmark(&wg), Some(MARK));
+
+        // The held port: a no-op, marks and sockets untouched.
+        let fds = listener_fds(&wg);
+        let attempts = wg.event_registration_attempts();
+        assert_eq!(wg.wg_set_port(fresh), UAPI_OK);
+        assert_eq!(listener_fds(&wg), fds);
+        assert_eq!(wg.event_registration_attempts(), attempts);
+        assert_eq!(
+            listener_marks(&wg),
+            (MARK, MARK),
+            "listen_port={} again",
+            fresh
+        );
+    }
+
+    /// The listeners end up marked whichever way round `fwmark=` and
+    /// `listen_port=` come in one request, and an explicit `fwmark=0` --
+    /// kept as `Some(0)` and reported as `fwmark=0` -- is carried over as the
+    /// value it is.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn every_ordering_of_fwmark_and_listen_port_leaves_the_listeners_marked() {
+        let wg = single_queue_device();
+        assert_eq!(wg.wg_set_port(free_port()), UAPI_OK);
+
+        // The mark first, then the rebind: the new listeners must inherit it.
+        let port = free_port();
+        let request = format!("fwmark={}\nlisten_port={}", MARK, port);
+        assert_eq!(wg.wg_set(&request), UAPI_OK);
+        assert_eq!(listen_port(&wg), port);
+        assert_eq!(
+            listener_marks(&wg),
+            (MARK, MARK),
+            "fwmark, then listen_port"
+        );
+
+        // The rebind first, then the mark: it marks the listeners it finds.
+        let (port, mark) = (free_port(), MARK + 1);
+        let request = format!("listen_port={}\nfwmark={}", port, mark);
+        assert_eq!(wg.wg_set(&request), UAPI_OK);
+        assert_eq!(listen_port(&wg), port);
+        assert_eq!(
+            listener_marks(&wg),
+            (mark, mark),
+            "listen_port, then fwmark"
+        );
+
+        // Zero is a value: it unmarks the listeners, is reported, and a
+        // rebind keeps it.
+        assert_eq!(wg.wg_set("fwmark=0"), UAPI_OK);
+        assert_eq!(listener_marks(&wg), (0, 0));
+        assert_eq!(reported_fwmark(&wg), Some(0));
+        assert_eq!(wg.wg_set_port(free_port()), UAPI_OK);
+        assert_eq!(listener_marks(&wg), (0, 0));
+        assert_eq!(reported_fwmark(&wg), Some(0));
+    }
+
+    /// A rebind whose fwmark cannot be put on the replacement listeners is
+    /// refused and changes nothing. The mark is applied in PREPARE, before
+    /// any registration: with the IPv4 candidate marked and the IPv6 one
+    /// refused, both candidates just close -- no event was registered, no
+    /// port is left held -- and the device keeps its marked listeners, its
+    /// port, its fwmark and its peers' connected sockets.
+    ///
+    /// The refusal is injected into this device only, at the IPv6
+    /// candidate's `mark_listener`, as the EPERM an unprivileged `set_mark`
+    /// gets.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_rebind_whose_fwmark_cannot_be_applied_changes_nothing() {
+        let wg = single_queue_device();
+        let old = free_port();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        assert_eq!(wg.wg_set_port(old), UAPI_OK);
+        let key = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let allowed = [AllowedIp {
+            ip: next_ip(),
+            cidr: 32,
+        }];
+        assert_eq!(wg.wg_set_peer(&key, &endpoint, &allowed), UAPI_OK);
+        assert_eq!(wg.wg_set(&format!("fwmark={}", MARK)), UAPI_OK);
+        let conn = plant_conn(&wg, &key);
+
+        let get_before = wg.wg_get();
+        let events_before = registered_events(&wg);
+        let listeners_before = listener_fds(&wg);
+        let attempts_before = wg.event_registration_attempts();
+
+        let new = free_port();
+        wg._device
+            .device
+            .read()
+            .fail_ipv6_listener_mark
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let reply = wg.wg_set_port(new);
+        assert!(
+            reply.starts_with("errno=") && reply != UAPI_OK,
+            "listen_port={} is refused, got {:?}",
+            new,
+            reply
+        );
+        assert!(
+            !wg._device
+                .device
+                .read()
+                .fail_ipv6_listener_mark
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the refusal came from the IPv6 candidate's mark"
+        );
+        assert_eq!(
+            wg.event_registration_attempts(),
+            attempts_before,
+            "marking comes before any registration"
+        );
+        assert_eq!(
+            wg.wg_get(),
+            get_before,
+            "fwmark and port reported as before"
+        );
+        assert_eq!(registered_events(&wg), events_before);
+        assert_eq!(listener_fds(&wg), listeners_before);
+        assert_eq!(
+            listener_marks(&wg),
+            (MARK, MARK),
+            "the old listeners keep it"
+        );
+        assert_eq!(bindable(old), HELD, "old port {}", old);
+        assert_eq!(bindable(new), FREE, "no candidate outlives the attempt");
+        assert_eq!(conn_fd(&wg, &key), Some(conn), "peers keep their sockets");
+
+        // Nothing is stuck: the same rebind, unhindered, goes through marked.
+        assert_eq!(wg.wg_set_port(new), UAPI_OK);
+        assert_eq!(listen_port(&wg), new);
+        assert_eq!(listener_marks(&wg), (MARK, MARK));
+        assert_eq!(registered_events(&wg), events_before);
+        assert_eq!(bindable(old), FREE, "old port {}", old);
+        assert_eq!(conn_fd(&wg, &key), None);
+    }
+
+    /// SO_MARK belongs to the socket, not the descriptor: a `try_clone` --
+    /// the descriptor the device registers each listener under -- sees a mark
+    /// set through the original, and the other way round. So marking the
+    /// listener marks what the event loop receives on.
+    ///
+    /// Needs CAP_NET_ADMIN, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn so_mark_is_shared_by_a_socket_and_its_clone() {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+        let clone = socket.try_clone().unwrap();
+        assert_ne!(socket.as_raw_fd(), clone.as_raw_fd());
+        socket.set_mark(MARK).unwrap();
+        assert_eq!(clone.mark().unwrap(), MARK);
+        clone.set_mark(MARK + 1).unwrap();
+        assert_eq!(socket.mark().unwrap(), MARK + 1);
+    }
 }
