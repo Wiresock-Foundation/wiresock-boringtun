@@ -1209,11 +1209,13 @@ impl Device {
     /// Not transactional. The mark each socket carries now is read first,
     /// and a failed read changes nothing. When a socket then refuses the new
     /// mark, the ones already changed are put back, best effort, and the
-    /// refusal is returned. Putting back can itself fail -- it needs the
-    /// same permission a refusal may just have shown is gone -- so after an
-    /// error some sockets can still carry the new mark. The stored mark
-    /// stays the previous one either way: `get=1`, rebinds and new peer
-    /// sockets keep using it, and resending it converges every socket.
+    /// refusal is returned. Putting back can itself fail -- losing the
+    /// permission to set SO_MARK is one case that refuses both -- so after
+    /// an error the sockets can be left on a mix of marks. The stored mark
+    /// stays the previous one throughout: `get=1`, rebinds and new peer
+    /// sockets keep using it. A later successful update, to either mark,
+    /// reconciles the sockets; a refusal that persists (permission, or
+    /// socket-option policy) can prevent that.
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     fn set_fwmark(&mut self, mark: u32) -> Result<(), Error> {
         // Every socket this call marks, in the order it marks them, each
