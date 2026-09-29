@@ -748,6 +748,22 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
     0
 }
 
+/// The `set=1` status for a device operation that failed: the OS errno the
+/// error carries -- positive, like every other status here -- or EIO when it
+/// carries none. Every `listen_port=` and `fwmark=` failure used to be
+/// EADDRINUSE, claiming a port collision for a refused SO_MARK or an
+/// exhausted descriptor table alike.
+fn device_errno(e: &Error) -> i32 {
+    match e.raw_os_error() {
+        Some(errno) if errno > 0 => errno,
+        _ => {
+            // No errno to hand back, so the detail goes to the log instead.
+            tracing::error!(message = "device operation failed", error = ?e);
+            EIO
+        }
+    }
+}
+
 fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -> i32 {
     d.try_writeable(
         |device| device.trigger_yield(),
@@ -793,7 +809,7 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                         "listen_port" => match val.parse::<u16>() {
                             Ok(port) => match device.open_listen_socket(port) {
                                 Ok(()) => {}
-                                Err(_) => return EADDRINUSE,
+                                Err(e) => return device_errno(&e),
                             },
                             Err(_) => return EINVAL,
                         },
@@ -805,7 +821,7 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                         "fwmark" => match val.parse::<u32>() {
                             Ok(mark) => match device.set_fwmark(mark) {
                                 Ok(()) => {}
-                                Err(_) => return EADDRINUSE,
+                                Err(e) => return device_errno(&e),
                             },
                             Err(_) => return EINVAL,
                         },
@@ -1179,6 +1195,53 @@ fn api_set_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn os(errno: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(errno)
+    }
+
+    /// A device failure reaches `set=1` as the errno it carries, exactly --
+    /// including errnos that share an `ErrorKind` (EPERM and EACCES are both
+    /// PermissionDenied), so the mapping cannot go through the kind.
+    #[test]
+    fn a_device_failure_reports_its_own_errno() {
+        for errno in [
+            EPERM,
+            EACCES,
+            EADDRINUSE,
+            EADDRNOTAVAIL,
+            EMFILE,
+            ENFILE,
+            ENOMEM,
+            ENOBUFS,
+            ENOSPC,
+            EINVAL,
+            EBADF,
+        ] {
+            assert_eq!(device_errno(&Error::IoError(os(errno))), errno);
+            assert_eq!(device_errno(&Error::EventQueue(os(errno))), errno);
+        }
+        assert_eq!(device_errno(&Error::Socket(os(EMFILE))), EMFILE);
+        assert_eq!(device_errno(&Error::FCntl(os(EBADF))), EBADF);
+    }
+
+    /// A failure with no errno to carry is EIO: never 0, which would report
+    /// success, never negative, and not the EADDRINUSE every failure used to
+    /// be.
+    #[test]
+    fn a_device_failure_without_an_errno_is_eio() {
+        let no_errno = [
+            Error::IoError(std::io::Error::other("listener has no inet address")),
+            Error::IoError(os(0)),
+            Error::Bind("bind".to_owned()),
+            Error::SetSockOpt("setsockopt".to_owned()),
+            Error::PeerSetup("peer".to_owned()),
+            Error::InvalidTunnelName,
+        ];
+        for e in &no_errno {
+            assert_eq!(device_errno(e), EIO, "{:?}", e);
+        }
+    }
 
     /// Protocol imitation survives a `set=1` that carries AmneziaWG keys.
     ///
