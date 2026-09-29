@@ -2149,6 +2149,12 @@ allowed_ip=10.66.66.2/32",
     #[cfg(target_os = "linux")]
     const UAPI_OK: &str = "errno=0\n\n";
 
+    /// The `set=1` reply for a failure with this errno.
+    #[cfg(target_os = "linux")]
+    fn uapi_errno(errno: i32) -> String {
+        format!("errno={}\n\n", errno)
+    }
+
     /// `bindable` of a port nothing holds, and of one held in both families.
     #[cfg(target_os = "linux")]
     const FREE: (bool, bool) = (true, true);
@@ -2385,11 +2391,14 @@ allowed_ip=10.66.66.2/32",
         let new = free_port();
         wg.fail_event_registration_after(1);
         let reply = wg.wg_set_port(new);
-        assert!(
-            reply.starts_with("errno=") && reply != UAPI_OK,
-            "listen_port={} is refused, got {:?}",
-            new,
-            reply
+        // The injected refusal is a real `epoll_ctl` on an invalid epoll
+        // descriptor, and its EBADF is what `set=1` reports -- neither a
+        // port collision nor a permission error.
+        assert_eq!(
+            reply,
+            uapi_errno(libc::EBADF),
+            "listen_port={} is refused",
+            new
         );
         assert_eq!(
             wg.event_registration_attempts() - attempts_before,
@@ -2482,12 +2491,12 @@ allowed_ip=10.66.66.2/32",
             let holder = hold();
             assert_eq!(listener_bindable(new), candidates, "{}", family);
             let reply = wg.wg_set_port(new);
-            assert!(
-                reply.starts_with("errno=") && reply != UAPI_OK,
-                "listen_port={} with an {} holder is refused, got {:?}",
+            assert_eq!(
+                reply,
+                uapi_errno(libc::EADDRINUSE),
+                "listen_port={} with an {} holder is refused as in use",
                 new,
-                family,
-                reply
+                family
             );
             assert_eq!(
                 wg.event_registration_attempts(),
@@ -2845,11 +2854,11 @@ allowed_ip=10.66.66.2/32",
         // The IPv4 candidate's mark goes through, the IPv6 one's is refused.
         fail_mark_after(&wg, 1);
         let reply = wg.wg_set_port(new);
-        assert!(
-            reply.starts_with("errno=") && reply != UAPI_OK,
-            "listen_port={} is refused, got {:?}",
-            new,
-            reply
+        assert_eq!(
+            reply,
+            uapi_errno(libc::EPERM),
+            "listen_port={} is refused with the mark's own errno",
+            new
         );
         assert!(
             !mark_fault_armed(&wg),
@@ -2951,11 +2960,7 @@ allowed_ip=10.66.66.2/32",
         let refused = |wg: &WGHandle, mark: u32| {
             fail_mark_after(wg, 0);
             let reply = wg.wg_set(&format!("fwmark={}", mark));
-            assert!(
-                reply.starts_with("errno=") && reply != UAPI_OK,
-                "{:?}",
-                reply
-            );
+            assert_eq!(reply, uapi_errno(libc::EPERM), "fwmark={}", mark);
             assert!(!mark_fault_armed(wg));
         };
 
@@ -3022,11 +3027,7 @@ allowed_ip=10.66.66.2/32",
         let refused_at = |wg: &WGHandle, allowed: usize| {
             fail_mark_after(wg, allowed);
             let reply = wg.wg_set(&format!("fwmark={}", new));
-            assert!(
-                reply.starts_with("errno=") && reply != UAPI_OK,
-                "{:?}",
-                reply
-            );
+            assert_eq!(reply, uapi_errno(libc::EPERM), "refused at {}", allowed);
             assert!(!mark_fault_armed(wg));
             assert_eq!(stored_fwmark(wg), Some(old), "the stored mark stays");
             assert_eq!(reported_fwmark(wg), Some(old));

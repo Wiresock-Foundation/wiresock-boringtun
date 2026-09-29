@@ -101,6 +101,33 @@ pub enum Error {
     PeerSetup(String),
 }
 
+impl Error {
+    /// The OS errno this error carries, if it wraps an `io::Error` that has
+    /// one. Exhaustive on purpose: a new variant has to say whether it does.
+    pub(crate) fn raw_os_error(&self) -> Option<i32> {
+        match self {
+            Error::IoError(e)
+            | Error::Socket(e)
+            | Error::FCntl(e)
+            | Error::EventQueue(e)
+            | Error::IOCtl(e)
+            | Error::IfaceRead(e)
+            | Error::ApiSocket(e) => e.raw_os_error(),
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+            Error::GetSockOpt(e) => e.raw_os_error(),
+            #[cfg(target_os = "linux")]
+            Error::Timer(e) => e.raw_os_error(),
+            Error::Bind(_)
+            | Error::Connect(_)
+            | Error::SetSockOpt(_)
+            | Error::InvalidTunnelName
+            | Error::GetSockName(_)
+            | Error::DropPrivileges(_)
+            | Error::PeerSetup(_) => None,
+        }
+    }
+}
+
 /// Whether a `Peer::connect_endpoint` failure says anything about *this
 /// listener's* capacity, or only about one peer's endpoint address.
 ///
