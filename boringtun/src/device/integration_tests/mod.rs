@@ -2842,11 +2842,8 @@ allowed_ip=10.66.66.2/32",
         let attempts_before = wg.event_registration_attempts();
 
         let new = free_port();
-        wg._device
-            .device
-            .read()
-            .fail_ipv6_listener_mark
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // The IPv4 candidate's mark goes through, the IPv6 one's is refused.
+        fail_mark_after(&wg, 1);
         let reply = wg.wg_set_port(new);
         assert!(
             reply.starts_with("errno=") && reply != UAPI_OK,
@@ -2855,11 +2852,7 @@ allowed_ip=10.66.66.2/32",
             reply
         );
         assert!(
-            !wg._device
-                .device
-                .read()
-                .fail_ipv6_listener_mark
-                .load(std::sync::atomic::Ordering::Relaxed),
+            !mark_fault_armed(&wg),
             "the refusal came from the IPv6 candidate's mark"
         );
         assert_eq!(
@@ -2890,6 +2883,227 @@ allowed_ip=10.66.66.2/32",
         assert_eq!(registered_events(&wg), events_before);
         assert_eq!(bindable(old), FREE, "old port {}", old);
         assert_eq!(conn_fd(&wg, &key), None);
+    }
+
+    /// Arm the device's one-shot mark fault: the next `allowed` SO_MARK
+    /// applications go through and the one after fails with EPERM.
+    #[cfg(target_os = "linux")]
+    fn fail_mark_after(wg: &WGHandle, allowed: usize) {
+        wg._device.device.read().fail_mark_after(allowed);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mark_fault_armed(wg: &WGHandle) -> bool {
+        let device = wg._device.device.read();
+        device.mark_fault.load(std::sync::atomic::Ordering::Relaxed) != usize::MAX
+    }
+
+    /// The device's stored fwmark, as the device itself holds it.
+    #[cfg(target_os = "linux")]
+    fn stored_fwmark(wg: &WGHandle) -> Option<u32> {
+        wg._device.device.read().fwmark
+    }
+
+    /// Add a peer and give it a connected socket, made by `connect_endpoint`
+    /// as a handshake would make it.
+    #[cfg(target_os = "linux")]
+    fn add_connected_peer(wg: &WGHandle) -> PublicKey {
+        let key = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let allowed = [AllowedIp {
+            ip: next_ip(),
+            cidr: 32,
+        }];
+        assert_eq!(wg.wg_set_peer(&key, &endpoint, &allowed), UAPI_OK);
+        connect_peer(wg, &key);
+        key
+    }
+
+    /// The SO_MARK the kernel holds on the peer's connected socket.
+    #[cfg(target_os = "linux")]
+    fn peer_conn_mark(wg: &WGHandle, key: &PublicKey) -> Option<u32> {
+        let device = wg._device.device.read();
+        let peer = device.peers[key].lock();
+        let mark = peer.endpoint().conn.as_ref().map(|c| c.mark().unwrap());
+        mark
+    }
+
+    /// A refused `fwmark=` is not stored: the device keeps -- and reports,
+    /// and carries to its next listener pair -- the last fwmark that every
+    /// socket accepted. The refusal here is the first listener's, before
+    /// any socket changed.
+    ///
+    /// `set_fwmark` used to store the mark first. Without CAP_NET_ADMIN,
+    /// where every `set_mark` fails -- boringtun-cli drops privileges by
+    /// default -- one failed `fwmark=` then left a mark the device reported
+    /// but no socket carried, and every later rebind, which now carries the
+    /// stored mark over, was refused until restart.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_refused_fwmark_update_leaves_the_last_committed_one() {
+        let wg = single_queue_device();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        assert_eq!(wg.wg_set_port(free_port()), UAPI_OK);
+        let peer = add_connected_peer(&wg);
+        let refused = |wg: &WGHandle, mark: u32| {
+            fail_mark_after(wg, 0);
+            let reply = wg.wg_set(&format!("fwmark={}", mark));
+            assert!(
+                reply.starts_with("errno=") && reply != UAPI_OK,
+                "{:?}",
+                reply
+            );
+            assert!(!mark_fault_armed(wg));
+        };
+
+        // Nothing committed yet: the device stays unmarked.
+        refused(&wg, MARK);
+        assert_eq!(stored_fwmark(&wg), None);
+        assert_eq!(reported_fwmark(&wg), None);
+        assert_eq!(listener_marks(&wg), (0, 0));
+        assert_eq!(peer_conn_mark(&wg, &peer), Some(0));
+        let port = free_port();
+        assert_eq!(wg.wg_set_port(port), UAPI_OK, "no stale mark to carry over");
+        assert_eq!(listen_port(&wg), port);
+        assert_eq!(listener_marks(&wg), (0, 0));
+        assert!(wg.wg_get().ends_with(UAPI_OK));
+
+        // A committed mark stays the committed one.
+        let (old, new) = (MARK, MARK + 1);
+        assert_eq!(wg.wg_set(&format!("fwmark={}", old)), UAPI_OK);
+        connect_peer(&wg, &peer); // the rebind above shut the old one
+        assert_eq!(peer_conn_mark(&wg, &peer), Some(old));
+        refused(&wg, new);
+        assert_eq!(stored_fwmark(&wg), Some(old));
+        assert_eq!(reported_fwmark(&wg), Some(old));
+        assert_eq!(listener_marks(&wg), (old, old));
+        assert_eq!(peer_conn_mark(&wg, &peer), Some(old));
+        let port = free_port();
+        assert_eq!(wg.wg_set_port(port), UAPI_OK);
+        assert_eq!(
+            listener_marks(&wg),
+            (old, old),
+            "the committed mark is carried"
+        );
+    }
+
+    /// Characterisation, not a guarantee of all-or-nothing: `set_fwmark`
+    /// stores the mark only once every socket took it, but does not roll
+    /// back the sockets that took it before a later one refused. What each
+    /// stage of a refusal leaves behind is pinned here, so neither the code
+    /// nor its comments can drift into claiming more.
+    ///
+    /// The order is fixed: IPv4 listener, IPv6 listener, then peers. Peers
+    /// are visited in map order, so with two of them the assertion is on
+    /// how many took the new mark, not which.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_fwmark_update_refused_part_way_is_not_rolled_back() {
+        let wg = single_queue_device();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        assert_eq!(wg.wg_set_port(free_port()), UAPI_OK);
+        let (old, new) = (MARK, MARK + 1);
+        assert_eq!(wg.wg_set(&format!("fwmark={}", old)), UAPI_OK);
+        let peers = [add_connected_peer(&wg), add_connected_peer(&wg)];
+        let peer_marks = |wg: &WGHandle| {
+            let mut marks: Vec<u32> = peers
+                .iter()
+                .map(|k| peer_conn_mark(wg, k).unwrap())
+                .collect();
+            marks.sort();
+            marks
+        };
+        let refused_at = |wg: &WGHandle, allowed: usize| {
+            fail_mark_after(wg, allowed);
+            let reply = wg.wg_set(&format!("fwmark={}", new));
+            assert!(
+                reply.starts_with("errno=") && reply != UAPI_OK,
+                "{:?}",
+                reply
+            );
+            assert!(!mark_fault_armed(wg));
+            assert_eq!(stored_fwmark(wg), Some(old), "the stored mark stays");
+            assert_eq!(reported_fwmark(wg), Some(old));
+        };
+        let restore = |wg: &WGHandle| {
+            assert_eq!(wg.wg_set(&format!("fwmark={}", old)), UAPI_OK);
+            assert_eq!(listener_marks(wg), (old, old));
+        };
+        assert_eq!(peer_marks(&wg), [old, old]);
+
+        // The first listener refuses: nothing changed.
+        refused_at(&wg, 0);
+        assert_eq!(listener_marks(&wg), (old, old));
+        assert_eq!(peer_marks(&wg), [old, old]);
+
+        // The second listener refuses: the first keeps the new mark.
+        refused_at(&wg, 1);
+        assert_eq!(listener_marks(&wg), (new, old));
+        assert_eq!(peer_marks(&wg), [old, old], "the peer stage is not reached");
+        restore(&wg);
+
+        // The first peer refuses: both listeners keep the new mark.
+        refused_at(&wg, 2);
+        assert_eq!(listener_marks(&wg), (new, new));
+        assert_eq!(peer_marks(&wg), [old, old]);
+        restore(&wg);
+
+        // The second peer refuses: the listeners and one peer keep it.
+        refused_at(&wg, 3);
+        assert_eq!(listener_marks(&wg), (new, new));
+        assert_eq!(peer_marks(&wg), [old, new]);
+        restore(&wg);
+
+        // Unhindered, the update takes everywhere and is stored.
+        assert_eq!(wg.wg_set(&format!("fwmark={}", new)), UAPI_OK);
+        assert_eq!(stored_fwmark(&wg), Some(new));
+        assert_eq!(listener_marks(&wg), (new, new));
+        assert_eq!(peer_marks(&wg), [new, new]);
+    }
+
+    /// A successful `fwmark=` marks both listeners and every connected peer
+    /// socket, and is stored and reported. `fwmark=0` is a value, not an
+    /// absence: stored as `Some(0)`, reported as `fwmark=0`, applied as 0 --
+    /// and a peer socket made afterwards takes it through `connect_endpoint`.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn fwmark_marks_the_listeners_and_connected_peers_and_zero_is_a_value() {
+        let wg = single_queue_device();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        assert_eq!(wg.wg_set_port(free_port()), UAPI_OK);
+        let peers = [add_connected_peer(&wg), add_connected_peer(&wg)];
+        for peer in &peers {
+            assert_eq!(peer_conn_mark(&wg, peer), Some(0));
+        }
+
+        assert_eq!(wg.wg_set(&format!("fwmark={}", MARK)), UAPI_OK);
+        assert_eq!(stored_fwmark(&wg), Some(MARK));
+        assert_eq!(reported_fwmark(&wg), Some(MARK));
+        assert_eq!(listener_marks(&wg), (MARK, MARK));
+        for peer in &peers {
+            assert_eq!(peer_conn_mark(&wg, peer), Some(MARK));
+        }
+
+        assert_eq!(wg.wg_set("fwmark=0"), UAPI_OK);
+        assert_eq!(stored_fwmark(&wg), Some(0));
+        assert_eq!(reported_fwmark(&wg), Some(0));
+        assert_eq!(listener_marks(&wg), (0, 0));
+        for peer in &peers {
+            assert_eq!(peer_conn_mark(&wg, peer), Some(0));
+        }
+
+        drop_conn(&wg, &peers[0]);
+        assert_eq!(connect_peer(&wg, &peers[0]).0, 0);
+        assert_eq!(peer_conn_mark(&wg, &peers[0]), Some(0));
     }
 
     /// SO_MARK belongs to the socket, not the descriptor: a `try_clone` --

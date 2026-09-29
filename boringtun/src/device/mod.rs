@@ -289,14 +289,16 @@ pub struct Device {
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
 
-    /// Test-only, one shot: fail the next IPv6 candidate listener's
-    /// `mark_listener`, after the IPv4 one has been marked -- a rebind that
-    /// fails halfway through PREPARE.
+    /// Test-only, one shot: `n` lets the next `n` of this device's SO_MARK
+    /// applications through and fails the one after; `usize::MAX` is
+    /// disarmed. Every `apply_mark` counts, in the order they run -- a
+    /// rebind's IPv4 then IPv6 candidate, or `set_fwmark`'s IPv4 listener,
+    /// IPv6 listener, then peers -- so one failure can be placed at any stage.
     #[cfg(all(
         test,
         any(target_os = "android", target_os = "fuchsia", target_os = "linux")
     ))]
-    fail_ipv6_listener_mark: AtomicBool,
+    mark_fault: AtomicUsize,
 }
 
 struct ThreadData {
@@ -834,7 +836,7 @@ impl Device {
                 test,
                 any(target_os = "android", target_os = "fuchsia", target_os = "linux")
             ))]
-            fail_ipv6_listener_mark: AtomicBool::new(false),
+            mark_fault: AtomicUsize::new(usize::MAX),
         };
 
         if uapi_fd >= 0 {
@@ -1036,36 +1038,62 @@ impl Device {
         let Some(mark) = self.fwmark else {
             return Ok(());
         };
+        self.apply_mark(listener, mark)
+    }
+
+    /// Set SO_MARK on one of the device's sockets.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    fn apply_mark(&self, socket: &socket2::Socket, mark: u32) -> io::Result<()> {
         #[cfg(test)]
-        if listener.domain()? == Domain::IPV6
-            && self.fail_ipv6_listener_mark.swap(false, Ordering::Relaxed)
+        if self
+            .mark_fault
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| match n {
+                usize::MAX => None,
+                0 => Some(usize::MAX),
+                n => Some(n - 1),
+            })
+            == Ok(0)
         {
             // What `set_mark` returns without CAP_NET_ADMIN.
             return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
-        listener.set_mark(mark)
+        socket.set_mark(mark)
+    }
+
+    /// Arm `mark_fault`: the next `allowed` SO_MARK applications go through
+    /// and the one after fails with EPERM, once.
+    #[cfg(all(
+        test,
+        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
+    ))]
+    pub(crate) fn fail_mark_after(&self, allowed: usize) {
+        self.mark_fault.store(allowed, Ordering::Relaxed);
     }
 
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     fn set_fwmark(&mut self, mark: u32) -> Result<(), Error> {
-        self.fwmark = Some(mark);
-
         // First set fwmark on listeners
         if let Some(ref sock) = self.udp4 {
-            sock.set_mark(mark)?;
+            self.apply_mark(sock, mark)?;
         }
 
         if let Some(ref sock) = self.udp6 {
-            sock.set_mark(mark)?;
+            self.apply_mark(sock, mark)?;
         }
 
         // Then on all currently connected sockets
         for peer in self.peers.values() {
             if let Some(ref sock) = peer.lock().endpoint().conn {
-                sock.set_mark(mark)?
+                self.apply_mark(sock, mark)?
             }
         }
 
+        // Stored only once every socket above took it, so a refused update
+        // is neither reported nor carried to the next listener pair -- which
+        // would otherwise refuse every rebind of a daemon without
+        // CAP_NET_ADMIN after one failed `fwmark=`. Sockets marked before a
+        // later failure keep the new mark: nothing is rolled back.
+        self.fwmark = Some(mark);
         Ok(())
     }
 
