@@ -316,16 +316,65 @@ pub struct Device {
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
 
-    /// Test-only, one shot: `n` lets the next `n` of this device's SO_MARK
-    /// applications through and fails the one after; `usize::MAX` is
-    /// disarmed. Every `apply_mark` counts, in the order they run -- a
-    /// rebind's IPv4 then IPv6 candidate, or `set_fwmark`'s IPv4 listener,
-    /// IPv6 listener, then peers -- so one failure can be placed at any stage.
+    /// Test-only: planned failures of this device's SO_MARK reads and
+    /// writes, by call index. See `MarkFaults`.
     #[cfg(all(
         test,
         any(target_os = "android", target_os = "fuchsia", target_os = "linux")
     ))]
-    mark_fault: AtomicUsize,
+    mark_faults: Mutex<MarkFaults>,
+}
+
+/// A socket `set_fwmark` marks: one of the listeners, or a peer's connected
+/// socket, reached through the peer's lock each time rather than held.
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum MarkTarget<'a> {
+    Udp4,
+    Udp6,
+    Peer(&'a Mutex<Peer>),
+}
+
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+impl MarkTarget<'_> {
+    fn kind(self) -> &'static str {
+        match self {
+            MarkTarget::Udp4 => "IPv4 listener",
+            MarkTarget::Udp6 => "IPv6 listener",
+            MarkTarget::Peer(_) => "peer connected socket",
+        }
+    }
+}
+
+/// Test-only: which of a device's SO_MARK reads (`read_mark`) and writes
+/// (`apply_mark`) fail, and with what errno. Calls are counted from when the
+/// plan is set, in the order they run -- a rebind's IPv4 then IPv6
+/// candidate; `set_fwmark`'s snapshot reads, then its IPv4 listener, IPv6
+/// listener and peers, then its restores in reverse -- so any stage can be
+/// made to fail, once each, independently of which peer is which.
+#[cfg(all(
+    test,
+    any(target_os = "android", target_os = "fuchsia", target_os = "linux")
+))]
+#[derive(Default)]
+struct MarkFaults {
+    reads: usize,
+    writes: usize,
+    fail_reads: Vec<(usize, i32)>,
+    fail_writes: Vec<(usize, i32)>,
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "android", target_os = "fuchsia", target_os = "linux")
+))]
+impl MarkFaults {
+    fn next(count: &mut usize, plan: &mut Vec<(usize, i32)>) -> Option<io::Error> {
+        let index = *count;
+        *count += 1;
+        let at = plan.iter().position(|&(i, _)| i == index)?;
+        Some(io::Error::from_raw_os_error(plan.remove(at).1))
+    }
 }
 
 struct ThreadData {
@@ -863,7 +912,7 @@ impl Device {
                 test,
                 any(target_os = "android", target_os = "fuchsia", target_os = "linux")
             ))]
-            mark_fault: AtomicUsize::new(usize::MAX),
+            mark_faults: Default::default(),
         };
 
         if uapi_fd >= 0 {
@@ -1072,56 +1121,151 @@ impl Device {
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     fn apply_mark(&self, socket: &socket2::Socket, mark: u32) -> io::Result<()> {
         #[cfg(test)]
-        if self
-            .mark_fault
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| match n {
-                usize::MAX => None,
-                0 => Some(usize::MAX),
-                n => Some(n - 1),
-            })
-            == Ok(0)
         {
-            // What `set_mark` returns without CAP_NET_ADMIN.
-            return Err(io::Error::from_raw_os_error(libc::EPERM));
+            let mut faults = self.mark_faults.lock();
+            let faults = &mut *faults;
+            if let Some(e) = MarkFaults::next(&mut faults.writes, &mut faults.fail_writes) {
+                return Err(e);
+            }
         }
         socket.set_mark(mark)
     }
 
-    /// Arm `mark_fault`: the next `allowed` SO_MARK applications go through
-    /// and the one after fails with EPERM, once.
+    /// Read the SO_MARK one of the device's sockets carries now.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    fn read_mark(&self, socket: &socket2::Socket) -> io::Result<u32> {
+        #[cfg(test)]
+        {
+            let mut faults = self.mark_faults.lock();
+            let faults = &mut *faults;
+            if let Some(e) = MarkFaults::next(&mut faults.reads, &mut faults.fail_reads) {
+                return Err(e);
+            }
+        }
+        socket.mark()
+    }
+
+    /// Plan SO_MARK failures from now on: each `(index, errno)` fails that
+    /// call, counting reads and writes separately from zero.
+    #[cfg(all(
+        test,
+        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
+    ))]
+    pub(crate) fn fail_mark_calls(&self, writes: &[(usize, i32)], reads: &[(usize, i32)]) {
+        *self.mark_faults.lock() = MarkFaults {
+            fail_writes: writes.to_vec(),
+            fail_reads: reads.to_vec(),
+            ..Default::default()
+        };
+    }
+
+    /// Let the next `allowed` SO_MARK writes through and fail the one after
+    /// with EPERM, once -- what `set_mark` returns without CAP_NET_ADMIN.
     #[cfg(all(
         test,
         any(target_os = "android", target_os = "fuchsia", target_os = "linux")
     ))]
     pub(crate) fn fail_mark_after(&self, allowed: usize) {
-        self.mark_fault.store(allowed, Ordering::Relaxed);
+        self.fail_mark_calls(&[(allowed, libc::EPERM)], &[]);
     }
 
+    /// `(reads, writes)` since the last plan, and whether any planned
+    /// failure is still pending.
+    #[cfg(all(
+        test,
+        any(target_os = "android", target_os = "fuchsia", target_os = "linux")
+    ))]
+    pub(crate) fn mark_calls(&self) -> (usize, usize, bool) {
+        let faults = self.mark_faults.lock();
+        let pending = !faults.fail_reads.is_empty() || !faults.fail_writes.is_empty();
+        (faults.reads, faults.writes, pending)
+    }
+
+    /// Run `f` on the target's socket, if it still has one. Under the
+    /// `set=1` write lock no listener or connected socket can come or go, so
+    /// a target listed by `set_fwmark` always does; `None` is only the
+    /// harmless answer should that ever not hold. One peer lock at a time,
+    /// as everywhere: device, then peer, then endpoint.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    fn with_mark_target<R>(
+        &self,
+        target: MarkTarget,
+        f: impl FnOnce(&socket2::Socket) -> io::Result<R>,
+    ) -> io::Result<Option<R>> {
+        match target {
+            MarkTarget::Udp4 => self.udp4.as_ref().map(f).transpose(),
+            MarkTarget::Udp6 => self.udp6.as_ref().map(f).transpose(),
+            MarkTarget::Peer(peer) => {
+                let peer = peer.lock();
+                let endpoint = peer.endpoint();
+                endpoint.conn.as_ref().map(f).transpose()
+            }
+        }
+    }
+
+    /// Set the device's fwmark on its listeners and its peers' connected
+    /// sockets, and store it once every one of them has taken it.
+    ///
+    /// Not transactional. The mark each socket carries now is read first,
+    /// and a failed read changes nothing. When a socket then refuses the new
+    /// mark, the ones already changed are put back, best effort, and the
+    /// refusal is returned. Putting back can itself fail -- losing the
+    /// permission to set SO_MARK is one case that refuses both -- so after
+    /// an error the sockets can be left on a mix of marks. The stored mark
+    /// stays the previous one throughout: `get=1`, rebinds and new peer
+    /// sockets keep using it. A later successful update, to either mark,
+    /// reconciles the sockets; a refusal that persists (permission, or
+    /// socket-option policy) can prevent that.
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     fn set_fwmark(&mut self, mark: u32) -> Result<(), Error> {
-        // First set fwmark on listeners
-        if let Some(ref sock) = self.udp4 {
-            self.apply_mark(sock, mark)?;
-        }
-
-        if let Some(ref sock) = self.udp6 {
-            self.apply_mark(sock, mark)?;
-        }
-
-        // Then on all currently connected sockets
-        for peer in self.peers.values() {
-            if let Some(ref sock) = peer.lock().endpoint().conn {
-                self.apply_mark(sock, mark)?
+        // Every socket this call marks, in the order it marks them, each
+        // with the mark it actually carries now -- which after an earlier
+        // failed update need not be the stored one.
+        let peers = self.peers.values().map(|peer| MarkTarget::Peer(peer));
+        let mut targets = Vec::new();
+        let listeners = [MarkTarget::Udp4, MarkTarget::Udp6];
+        for target in listeners.iter().copied().chain(peers) {
+            if let Some(previous) = self.with_mark_target(target, |s| self.read_mark(s))? {
+                targets.push((target, previous));
             }
         }
 
-        // Stored only once every socket above took it, so a refused update
-        // is neither reported nor carried to the next listener pair -- which
-        // would otherwise refuse every rebind of a daemon without
-        // CAP_NET_ADMIN after one failed `fwmark=`. Sockets marked before a
-        // later failure keep the new mark: nothing is rolled back.
+        for (changed, &(target, _)) in targets.iter().enumerate() {
+            if let Err(e) = self.with_mark_target(target, |s| self.apply_mark(s, mark)) {
+                self.restore_marks(&targets[..changed], mark, target, &e);
+                return Err(e.into());
+            }
+        }
+
         self.fwmark = Some(mark);
         Ok(())
+    }
+
+    /// Put each of `changed` back to the mark it carried before this update,
+    /// newest first, trying every one however many refuse. Best effort: a
+    /// socket that refuses keeps the new mark, and the refusal is only
+    /// logged -- the caller reports the error that started this.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    fn restore_marks(
+        &self,
+        changed: &[(MarkTarget, u32)],
+        requested: u32,
+        refused_by: MarkTarget,
+        cause: &io::Error,
+    ) {
+        for &(target, previous) in changed.iter().rev() {
+            if let Err(e) = self.with_mark_target(target, |s| self.apply_mark(s, previous)) {
+                tracing::error!(
+                    message = "could not restore a socket's fwmark after a failed update",
+                    socket = target.kind(),
+                    restoring = previous,
+                    requested,
+                    refused_by = refused_by.kind(),
+                    cause = %cause,
+                    error = %e,
+                );
+            }
+        }
     }
 
     fn clear_peers(&mut self) {
