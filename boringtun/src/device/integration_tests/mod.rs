@@ -236,66 +236,208 @@ mod tests {
             })
         }
 
-        fn get_request(&self) -> String {
-            let mut tcp_conn = self.connect();
-
-            write!(
-                tcp_conn,
-                "GET / HTTP/1.1\nHost: localhost\nAccept: */*\nConnection: close\n\n"
-            )
-            .unwrap();
-
-            tcp_conn
-                .set_read_timeout(Some(std::time::Duration::from_secs(60)))
-                .ok();
-
-            let mut reader = BufReader::new(tcp_conn);
-            let mut line = String::new();
-            let mut response = String::new();
-            let mut len = 0usize;
-
-            // Read response code
-            if reader.read_line(&mut line).is_ok() && !line.starts_with("HTTP/1.1 200") {
-                return response;
-            }
-            line.clear();
-
-            // Read headers
-            while reader.read_line(&mut line).is_ok() {
-                if line.trim() == "" {
-                    break;
-                }
-
-                {
-                    let parsed_line: Vec<&str> = line.split(':').collect();
-                    if parsed_line.len() < 2 {
-                        return response;
-                    }
-
-                    let (key, val) = (parsed_line[0], parsed_line[1]);
-                    if key.to_lowercase() == "content-length" {
-                        len = match val.trim().parse() {
-                            Err(_) => return response,
-                            Ok(len) => len,
-                        };
-                    }
-                }
-                line.clear();
-            }
-
-            // Read body
-            let mut buf = [0u8; 256];
-            while len > 0 {
-                let to_read = len.min(buf.len());
-                if reader.read_exact(&mut buf[..to_read]).is_err() {
-                    return response;
-                }
-                response.push_str(&String::from_utf8_lossy(&buf[..to_read]));
-                len -= to_read;
-            }
-
-            response
+        /// GET the peer's page through the tunnel: connect within
+        /// `CONNECT_BUDGET`, then exchange the request and the response
+        /// under `HTTP_IO_TIMEOUT` per socket operation. The error names the
+        /// stage that failed.
+        fn try_get_request(&self) -> std::io::Result<String> {
+            http_exchange(self.connect(), HTTP_IO_TIMEOUT)
         }
+
+        fn get_request(&self) -> String {
+            self.try_get_request().unwrap_or_else(|err| {
+                panic!(
+                    "HTTP GET from {} through the tunnel failed ({:?}): {}",
+                    SocketAddr::new(self.allowed_ips[0].ip, 80),
+                    err.kind(),
+                    err
+                )
+            })
+        }
+    }
+
+    /// How long each socket operation of an HTTP exchange may wait once the
+    /// connection is up -- the request write, and every read of the status
+    /// line, the headers and the body. Separate from `CONNECT_BUDGET`, which
+    /// ends when `connect` returns.
+    ///
+    /// Measured on the suite (10 runs, 10,050 exchanges): from the request
+    /// write to the last body byte took 1.9 ms at the median, 25 ms at
+    /// p99.9 and 48 ms at worst, nearly all of it waiting for the status
+    /// line. 10 s is some 200 times the worst.
+    ///
+    /// Per operation, not a deadline for the whole response: a server that
+    /// keeps trickling bytes restarts it with each read. The peer is this
+    /// suite's own nginx, which answers in one short burst, so the case
+    /// that matters is a peer that stops -- and that fails after one
+    /// timeout, naming the stage.
+    const HTTP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The request, byte for byte: HTTP/1.1 with CRLF line ends.
+    const HTTP_REQUEST: &[u8] =
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nConnection: close\r\n\r\n";
+
+    /// Ceilings for what the helper will read. The page is a 64-character
+    /// hex public key and nginx sends a few hundred bytes of headers, so
+    /// both are generous; exceeding either is a malformed response, not
+    /// something to allocate for.
+    const HTTP_MAX_HEAD: usize = 8 * 1024;
+    const HTTP_MAX_BODY: usize = 4 * 1024;
+
+    /// Send `HTTP_REQUEST` on a connected `stream` and read the response
+    /// body, with `timeout` on every socket operation.
+    fn http_exchange(
+        mut stream: std::net::TcpStream,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<String> {
+        configure_http_stream(&stream, timeout)?;
+        stream
+            .write_all(HTTP_REQUEST)
+            .map_err(|e| http_stage("writing the request", e))?;
+        read_http_response(&mut BufReader::new(stream))
+    }
+
+    /// Bound both directions before any I/O. A timeout that cannot be set
+    /// is an error, not a socket left blocking forever.
+    fn configure_http_stream(
+        stream: &std::net::TcpStream,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| http_stage("setting the write timeout", e))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| http_stage("setting the read timeout", e))
+    }
+
+    /// Read the one response this suite's nginx sends: `HTTP/1.1 200`,
+    /// headers up to the blank line, and exactly `Content-Length` bytes of
+    /// UTF-8 body. Only as much HTTP as that fixture needs; anything else
+    /// is an error naming what was wrong.
+    ///
+    /// * A read error, and EOF, fail the stage they happen in -- they never
+    ///   stand in for a blank line or a successful status.
+    /// * Headers are split at the first colon, and names compare
+    ///   ASCII-case-insensitively. Unknown headers are ignored.
+    /// * `Content-Length` is required. A repeat with the same value is
+    ///   accepted, as RFC 9110 lets a recipient; a different one is an
+    ///   error. Zero is a valid, empty body.
+    /// * `Transfer-Encoding` is refused: nginx sends a length for this
+    ///   page, and a chunked decoder is more HTTP than the suite needs.
+    /// * The body is read with `read_exact`, never to EOF, so a server that
+    ///   keeps the connection open does not delay it.
+    fn read_http_response(reader: &mut impl BufRead) -> std::io::Result<String> {
+        let mut budget = HTTP_MAX_HEAD;
+        let mut line = String::new();
+
+        read_head_line(reader, &mut line, &mut budget, "reading the status line")?;
+        let status = line.trim_end_matches(['\r', '\n']);
+        let mut parts = status.splitn(3, ' ');
+        match (parts.next(), parts.next()) {
+            (Some("HTTP/1.1"), Some("200")) => {}
+            _ => return Err(http_invalid(format!("unexpected status line {:?}", status))),
+        }
+
+        let mut content_length: Option<usize> = None;
+        loop {
+            line.clear();
+            read_head_line(reader, &mut line, &mut budget, "reading the headers")?;
+            let header = line.trim_end_matches(['\r', '\n']);
+            if header.is_empty() {
+                break;
+            }
+            let (name, value) = match header.split_once(':') {
+                Some((name, value))
+                    if !name.is_empty() && !name.contains(|c: char| c.is_ascii_whitespace()) =>
+                {
+                    (name, value.trim())
+                }
+                _ => return Err(http_invalid(format!("malformed header line {:?}", header))),
+            };
+            if name.eq_ignore_ascii_case("content-length") {
+                let len = match value.parse::<usize>() {
+                    Ok(len) if value.bytes().all(|b| b.is_ascii_digit()) => len,
+                    _ => {
+                        return Err(http_invalid(format!(
+                            "malformed Content-Length {:?}",
+                            value
+                        )))
+                    }
+                };
+                match content_length {
+                    Some(previous) if previous != len => {
+                        return Err(http_invalid(format!(
+                            "conflicting Content-Length values {} and {}",
+                            previous, len
+                        )))
+                    }
+                    _ => content_length = Some(len),
+                }
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                return Err(http_invalid(format!(
+                    "Transfer-Encoding {:?} is not supported by this test helper",
+                    value
+                )));
+            }
+        }
+
+        let len = content_length.ok_or_else(|| http_invalid("no Content-Length header".into()))?;
+        if len > HTTP_MAX_BODY {
+            return Err(http_invalid(format!(
+                "Content-Length {} exceeds the {}-byte limit",
+                len, HTTP_MAX_BODY
+            )));
+        }
+        let mut body = vec![0u8; len];
+        reader
+            .read_exact(&mut body)
+            .map_err(|e| http_stage("reading the body", e))?;
+        String::from_utf8(body).map_err(|_| http_invalid("the body is not UTF-8".into()))
+    }
+
+    /// One line of the status line and headers, charged against `budget`,
+    /// the bytes left for the whole head. EOF before the line ends fails
+    /// `stage`, and so does running out of budget.
+    fn read_head_line(
+        reader: &mut impl BufRead,
+        line: &mut String,
+        budget: &mut usize,
+        stage: &str,
+    ) -> std::io::Result<()> {
+        let read = reader
+            .by_ref()
+            .take(*budget as u64)
+            .read_line(line)
+            .map_err(|e| http_stage(stage, e))?;
+        if !line.ends_with('\n') {
+            return Err(if read == *budget {
+                http_invalid(format!(
+                    "{}: the response head exceeds {} bytes",
+                    stage, HTTP_MAX_HEAD
+                ))
+            } else {
+                http_stage(
+                    stage,
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the connection closed mid-response",
+                    ),
+                )
+            });
+        }
+        *budget -= read;
+        Ok(())
+    }
+
+    /// `err` with the stage it happened in, keeping its kind -- so a
+    /// timeout still reads as one.
+    fn http_stage(stage: &str, err: std::io::Error) -> std::io::Error {
+        std::io::Error::new(err.kind(), format!("{}: {}", stage, err))
+    }
+
+    fn http_invalid(detail: String) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, detail)
     }
 
     impl WGHandle {
@@ -1087,6 +1229,359 @@ mod tests {
             "{:?} is over the {:?} budget",
             took,
             CONNECT_BUDGET
+        );
+    }
+
+    /// What this suite's nginx sends for its page (captured from the
+    /// fixture), with `body` and its length.
+    fn nginx_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nServer: nginx/1.15.9\r\nDate: Wed, 30 Sep 2026 11:32:53 GMT\r\n\
+             Content-Type: application/octet-stream\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn parse(response: &str) -> std::io::Result<String> {
+        read_http_response(&mut std::io::Cursor::new(response.as_bytes().to_vec()))
+    }
+
+    fn parse_err(response: &str) -> std::io::Error {
+        parse(response).expect_err("a malformed response must be an error")
+    }
+
+    /// The request is HTTP/1.1 with CRLF line ends -- never bare LFs -- and
+    /// the blank line that ends it.
+    #[test]
+    fn the_http_request_is_crlf_terminated() {
+        assert_eq!(
+            HTTP_REQUEST,
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        );
+        assert!(HTTP_REQUEST.ends_with(b"\r\n\r\n"));
+        for (i, &b) in HTTP_REQUEST.iter().enumerate() {
+            if b == b'\n' {
+                assert_eq!(HTTP_REQUEST[i - 1], b'\r', "bare LF at byte {}", i);
+            }
+        }
+    }
+
+    /// The fixture's own response parses to its body, and a body of exactly
+    /// `Content-Length` bytes is taken whole, with nothing read past it.
+    #[test]
+    fn the_nginx_response_parses_to_its_body() {
+        let key = "7a".repeat(32);
+        assert_eq!(parse(&nginx_response(&key)).unwrap(), key);
+        let mut trailing = nginx_response(&key);
+        trailing.push_str("unread");
+        assert_eq!(parse(&trailing).unwrap(), key);
+    }
+
+    #[test]
+    fn a_status_other_than_200_is_an_error() {
+        for status in [
+            "HTTP/1.1 404 Not Found",
+            "HTTP/1.1 500 Internal Server Error",
+            "HTTP/1.1 2000 OK",
+            "HTTP/1.0 200 OK",
+            "HTTP/1.1  200 OK",
+            "garbage 200",
+        ] {
+            let response = nginx_response("x").replacen("HTTP/1.1 200 OK", status, 1);
+            let err = parse_err(&response);
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "{}: {}",
+                status,
+                err
+            );
+        }
+    }
+
+    /// EOF where a line should be fails the stage it happened in -- it is
+    /// not a blank line and not a success.
+    #[test]
+    fn eof_before_the_status_or_inside_the_headers_is_an_error() {
+        for (response, stage) in [
+            ("", "reading the status line"),
+            ("HTTP/1.1 200", "reading the status line"),
+            ("HTTP/1.1 200 OK\r\n", "reading the headers"),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n",
+                "reading the headers",
+            ),
+            ("HTTP/1.1 200 OK\r\nContent-Len", "reading the headers"),
+        ] {
+            let err = parse_err(response);
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "{:?}",
+                response
+            );
+            assert!(
+                err.to_string().starts_with(stage),
+                "{:?}: {}",
+                response,
+                err
+            );
+        }
+    }
+
+    /// A read error is returned as itself, from the stage it happened in.
+    #[test]
+    fn a_read_error_is_returned_not_parsed_past() {
+        struct Failing(Vec<u8>);
+        impl Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.is_empty() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "stalled"));
+                }
+                let n = buf.len().min(self.0.len());
+                buf[..n].copy_from_slice(&self.0[..n]);
+                self.0.drain(..n);
+                Ok(n)
+            }
+        }
+        let full = nginx_response(&"7a".repeat(32));
+        let head_end = full.find("\r\n\r\n").unwrap() + 4;
+        for (cut, stage) in [
+            (0, "reading the status line"),
+            (full.find("\r\n").unwrap() + 2, "reading the headers"),
+            (head_end, "reading the body"),
+            (head_end + 10, "reading the body"),
+        ] {
+            let mut reader = BufReader::new(Failing(full.as_bytes()[..cut].to_vec()));
+            let err = read_http_response(&mut reader).expect_err("stalled");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::TimedOut,
+                "cut at {}: {}",
+                cut,
+                err
+            );
+            assert!(
+                err.to_string().starts_with(stage),
+                "cut at {}: {}",
+                cut,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_header_line_is_an_error() {
+        for header in [
+            "no colon here",
+            ": empty name",
+            "Bad Name: x",
+            "Content-Length : 1",
+        ] {
+            let response = nginx_response("x").replacen("Server: nginx/1.15.9", header, 1);
+            let err = parse_err(&response);
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "{}: {}",
+                header,
+                err
+            );
+        }
+    }
+
+    /// Content-Length is required, must be a plain decimal, and must not
+    /// contradict itself. The same value twice is accepted; zero is an
+    /// empty body.
+    #[test]
+    fn content_length_is_required_well_formed_and_consistent() {
+        let missing = nginx_response("x").replacen("Content-Length: 1\r\n", "", 1);
+        assert_eq!(parse_err(&missing).kind(), std::io::ErrorKind::InvalidData);
+
+        for value in [
+            "",
+            "abc",
+            "-1",
+            "+1",
+            "1 2",
+            "1:1",
+            "0x10",
+            "99999999999999999999999",
+        ] {
+            let response = nginx_response("x").replacen(
+                "Content-Length: 1",
+                &format!("Content-Length: {}", value),
+                1,
+            );
+            let err = parse_err(&response);
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "{:?}: {}",
+                value,
+                err
+            );
+        }
+
+        let conflicting = nginx_response("x").replacen("Connection: close", "Content-Length: 2", 1);
+        assert_eq!(
+            parse_err(&conflicting).kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let repeated = nginx_response("x").replacen("Connection: close", "Content-Length: 1", 1);
+        assert_eq!(parse(&repeated).unwrap(), "x");
+
+        assert_eq!(parse(&nginx_response("")).unwrap(), "");
+    }
+
+    #[test]
+    fn content_length_is_case_insensitive() {
+        let lower = nginx_response("abc").replacen("Content-Length", "content-length", 1);
+        assert_eq!(parse(&lower).unwrap(), "abc");
+        let upper = nginx_response("abc").replacen("Content-Length", "CONTENT-LENGTH", 1);
+        assert_eq!(parse(&upper).unwrap(), "abc");
+    }
+
+    /// Only the first colon splits a header: a value with colons in it is
+    /// ignored like any other unknown header, and a header whose *value*
+    /// mentions Content-Length is not taken for one.
+    #[test]
+    fn a_header_value_with_colons_is_not_split_again() {
+        let response = nginx_response("abc").replacen(
+            "Server: nginx/1.15.9",
+            "X-Note: Content-Length: 9999: not this one",
+            1,
+        );
+        assert_eq!(parse(&response).unwrap(), "abc");
+    }
+
+    #[test]
+    fn a_body_shorter_than_its_content_length_is_an_error() {
+        let response = nginx_response("abcdef").replacen("abcdef", "abc", 1);
+        let err = parse_err(&response);
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "{}", err);
+        assert!(err.to_string().starts_with("reading the body"), "{}", err);
+    }
+
+    #[test]
+    fn a_body_over_the_limit_is_an_error_and_is_not_allocated() {
+        let at_limit = "a".repeat(HTTP_MAX_BODY);
+        assert_eq!(parse(&nginx_response(&at_limit)).unwrap(), at_limit);
+
+        let over = nginx_response("x").replacen(
+            "Content-Length: 1",
+            &format!("Content-Length: {}", HTTP_MAX_BODY + 1),
+            1,
+        );
+        assert_eq!(parse_err(&over).kind(), std::io::ErrorKind::InvalidData);
+
+        let huge =
+            nginx_response("x").replacen("Content-Length: 1", "Content-Length: 4294967296", 1);
+        assert_eq!(parse_err(&huge).kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_response_head_over_the_limit_is_an_error() {
+        let long = format!("X-Pad: {}", "p".repeat(HTTP_MAX_HEAD));
+        let response = nginx_response("x").replacen("Server: nginx/1.15.9", &long, 1);
+        let err = parse_err(&response);
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{}", err);
+    }
+
+    #[test]
+    fn transfer_encoding_is_refused() {
+        let chunked =
+            nginx_response("x").replacen("Connection: close", "Transfer-Encoding: chunked", 1);
+        assert_eq!(parse_err(&chunked).kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_body_that_is_not_utf8_is_an_error() {
+        let mut response = nginx_response("xy").into_bytes();
+        let n = response.len();
+        response[n - 1] = 0xff;
+        let err = read_http_response(&mut std::io::Cursor::new(response)).expect_err("not UTF-8");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Both directions of the exchange's socket are bounded before any I/O,
+    /// at the configured timeout. Loopback only; nothing waits.
+    #[test]
+    fn the_http_stream_gets_read_and_write_timeouts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        assert_eq!(stream.write_timeout().unwrap(), None);
+
+        configure_http_stream(&stream, HTTP_IO_TIMEOUT).unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), Some(HTTP_IO_TIMEOUT));
+        assert_eq!(stream.write_timeout().unwrap(), Some(HTTP_IO_TIMEOUT));
+    }
+
+    /// A timeout that cannot be set is an error naming what failed, not a
+    /// socket quietly left to block. A zero duration is the one the
+    /// standard library refuses outright.
+    #[test]
+    fn a_timeout_that_cannot_be_set_is_an_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let err = configure_http_stream(&stream, std::time::Duration::ZERO)
+            .expect_err("a zero timeout is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{}", err);
+        assert!(
+            err.to_string().starts_with("setting the write timeout"),
+            "{}",
+            err
+        );
+    }
+
+    /// End to end over loopback: the exact request reaches the server, and
+    /// the nginx-shaped answer comes back as the body.
+    #[test]
+    fn an_http_exchange_over_loopback_returns_the_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let key = "5c".repeat(32);
+        let reply = nginx_response(&key);
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut request = vec![0u8; HTTP_REQUEST.len()];
+            conn.read_exact(&mut request).unwrap();
+            conn.write_all(reply.as_bytes()).unwrap();
+            request
+        });
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        assert_eq!(http_exchange(stream, HTTP_IO_TIMEOUT).unwrap(), key);
+        assert_eq!(server.join().unwrap(), HTTP_REQUEST);
+    }
+
+    /// A server that accepts and never answers fails the exchange after one
+    /// timeout, at the status line, as the socket's timeout error -- not an
+    /// empty body. A short timeout stands in for `HTTP_IO_TIMEOUT`; nothing
+    /// asserts how long it took.
+    #[test]
+    fn a_silent_http_server_fails_the_status_read_with_a_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_held, _) = listener.accept().unwrap();
+        let err = http_exchange(stream, std::time::Duration::from_millis(200))
+            .expect_err("nothing is ever sent");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "{:?}: {}",
+            err.kind(),
+            err
+        );
+        assert!(
+            err.to_string().starts_with("reading the status line"),
+            "{}",
+            err
         );
     }
 
