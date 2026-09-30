@@ -323,6 +323,13 @@ pub struct Device {
         any(target_os = "android", target_os = "fuchsia", target_os = "linux")
     ))]
     mark_faults: Mutex<MarkFaults>,
+
+    /// Test-only: while set, the MTU monitor leaves `mtu` and the padding
+    /// clamps as they are, so a test can keep the cached MTU apart from the
+    /// interface's for as long as it needs -- the gap a real MTU change opens
+    /// for up to a second. See `register_mtu_monitor`.
+    #[cfg(test)]
+    hold_mtu: AtomicBool,
 }
 
 /// A socket `set_fwmark` marks: one of the listeners, or a peer's connected
@@ -913,6 +920,8 @@ impl Device {
                 any(target_os = "android", target_os = "fuchsia", target_os = "linux")
             ))]
             mark_faults: Default::default(),
+            #[cfg(test)]
+            hold_mtu: AtomicBool::new(false),
         };
 
         if uapi_fd >= 0 {
@@ -1891,14 +1900,21 @@ impl Device {
                 // * Determine peer based on packet destination ip
                 // * Encapsulate the packet for the given peer
                 // * Send encapsulated packet to the peer's endpoint
-                let mtu = d.mtu.load(Ordering::Relaxed);
-
                 let udp4 = d.udp4.as_ref().expect("Not connected");
                 let udp6 = d.udp6.as_ref().expect("Not connected");
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
-                    let src = match iface.read(&mut t.src_buf[..mtu]) {
+                    // The whole buffer, never the cached `d.mtu`: a TUN read
+                    // shorter than the packet returns its start and silently
+                    // drops the rest, and the cached value can lag the
+                    // interface -- for up to a second after an MTU increase,
+                    // or for good on a provided descriptor whose MTU cannot be
+                    // read. Packets are held to the interface MTU where they
+                    // enter the TUN, so there is nothing to check here; one
+                    // queued before an MTU decrease is still read whole. Only
+                    // the bytes read are used below.
+                    let src = match iface.read(&mut t.src_buf[..]) {
                         Ok(src) => src,
                         Err(Error::IfaceRead(e)) => {
                             let ek = e.kind();
