@@ -519,6 +519,13 @@ impl Device {
     pub(crate) fn register_mtu_monitor(&self) -> Result<(), Error> {
         self.queue.new_periodic_event(
             Box::new(|d, _| {
+                #[cfg(test)]
+                {
+                    if d.hold_mtu.load(Ordering::Relaxed) {
+                        return Action::Continue;
+                    }
+                }
+
                 if let Ok(mtu) = d.iface.mtu() {
                     d.mtu.store(mtu, Ordering::Relaxed);
 

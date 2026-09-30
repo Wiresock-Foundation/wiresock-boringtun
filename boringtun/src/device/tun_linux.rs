@@ -155,12 +155,12 @@ impl TunSocket {
 
     /// Get the current MTU value
     ///
-    /// The value sizes the TUN read buffer and clamps AmneziaWG content
-    /// padding, and the device re-reads it for as long as it lives, so a
-    /// fabricated answer would never self-correct. The interface is
-    /// therefore asked under the name recovered live from the fd
-    /// (TUNGETIFF) -- which also tracks renames -- and `self.name` is only
-    /// the fallback for a named device whose fd refuses TUNGETIFF.
+    /// The value clamps AmneziaWG content padding; it does not size the TUN
+    /// read, which always offers the whole buffer. The device re-reads it for
+    /// as long as it lives, so a fabricated answer would never self-correct.
+    /// The interface is therefore asked under the name recovered live from
+    /// the fd (TUNGETIFF) -- which also tracks renames -- and `self.name` is
+    /// only the fallback for a named device whose fd refuses TUNGETIFF.
     ///
     /// `name()` deliberately keeps returning what the socket was built
     /// from: the UAPI socket is named after it, and for an embedder-provided

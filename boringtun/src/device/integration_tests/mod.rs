@@ -5,6 +5,8 @@
 // Those tests require docker and sudo privileges to run
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use crate::device::MAX_UDP_SIZE;
     use crate::device::{DeviceConfig, DeviceHandle};
     #[cfg(target_os = "linux")]
     use crate::noise::{Packet, Tunn, TunnResult};
@@ -20,7 +22,9 @@ mod tests {
     use std::net::UdpSocket;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     #[cfg(target_os = "linux")]
-    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::UnixDatagram;
     use std::os::unix::net::UnixStream;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3840,5 +3844,716 @@ allowed_ip=10.66.66.2/32",
         assert_eq!(clone.mark().unwrap(), MARK);
         clone.set_mark(MARK + 1).unwrap();
         assert_eq!(socket.mark().unwrap(), MARK + 1);
+    }
+
+    // The TUN read. The iface handler reads each packet into its worker's
+    // whole source buffer. It used to offer only the cached MTU, which the
+    // monitor refreshes once a second -- and a TUN read shorter than the
+    // packet returns the start of it and drops the rest, so for up to a
+    // second after an MTU increase every packet larger than the old MTU
+    // reached the peer truncated, and the peer refused it. The tests below
+    // put packets of known bytes into the device's TUN and read them back,
+    // decrypted, at a peer running in this process.
+
+    /// How long the MTU monitor, which runs once a second, is given to catch
+    /// up with a change. A fail-safe, not a synchronisation: the waits poll
+    /// the state the monitor writes and return as soon as it is there.
+    #[cfg(target_os = "linux")]
+    const MONITOR_WAIT: Duration = Duration::from_secs(5);
+
+    /// Protocol 253, reserved for experimentation (RFC 3692): these packets
+    /// are carried through the tunnel, never handed to an IP stack.
+    #[cfg(target_os = "linux")]
+    const EXPERIMENT: u8 = 253;
+
+    /// An IPv4 packet of exactly `len` bytes, with a valid header checksum
+    /// and `tag` in its identification field and its payload, so no two
+    /// packets a test sends are alike.
+    #[cfg(target_os = "linux")]
+    fn packet_v4(src: Ipv4Addr, dst: Ipv4Addr, len: usize, tag: u16) -> Vec<u8> {
+        let mut p = vec![0u8; len];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        p[4..6].copy_from_slice(&tag.to_be_bytes());
+        p[8] = 64;
+        p[9] = EXPERIMENT;
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        let sum: u32 = p[..20]
+            .chunks(2)
+            .map(|w| u32::from(u16::from_be_bytes([w[0], w[1]])))
+            .sum();
+        let sum = (sum & 0xffff) + (sum >> 16);
+        let sum = (sum & 0xffff) + (sum >> 16);
+        p[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+        fill_payload(&mut p[20..], tag);
+        p
+    }
+
+    /// An IPv6 packet of exactly `len` bytes; see `packet_v4`.
+    #[cfg(target_os = "linux")]
+    fn packet_v6(src: Ipv6Addr, dst: Ipv6Addr, len: usize, tag: u16) -> Vec<u8> {
+        let mut p = vec![0u8; len];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&((len - 40) as u16).to_be_bytes());
+        p[6] = EXPERIMENT;
+        p[7] = 64;
+        p[8..24].copy_from_slice(&src.octets());
+        p[24..40].copy_from_slice(&dst.octets());
+        fill_payload(&mut p[40..], tag);
+        p
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fill_payload(payload: &mut [u8], tag: u16) {
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i as u16).wrapping_mul(7).wrapping_add(tag) as u8;
+        }
+    }
+
+    /// `got` is `sent`, byte for byte. Reported by length and first
+    /// difference rather than by printing both packets.
+    #[cfg(target_os = "linux")]
+    fn assert_same(got: &[u8], sent: &[u8]) {
+        if got != sent {
+            let first_difference = got.iter().zip(sent).position(|(a, b)| a != b);
+            panic!(
+                "a {}-byte IPv{} packet arrived as {} bytes (first difference at {:?})",
+                sent.len(),
+                sent[0] >> 4,
+                got.len(),
+                first_difference
+            );
+        }
+    }
+
+    /// Puts packets into a TUN interface the way routed traffic gets there:
+    /// the kernel sends each one out through the interface, and it queues
+    /// for the device's reader. An AF_PACKET socket addressing the interface
+    /// by index, with protocol 0, so it receives nothing. Like routed
+    /// traffic, it is held to the interface MTU -- a larger packet is refused
+    /// with EMSGSIZE -- so the device only ever reads what the interface
+    /// allowed.
+    #[cfg(target_os = "linux")]
+    struct TunInjector {
+        socket: OwnedFd,
+        ifindex: libc::c_int,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TunInjector {
+        fn new(name: &str) -> TunInjector {
+            let c_name = std::ffi::CString::new(name).unwrap();
+            let ifindex = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+            assert_ne!(
+                ifindex,
+                0,
+                "if_nametoindex({}): {}",
+                name,
+                std::io::Error::last_os_error()
+            );
+            let fd =
+                unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+            assert!(
+                fd >= 0,
+                "AF_PACKET socket: {}",
+                std::io::Error::last_os_error()
+            );
+            TunInjector {
+                // SAFETY: a descriptor just returned by socket(2), owned by
+                // nothing else.
+                socket: unsafe { OwnedFd::from_raw_fd(fd) },
+                ifindex: ifindex as libc::c_int,
+            }
+        }
+
+        fn send(&self, packet: &[u8]) -> std::io::Result<()> {
+            let protocol = match packet[0] >> 4 {
+                4 => libc::ETH_P_IP,
+                6 => libc::ETH_P_IPV6,
+                version => panic!("not an IP packet: version {}", version),
+            } as u16;
+            // SAFETY: all-zero is a valid `sockaddr_ll`.
+            let mut to: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            to.sll_family = libc::AF_PACKET as u16;
+            to.sll_protocol = protocol.to_be();
+            to.sll_ifindex = self.ifindex;
+            // SAFETY: both pointers are valid for the lengths passed with
+            // them, for the duration of the call.
+            let sent = unsafe {
+                libc::sendto(
+                    self.socket.as_raw_fd(),
+                    packet.as_ptr().cast(),
+                    packet.len(),
+                    0,
+                    (&to as *const libc::sockaddr_ll).cast(),
+                    std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                )
+            };
+            if sent < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            assert_eq!(sent as usize, packet.len(), "a short send");
+            Ok(())
+        }
+    }
+
+    /// The device's peer, in this process: a `Tunn` on a loopback UDP
+    /// socket, routed `v4` and `v6` inside the tunnel.
+    #[cfg(target_os = "linux")]
+    struct LoopbackPeer {
+        tunn: Tunn,
+        public: PublicKey,
+        sock: UdpSocket,
+        v4: Ipv4Addr,
+        v6: Ipv6Addr,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LoopbackPeer {
+        fn new(device: PublicKey) -> LoopbackPeer {
+            let secret = StaticSecret::random_from_rng(OsRng);
+            let public = PublicKey::from(&secret);
+            let tunn = Tunn::new_with_obfuscation(
+                secret,
+                device,
+                None,
+                None,
+                0x51,
+                None,
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap();
+            let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let IpAddr::V4(v4) = next_ip() else {
+                unreachable!()
+            };
+            let IpAddr::V6(v6) = next_ip_v6() else {
+                unreachable!()
+            };
+            LoopbackPeer {
+                tunn,
+                public,
+                sock,
+                v4,
+                v6,
+            }
+        }
+
+        /// The `set=1` lines that add this peer to the device.
+        fn uapi_entry(&self) -> String {
+            format!(
+                "public_key={}\nendpoint={}\nallowed_ip={}/32\nallowed_ip={}/128",
+                encode(self.public.as_bytes()),
+                self.sock.local_addr().unwrap(),
+                self.v4,
+                self.v6
+            )
+        }
+
+        /// Answer the handshake the device starts for its first packet, and
+        /// return that packet as it arrives once the session is up.
+        fn accept_session(&mut self) -> Vec<u8> {
+            let mut datagram = vec![0u8; MAX_UDP_SIZE];
+            let mut out = vec![0u8; MAX_UDP_SIZE];
+            let (n, from) = self
+                .sock
+                .recv_from(&mut datagram)
+                .expect("no handshake initiation reached the peer");
+            match self
+                .tunn
+                .decapsulate(Some(from.ip()), &datagram[..n], &mut out)
+            {
+                TunnResult::WriteToNetwork(response) => {
+                    self.sock.send_to(response, from).unwrap();
+                }
+                other => panic!("expected a handshake initiation, got {:?}", other),
+            }
+            self.receive()
+                .unwrap_or_else(|e| panic!("the packet that started the handshake: {}", e))
+        }
+
+        /// The next packet the device sends through the tunnel, decrypted,
+        /// or what arrived instead. Keepalives are skipped. A handshake
+        /// message is an error: every caller has a session up, so one would
+        /// mean the device had dropped it.
+        fn receive(&mut self) -> Result<Vec<u8>, String> {
+            let mut datagram = vec![0u8; MAX_UDP_SIZE];
+            let mut out = vec![0u8; MAX_UDP_SIZE];
+            loop {
+                let (n, from) = self
+                    .sock
+                    .recv_from(&mut datagram)
+                    .map_err(|e| format!("nothing arrived: {}", e))?;
+                match self
+                    .tunn
+                    .decapsulate(Some(from.ip()), &datagram[..n], &mut out)
+                {
+                    TunnResult::WriteToTunnelV4(packet, _)
+                    | TunnResult::WriteToTunnelV6(packet, _) => return Ok(packet.to_vec()),
+                    TunnResult::Done => {}
+                    TunnResult::Err(e) => {
+                        return Err(format!("a {}-byte datagram was refused: {:?}", n, e))
+                    }
+                    other => {
+                        return Err(format!(
+                            "a {}-byte datagram was not a data packet: {:?}",
+                            n, other
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    /// A device on a TUN interface, with one `LoopbackPeer` and a session up
+    /// between them.
+    #[cfg(target_os = "linux")]
+    struct TunLink {
+        wg: WGHandle,
+        device_public: PublicKey,
+        tun: TunInjector,
+        peer: LoopbackPeer,
+        tag: u16,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TunLink {
+        /// Two workers; the interface up at an MTU of 1420.
+        fn new(use_multi_queue: bool, use_connected_socket: bool) -> TunLink {
+            let wg = WGHandle::init_with_config(
+                next_ip(),
+                next_ip_v6(),
+                DeviceConfig {
+                    n_threads: 2,
+                    use_connected_socket,
+                    use_multi_queue,
+                    uapi_fd: -1,
+                    ..Default::default()
+                },
+            );
+            let secret = StaticSecret::random_from_rng(OsRng);
+            let device_public = PublicKey::from(&secret);
+            let peer = LoopbackPeer::new(device_public);
+            assert_eq!(wg.wg_set_key(secret), UAPI_OK);
+            assert_eq!(wg.wg_set(&peer.uapi_entry()), UAPI_OK);
+            set_link_mtu(&wg, 1420);
+            let tun = TunInjector::new(&wg.name);
+            let mut link = TunLink {
+                wg,
+                device_public,
+                tun,
+                peer,
+                tag: 0,
+            };
+            let first = link.packet_v4(64);
+            link.tun.send(&first).unwrap();
+            assert_same(&link.peer.accept_session(), &first);
+            link
+        }
+
+        /// A packet from a source address of its own, so that each is a
+        /// flow of its own. A multi-queue TUN picks the queue by flow hash:
+        /// with one fixed source, every IPv4 packet went to one queue and
+        /// every IPv6 packet to one queue, and the other queue's reader
+        /// could go untested.
+        fn packet_v4(&mut self, len: usize) -> Vec<u8> {
+            self.tag += 1;
+            // 198.51.100.0/24 (TEST-NET-2) and on.
+            let src = Ipv4Addr::from(0xc633_6400_u32.wrapping_add(u32::from(self.tag)));
+            packet_v4(src, self.peer.v4, len, self.tag)
+        }
+
+        fn packet_v6(&mut self, len: usize) -> Vec<u8> {
+            self.tag += 1;
+            let src = Ipv6Addr::new(0x2001, 0xdb8, 0x5, 0, 0, 0, 0, self.tag);
+            packet_v6(src, self.peer.v6, len, self.tag)
+        }
+
+        /// Put an IPv4 and an IPv6 packet of `len` bytes into the TUN, and
+        /// assert each reaches the peer whole.
+        fn round_trip(&mut self, len: usize) {
+            for packet in [self.packet_v4(len), self.packet_v6(len)] {
+                self.tun.send(&packet).unwrap_or_else(|e| {
+                    panic!("the kernel refused a {}-byte packet: {}", packet.len(), e)
+                });
+                let got = self.peer.receive().unwrap_or_else(|e| {
+                    panic!(
+                        "a {}-byte IPv{} packet did not arrive: {}",
+                        packet.len(),
+                        packet[0] >> 4,
+                        e
+                    )
+                });
+                assert_same(&got, &packet);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_link_mtu(wg: &WGHandle, mtu: usize) {
+        let status = run(Command::new("ip").args([
+            "link",
+            "set",
+            "dev",
+            &wg.name,
+            "mtu",
+            &mtu.to_string(),
+            "up",
+        ]))
+        .expect("failed to run ip");
+        assert!(status.success(), "ip link set {} mtu {}", wg.name, mtu);
+    }
+
+    /// The interface's MTU, as the kernel reports it now.
+    #[cfg(target_os = "linux")]
+    fn link_mtu(wg: &WGHandle) -> usize {
+        wg._device.device.read().iface.mtu().unwrap()
+    }
+
+    /// Everywhere the device keeps the MTU: the value the monitor caches,
+    /// and the padding clamp it pushes into the interface's AmneziaWG
+    /// settings and into every peer's tunnel.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct MtuSeen {
+        cached: usize,
+        interface_clamp: u16,
+        peer_clamps: Vec<u16>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl MtuSeen {
+        fn everywhere(&self, mtu: usize) -> bool {
+            self.cached == mtu
+                && usize::from(self.interface_clamp) == mtu
+                && self.peer_clamps.iter().all(|&c| usize::from(c) == mtu)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mtu_seen(wg: &WGHandle) -> MtuSeen {
+        let device = wg._device.device.read();
+        let peer_clamps = device
+            .peers
+            .values()
+            .map(|p| p.lock().tunnel.amnezia_config().content_padding_mtu)
+            .collect();
+        MtuSeen {
+            cached: device.mtu.load(Ordering::Relaxed),
+            interface_clamp: device.config.amnezia.content_padding_mtu,
+            peer_clamps,
+        }
+    }
+
+    /// Block until the monitor has put `mtu` everywhere `MtuSeen` looks, or
+    /// `MONITOR_WAIT` passes. Returns what was seen last, so the caller
+    /// still asserts: waiting must never stand in for the assertion.
+    #[cfg(target_os = "linux")]
+    fn wait_for_mtu(wg: &WGHandle, mtu: usize) -> MtuSeen {
+        let deadline = Instant::now() + MONITOR_WAIT;
+        loop {
+            let seen = mtu_seen(wg);
+            if seen.everywhere(mtu) || Instant::now() >= deadline {
+                return seen;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Hold the device's MTU monitor, or release it (`Device::hold_mtu`).
+    /// Set under the write lock, which waits out every handler already
+    /// running: a refresh in progress when this is called has finished when
+    /// it returns, and none begins while the hold is on.
+    #[cfg(target_os = "linux")]
+    fn hold_mtu_monitor(wg: &WGHandle, hold: bool) {
+        wg._device.device.read().try_writeable(
+            |d| d.trigger_yield(),
+            |d| {
+                d.cancel_yield();
+                d.hold_mtu.store(hold, Ordering::Relaxed);
+            },
+        );
+    }
+
+    /// After an MTU increase, a packet larger than the old MTU reaches the
+    /// peer whole, IPv4 and IPv6, before the monitor has caught up.
+    ///
+    /// The interface goes 1420 -> 1280, the monitor is allowed to see 1280,
+    /// and is then held there while the interface goes back to 1420 -- the
+    /// window a real increase leaves until the next refresh, kept open for
+    /// as long as the test needs it. The test cannot pass by the monitor
+    /// catching up first: the cached MTU is asserted to be 1280 both before
+    /// the packets go in and after they have all arrived. With the read
+    /// sized by the cached MTU, the 1281-byte packet reached the peer as its
+    /// first 1280 bytes, and the peer refused it (`InvalidPacket`, the IP
+    /// length being longer than what arrived).
+    ///
+    /// Also the steady state beforehand: at a settled MTU, packets up to it
+    /// arrive as they were sent.
+    #[cfg(target_os = "linux")]
+    fn a_packet_over_a_stale_cached_mtu_arrives_whole(
+        use_multi_queue: bool,
+        use_connected_socket: bool,
+    ) {
+        let mut link = TunLink::new(use_multi_queue, use_connected_socket);
+        let seen = wait_for_mtu(&link.wg, 1420);
+        assert!(
+            seen.everywhere(1420),
+            "the monitor never saw 1420: {:?}",
+            seen
+        );
+        for len in [96, 1280, 1400, 1420] {
+            link.round_trip(len);
+        }
+
+        set_link_mtu(&link.wg, 1280);
+        let seen = wait_for_mtu(&link.wg, 1280);
+        assert!(
+            seen.everywhere(1280),
+            "the monitor never saw 1280: {:?}",
+            seen
+        );
+        hold_mtu_monitor(&link.wg, true);
+        set_link_mtu(&link.wg, 1420);
+        assert_eq!(link_mtu(&link.wg), 1420, "the interface MTU");
+        assert_eq!(mtu_seen(&link.wg).cached, 1280, "the cached MTU");
+
+        for len in [1281, 1400, 1420] {
+            link.round_trip(len);
+        }
+        let seen = mtu_seen(&link.wg);
+        assert!(
+            seen.everywhere(1280),
+            "the cached MTU moved while the packets went through, so they may \
+             not have been read under it: {:?}",
+            seen
+        );
+
+        hold_mtu_monitor(&link.wg, false);
+        let seen = wait_for_mtu(&link.wg, 1420);
+        assert!(
+            seen.everywhere(1420),
+            "released, the monitor never caught up: {:?}",
+            seen
+        );
+        assert!(workers_alive(&link.wg));
+    }
+
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_packet_over_a_stale_cached_mtu_arrives_whole_multi_queue_connected() {
+        a_packet_over_a_stale_cached_mtu_arrives_whole(true, true);
+    }
+
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_packet_over_a_stale_cached_mtu_arrives_whole_single_queue_unconnected() {
+        a_packet_over_a_stale_cached_mtu_arrives_whole(false, false);
+    }
+
+    /// An MTU decrease, both ways round.
+    ///
+    /// Cached MTU above the interface's: the monitor is held at 1420 while
+    /// the interface drops to 1280, and what the interface still lets
+    /// through arrives as sent.
+    ///
+    /// Cached MTU below a queued packet: with the workers stopped (the
+    /// write lock), 1400-byte packets go into the TUN's queue at 1420; the
+    /// interface then drops to 1280, and the cached MTU follows as the
+    /// monitor's next refresh would -- all before any worker runs. The
+    /// kernel still hands the queued packets over whole, and the device
+    /// must read them whole and send them on: an MTU change is no reason to
+    /// refuse a packet the interface already accepted. With the read sized
+    /// by the cached MTU, they went out cut to 1280 bytes.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_packet_queued_before_an_mtu_decrease_arrives_whole() {
+        let mut link = TunLink::new(true, true);
+        let seen = wait_for_mtu(&link.wg, 1420);
+        assert!(
+            seen.everywhere(1420),
+            "the monitor never saw 1420: {:?}",
+            seen
+        );
+        hold_mtu_monitor(&link.wg, true);
+
+        set_link_mtu(&link.wg, 1280);
+        assert_eq!(mtu_seen(&link.wg).cached, 1420, "the cached MTU");
+        link.round_trip(1280);
+
+        set_link_mtu(&link.wg, 1420);
+        let queued = [link.packet_v4(1400), link.packet_v6(1400)];
+        link.wg._device.device.read().try_writeable(
+            |d| d.trigger_yield(),
+            |d| {
+                d.cancel_yield();
+                for packet in &queued {
+                    link.tun.send(packet).unwrap();
+                }
+                set_link_mtu(&link.wg, 1280);
+                d.mtu.store(1280, Ordering::Relaxed);
+            },
+        );
+
+        // Two queues can hand them over in either order.
+        let mut arrived: Vec<Vec<u8>> = (0..queued.len())
+            .map(|_| {
+                link.peer.receive().unwrap_or_else(|e| {
+                    panic!("a packet queued before the decrease did not arrive: {}", e)
+                })
+            })
+            .collect();
+        arrived.sort_by_key(|p| p[0] >> 4);
+        for (got, sent) in arrived.iter().zip(&queued) {
+            assert_same(got, sent);
+        }
+        assert_eq!(link_mtu(&link.wg), 1280, "the interface MTU");
+        assert_eq!(mtu_seen(&link.wg).cached, 1280, "the cached MTU");
+
+        hold_mtu_monitor(&link.wg, false);
+        let seen = wait_for_mtu(&link.wg, 1280);
+        assert!(
+            seen.everywhere(1280),
+            "released, the monitor never caught up: {:?}",
+            seen
+        );
+        assert!(workers_alive(&link.wg));
+    }
+
+    /// The MTU monitor carries an interface MTU change to the cached MTU,
+    /// the interface's padding clamp and every existing peer's; a peer added
+    /// afterwards is built with it; and the session survives -- the next
+    /// packets go out on it, not after a new handshake. The TUN read no
+    /// longer depends on the cached MTU, so this is what keeps the monitor
+    /// itself covered.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn the_mtu_monitor_carries_a_change_everywhere_and_keeps_the_session() {
+        let mut link = TunLink::new(true, true);
+        let seen = wait_for_mtu(&link.wg, 1420);
+        assert!(
+            seen.everywhere(1420),
+            "the monitor never saw 1420: {:?}",
+            seen
+        );
+
+        set_link_mtu(&link.wg, 1300);
+        let seen = wait_for_mtu(&link.wg, 1300);
+        assert!(
+            seen.everywhere(1300),
+            "the monitor did not carry 1300 everywhere: {:?}",
+            seen
+        );
+
+        let later = LoopbackPeer::new(link.device_public);
+        assert_eq!(link.wg.wg_set(&later.uapi_entry()), UAPI_OK);
+        let clamp = {
+            let device = link.wg._device.device.read();
+            let peer = device.peers[&later.public].lock();
+            peer.tunnel.amnezia_config().content_padding_mtu
+        };
+        assert_eq!(clamp, 1300, "the clamp of a peer added after the change");
+
+        link.round_trip(1300);
+    }
+
+    /// A `set=1` on the stream an fd-activated device serves its UAPI on
+    /// (`DeviceConfig::uapi_fd`), and the reply.
+    #[cfg(target_os = "linux")]
+    fn uapi_stream_set(stream: &mut UnixStream, setting: &str) -> String {
+        write!(stream, "set=1\n{}\n\n", setting).unwrap();
+        let mut reader = BufReader::new(&*stream);
+        let mut reply = String::new();
+        while !reply.ends_with("\n\n") {
+            if reader.read_line(&mut reply).unwrap() == 0 {
+                break;
+            }
+        }
+        reply
+    }
+
+    /// A device on an embedder's descriptor that is not a TUN reads packets
+    /// larger than its cached MTU whole.
+    ///
+    /// Such a descriptor refuses TUNGETIFF with ENOTTY, so `TunSocket::mtu`
+    /// answers the 1500 it always has for one, and the monitor re-reads that
+    /// same 1500 every second: this cached MTU never catches up with
+    /// anything. So this pins the iface handler's read to the whole buffer
+    /// with no monitor hold and no timing at all -- and it runs without
+    /// root: the descriptor is one end of a datagram socketpair (a read
+    /// shorter than a datagram drops the rest of it, as a TUN read does),
+    /// and the UAPI is served on a socketpair too. With the read sized by
+    /// the cached MTU, anything over 1500 bytes lost its tail for good here,
+    /// not for a second.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_provided_descriptor_hands_over_packets_larger_than_its_cached_mtu_whole() {
+        let (device_end, tun) = UnixDatagram::pair().unwrap();
+        let (uapi_end, mut uapi) = UnixStream::pair().unwrap();
+        uapi.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let device = DeviceHandle::new(
+            &device_end.into_raw_fd().to_string(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: true,
+                use_multi_queue: false,
+                uapi_fd: uapi_end.into_raw_fd(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cached = || device.device.read().mtu.load(Ordering::Relaxed);
+        assert_eq!(
+            cached(),
+            1500,
+            "the cached MTU of a descriptor that is not a TUN"
+        );
+
+        let secret = StaticSecret::random_from_rng(OsRng);
+        let mut peer = LoopbackPeer::new(PublicKey::from(&secret));
+        let setting = format!(
+            "private_key={}\n{}",
+            encode(secret.to_bytes()),
+            peer.uapi_entry()
+        );
+        assert_eq!(uapi_stream_set(&mut uapi, &setting), UAPI_OK);
+
+        let src_v4 = Ipv4Addr::new(192, 0, 2, 1);
+        let src_v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let first = packet_v4(src_v4, peer.v4, 64, 1);
+        tun.send(&first).unwrap();
+        assert_same(&peer.accept_session(), &first);
+
+        for (tag, len) in [(2, 1500), (3, 1501), (4, 2000)] {
+            let v4 = packet_v4(src_v4, peer.v4, len, tag);
+            let v6 = packet_v6(src_v6, peer.v6, len, tag);
+            for packet in [v4, v6] {
+                tun.send(&packet).unwrap();
+                let got = peer.receive().unwrap_or_else(|e| {
+                    panic!(
+                        "a {}-byte IPv{} packet did not arrive: {}",
+                        len,
+                        packet[0] >> 4,
+                        e
+                    )
+                });
+                assert_same(&got, &packet);
+            }
+        }
+        assert_eq!(cached(), 1500, "the cached MTU");
     }
 }
