@@ -279,8 +279,8 @@ fn query_mtu(sock: OwnedFd, name: &[u8]) -> Result<usize, Error> {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::os::unix::io::IntoRawFd;
-    use std::os::unix::net::UnixStream;
     use std::sync::Mutex;
 
     /// Every macOS host has it.
@@ -454,13 +454,16 @@ mod tests {
     /// `mtu` fetches the interface name before it opens a socket, so a
     /// descriptor that cannot report one fails with that error -- the
     /// `getsockopt` failure, not a query error -- and no query socket exists
-    /// to be left behind. A socketpair end stands in for a utun control
-    /// socket gone bad: it refuses UTUN_OPT_IFNAME.
+    /// to be left behind. The descriptor is not a socket at all (/dev/null),
+    /// so getsockopt must fail. A socketpair end would not do: a Unix socket
+    /// answers option 2 at any level (it is LOCAL_PEERPID there), and the
+    /// query then went on to SIOCGIFMTU for whatever name that made.
     #[test]
     fn an_mtu_query_that_cannot_name_its_interface_reports_the_name_error() {
-        let (end, _other) = UnixStream::pair().unwrap();
+        let file = File::open("/dev/null").unwrap();
+        // The TunSocket is the descriptor's only owner from here on.
         let tun = TunSocket {
-            fd: end.into_raw_fd(),
+            fd: file.into_raw_fd(),
         };
         let result = tun.mtu();
         assert!(matches!(result, Err(Error::GetSockOpt(_))), "{:?}", result);
