@@ -8,6 +8,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, S
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::device::udp_diagnostics::{
+    self, DiagGen, GenAllocator, PeerUdpDiagnostics, ReplacementDecision,
+};
 use crate::device::Error;
 use crate::noise::{Tunn, TunnResult};
 
@@ -72,6 +75,13 @@ pub struct Peer {
     /// `set_endpoint`'s `&self` signatures stay put; every `Peer` is already
     /// behind a `Mutex`, so there is no contention to speak of.
     upgrade_suppressed: AtomicBool,
+    /// This peer's UDP failure episodes and log cooldowns. Plain data, mutated
+    /// under the peer lock its send sites already hold.
+    udp_diag: PeerUdpDiagnostics,
+    /// The diagnostic generation of the connected socket last committed to
+    /// `endpoint.conn`; `Untracked` until the device assigns one. Kept here
+    /// rather than on `Endpoint`, whose fields are public.
+    conn_gen: DiagGen,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -115,6 +125,8 @@ impl Peer {
             }),
             preshared_key,
             upgrade_suppressed: AtomicBool::new(false),
+            udp_diag: PeerUdpDiagnostics::default(),
+            conn_gen: DiagGen::Untracked,
         }
     }
 
@@ -308,11 +320,55 @@ impl Peer {
     pub fn index(&self) -> u32 {
         self.index
     }
+
+    pub(super) fn udp_diagnostics_mut(&mut self) -> &mut PeerUdpDiagnostics {
+        &mut self.udp_diag
+    }
+
+    #[cfg(test)]
+    pub(super) fn udp_diagnostics(&self) -> &PeerUdpDiagnostics {
+        &self.udp_diag
+    }
+
+    /// Give the connected socket just committed to `endpoint.conn` a fresh
+    /// generation, and re-key the connected failure record to it. Pure state:
+    /// the device records the returned decision. Called under the same peer
+    /// lock as the commit.
+    pub(super) fn assign_connected_generation(&mut self) -> (DiagGen, ReplacementDecision) {
+        self.assign_connected_generation_from(udp_diagnostics::generations())
+    }
+
+    pub(super) fn assign_connected_generation_from(
+        &mut self,
+        alloc: &GenAllocator,
+    ) -> (DiagGen, ReplacementDecision) {
+        let gen = alloc.allocate();
+        self.conn_gen = gen;
+        (gen, self.udp_diag.replace_connected(gen))
+    }
+
+    /// The generation of the connected socket this peer commits now, or
+    /// `None` when it commits none. A handler whose generation this is not is
+    /// retired. Takes the endpoint lock, so never while holding an endpoint
+    /// guard of this peer; failure paths only.
+    pub(super) fn connected_generation(&self) -> Option<DiagGen> {
+        self.endpoint.read().conn.as_ref().map(|_| self.conn_gen)
+    }
+
+    /// The generation last assigned, without the endpoint lock: for a caller
+    /// that holds the endpoint guard and has seen `conn` present.
+    pub(super) fn assigned_connected_generation(&self) -> DiagGen {
+        self.conn_gen
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::udp_diagnostics::{
+        commit_connected_socket_from, diag_lock, observe_peer_send, synthetic_attempt,
+        DeviceUdpDiagnostics, Line, Site, Target,
+    };
     use crate::noise::amnezia::AmneziaConfig;
     use crate::noise::Tunn;
     use crate::x25519;
@@ -458,6 +514,80 @@ mod tests {
         peer.tunnel.set_udp_window(1400);
         peer.set_endpoint("198.51.100.9:51821".parse().unwrap());
         assert_eq!(peer.tunnel.udp_window(), DEFAULT_UDP_WINDOW, "a new host");
+    }
+
+    /// Every commit gets its own generation, from the process allocator.
+    #[test]
+    fn each_connected_commit_gets_a_new_generation() {
+        let mut peer = test_peer();
+        let gens: Vec<DiagGen> = (0..4)
+            .map(|_| peer.assign_connected_generation().0)
+            .collect();
+        for (i, a) in gens.iter().enumerate() {
+            assert!(matches!(a, DiagGen::Tracked(_)));
+            for b in &gens[i + 1..] {
+                assert_ne!(a, b, "no generation is handed out twice");
+            }
+        }
+        assert_eq!(peer.assigned_connected_generation(), gens[3]);
+    }
+
+    /// `connected_generation` names the committed socket, and nothing when
+    /// there is none -- before any commit, after a rollback that clears
+    /// `conn`, and after a shutdown.
+    #[test]
+    fn connected_generation_follows_the_committed_socket() {
+        let mut peer = test_peer();
+        assert_eq!(peer.connected_generation(), None, "nothing committed");
+        peer.endpoint_mut().conn = Some(unconnected_socket());
+        let (gen, _) = peer.assign_connected_generation();
+        assert_eq!(peer.connected_generation(), Some(gen));
+        // A refused registration clears `conn` but keeps the assignment.
+        peer.endpoint_mut().conn = None;
+        assert_eq!(peer.connected_generation(), None);
+        assert_eq!(peer.assigned_connected_generation(), gen);
+        peer.endpoint_mut().conn = Some(unconnected_socket());
+        peer.shutdown_endpoint();
+        assert_eq!(peer.connected_generation(), None, "a shutdown retires it");
+    }
+
+    /// Identity is the generation, never the descriptor: the same socket
+    /// object -- one descriptor number -- committed twice is two identities,
+    /// each allowed its own lifecycle ERROR.
+    #[test]
+    fn m10a_same_descriptor_metadata_under_a_new_generation_is_a_new_identity() {
+        let g = diag_lock();
+        let env = DeviceUdpDiagnostics::for_tests(&g);
+        let alloc = GenAllocator::starting_at(200);
+        let mut peer = test_peer();
+        peer.endpoint_mut().conn = Some(unconnected_socket());
+        let g1 = commit_connected_socket_from(&env, &mut peer, &alloc);
+        let fail = |env: &DeviceUdpDiagnostics, peer: &mut Peer, gen: DiagGen| {
+            let ebadf = Err(std::io::Error::from_raw_os_error(libc::EBADF));
+            let attempt = synthetic_attempt(env, ebadf);
+            let target = Target::Connected { gen, to: None };
+            let diag = peer.udp_diagnostics_mut();
+            observe_peer_send(
+                env,
+                diag,
+                1,
+                target,
+                Site::TunConnected,
+                10,
+                &attempt,
+                false,
+            );
+        };
+        fail(&env, &mut peer, g1);
+        let g2 = commit_connected_socket_from(&env, &mut peer, &alloc);
+        assert_ne!(g1, g2, "[M10a] the same descriptor, a new generation");
+        env.advance_clock(std::time::Duration::from_secs(60));
+        fail(&env, &mut peer, g2);
+        assert_eq!(
+            env.count(Line::ErrorConnected),
+            2,
+            "[M10a] one ERROR per generation"
+        );
     }
 
     /// Environment marker naming the child half of the descriptor-exhaustion

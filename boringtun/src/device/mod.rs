@@ -11,6 +11,7 @@ pub mod peer;
 mod probe_budget;
 mod probe_reply;
 mod reply_policy;
+mod udp_diagnostics;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[path = "kqueue.rs"]
@@ -29,7 +30,7 @@ pub mod tun;
 pub mod tun;
 
 use std::collections::HashMap;
-use std::io::{self, Write as _};
+use std::io;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -55,6 +56,7 @@ use rand_chacha::ChaCha8Rng;
 use rand_core::{OsRng, RngCore, SeedableRng};
 use socket2::{Domain, Protocol, Type};
 use tun::TunSocket;
+use udp_diagnostics::{DeviceUdpDiagnostics, DiagGen, Family, ListenerId, RecvStep, Site};
 
 use dev_lock::{Lock, LockReadGuard};
 
@@ -283,6 +285,13 @@ pub struct Device {
     /// the `try_clone` each `register_udp_handler` call owns, not `udp4` or
     /// `udp6` themselves. `open_listen_socket` removes exactly these.
     udp_listener_fds: Vec<RawFd>,
+    /// The diagnostic generations of `udp4` and `udp6`: `Untracked` until the
+    /// first bind, then a fresh one with every listener pair committed.
+    udp4_gen: DiagGen,
+    udp6_gen: DiagGen,
+    /// What the device's UDP sends and connected receives reported, bounded.
+    /// See `udp_diagnostics`.
+    udp_diag: DeviceUdpDiagnostics,
 
     yield_notice: Option<EventRef>,
     exit_notice: Option<EventRef>,
@@ -909,6 +918,9 @@ impl Device {
             udp4: Default::default(),
             udp6: Default::default(),
             udp_listener_fds: Vec::new(),
+            udp4_gen: DiagGen::Untracked,
+            udp6_gen: DiagGen::Untracked,
+            udp_diag: DeviceUdpDiagnostics::new(),
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
@@ -989,6 +1001,16 @@ impl Device {
             self.mark_listener(listener)?;
         }
         let (clone4, clone6) = (udp4.try_clone()?, udp6.try_clone()?);
+        // The candidates' diagnostic identities, so their handlers can name
+        // them. A failed rebind discards them; none is ever handed out again.
+        let id4 = ListenerId {
+            family: Family::V4,
+            gen: udp_diagnostics::allocate_generation(),
+        };
+        let id6 = ListenerId {
+            family: Family::V6,
+            gen: udp_diagnostics::allocate_generation(),
+        };
 
         // Register the pair, under the clones' descriptors -- the ones the
         // events are keyed by, and so the ones to remove them by. A refused
@@ -1002,8 +1024,8 @@ impl Device {
         // reached either before the loop starts (`DeviceHandle::new`) or from
         // `set=1` inside the device's write closure, and a worker dispatches
         // only while holding the device read lock, which the write excludes.
-        let fd4 = self.register_udp_handler(clone4)?;
-        let fd6 = match self.register_udp_handler(clone6) {
+        let fd4 = self.register_udp_handler(clone4, id4)?;
+        let fd6 = match self.register_udp_handler(clone6, id6) {
             Ok(fd) => fd,
             Err(e) => {
                 unsafe { self.queue.clear_event_by_fd(fd4) };
@@ -1020,6 +1042,8 @@ impl Device {
         }
         self.udp4 = Some(udp4);
         self.udp6 = Some(udp6);
+        self.udp4_gen = id4.gen;
+        self.udp6_gen = id6.gen;
         self.listen_port = port;
 
         // Peers' connected sockets are bound to the port just given up, so
@@ -1055,6 +1079,15 @@ impl Device {
         udp6.set_nonblocking(true)?;
 
         Ok((udp4, udp6, port))
+    }
+
+    /// The committed listener of `family`, by diagnostic identity.
+    fn listener_id(&self, family: Family) -> ListenerId {
+        let gen = match family {
+            Family::V4 => self.udp4_gen,
+            Family::V6 => self.udp6_gen,
+        };
+        ListenerId { family, gen }
     }
 
     fn set_key(&mut self, private_key: x25519::StaticSecret) {
@@ -1335,14 +1368,16 @@ impl Device {
                         }
                         TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
                         TunnResult::WriteToNetwork(packet) => {
-                            match endpoint_addr {
-                                SocketAddr::V4(_) => {
-                                    udp4.send_to(packet, &endpoint_addr.into()).ok()
-                                }
-                                SocketAddr::V6(_) => {
-                                    udp6.send_to(packet, &endpoint_addr.into()).ok()
-                                }
-                            };
+                            udp_diagnostics::timer_send_step(
+                                &d.udp_diag,
+                                &mut p,
+                                udp4,
+                                d.listener_id(Family::V4),
+                                udp6,
+                                d.listener_id(Family::V6),
+                                endpoint_addr,
+                                packet,
+                            );
                         }
                         // update_timers only yields Done/Err/WriteToNetwork, but
                         // this runs on a 250 ms tick for every peer: an
@@ -1377,8 +1412,9 @@ impl Device {
 
     /// Registers the listener event for `udp`, which the handler takes
     /// ownership of, and returns the descriptor it is registered under --
-    /// what `open_listen_socket` must later clear it by.
-    fn register_udp_handler(&self, udp: socket2::Socket) -> Result<RawFd, Error> {
+    /// what `open_listen_socket` must later clear it by. `id` names the
+    /// listener in the diagnostics of the replies the handler sends.
+    fn register_udp_handler(&self, udp: socket2::Socket, id: ListenerId) -> Result<RawFd, Error> {
         let fd = udp.as_raw_fd();
         // Logged at most once per socket. The keyless path is re-dispatched
         // for every batch of arriving datagrams, and a daemon that is never
@@ -1564,7 +1600,15 @@ impl Device {
                     ) {
                         probe_reply::Ingress::Wireguard(candidates) => candidates,
                         probe_reply::Ingress::Reply(reply) => {
-                            let _: Result<_, _> = udp.send_to(&reply, &addr);
+                            udp_diagnostics::unauthenticated_send_step(
+                                &d.udp_diag,
+                                &udp,
+                                id,
+                                Site::ProbeReply,
+                                &reply,
+                                from,
+                                &addr,
+                            );
                             continue;
                         }
                         probe_reply::Ingress::Drop => continue,
@@ -1644,7 +1688,15 @@ impl Device {
                                         &mut t.junk_rng,
                                     ) {
                                         if !reply_amplifies(packet_len, out.len()) {
-                                            let _: Result<_, _> = udp.send_to(out, &addr);
+                                            udp_diagnostics::unauthenticated_send_step(
+                                                &d.udp_diag,
+                                                &udp,
+                                                id,
+                                                Site::CookieReply,
+                                                out,
+                                                from,
+                                                &addr,
+                                            );
                                         }
                                     }
                                 }
@@ -1680,7 +1732,16 @@ impl Device {
                         TunnResult::Err(_) => continue,
                         TunnResult::WriteToNetwork(packet) => {
                             flush = true;
-                            let _: Result<_, _> = udp.send_to(packet, &addr);
+                            udp_diagnostics::listener_peer_send_step(
+                                &d.udp_diag,
+                                &mut p,
+                                &udp,
+                                id,
+                                Site::HandshakeReply,
+                                packet,
+                                from,
+                                &addr,
+                            );
                         }
                         TunnResult::WriteToTunnelV4(packet, addr) => {
                             if d.peer_owns(peer, addr.into()) {
@@ -1699,12 +1760,20 @@ impl Device {
                         while let TunnResult::WriteToNetwork(packet) =
                             p.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
                         {
-                            let _: Result<_, _> = udp.send_to(packet, &addr);
+                            udp_diagnostics::listener_peer_send_step(
+                                &d.udp_diag,
+                                &mut p,
+                                &udp,
+                                id,
+                                Site::ListenerFlush,
+                                packet,
+                                from,
+                                &addr,
+                            );
                         }
                     }
 
                     // This packet was OK, that means we want to create a connected socket for this peer
-                    let ip_addr = from.ip();
                     p.adopt_endpoint(from);
                     if d.config.use_connected_socket
                         && !conn_upgrade_disabled.load(Ordering::Relaxed)
@@ -1759,6 +1828,11 @@ impl Device {
                             }
                         }
                         if let Ok(sock) = upgrade {
+                            // The socket just committed gets its diagnostic
+                            // generation under this same peer lock, before its
+                            // handler exists: nothing can observe it under the
+                            // generation it replaces.
+                            let gen = udp_diagnostics::commit_connected_socket(&d.udp_diag, &mut p);
                             // Not `unwrap`: this is `epoll_ctl(EPOLL_CTL_ADD)`,
                             // which fails with ENOSPC once this UID is out of
                             // `max_user_watches` -- reachable on a server with
@@ -1769,7 +1843,8 @@ impl Device {
                             // lookup and the tunnel have all accepted the
                             // datagram. Note the sibling `Result` one line
                             // above is already handled this way.
-                            if let Err(e) = d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
+                            if let Err(e) =
+                                d.register_conn_handler(Arc::clone(peer), sock, from, gen)
                             {
                                 // `swap`, not `store`: four worker threads can
                                 // race into this block on different peers.
@@ -1824,12 +1899,16 @@ impl Device {
         Ok(fd)
     }
 
+    /// `endpoint` is the address `udp` is connected to and `gen` its
+    /// diagnostic generation.
     fn register_conn_handler(
         &self,
         peer: Arc<Mutex<Peer>>,
         udp: socket2::Socket,
-        peer_addr: IpAddr,
+        endpoint: SocketAddr,
+        gen: DiagGen,
     ) -> Result<(), Error> {
+        let peer_addr = endpoint.ip();
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
@@ -1844,7 +1923,16 @@ impl Device {
                 let src_buf =
                     unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
 
-                while let Ok(read_bytes) = udp.recv(src_buf) {
+                // Any error ends the batch, as it always did; one that is not
+                // the end of the queue is reported first.
+                while let RecvStep::Datagram(read_bytes) = udp_diagnostics::conn_recv_step(
+                    &d.udp_diag,
+                    &peer,
+                    &udp,
+                    gen,
+                    endpoint,
+                    src_buf,
+                ) {
                     let mut flush = false;
                     let mut p = peer.lock();
                     match p.tunnel.decapsulate(
@@ -1853,10 +1941,18 @@ impl Device {
                         &mut t.dst_buf[..],
                     ) {
                         TunnResult::Done => {}
-                        TunnResult::Err(e) => eprintln!("Decapsulate error {:?}", e),
+                        TunnResult::Err(e) => log_decapsulate_error(p.index(), &e),
                         TunnResult::WriteToNetwork(packet) => {
                             flush = true;
-                            let _: Result<_, _> = udp.send(packet);
+                            udp_diagnostics::connected_send_step(
+                                &d.udp_diag,
+                                &mut p,
+                                &udp,
+                                gen,
+                                endpoint,
+                                Site::ConnectedReply,
+                                packet,
+                            );
                         }
                         TunnResult::WriteToTunnelV4(packet, addr) => {
                             if d.peer_owns(&peer, addr.into()) {
@@ -1875,7 +1971,15 @@ impl Device {
                         while let TunnResult::WriteToNetwork(packet) =
                             p.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
                         {
-                            let _: Result<_, _> = udp.send(packet);
+                            udp_diagnostics::connected_send_step(
+                                &d.udp_diag,
+                                &mut p,
+                                &udp,
+                                gen,
+                                endpoint,
+                                Site::ConnectedFlush,
+                                packet,
+                            );
                         }
                     }
 
@@ -1916,18 +2020,10 @@ impl Device {
                     // the bytes read are used below.
                     let src = match iface.read(&mut t.src_buf[..]) {
                         Ok(src) => src,
-                        Err(Error::IfaceRead(e)) => {
-                            let ek = e.kind();
-                            if ek == io::ErrorKind::Interrupted || ek == io::ErrorKind::WouldBlock {
-                                break;
-                            }
-                            eprintln!("Fatal read error on tun interface: {:?}", e);
-                            return Action::Exit;
-                        }
-                        Err(e) => {
-                            eprintln!("Unexpected error on tun interface: {:?}", e);
-                            return Action::Exit;
-                        }
+                        Err(e) => match on_tun_read_error(&e) {
+                            TunReadFailure::EndOfBatch => break,
+                            TunReadFailure::Exit => return Action::Exit,
+                        },
                     };
 
                     let dst_addr = match Tunn::dst_address(src) {
@@ -1946,15 +2042,17 @@ impl Device {
                             tracing::error!(message = "Encapsulate error", error = ?e)
                         }
                         TunnResult::WriteToNetwork(packet) => {
-                            let mut endpoint = peer.endpoint_mut();
-                            if let Some(conn) = endpoint.conn.as_mut() {
-                                // Prefer to send using the connected socket
-                                let _: Result<_, _> = conn.write(packet);
-                            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                                let _: Result<_, _> = udp4.send_to(packet, &addr.into());
-                            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                                let _: Result<_, _> = udp6.send_to(packet, &addr.into());
-                            } else {
+                            // Prefers the connected socket, else the listener
+                            // of the endpoint's family.
+                            if !udp_diagnostics::tun_send_step(
+                                &d.udp_diag,
+                                &mut peer,
+                                udp4,
+                                d.listener_id(Family::V4),
+                                udp6,
+                                d.listener_id(Family::V6),
+                                packet,
+                            ) {
                                 tracing::error!("No endpoint");
                             }
                         }
@@ -1971,6 +2069,45 @@ impl Device {
         )?;
         Ok(())
     }
+}
+
+/// What a failed TUN read means for the iface handler's batch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TunReadFailure {
+    /// Nothing more to read now: the batch ends.
+    EndOfBatch,
+    /// The interface is unusable: the event loop stops.
+    Exit,
+}
+
+/// Report a failed TUN read and say what the handler does next. The two fatal
+/// cases go through `tracing` like every other Device diagnostic, with the
+/// content the `eprintln!`s they replace printed.
+fn on_tun_read_error(e: &Error) -> TunReadFailure {
+    match e {
+        Error::IfaceRead(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            TunReadFailure::EndOfBatch
+        }
+        Error::IfaceRead(e) => {
+            tracing::error!(message = "Fatal read error on tun interface", error = ?e);
+            TunReadFailure::Exit
+        }
+        e => {
+            tracing::error!(message = "Unexpected error on tun interface", error = ?e);
+            TunReadFailure::Exit
+        }
+    }
+}
+
+/// A datagram on a peer's connected socket that the tunnel refused. Remote
+/// and per datagram, so DEBUG -- the listener path drops these silently.
+fn log_decapsulate_error(peer: u32, e: &WireGuardError) {
+    tracing::debug!(message = "Decapsulate error", peer, error = ?e);
 }
 
 /// A basic linear-feedback shift register implemented as xorshift, used to
@@ -2019,6 +2156,110 @@ impl Default for IndexLfsr {
             lfsr: seed,
             mask: Self::random_index(),
         }
+    }
+}
+
+#[cfg(test)]
+mod converted_stderr_tests {
+    //! The TUN-read and connected-decapsulate diagnostics that used to be
+    //! `eprintln!`s, checked through the same setup-only direct capture as
+    //! `udp_diagnostics`, on this module's own target.
+
+    use super::udp_diagnostics::capture::{capture_exactly, value as v, Spec};
+    use super::udp_diagnostics::diag_lock;
+    use super::*;
+    use tracing::Level;
+
+    /// The target of every line `device/mod.rs` emits.
+    const TARGET: &str = "boringtun::device";
+
+    /// The calibration callsite for that target: never a production line.
+    fn emit_capture_readiness(nonce: u64) {
+        tracing::debug!(
+            target: "boringtun::device",
+            message = udp_diagnostics::capture::READINESS_MESSAGE,
+            readiness_nonce = nonce
+        );
+    }
+
+    fn iface_read(errno: i32) -> Error {
+        Error::IfaceRead(io::Error::from_raw_os_error(errno))
+    }
+
+    /// Test 26: the end of a batch stays silent and keeps reading; anything
+    /// else still stops the event loop.
+    #[test]
+    fn tun_read_errors_log_through_tracing_and_keep_exit() {
+        let _g = diag_lock();
+        assert_eq!(
+            on_tun_read_error(&iface_read(libc::EAGAIN)),
+            TunReadFailure::EndOfBatch
+        );
+        assert_eq!(
+            on_tun_read_error(&iface_read(libc::EINTR)),
+            TunReadFailure::EndOfBatch
+        );
+        assert_eq!(
+            on_tun_read_error(&iface_read(libc::EIO)),
+            TunReadFailure::Exit
+        );
+        assert_eq!(
+            on_tun_read_error(&iface_read(libc::EBADF)),
+            TunReadFailure::Exit
+        );
+        assert_eq!(
+            on_tun_read_error(&Error::InvalidTunnelName),
+            TunReadFailure::Exit
+        );
+    }
+
+    #[test]
+    fn direct_d_converted_fatal_tun_errors() {
+        let _g = diag_lock();
+        let eio = io::Error::from_raw_os_error(libc::EIO);
+        let spec = [Spec {
+            level: Level::ERROR,
+            message: "Fatal read error on tun interface",
+            fields: &["message", "error"],
+            values: vec![v("error", &format!("{:?}", eio))],
+        }];
+        let r = capture_exactly(TARGET, emit_capture_readiness, &spec, || {
+            on_tun_read_error(&iface_read(libc::EIO))
+        })
+        .expect("[D] fatal read fields");
+        assert_eq!(r, TunReadFailure::Exit, "[D] Exit preserved");
+        let other = Error::InvalidTunnelName;
+        let spec = [Spec {
+            level: Level::ERROR,
+            message: "Unexpected error on tun interface",
+            fields: &["message", "error"],
+            values: vec![v("error", &format!("{:?}", other))],
+        }];
+        let r = capture_exactly(TARGET, emit_capture_readiness, &spec, || {
+            on_tun_read_error(&other)
+        })
+        .expect("[D] unexpected-error fields");
+        assert_eq!(r, TunReadFailure::Exit, "[D] Exit preserved");
+        let r = capture_exactly(TARGET, emit_capture_readiness, &[], || {
+            on_tun_read_error(&iface_read(libc::EAGAIN))
+        })
+        .expect("[D] the end of a batch is silent");
+        assert_eq!(r, TunReadFailure::EndOfBatch);
+    }
+
+    #[test]
+    fn direct_e_converted_decapsulate_error() {
+        let _g = diag_lock();
+        let spec = [Spec {
+            level: Level::DEBUG,
+            message: "Decapsulate error",
+            fields: &["message", "peer", "error"],
+            values: vec![v("peer", "9"), v("error", "InvalidMac")],
+        }];
+        capture_exactly(TARGET, emit_capture_readiness, &spec, || {
+            log_decapsulate_error(9, &WireGuardError::InvalidMac)
+        })
+        .expect("[E] decapsulate fields");
     }
 }
 
