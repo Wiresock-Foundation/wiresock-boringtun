@@ -26,6 +26,13 @@ mod live_reframe_tests;
 mod random_trailers_tests;
 #[cfg(test)]
 mod upstream_collision_tests;
+// R3 write admission, owned drain, burst lifecycle and burst-output goldens.
+#[cfg(test)]
+mod burst_lifecycle_tests;
+#[cfg(test)]
+mod jc_golden_tests;
+#[cfg(test)]
+mod write_admission_tests;
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
 pub(crate) mod quic;
 mod session;
@@ -137,6 +144,17 @@ struct PendingAmneziaJunk {
     imitation_datagrams: VecDeque<(Duration, Vec<u8>)>,
     remaining: u16,
     last_packet_at: Option<Instant>,
+    /// This burst restarts a cycle after terminal expiry and nothing of it has
+    /// been committed: the timers still hold the expiry instant. Set only when
+    /// a burst is built on an Expired handshake, carried by a live-reframe
+    /// rebuild, and spent by the first datagram that actually leaves, which
+    /// resets the timers. While it is set the burst owns no accepted packet
+    /// (a write is admitted only by a call that committed a datagram) and
+    /// paces nothing (`last_packet_at` is `None`), so every call either
+    /// commits a datagram or refuses one. `update_timers` lets only such a
+    /// burst, on a still-Expired handshake, run ahead of the absolute
+    /// lifetime bounds.
+    reset_expired_timers: bool,
 }
 
 type MessageType = u32;
@@ -634,7 +652,8 @@ impl Tunn {
     /// leaves the tunnel without a burst it had: see [`Self::set_obfuscation`].
     fn restart_pending_burst(&mut self) {
         if let Some(old) = self.pending_amnezia_junk.take() {
-            self.pending_amnezia_junk = Some(self.new_pre_handshake_burst(old.last_packet_at));
+            self.pending_amnezia_junk =
+                Some(self.new_pre_handshake_burst(old.last_packet_at, old.reset_expired_timers));
         }
     }
 
@@ -796,7 +815,43 @@ impl Tunn {
     /// no-session path beside it returned this error. Since both are reached
     /// through `extern "C"` FFI callees, where a panic aborts instead of
     /// unwinding, that inconsistency cost the caller their process.
+    ///
+    /// # Ownership of `src`
+    ///
+    /// The result says whether the tunnel accepted `src`:
+    ///
+    /// * `Err(_)` -- **not accepted**; the caller still owns the packet. After
+    ///   `DestinationBufferTooSmall` retry the same `src` with a larger `dst`.
+    ///   After `PacketQueueFull` (no session, and the queue of packets waiting
+    ///   for a handshake is full) the existing queue is unchanged; let the
+    ///   handshake make progress (drain with [`Self::decapsulate`], tick with
+    ///   [`Self::update_timers`]) before retrying, or drop the packet.
+    /// * `WriteToNetwork(_)` or `Done` -- **accepted exactly once**: sent
+    ///   directly on the established session, or queued once to be sent when a
+    ///   session exists (the output is then a handshake datagram, or `Done`).
+    ///   Never resubmit it.
+    ///
+    /// Without a session a refused write accepts nothing, but protocol output
+    /// the call prepared before the refusal (a pre-handshake burst and its
+    /// imitation datagrams) may stay pending for the next call: this is not a
+    /// whole-state rollback. Acceptance is not a delivery guarantee either:
+    /// queued packets are still dropped by the existing handshake-expiry,
+    /// reset and teardown rules.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
+        if self.has_current_session() {
+            return self.encapsulate_on_session(src, dst);
+        }
+        self.admit_without_session(src, dst)
+    }
+
+    fn has_current_session(&self) -> bool {
+        self.sessions[self.current % N_SESSIONS].is_some()
+    }
+
+    /// Format `src` on the current session -- a new submission from
+    /// `encapsulate`, or a queue head `send_queued_packet` already owns. No
+    /// admission happens here. `NoCurrentSession` if there is none.
+    fn encapsulate_on_session<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let current = self.current;
         let transport_junk = self.amnezia.transport_junk_size();
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
@@ -806,12 +861,12 @@ impl Tunn {
             // `write_to_network` -- so a dst falling between those two sizes
             // used to burn a nonce on every rejected call.
             //
-            // This has to stay inside the established-session branch. The
-            // no-session branch below emits a handshake initiation, or a
-            // standalone pre-handshake junk datagram, and neither size has
-            // anything to do with `src.len()` or S4. Gating those on a
-            // transport-shaped bound would stop the tunnel coming up at all,
-            // and would drop the packet instead of queueing it for retry.
+            // This has to stay inside the established-session path. The
+            // no-session path (`admit_without_session`) emits a handshake
+            // initiation, or a standalone pre-handshake junk datagram, and
+            // neither size has anything to do with `src.len()` or S4. Gating
+            // those on a transport-shaped bound would refuse every write that
+            // has to bring the tunnel up.
             if dst.len() < src.len() + DATA_OVERHEAD_SZ + transport_junk {
                 return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
             }
@@ -854,11 +909,25 @@ impl Tunn {
             self.tx_bytes += src.len();
             return self.write_to_network(dst, packet_size);
         }
+        TunnResult::Err(WireGuardError::NoCurrentSession)
+    }
 
-        // If there is no session, queue the packet for future retry
-        self.queue_packet(src);
-        // Initiate a new handshake if none is in progress
-        self.format_handshake_initiation(dst, false)
+    /// A new application packet with no session: refuse it outright when the
+    /// queue is full; otherwise drive the handshake output first and admit
+    /// `src` -- once -- only when that output is not an error.
+    fn admit_without_session<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
+        if !self.queue_has_room() {
+            return TunnResult::Err(WireGuardError::PacketQueueFull);
+        }
+        let result = self.format_handshake_initiation(dst, false);
+        if matches!(result, TunnResult::Err(_)) {
+            return result;
+        }
+        // Cannot fail: room was checked above and nothing since touches the queue.
+        if let Err(e) = self.queue_packet(src) {
+            return TunnResult::Err(e);
+        }
+        result
     }
 
     /// Receives a UDP datagram from the network and parses it.
@@ -867,6 +936,14 @@ impl Tunn {
     /// If the result is of type TunnResult::WriteToNetwork, should repeat the call with empty datagram,
     /// until TunnResult::Done is returned. If batch processing packets, it is OK to defer until last
     /// packet is processed.
+    ///
+    /// A call with an empty `datagram` drains packets the tunnel already owns
+    /// (accepted by [`Self::encapsulate`]); it never re-admits them. With a
+    /// session, a queued packet that does not fit `dst` stays at the head of
+    /// the queue and the call returns `Err(DestinationBufferTooSmall)`: repeat
+    /// the drain with a larger `dst`, never resubmit the packet. Without a
+    /// session the drain only drives the handshake, so `Done` there does not
+    /// mean the queue is empty.
     pub fn decapsulate<'a>(
         &mut self,
         src_addr: Option<IpAddr>,
@@ -1277,16 +1354,18 @@ impl Tunn {
             return TunnResult::Done;
         }
 
-        if self.handshake.is_expired() {
-            self.timers.clear();
-        }
+        // Reset only once this cycle's first output is committed -- never on a
+        // capacity refusal (see `format_handshake_initiation_now` and
+        // `reset_expired_timers_on_first_emit`).
+        let reset_expired_timers = self.handshake.is_expired();
 
         if self.amnezia.emits_pre_handshake() {
-            self.pending_amnezia_junk = Some(self.new_pre_handshake_burst(None));
+            self.pending_amnezia_junk =
+                Some(self.new_pre_handshake_burst(None, reset_expired_timers));
             return self.advance_amnezia_junk(dst);
         }
 
-        self.format_handshake_initiation_now(dst, force_resend)
+        self.format_handshake_initiation_now(dst, force_resend, reset_expired_timers)
     }
 
     /// The pre-handshake burst the current configuration calls for, ahead of
@@ -1314,12 +1393,17 @@ impl Tunn {
     /// out. It does not delay an imitation sequence: each imitation datagram
     /// carries its own protocol delay, measured from the same clock, and the
     /// first is deliberately zero.
-    fn new_pre_handshake_burst(&mut self, last_packet_at: Option<Instant>) -> PendingAmneziaJunk {
+    fn new_pre_handshake_burst(
+        &mut self,
+        last_packet_at: Option<Instant>,
+        reset_expired_timers: bool,
+    ) -> PendingAmneziaJunk {
         if !self.amnezia.emits_pre_handshake() {
             return PendingAmneziaJunk {
                 imitation_datagrams: VecDeque::new(),
                 remaining: 0,
                 last_packet_at,
+                reset_expired_timers,
             };
         }
         PendingAmneziaJunk {
@@ -1328,16 +1412,32 @@ impl Tunn {
                 .pre_handshake_imitation_datagrams(&mut self.handshake.rng),
             remaining: self.amnezia.pre_handshake_junk.packet_count,
             last_packet_at,
+            reset_expired_timers,
         }
     }
 
+    /// Shared body of every initiation send -- direct, burst completion and
+    /// timer-driven: the mandatory-capacity preflight, then the Expired-cycle
+    /// timer reset if `reset_expired_timers`, then the handshake.
     fn format_handshake_initiation_now<'a>(
         &mut self,
         dst: &'a mut [u8],
         force_resend: bool,
+        reset_expired_timers: bool,
     ) -> TunnResult<'a> {
         if self.handshake.is_in_progress() && !force_resend {
             return TunnResult::Done;
+        }
+
+        // Mandatory frame: the base initiation and its S1 prefix. Checked before
+        // the handshake consumes an index, an ephemeral key or its state, and
+        // before any deadline draw, attempt count or timer tick below.
+        if dst.len() < self.initiation_wire_floor() {
+            return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+        }
+
+        if reset_expired_timers && self.handshake.is_expired() {
+            self.timers.clear();
         }
 
         let starting_new_handshake = !self.handshake.is_in_progress();
@@ -1373,6 +1473,35 @@ impl Tunn {
                 self.write_to_network(dst, packet_size)
             }
             Err(e) => TunnResult::Err(e),
+        }
+    }
+
+    /// `HANDSHAKE_INIT_SZ + S1`: what an initiation needs whatever the trailer
+    /// (RandomTrailers shrinks to the room left, down to nothing).
+    fn initiation_wire_floor(&self) -> usize {
+        HANDSHAKE_INIT_SZ + self.amnezia.handshake_init_junk_size()
+    }
+
+    /// Whether the pending burst restarts an Expired cycle that has not begun:
+    /// its deferred timer reset is still owed and the handshake is still
+    /// Expired, so there is no session, no handshake state and no accepted
+    /// packet for the absolute bounds to end -- only the burst's own prepared
+    /// protocol output, which may stay pending across capacity refusals.
+    pub(super) fn burst_owes_expired_reset(&self) -> bool {
+        self.handshake.is_expired()
+            && self
+                .pending_amnezia_junk
+                .as_ref()
+                .is_some_and(|p| p.reset_expired_timers)
+    }
+
+    /// Spend a pending burst's deferred Expired-cycle timer reset, at the
+    /// first datagram actually committed.
+    fn reset_expired_timers_on_first_emit(&mut self) {
+        if let Some(pending) = &mut self.pending_amnezia_junk {
+            if std::mem::take(&mut pending.reset_expired_timers) && self.handshake.is_expired() {
+                self.timers.clear();
+            }
         }
     }
 
@@ -1427,25 +1556,41 @@ impl Tunn {
             } else {
                 Some(Instant::now())
             };
+            self.reset_expired_timers_on_first_emit();
             dst[..size].copy_from_slice(&datagram);
             return TunnResult::WriteToNetwork(&mut dst[..size]);
         }
 
         if remaining == 0 {
             // The initiation was deliberately deferred behind the junk packets, so
-            // it must be emitted now: force the (re)format. A previous attempt may
-            // have already moved the handshake into `InitSent` before
-            // `write_to_network` failed on an oversized prefix, and a non-forced
-            // retry would otherwise hit the `is_in_progress()` guard, return `Done`,
-            // and silently drop the initiation. Clear the pending state only once
-            // the initiation packet is actually written to the network, so a retry
-            // with a larger buffer resends only the initiation, never the junk.
-            let result = self.format_handshake_initiation_now(dst, true);
+            // it must be emitted now: force the (re)format. The handshake may
+            // already be `InitSent` -- a retransmission burst follows an initiation
+            // in flight, and an initiation whose framing failed after it was
+            // formatted (the header-protection backstop) leaves it there too -- and
+            // a non-forced retry would hit the `is_in_progress()` guard, return
+            // `Done`, and silently drop the initiation. A `dst` short of the
+            // mandatory frame is refused before anything is formatted. Clear the
+            // pending state only once the initiation packet is actually written to
+            // the network, so a retry with a larger buffer resends only the
+            // initiation, never the junk.
+            let reset = self
+                .pending_amnezia_junk
+                .as_ref()
+                .is_some_and(|p| p.reset_expired_timers);
+            let result = self.format_handshake_initiation_now(dst, true, reset);
             if matches!(result, TunnResult::WriteToNetwork(_)) {
                 self.pending_amnezia_junk = None;
             }
             return result;
         }
+
+        // Preflight against the largest size the draw can produce, before the
+        // draw: deterministic admission, no RNG spent on a refusal, and no
+        // retry-dependent size.
+        if dst.len() < self.amnezia.pre_handshake_junk_max_size() {
+            return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+        }
+        self.reset_expired_timers_on_first_emit();
 
         let packet = match self
             .amnezia
@@ -1557,34 +1702,55 @@ impl Tunn {
         }
     }
 
-    /// Get a packet from the queue, and try to encapsulate it
+    /// Drain one packet the queue already owns. Never re-admits it.
+    ///
+    /// No session: drive the handshake the queue is waiting for and leave the
+    /// queue untouched. A session: format the head on it; on a refusal the
+    /// same head goes back to the front and a capacity error is reported
+    /// rather than hidden as `Done`.
     fn send_queued_packet<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
-        if let Some(packet) = self.dequeue_packet() {
-            match self.encapsulate(&packet, dst) {
-                TunnResult::Err(_) => {
-                    // On error, return packet to the queue
-                    self.requeue_packet(packet);
+        if self.packet_queue.is_empty() {
+            return TunnResult::Done;
+        }
+        if !self.has_current_session() {
+            return self.format_handshake_initiation(dst, false);
+        }
+        let packet = self
+            .dequeue_packet()
+            .expect("queue checked non-empty above");
+        match self.encapsulate_on_session(&packet, dst) {
+            TunnResult::Err(e) => {
+                self.requeue_packet(packet);
+                match e {
+                    WireGuardError::DestinationBufferTooSmall => TunnResult::Err(e),
+                    // Unreachable today (the session was checked above and
+                    // formatting reports nothing else); kept as it was.
+                    _ => TunnResult::Done,
                 }
-                r => return r,
             }
-        }
-        TunnResult::Done
-    }
-
-    /// Push packet to the back of the queue
-    fn queue_packet(&mut self, packet: &[u8]) {
-        if self.packet_queue.len() < MAX_QUEUE_DEPTH {
-            // Drop if too many are already in queue
-            self.packet_queue.push_back(packet.to_vec());
+            r => r,
         }
     }
 
-    /// Push packet to the front of the queue
+    fn queue_has_room(&self) -> bool {
+        self.packet_queue.len() < MAX_QUEUE_DEPTH
+    }
+
+    /// Admit a new application packet at the back: one copy, or nothing and
+    /// `PacketQueueFull` when there is no room.
+    fn queue_packet(&mut self, packet: &[u8]) -> Result<(), WireGuardError> {
+        if !self.queue_has_room() {
+            return Err(WireGuardError::PacketQueueFull);
+        }
+        self.packet_queue.push_back(packet.to_vec());
+        Ok(())
+    }
+
+    /// Put back the head `dequeue_packet` removed earlier in the same `&mut
+    /// self` operation. Nothing is admitted in between, so there is room.
     fn requeue_packet(&mut self, packet: Vec<u8>) {
-        if self.packet_queue.len() < MAX_QUEUE_DEPTH {
-            // Drop if too many are already in queue
-            self.packet_queue.push_front(packet);
-        }
+        debug_assert!(self.packet_queue.len() < MAX_QUEUE_DEPTH);
+        self.packet_queue.push_front(packet);
     }
 
     fn dequeue_packet(&mut self) -> Option<Vec<u8>> {

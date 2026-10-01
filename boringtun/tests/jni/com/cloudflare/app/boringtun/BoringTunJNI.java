@@ -130,6 +130,101 @@ public class BoringTunJNI {
         return p;
     }
 
+    /** `WireGuardError::PacketQueueFull` as the C/JNI layers report it. */
+    private static final int PACKET_QUEUE_FULL = 17;
+
+    /**
+     * The write-ownership contract through the JNI door: an error means the
+     * packet was NOT accepted (retry it), success means accepted exactly once
+     * (never resubmit), a full queue is code 17, and a drain that does not fit
+     * keeps its packet at the head and reports an error instead of DONE.
+     */
+    private static void writeOwnershipChecks() {
+        System.out.println("== write ownership (no-session admission, owned drain, queue full) ==");
+        byte[] sA = x25519_secret_key();
+        byte[] sB = x25519_secret_key();
+        long a = new_tunnel(x25519_key_to_base64(sA), x25519_key_to_base64(x25519_public_key(sB)),
+                            null, (short) 0, 20);
+        long b = new_tunnel(x25519_key_to_base64(sB), x25519_key_to_base64(x25519_public_key(sA)),
+                            null, (short) 0, 21);
+        ByteBuffer net = ByteBuffer.allocateDirect(2048);
+        ByteBuffer netB = ByteBuffer.allocateDirect(2048);
+        ByteBuffer short100 = ByteBuffer.allocateDirect(100);
+        ByteBuffer drain1000 = ByteBuffer.allocateDirect(1000);
+        ByteBuffer op = ByteBuffer.allocateDirect(1);
+        ByteBuffer opB = ByteBuffer.allocateDirect(1);
+        byte[] large = ipv4Packet(1428);
+        byte[] small = ipv4Packet(68);
+
+        armOp(op);
+        int r = wireguard_write(a, large, large.length, short100, 100, op);
+        check(opOf(op) == WIREGUARD_ERROR && r == 0,
+              "a no-session write into a 100-byte dst is refused (op 2, code 0)");
+        armOp(op);
+        r = wireguard_write(a, large, large.length, net, 2048, op);
+        check(opOf(op) == WRITE_TO_NETWORK && r == 148,
+              "its retry with 2048 bytes is accepted and emits the 148-byte initiation (got " + r + ")");
+        byte[] init = taken(net, r);
+        armOp(op);
+        r = wireguard_write(a, small, small.length, net, 2048, op);
+        check(opOf(op) == WIREGUARD_DONE, "a second write while the handshake is in flight is accepted (DONE)");
+
+        armOp(opB);
+        int n = wireguard_read(b, init, init.length, netB, 2048, opB);
+        byte[] resp = taken(netB, n);
+        armOp(op);
+        n = wireguard_read(a, resp, resp.length, net, 2048, op);
+        if (opOf(op) == WRITE_TO_NETWORK && n > 0) {
+            byte[] ka = taken(net, n);
+            armOp(opB);
+            wireguard_read(b, ka, ka.length, netB, 2048, opB);
+        }
+
+        armOp(op);
+        r = wireguard_read(a, new byte[0], 0, drain1000, 1000, op);
+        check(opOf(op) == WIREGUARD_ERROR && r == 0,
+              "a drain into 1000 bytes with a 1428-byte packet at the head reports op 2, code 0");
+        int delivered = 0, deliveredLarge = 0, deliveredSmall = 0;
+        for (int i = 0; i < 4; i++) {
+            armOp(op);
+            int m = wireguard_read(a, new byte[0], 0, net, 2048, op);
+            if (opOf(op) != WRITE_TO_NETWORK) {
+                break;
+            }
+            byte[] pkt = taken(net, m);
+            armOp(opB);
+            int got = wireguard_read(b, pkt, pkt.length, netB, 2048, opB);
+            if (opOf(opB) == WRITE_TO_TUNNEL_IPV4) {
+                byte[] plain = taken(netB, got);
+                delivered++;
+                if (java.util.Arrays.equals(plain, large)) deliveredLarge++;
+                if (java.util.Arrays.equals(plain, small)) deliveredSmall++;
+            }
+        }
+        check(delivered == 2 && deliveredLarge == 1 && deliveredSmall == 1,
+              "after the retried write and the refused drain, each packet arrives exactly once"
+                  + " (delivered " + delivered + ")");
+
+        long c = new_tunnel(x25519_key_to_base64(x25519_secret_key()),
+                            x25519_key_to_base64(x25519_public_key(x25519_secret_key())),
+                            null, (short) 0, 22);
+        boolean allAccepted = true;
+        for (int i = 0; i < 256; i++) {
+            armOp(op);
+            wireguard_write(c, small, small.length, net, 2048, op);
+            allAccepted &= opOf(op) == WRITE_TO_NETWORK || opOf(op) == WIREGUARD_DONE;
+        }
+        check(allAccepted, "256 writes without a session are all accepted");
+        armOp(op);
+        r = wireguard_write(c, small, small.length, net, 2048, op);
+        check(opOf(op) == WIREGUARD_ERROR && r == PACKET_QUEUE_FULL,
+              "the 257th write reports queue full: op 2, code 17 (got op " + opOf(op) + ", " + r + ")");
+        armOp(op);
+        r = wireguard_write(c, small, small.length, short100, 100, op);
+        check(opOf(op) == WIREGUARD_ERROR && r == PACKET_QUEUE_FULL,
+              "queue full takes precedence over a short dst (code 17)");
+    }
+
     public static void main(String[] args) {
         if (args.length > 0 && "fatal-inputs".equals(args[0])) {
             fatalInputChild();
@@ -321,6 +416,8 @@ public class BoringTunJNI {
             }
         }
         check(roundTripped, "a packet written by A arrives at B byte-for-byte identical");
+
+        writeOwnershipChecks();
 
         awgParamsChecks();
 
