@@ -1596,6 +1596,14 @@ impl AmneziaConfig {
         self.outbound_junk_size(PacketKind::TransportData)
     }
 
+    /// The S1 prefix a self-formatted handshake initiation carries on the
+    /// wire; the same accessor and the same classification argument as
+    /// [`Self::transport_junk_size`] (a self-emitted initiation carries an H1
+    /// tag at `HANDSHAKE_INIT_SZ`, so it always classifies as an initiation).
+    pub(crate) fn handshake_init_junk_size(&self) -> usize {
+        self.outbound_junk_size(PacketKind::HandshakeInit)
+    }
+
     /// The message-type tag at `offset`, with `mask` XORed off it.
     ///
     /// `mask` is the header-protection keystream when a key is set and all
@@ -2378,26 +2386,35 @@ impl AmneziaConfig {
         Ok(packet)
     }
 
-    fn pre_handshake_junk_size(&self, rng: &mut impl RngCore) -> usize {
+    /// The inclusive size range a Jc junk datagram is drawn from: the one
+    /// source both the draw and the capacity preflight read.
+    fn pre_handshake_junk_size_range(&self) -> (usize, usize) {
         match self.imitation.protocol {
-            AmneziaImitationProtocol::None => random_usize_inclusive(
+            AmneziaImitationProtocol::None => (
                 self.pre_handshake_junk.packet_size_min as usize,
                 self.pre_handshake_junk.packet_size_max as usize,
-                rng,
             ),
-            AmneziaImitationProtocol::Dns => {
-                random_usize_inclusive(DNS_JUNK_SIZE_MIN, DNS_JUNK_SIZE_MAX, rng)
-            }
-            AmneziaImitationProtocol::Quic => {
-                random_usize_inclusive(QUIC_JUNK_SIZE_MIN, QUIC_JUNK_SIZE_MAX, rng)
-            }
-            AmneziaImitationProtocol::Sip => {
-                random_usize_inclusive(SIP_JUNK_SIZE_MIN, SIP_JUNK_SIZE_MAX, rng)
-            }
-            AmneziaImitationProtocol::Stun => {
-                random_usize_inclusive(STUN_JUNK_SIZE_MIN, STUN_JUNK_SIZE_MAX, rng)
-            }
+            AmneziaImitationProtocol::Dns => (DNS_JUNK_SIZE_MIN, DNS_JUNK_SIZE_MAX),
+            AmneziaImitationProtocol::Quic => (QUIC_JUNK_SIZE_MIN, QUIC_JUNK_SIZE_MAX),
+            AmneziaImitationProtocol::Sip => (SIP_JUNK_SIZE_MIN, SIP_JUNK_SIZE_MAX),
+            AmneziaImitationProtocol::Stun => (STUN_JUNK_SIZE_MIN, STUN_JUNK_SIZE_MAX),
         }
+    }
+
+    fn pre_handshake_junk_size(&self, rng: &mut impl RngCore) -> usize {
+        let (lo, hi) = self.pre_handshake_junk_size_range();
+        random_usize_inclusive(lo, hi, rng)
+    }
+
+    /// The largest Jc junk datagram the next draw can produce, without
+    /// drawing: 0 when Jc is off (the fill then writes nothing).
+    /// `random_usize_inclusive` never exceeds `max(lo, hi)`.
+    pub(crate) fn pre_handshake_junk_max_size(&self) -> usize {
+        if !self.pre_handshake_junk.is_enabled() {
+            return 0;
+        }
+        let (lo, hi) = self.pre_handshake_junk_size_range();
+        lo.max(hi)
     }
 
     fn fill_outbound_junk(&self, dst: &mut [u8], trailing_size: usize, rng: &mut impl RngCore) {
@@ -5012,5 +5029,58 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("keepalive_timeout + rekey_timeout"), "{}", err);
+    }
+
+    /// The Jc capacity preflight's maximum is the draw's own upper bound, read
+    /// from the same single source per protocol, and 0 when Jc is off; no draw
+    /// ever exceeds it (inverted configured ranges included).
+    #[test]
+    fn pre_handshake_junk_max_size_is_the_draws_upper_bound_per_protocol() {
+        use rand_core::SeedableRng;
+        let jc = AmneziaConfig::new(0, 0, 0, 0).with_pre_handshake_junk(2, 300, 900, 0);
+        assert_eq!(
+            jc.pre_handshake_junk_max_size(),
+            900,
+            "[R3:JCMAX:RANDOM-RANGE]"
+        );
+        // An unusable configured range falls back to the default one.
+        let inverted = AmneziaConfig::new(0, 0, 0, 0).with_pre_handshake_junk(2, 900, 300, 0);
+        assert_eq!(
+            inverted.pre_handshake_junk_max_size(),
+            DEFAULT_JUNK_PACKET_SIZE_MAX as usize,
+            "[R3:JCMAX:FALLBACK-RANGE]"
+        );
+        assert_eq!(
+            AmneziaConfig::new(0, 0, 0, 0).pre_handshake_junk_max_size(),
+            0,
+            "[R3:JCMAX:JC-OFF]"
+        );
+        let mut cfgs = vec![jc.clone(), inverted];
+        for (protocol, max) in [
+            (AmneziaImitationProtocol::Dns, DNS_JUNK_SIZE_MAX),
+            (AmneziaImitationProtocol::Quic, QUIC_JUNK_SIZE_MAX),
+            (AmneziaImitationProtocol::Sip, SIP_JUNK_SIZE_MAX),
+            (AmneziaImitationProtocol::Stun, STUN_JUNK_SIZE_MAX),
+        ] {
+            let cfg = jc
+                .clone()
+                .with_protocol_imitation(protocol, Some("example.com".into()));
+            assert_eq!(
+                cfg.pre_handshake_junk_max_size(),
+                max,
+                "[R3:JCMAX:PROTOCOL-RANGE] {:?}",
+                protocol
+            );
+            cfgs.push(cfg);
+        }
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(7);
+        for cfg in &cfgs {
+            for _ in 0..500 {
+                assert!(
+                    cfg.pre_handshake_junk_size(&mut rng) <= cfg.pre_handshake_junk_max_size(),
+                    "[R3:JCMAX:DRAW-WITHIN-MAX]"
+                );
+            }
+        }
     }
 }

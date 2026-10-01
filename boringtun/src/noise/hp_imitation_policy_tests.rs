@@ -307,7 +307,7 @@ fn build(cfg: &AmneziaConfig) -> Result<Pair, String> {
 /// burst, which paces itself on timers and is not what is tested here.
 fn round_trip(p: &mut Pair) {
     let (mut abuf, mut bbuf) = (vec![0u8; 4096], vec![0u8; 4096]);
-    let init = match p.a.format_handshake_initiation_now(&mut abuf, false) {
+    let init = match p.a.format_handshake_initiation_now(&mut abuf, false, false) {
         TunnResult::WriteToNetwork(d) => d.to_vec(),
         other => panic!("initiation: {:?}", other),
     };

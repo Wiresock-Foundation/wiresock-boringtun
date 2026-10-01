@@ -59,7 +59,7 @@ pub struct Timers {
     /// Did we receive data without sending anything back?
     want_keepalive: bool,
     /// Did we send data without hearing back?
-    want_handshake: bool,
+    pub(super) want_handshake: bool,
     persistent_keepalive: usize,
     /// Should this timer call reset rr function (if not a shared rr instance)
     pub(super) should_reset_rr: bool,
@@ -250,7 +250,7 @@ impl Tunn {
 
     // We don't really clear the timers, but we set them to the current time to
     // so the reference time frame is the same
-    fn clear_all(&mut self) {
+    pub(super) fn clear_all(&mut self) {
         for session in &mut self.sessions {
             *session = None;
         }
@@ -289,8 +289,66 @@ impl Tunn {
         }
     }
 
+    /// The two absolute lifetime bounds, which nothing a refused output does
+    /// can move: key material older than `keychain_expire() * 3`, and the
+    /// untuned 90-second handshake window. On either, the cycle ends here --
+    /// `set_expired` and `clear_all`, which drops a pending burst and every
+    /// queued packet -- and `true` is returned.
+    ///
+    /// Checked before a pending burst is serviced as well as on the ordinary
+    /// path; see `update_timers` for the one burst exempted.
+    fn expire_past_absolute_bounds(&mut self, now: Duration) -> bool {
+        // All ephemeral private keys and symmetric session keys are zeroed out after
+        // (REJECT_AFTER_TIME * 3) ms if no new keys have been exchanged.
+        // The tunable's high end stands in when configured, exactly as
+        // upstream arms zeroKeyMaterial at keychainExpireTime() * 3.
+        let zero_key_after = self.amnezia.timers.keychain_expire() * 3;
+        if now - self.timers[TimeSessionEstablished] >= zero_key_after {
+            tracing::error!(
+                message = "CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)",
+                after_secs = zero_key_after.as_secs()
+            );
+            self.handshake.set_expired();
+            self.clear_all();
+            return true;
+        }
+
+        if self.handshake.timer().is_none() {
+            return false;
+        }
+
+        // The classic absolute bound, kept for the untuned case only.
+        //
+        // Counting retransmissions is the right model once the
+        // intervals are drawn, but it measures nothing when polls are
+        // sparse: a caller that runs `update_timers` once, 100 seconds
+        // after the initiation, used to expire the cycle here and now
+        // sends a retry and carries on for the rest of its budget. The
+        // device polls at 250ms so it never notices, but the FFI
+        // callers drive this loop themselves, and an untuned tunnel
+        // must behave exactly as it did before the tunables existed.
+        //
+        // Only when neither relevant range is set, which is what makes
+        // it safe to check beside the retransmission deadline: the
+        // race that motivated the count model needs a drawn interval
+        // that can exceed the window, and with both unset the two are
+        // the fixed 5 and 90 seconds. A tuned tunnel is bounded by the
+        // count, and beyond that by `keychain_expire() * 3` above.
+        if self.amnezia.timers.max_handshake_attempts == (0, 0)
+            && self.amnezia.timers.rekey_timeout == (0, 0)
+            && now - self.timers[TimeLastHandshakeStarted] >= REKEY_ATTEMPT_TIME
+        {
+            tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
+            self.handshake.set_expired();
+            self.clear_all();
+            return true;
+        }
+        false
+    }
+
     pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
         let mut handshake_initiation_required = false;
+        let mut consumed_handshake_latch = false;
         let mut keepalive_required = false;
 
         let time = Instant::now();
@@ -306,7 +364,24 @@ impl Tunn {
 
         self.update_session_timers(now);
 
+        // A burst that restarts an Expired cycle and has committed nothing yet
+        // runs first: the timers still hold the previous cycle's expiry
+        // instant, so the bounds below would measure that finished cycle and
+        // destroy the new one. The cycle holds no accepted packet, session or
+        // handshake state for them to end -- only the protocol output this
+        // burst prepared, which stays pending across capacity refusals (see
+        // `PendingAmneziaJunk::reset_expired_timers`).
+        if self.burst_owes_expired_reset() {
+            return self.advance_amnezia_junk(dst);
+        }
+
+        // Any other burst belongs to a cycle whose lifetime has begun. The
+        // absolute bounds come first, or a burst whose next datagram never
+        // fits would intercept every tick and keep its queued packets forever.
         if self.pending_amnezia_junk.is_some() {
+            if self.expire_past_absolute_bounds(now) {
+                return TunnResult::Err(WireGuardError::ConnectionExpired);
+            }
             return self.advance_amnezia_junk(dst);
         }
 
@@ -330,49 +405,11 @@ impl Tunn {
                 self.handshake.clear_cookie();
             }
 
-            // All ephemeral private keys and symmetric session keys are zeroed out after
-            // (REJECT_AFTER_TIME * 3) ms if no new keys have been exchanged.
-            // The tunable's high end stands in when configured, exactly as
-            // upstream arms zeroKeyMaterial at keychainExpireTime() * 3.
-            let zero_key_after = self.amnezia.timers.keychain_expire() * 3;
-            if now - session_established >= zero_key_after {
-                tracing::error!(
-                    message = "CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)",
-                    after_secs = zero_key_after.as_secs()
-                );
-                self.handshake.set_expired();
-                self.clear_all();
+            if self.expire_past_absolute_bounds(now) {
                 return TunnResult::Err(WireGuardError::ConnectionExpired);
             }
 
             if let Some(time_init_sent) = self.handshake.timer() {
-                // The classic absolute bound, kept for the untuned case only.
-                //
-                // Counting retransmissions is the right model once the
-                // intervals are drawn, but it measures nothing when polls are
-                // sparse: a caller that runs `update_timers` once, 100 seconds
-                // after the initiation, used to expire the cycle here and now
-                // sends a retry and carries on for the rest of its budget. The
-                // device polls at 250ms so it never notices, but the FFI
-                // callers drive this loop themselves, and an untuned tunnel
-                // must behave exactly as it did before the tunables existed.
-                //
-                // Only when neither relevant range is set, which is what makes
-                // it safe to check beside the retransmission deadline: the
-                // race that motivated the count model needs a drawn interval
-                // that can exceed the window, and with both unset the two are
-                // the fixed 5 and 90 seconds. A tuned tunnel is bounded by the
-                // count, and beyond that by `keychain_expire() * 3` above.
-                if self.amnezia.timers.max_handshake_attempts == (0, 0)
-                    && self.amnezia.timers.rekey_timeout == (0, 0)
-                    && now - self.timers[TimeLastHandshakeStarted] >= REKEY_ATTEMPT_TIME
-                {
-                    tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
-                    self.handshake.set_expired();
-                    self.clear_all();
-                    return TunnResult::Err(WireGuardError::ConnectionExpired);
-                }
-
                 // Handshake Initiation Retransmission.
                 //
                 // We avoid using `time` here, because it can be earlier than
@@ -455,6 +492,7 @@ impl Tunn {
                 {
                     tracing::warn!("HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)");
                     handshake_initiation_required = true;
+                    consumed_handshake_latch = true;
                 }
 
                 if !handshake_initiation_required {
@@ -483,7 +521,21 @@ impl Tunn {
         }
 
         if handshake_initiation_required {
-            return self.format_handshake_initiation(dst, true);
+            let result = self.format_handshake_initiation(dst, true);
+            // The edge-triggered latch was spent selecting this demand. A
+            // capacity refusal now happens before any handshake state exists
+            // to retransmit, so re-arm it -- unless a burst was prepared, which
+            // carries the demand itself.
+            if consumed_handshake_latch
+                && self.pending_amnezia_junk.is_none()
+                && matches!(
+                    result,
+                    TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+                )
+            {
+                self.timers.want_handshake = true;
+            }
+            return result;
         }
 
         if keepalive_required {
