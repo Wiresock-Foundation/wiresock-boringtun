@@ -6,6 +6,8 @@
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     #[cfg(target_os = "linux")]
+    use crate::device::udp_diagnostics;
+    #[cfg(target_os = "linux")]
     use crate::device::MAX_UDP_SIZE;
     use crate::device::{DeviceConfig, DeviceHandle};
     #[cfg(target_os = "linux")]
@@ -2759,7 +2761,8 @@ allowed_ip=10.66.66.2/32",
     /// Give the peer a connected socket, as a completed handshake would, and
     /// return its descriptor. It is not registered with the poll: the tests
     /// only ask whether a rebind keeps it or shuts it down, which
-    /// `Endpoint::conn` shows.
+    /// `Endpoint::conn` shows. It gets a diagnostic generation, as the
+    /// upgrade gives one.
     #[cfg(target_os = "linux")]
     fn plant_conn(wg: &WGHandle, key: &PublicKey) -> RawFd {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -2767,7 +2770,9 @@ allowed_ip=10.66.66.2/32",
         let sock = socket2::Socket::from(sock);
         let fd = sock.as_raw_fd();
         let device = wg._device.device.read();
-        device.peers[key].lock().endpoint_mut().conn = Some(sock);
+        let mut peer = device.peers[key].lock();
+        peer.endpoint_mut().conn = Some(sock);
+        udp_diagnostics::commit_connected_socket(&device.udp_diag, &mut peer);
         fd
     }
 
@@ -4012,6 +4017,11 @@ allowed_ip=10.66.66.2/32",
     #[cfg(target_os = "linux")]
     impl LoopbackPeer {
         fn new(device: PublicKey) -> LoopbackPeer {
+            LoopbackPeer::new_on(device, "127.0.0.1:0")
+        }
+
+        /// As `new`, with the peer's socket bound to `bind`.
+        fn new_on(device: PublicKey, bind: &str) -> LoopbackPeer {
             let secret = StaticSecret::random_from_rng(OsRng);
             let public = PublicKey::from(&secret);
             let tunn = Tunn::new_with_obfuscation(
@@ -4025,7 +4035,7 @@ allowed_ip=10.66.66.2/32",
                 Default::default(),
             )
             .unwrap();
-            let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let sock = UdpSocket::bind(bind).unwrap();
             sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let IpAddr::V4(v4) = next_ip() else {
                 unreachable!()
@@ -4555,5 +4565,892 @@ allowed_ip=10.66.66.2/32",
             }
         }
         assert_eq!(cached(), 1500, "the cached MTU");
+    }
+
+    // UDP send diagnostics through the real handlers. The unit tests in
+    // `udp_diagnostics` run every step without root; these prove the Device's
+    // handlers call them -- each concrete send site, each family -- and that
+    // a failed send stays a lost datagram end to end. They assert on the
+    // device's decision journal, not on captured tracing: the events come from
+    // worker threads.
+
+    #[cfg(target_os = "linux")]
+    use udp_diagnostics::{
+        DeviceUdpDiagnostics, DiagGen, FaultRule, JournalEvent, Line, Op, Site, SocketRef, Step,
+    };
+
+    /// Run `f` on the device's diagnostics, under its read lock.
+    #[cfg(target_os = "linux")]
+    fn udp_diag<R>(wg: &WGHandle, f: impl FnOnce(&DeviceUdpDiagnostics) -> R) -> R {
+        let device = wg._device.device.read();
+        f(&device.udp_diag)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn plan_udp_faults(wg: &WGHandle, rules: Vec<FaultRule>) {
+        udp_diag(wg, |d| d.plan(rules));
+    }
+
+    /// One journaled attempt: site, socket, destination, injected, result.
+    #[cfg(target_os = "linux")]
+    type Attempted = (
+        Site,
+        SocketRef,
+        Option<SocketAddr>,
+        bool,
+        Option<Result<usize, Option<i32>>>,
+    );
+
+    /// Every journaled attempt, in order.
+    #[cfg(target_os = "linux")]
+    fn udp_attempts(wg: &WGHandle) -> Vec<Attempted> {
+        udp_diag(wg, |d| {
+            d.journal()
+                .into_iter()
+                .filter_map(|e| match e {
+                    JournalEvent::Attempt {
+                        meta,
+                        injected,
+                        result,
+                        ..
+                    } => Some((meta.site, meta.socket, meta.dest, injected, result)),
+                    JournalEvent::Decision { .. } => None,
+                })
+                .collect()
+        })
+    }
+
+    /// The journal once `settled` holds of it, or as it stands at the deadline.
+    ///
+    /// A datagram can reach its receiver before the sending worker has
+    /// journaled the attempt's result, so a test that has just received one
+    /// polls instead of reading once. It never asserts: the assertions on what
+    /// it returns stay the test's own, with their own messages.
+    #[cfg(target_os = "linux")]
+    fn settled_attempts(wg: &WGHandle, settled: impl Fn(&[Attempted]) -> bool) -> Vec<Attempted> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let attempts = udp_attempts(wg);
+            if settled(&attempts) || Instant::now() >= deadline {
+                return attempts;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn udp_decisions(wg: &WGHandle) -> Vec<(Line, Option<udp_diagnostics::Class>)> {
+        udp_diag(wg, |d| d.decisions())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn udp_count(wg: &WGHandle, line: Line) -> usize {
+        udp_diag(wg, |d| d.count(line))
+    }
+
+    /// Wait for `done`, polling; panics naming `what` at the deadline.
+    #[cfg(target_os = "linux")]
+    fn wait_until(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {}", what);
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fault(op: Op, site: Option<Site>, socket: Option<DiagGen>, script: Vec<Step>) -> FaultRule {
+        FaultRule {
+            op,
+            site,
+            socket,
+            dest: None,
+            script,
+        }
+    }
+
+    /// The generation of the connected socket the peer commits.
+    #[cfg(target_os = "linux")]
+    fn conn_generation(wg: &WGHandle, key: &PublicKey) -> DiagGen {
+        let device = wg._device.device.read();
+        let peer = device.peers[key].lock();
+        peer.assigned_connected_generation()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn listener_generations(wg: &WGHandle) -> (DiagGen, DiagGen) {
+        let device = wg._device.device.read();
+        (device.udp4_gen, device.udp6_gen)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn device_listener(wg: &WGHandle, family: IpAddr) -> SocketAddr {
+        let port = wg._device.device.read().listen_port;
+        SocketAddr::new(family, port)
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LoopbackPeer {
+        /// Encrypt `packet` and send it to the device's listener port, from
+        /// this peer's socket -- which a connected socket for this peer takes.
+        fn send_to_device(&mut self, wg: &WGHandle, packet: &[u8]) {
+            let mut out = vec![0u8; MAX_UDP_SIZE];
+            let server = device_listener(wg, self.sock.local_addr().unwrap().ip());
+            match self.tunn.encapsulate(packet, &mut out) {
+                TunnResult::WriteToNetwork(datagram) => {
+                    self.sock.send_to(datagram, server).unwrap();
+                }
+                other => panic!("the peer has a session, got {:?}", other),
+            }
+        }
+    }
+
+    /// A `TunLink` whose peer the device has moved to a connected socket.
+    #[cfg(target_os = "linux")]
+    fn connected_link() -> TunLink {
+        let link = TunLink::new(false, true);
+        let key = link.peer.public;
+        wait_until(
+            "the connected-socket upgrade",
+            Duration::from_secs(5),
+            || conn_fd(&link.wg, &key).is_some(),
+        );
+        link
+    }
+
+    /// Sites #10/#5/#6 on IPv4 and #11/#5/#6 on IPv6: a peer with no session
+    /// is reached through the TUN, its initiation leaves on the listener of
+    /// its endpoint's family, and the handshake response it sends back is
+    /// answered with a keepalive and the queued packet, on that same listener.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn site_coverage_listener_reply_and_flush_v4_and_v6() {
+        let wg = WGHandle::init_with_config(
+            next_ip(),
+            next_ip_v6(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: false,
+                use_multi_queue: false,
+                uapi_fd: -1,
+                ..Default::default()
+            },
+        );
+        let secret = StaticSecret::random_from_rng(OsRng);
+        let device_public = PublicKey::from(&secret);
+        assert_eq!(wg.wg_set_key(secret), UAPI_OK);
+        let mut p4 = LoopbackPeer::new(device_public);
+        let mut p6 = LoopbackPeer::new_on(device_public, "[::1]:0");
+        assert_eq!(wg.wg_set(&p4.uapi_entry()), UAPI_OK);
+        assert_eq!(wg.wg_set(&p6.uapi_entry()), UAPI_OK);
+        set_link_mtu(&wg, 1420);
+        let tun = TunInjector::new(&wg.name);
+        let (id4, id6) = listener_generations(&wg);
+        let src = Ipv4Addr::new(198, 51, 100, 1);
+        let first4 = packet_v4(src, p4.v4, 64, 1);
+        tun.send(&first4).unwrap();
+        assert_same(&p4.accept_session(), &first4);
+        let first6 = packet_v4(src, p6.v4, 64, 2);
+        tun.send(&first6).unwrap();
+        assert_same(&p6.accept_session(), &first6);
+        let ep4 = p4.sock.local_addr().unwrap();
+        let ep6 = p6.sock.local_addr().unwrap();
+        let saw = |attempts: &[Attempted], site: Site, gen: DiagGen, dest: SocketAddr| {
+            attempts.iter().any(|(s, socket, d, injected, result)| {
+                *s == site
+                    && matches!(socket, SocketRef::Listener(id) if id.gen == gen)
+                    && *d == Some(dest)
+                    && !injected
+                    && matches!(result, Some(Ok(_)))
+            })
+        };
+        let wanted = [
+            (Site::TunV4, id4, ep4),
+            (Site::TunV6, id6, ep6),
+            (Site::HandshakeReply, id4, ep4),
+            (Site::HandshakeReply, id6, ep6),
+            (Site::ListenerFlush, id4, ep4),
+            (Site::ListenerFlush, id6, ep6),
+        ];
+        let attempts = settled_attempts(&wg, |a| wanted.iter().all(|&(s, g, d)| saw(a, s, g, d)));
+        assert!(
+            saw(&attempts, Site::TunV4, id4, ep4),
+            "[SITE-10] TUN output on the IPv4 listener: {:?}",
+            attempts
+        );
+        assert!(
+            saw(&attempts, Site::TunV6, id6, ep6),
+            "[SITE-11] TUN output on the IPv6 listener: {:?}",
+            attempts
+        );
+        assert!(
+            saw(&attempts, Site::HandshakeReply, id4, ep4),
+            "[SITE-5] the keepalive answer, IPv4: {:?}",
+            attempts
+        );
+        assert!(
+            saw(&attempts, Site::HandshakeReply, id6, ep6),
+            "[SITE-5] the keepalive answer, IPv6: {:?}",
+            attempts
+        );
+        assert!(
+            saw(&attempts, Site::ListenerFlush, id4, ep4),
+            "[SITE-6] the queued packet, IPv4: {:?}",
+            attempts
+        );
+        assert!(
+            saw(&attempts, Site::ListenerFlush, id6, ep6),
+            "[SITE-6] the queued packet, IPv6: {:?}",
+            attempts
+        );
+        assert!(
+            udp_decisions(&wg).is_empty(),
+            "nothing failed, nothing logged"
+        );
+    }
+
+    /// Sites #1/#2: timer output -- here the initiation a persistent
+    /// keepalive starts -- on the listener of each endpoint's family.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn site_coverage_timer_v4_and_v6() {
+        let wg = single_queue_device();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        let (id4, id6) = listener_generations(&wg);
+        let e4 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let e6 = UdpSocket::bind("[::1]:0").unwrap();
+        for (e, ip) in [(&e4, next_ip()), (&e6, next_ip())] {
+            e.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let key = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+            let reply = wg.wg_set(&format!(
+                "public_key={}\nendpoint={}\npersistent_keepalive_interval=1\nallowed_ip={}/32",
+                encode(key.as_bytes()),
+                e.local_addr().unwrap(),
+                ip
+            ));
+            assert_eq!(reply, UAPI_OK);
+        }
+        let mut buf = [0u8; 256];
+        for e in [&e4, &e6] {
+            let (n, _) = e.recv_from(&mut buf).expect("a timer initiation");
+            assert_eq!(n, 148);
+        }
+        let saw = |attempts: &[Attempted], site: Site, gen: DiagGen, dest: SocketAddr| {
+            attempts.iter().any(|(s, socket, d, _, result)| {
+                *s == site
+                    && matches!(socket, SocketRef::Listener(id) if id.gen == gen)
+                    && *d == Some(dest)
+                    && matches!(result, Some(Ok(148)))
+            })
+        };
+        let (d4, d6) = (e4.local_addr().unwrap(), e6.local_addr().unwrap());
+        let attempts = settled_attempts(&wg, |a| {
+            saw(a, Site::TimerV4, id4, d4) && saw(a, Site::TimerV6, id6, d6)
+        });
+        assert!(
+            saw(&attempts, Site::TimerV4, id4, d4),
+            "[SITE-1] {:?}",
+            attempts
+        );
+        assert!(
+            saw(&attempts, Site::TimerV6, id6, d6),
+            "[SITE-2] {:?}",
+            attempts
+        );
+    }
+
+    /// Sites #3/#4: a probe reply to a DNS query and a cookie reply to an
+    /// initiation under load, both on the listener they arrived on.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn site_coverage_probe_and_cookie_replies() {
+        use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationProtocol};
+        use crate::noise::rate_limiter::RateLimiter;
+        let mut wg = WGHandle::init_with_config(
+            next_ip(),
+            next_ip_v6(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: false,
+                use_multi_queue: false,
+                uapi_fd: -1,
+                amnezia: AmneziaConfig::default().with_protocol_imitation(
+                    AmneziaImitationProtocol::Dns,
+                    Some("example.com".to_owned()),
+                ),
+                probe_reply_bytes_per_sec: Some(crate::device::DEFAULT_PROBE_REPLY_BYTES_PER_SEC),
+                ..Default::default()
+            },
+        );
+        let secret = StaticSecret::random_from_rng(OsRng);
+        let server_public = PublicKey::from(&secret);
+        assert_eq!(wg.wg_set_key(secret), UAPI_OK);
+        wg.start();
+        let (id4, _) = listener_generations(&wg);
+        // The probe door refuses loopback sources; the TUN's own address is
+        // local and not loopback.
+        let IpAddr::V4(own) = wg.addr_v4 else {
+            unreachable!()
+        };
+        let prober = UdpSocket::bind((own, 0)).unwrap();
+        prober
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let query = crate::noise::imitation::dns::generate("example.com", &mut OsRng)
+            .into_iter()
+            .next()
+            .unwrap();
+        prober
+            .send_to(&query, device_listener(&wg, IpAddr::V4(own)))
+            .unwrap();
+        let mut rx = [0u8; 2048];
+        prober.recv_from(&mut rx).expect("a DNS probe reply");
+        // Under load: every handshake draws a cookie reply.
+        {
+            let mut guard = wg._device.device.read();
+            guard.try_writeable(
+                |d| d.trigger_yield(),
+                |d| {
+                    d.cancel_yield();
+                    d.rate_limiter = Some(Arc::new(RateLimiter::new(&server_public, 0)));
+                },
+            );
+        }
+        let client_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client_sock
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut client = Tunn::new_with_obfuscation(
+            StaticSecret::random_from_rng(OsRng),
+            server_public,
+            None,
+            None,
+            0x77,
+            None,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut buf = vec![0u8; 2048];
+        let init = match client.format_handshake_initiation(&mut buf, false) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+        client_sock
+            .send_to(&init, device_listener(&wg, IpAddr::V4(Ipv4Addr::LOCALHOST)))
+            .unwrap();
+        let (n, _) = client_sock.recv_from(&mut rx).expect("a cookie reply");
+        assert_eq!(n, 64, "a vanilla cookie reply");
+        let saw = |attempts: &[Attempted], site: Site, dest: SocketAddr| {
+            attempts.iter().any(|(s, socket, d, _, result)| {
+                *s == site
+                    && matches!(socket, SocketRef::Listener(id) if id.gen == id4)
+                    && *d == Some(dest)
+                    && matches!(result, Some(Ok(_)))
+            })
+        };
+        let (from_prober, from_client) = (
+            prober.local_addr().unwrap(),
+            client_sock.local_addr().unwrap(),
+        );
+        let attempts = settled_attempts(&wg, |a| {
+            saw(a, Site::ProbeReply, from_prober) && saw(a, Site::CookieReply, from_client)
+        });
+        assert!(
+            saw(&attempts, Site::ProbeReply, from_prober),
+            "[SITE-3] {:?}",
+            attempts
+        );
+        assert!(
+            saw(&attempts, Site::CookieReply, from_client),
+            "[SITE-4] {:?}",
+            attempts
+        );
+    }
+
+    /// Sites #9/#7/#8 and the connected receive: TUN output on the connected
+    /// socket; a datagram from the peer received on it; then, the device's
+    /// session dropped by a preshared-key change, a TUN packet queued behind
+    /// a new initiation, whose response arrives on the connected socket and
+    /// is answered there with a keepalive and the queued packet.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn site_coverage_connected_reply_flush_and_recv() {
+        let mut link = connected_link();
+        let key = link.peer.public;
+        let gen = conn_generation(&link.wg, &key);
+        assert!(
+            matches!(gen, DiagGen::Tracked(_)),
+            "the upgrade assigned a generation"
+        );
+        let packet = link.packet_v4(80);
+        link.tun.send(&packet).unwrap();
+        assert_same(&link.peer.receive().unwrap(), &packet);
+        let inbound = packet_v4(link.peer.v4, Ipv4Addr::new(198, 51, 100, 9), 60, 77);
+        link.peer.send_to_device(&link.wg, &inbound);
+        wait_until(
+            "a datagram received on the connected socket",
+            Duration::from_secs(5),
+            || {
+                udp_attempts(&link.wg)
+                    .iter()
+                    .any(|(s, _, _, _, r)| *s == Site::ConnectedRecv && matches!(r, Some(Ok(_))))
+            },
+        );
+        let psk = [0x5au8; 32];
+        assert_eq!(
+            link.wg.wg_set(&format!(
+                "public_key={}\npreshared_key={}",
+                encode(key.as_bytes()),
+                encode(psk)
+            )),
+            UAPI_OK
+        );
+        link.peer.tunn.set_preshared_key(Some(psk));
+        assert_eq!(
+            conn_generation(&link.wg, &key),
+            gen,
+            "the same connected socket"
+        );
+        let queued = link.packet_v4(90);
+        link.tun.send(&queued).unwrap();
+        assert_same(&link.peer.accept_session(), &queued);
+        let peer_addr = link.peer.sock.local_addr().unwrap();
+        let saw = |attempts: &[Attempted], site: Site| {
+            attempts.iter().any(|(s, socket, d, _, result)| {
+                *s == site
+                    && *socket == SocketRef::Connected(gen)
+                    && *d == Some(peer_addr)
+                    && matches!(result, Some(Ok(_)))
+            })
+        };
+        let sites = [
+            Site::TunConnected,
+            Site::ConnectedRecv,
+            Site::ConnectedReply,
+            Site::ConnectedFlush,
+        ];
+        let attempts = settled_attempts(&link.wg, |a| sites.iter().all(|&s| saw(a, s)));
+        assert!(
+            saw(&attempts, Site::TunConnected),
+            "[SITE-9] {:?}",
+            attempts
+        );
+        assert!(
+            saw(&attempts, Site::ConnectedRecv),
+            "[SITE-R] {:?}",
+            attempts
+        );
+        assert!(
+            saw(&attempts, Site::ConnectedReply),
+            "[SITE-7] {:?}",
+            attempts
+        );
+        assert!(
+            saw(&attempts, Site::ConnectedFlush),
+            "[SITE-8] {:?}",
+            attempts
+        );
+        assert!(udp_decisions(&link.wg).is_empty());
+    }
+
+    /// M6/M12 end to end: a receive success and the quiet end of the batch
+    /// that follows it are not a recovery; only a later send on the same
+    /// socket is.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_quiet_receive_end_does_not_close_a_send_failure_episode() {
+        let mut link = connected_link();
+        let key = link.peer.public;
+        let gen = conn_generation(&link.wg, &key);
+        plan_udp_faults(
+            &link.wg,
+            vec![fault(
+                Op::Send,
+                Some(Site::TunConnected),
+                Some(gen),
+                vec![Step::Fail(libc::ENETUNREACH)],
+            )],
+        );
+        let lost = link.packet_v4(70);
+        link.tun.send(&lost).unwrap();
+        wait_until("the failed send", Duration::from_secs(5), || {
+            udp_count(&link.wg, Line::WarnOpening) == 1
+        });
+        let inbound = packet_v4(link.peer.v4, Ipv4Addr::new(198, 51, 100, 9), 60, 78);
+        link.peer.send_to_device(&link.wg, &inbound);
+        wait_until(
+            "the receive and its quiet end",
+            Duration::from_secs(5),
+            || {
+                let a = udp_attempts(&link.wg);
+                a.iter()
+                    .any(|(s, _, _, _, r)| *s == Site::ConnectedRecv && matches!(r, Some(Ok(_))))
+                    && a.iter().any(|(s, _, _, _, r)| {
+                        *s == Site::ConnectedRecv && matches!(r, Some(Err(_)))
+                    })
+            },
+        );
+        assert_eq!(
+            udp_count(&link.wg, Line::DebugRecovery),
+            0,
+            "[M6] [M12] no recovery from receiving"
+        );
+        assert!(
+            link.wg._device.device.read().peers[&key]
+                .lock()
+                .udp_diagnostics()
+                .connected_active(),
+            "[M6] the episode is still open"
+        );
+        let next = link.packet_v4(70);
+        link.tun.send(&next).unwrap();
+        assert_same(&link.peer.receive().unwrap(), &next);
+        wait_until("the recovery", Duration::from_secs(5), || {
+            udp_count(&link.wg, Line::DebugRecovery) == 1
+        });
+    }
+
+    /// M15 end to end: once the peer no longer commits the socket -- here
+    /// taken without a shutdown, the state a refused registration leaves --
+    /// the still-registered handler's error is teardown, not a defect.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_retired_connected_handler_reports_teardown_not_a_defect() {
+        let mut link = connected_link();
+        let key = link.peer.public;
+        let gen = conn_generation(&link.wg, &key);
+        drop_conn(&link.wg, &key);
+        plan_udp_faults(
+            &link.wg,
+            vec![fault(
+                Op::Recv,
+                None,
+                Some(gen),
+                vec![Step::Fail(libc::EBADF)],
+            )],
+        );
+        let inbound = packet_v4(link.peer.v4, Ipv4Addr::new(198, 51, 100, 9), 60, 79);
+        link.peer.send_to_device(&link.wg, &inbound);
+        wait_until(
+            "[M15] the retired handler's error",
+            Duration::from_secs(5),
+            || udp_count(&link.wg, Line::DebugRetired) == 1,
+        );
+        assert_eq!(
+            udp_count(&link.wg, Line::ErrorConnected),
+            0,
+            "[M15] no lifecycle ERROR"
+        );
+        assert!(
+            !link.wg._device.device.read().peers[&key]
+                .lock()
+                .udp_diagnostics()
+                .connected_active(),
+            "[M15] the record is untouched"
+        );
+    }
+
+    /// Test 21: an error from the connected receive ends that batch and is
+    /// reported, and nothing else: the socket stays committed, its handler
+    /// registered, and the datagram behind the error is still read.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_connected_recv_error_keeps_the_socket_and_its_handler() {
+        let mut link = connected_link();
+        let key = link.peer.public;
+        let gen = conn_generation(&link.wg, &key);
+        let fd = conn_fd(&link.wg, &key);
+        plan_udp_faults(
+            &link.wg,
+            vec![fault(
+                Op::Recv,
+                None,
+                Some(gen),
+                vec![Step::Fail(libc::ECONNREFUSED)],
+            )],
+        );
+        let inbound = packet_v4(link.peer.v4, Ipv4Addr::new(198, 51, 100, 9), 60, 80);
+        link.peer.send_to_device(&link.wg, &inbound);
+        wait_until(
+            "the datagram behind the error",
+            Duration::from_secs(5),
+            || {
+                udp_attempts(&link.wg).iter().any(|(s, _, _, injected, r)| {
+                    *s == Site::ConnectedRecv && !injected && matches!(r, Some(Ok(_)))
+                })
+            },
+        );
+        assert_eq!(
+            udp_decisions(&link.wg),
+            vec![(Line::WarnOpening, Some(udp_diagnostics::Class::Refused))],
+            "one refused WARN"
+        );
+        assert_eq!(
+            conn_fd(&link.wg, &key),
+            fd,
+            "the connected socket stays committed"
+        );
+        assert_eq!(conn_generation(&link.wg, &key), gen);
+        let packet = link.packet_v4(80);
+        link.tun.send(&packet).unwrap();
+        assert_same(&link.peer.receive().unwrap(), &packet);
+        assert!(workers_alive(&link.wg));
+    }
+
+    /// Test 23: a failed transport send is lost, as on the network: the next
+    /// packet goes out, the failed one never does, and nothing is sent twice.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_failed_transport_send_is_not_retried_or_requeued() {
+        let mut link = connected_link();
+        let key = link.peer.public;
+        let gen = conn_generation(&link.wg, &key);
+        plan_udp_faults(
+            &link.wg,
+            vec![fault(
+                Op::Send,
+                Some(Site::TunConnected),
+                Some(gen),
+                vec![Step::Fail(libc::ENOBUFS)],
+            )],
+        );
+        let before = udp_attempts(&link.wg).len();
+        let lost = link.packet_v4(100);
+        link.tun.send(&lost).unwrap();
+        wait_until("the failed send", Duration::from_secs(5), || {
+            udp_attempts(&link.wg).len() > before
+        });
+        let next = link.packet_v4(100);
+        link.tun.send(&next).unwrap();
+        assert_same(&link.peer.receive().unwrap(), &next);
+        link.peer
+            .sock
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        assert!(
+            link.peer.receive().is_err(),
+            "[T23] the failed packet never arrives"
+        );
+        let tun: Vec<_> = udp_attempts(&link.wg)
+            .into_iter()
+            .skip(before)
+            .filter(|(s, ..)| *s == Site::TunConnected)
+            .collect();
+        assert_eq!(tun.len(), 2, "[T23] two packets, two attempts: {:?}", tun);
+        assert!(
+            tun[0].3 && !tun[1].3,
+            "[T23] the first injected, the second real"
+        );
+    }
+
+    /// Test 24: a failed initiation send does not move the retransmission:
+    /// the timer resends it on schedule, on the listener.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_failed_initiation_send_keeps_the_retransmission_schedule() {
+        let mut wg = single_queue_device();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        wg.start();
+        let peer = TunPeer::add(&wg);
+        let (id4, _) = listener_generations(&wg);
+        plan_udp_faults(
+            &wg,
+            vec![fault(
+                Op::Send,
+                Some(Site::TunV4),
+                Some(id4),
+                vec![Step::Fail(libc::EHOSTUNREACH)],
+            )],
+        );
+        UdpSocket::bind("0.0.0.0:0")
+            .unwrap()
+            .send_to(b"through the tunnel", (peer.ip, 9))
+            .unwrap();
+        let started = Instant::now();
+        let mut buf = [0u8; 256];
+        let (n, _) = peer
+            .endpoint
+            .recv_from(&mut buf)
+            .expect("[T24] the retransmission reaches the peer");
+        assert_eq!(n, 148, "an initiation");
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "[T24] the resend waited for REKEY_TIMEOUT: {:?}",
+            started.elapsed()
+        );
+        let attempts = udp_attempts(&wg);
+        assert_eq!(
+            attempts.iter().filter(|(s, ..)| *s == Site::TunV4).count(),
+            1,
+            "[T24] the failed initiation was attempted once"
+        );
+        assert!(
+            attempts.iter().any(|(s, ..)| *s == Site::TimerV4),
+            "[T24] the timer resent it"
+        );
+    }
+
+    /// Test 25: a failed Jc junk send is not sent again: the burst goes on
+    /// with the next junk and the initiation.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_failed_junk_send_is_not_reemitted() {
+        let mut wg = single_queue_device();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        assert_eq!(wg.wg_set("jc=3\njmin=100\njmax=100"), UAPI_OK);
+        wg.start();
+        let peer = TunPeer::add(&wg);
+        let endpoint = peer.endpoint.local_addr().unwrap();
+        let (id4, _) = listener_generations(&wg);
+        plan_udp_faults(
+            &wg,
+            vec![FaultRule {
+                op: Op::Send,
+                site: None,
+                socket: Some(id4),
+                dest: Some(endpoint),
+                script: vec![Step::Pass, Step::Fail(libc::ENOBUFS)],
+            }],
+        );
+        UdpSocket::bind("0.0.0.0:0")
+            .unwrap()
+            .send_to(b"through the tunnel", (peer.ip, 9))
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        let mut lens = Vec::new();
+        while lens.last() != Some(&148) {
+            let (n, _) = peer
+                .endpoint
+                .recv_from(&mut buf)
+                .expect("the burst and its initiation");
+            lens.push(n);
+        }
+        assert_eq!(
+            lens,
+            vec![100, 100, 148],
+            "[T25] junk, junk, initiation: the failed junk is gone"
+        );
+        let attempts = udp_attempts(&wg);
+        let to_peer: Vec<_> = attempts
+            .iter()
+            .filter(|(_, _, d, ..)| *d == Some(endpoint))
+            .collect();
+        assert_eq!(
+            to_peer.len(),
+            4,
+            "[T25] four datagrams produced, each attempted once: {:?}",
+            to_peer
+        );
+        assert!(to_peer[1].3, "[T25] the second was the injected failure");
+    }
+
+    /// A lifecycle error -- an invalid-socket-state errno on a live listener
+    /// -- is reported, once, and every worker carries on.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn an_injected_lifecycle_error_does_not_take_a_worker_down() {
+        let mut wg = single_queue_device();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        wg.start();
+        let (id4, _) = listener_generations(&wg);
+        plan_udp_faults(
+            &wg,
+            vec![fault(
+                Op::Send,
+                Some(Site::TunV4),
+                Some(id4),
+                vec![Step::Fail(libc::EBADF)],
+            )],
+        );
+        let first = TunPeer::add(&wg);
+        UdpSocket::bind("0.0.0.0:0")
+            .unwrap()
+            .send_to(b"through the tunnel", (first.ip, 9))
+            .unwrap();
+        wait_until("the lifecycle ERROR", Duration::from_secs(5), || {
+            udp_count(&wg, Line::ErrorListener) == 1
+        });
+        assert!(workers_alive(&wg), "no worker went down");
+        let second = TunPeer::add(&wg);
+        second.dispatch();
+        assert!(workers_alive(&wg));
+        assert_eq!(udp_count(&wg, Line::ErrorListener), 1);
+    }
+
+    /// A rebind gives the listener pair fresh generations, and the listener
+    /// lifecycle latch is per generation: one ERROR before, one after.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn a_rebind_gives_the_listeners_new_generations_and_a_fresh_listener_latch() {
+        let mut wg = single_queue_device();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        wg.start();
+        let (a4, a6) = listener_generations(&wg);
+        assert!(matches!(a4, DiagGen::Tracked(_)) && matches!(a6, DiagGen::Tracked(_)));
+        assert_ne!(a4, a6);
+        plan_udp_faults(
+            &wg,
+            vec![fault(
+                Op::Send,
+                Some(Site::TunV4),
+                None,
+                vec![Step::Fail(libc::EBADF); 2],
+            )],
+        );
+        for _ in 0..2 {
+            let p = TunPeer::add(&wg);
+            UdpSocket::bind("0.0.0.0:0")
+                .unwrap()
+                .send_to(b"through the tunnel", (p.ip, 9))
+                .unwrap();
+        }
+        wait_until("two failed sends", Duration::from_secs(5), || {
+            udp_attempts(&wg)
+                .iter()
+                .filter(|(s, ..)| *s == Site::TunV4)
+                .count()
+                == 2
+        });
+        assert_eq!(
+            udp_count(&wg, Line::ErrorListener),
+            1,
+            "once per listener generation"
+        );
+        assert_eq!(wg.wg_set_port(free_port()), UAPI_OK);
+        let (b4, b6) = listener_generations(&wg);
+        assert!(
+            b4 != a4 && b6 != a6 && b4 != b6,
+            "fresh generations, never reused"
+        );
+        plan_udp_faults(
+            &wg,
+            vec![fault(
+                Op::Send,
+                Some(Site::TunV4),
+                Some(b4),
+                vec![Step::Fail(libc::EBADF)],
+            )],
+        );
+        let p = TunPeer::add(&wg);
+        UdpSocket::bind("0.0.0.0:0")
+            .unwrap()
+            .send_to(b"through the tunnel", (p.ip, 9))
+            .unwrap();
+        wait_until("the new generation's ERROR", Duration::from_secs(5), || {
+            udp_count(&wg, Line::ErrorListener) == 2
+        });
     }
 }
