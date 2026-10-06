@@ -36,12 +36,7 @@
 //! function of the datagram, so it needs no device, no socket and no key, and it
 //! is testable on every platform rather than only where `device` compiles.
 
-// The caller is `device::probe_reply`, which exists only behind the `device`
-// feature. Without it the crate has no ingress path, so the classifier's only
-// consumers are this module's tests and the invariant table in `amnezia.rs`,
-// and the allow states that rather than hiding it. In a `--features device`
-// build -- what ships, and what CI runs -- nothing here is exempt.
-#![cfg_attr(not(feature = "device"), allow(dead_code))]
+// Both core auto-mode learning and the device probe responder use this parser.
 
 use super::super::amnezia::AmneziaImitationProtocol;
 
@@ -60,7 +55,17 @@ pub(crate) enum Probe {
 }
 
 impl Probe {
+    pub(crate) fn protocol(self) -> AmneziaImitationProtocol {
+        match self {
+            Self::Dns => AmneziaImitationProtocol::Dns,
+            Self::Quic => AmneziaImitationProtocol::Quic,
+            Self::Sip => AmneziaImitationProtocol::Sip,
+            Self::Stun => AmneziaImitationProtocol::Stun,
+        }
+    }
+
     /// Does this detection correspond to the configured imitation protocol?
+    #[cfg(any(feature = "device", test))]
     pub(crate) fn is(self, configured: AmneziaImitationProtocol) -> bool {
         matches!(
             (self, configured),

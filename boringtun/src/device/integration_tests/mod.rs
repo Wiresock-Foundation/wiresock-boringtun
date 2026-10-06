@@ -4689,6 +4689,151 @@ allowed_ip=10.66.66.2/32",
         SocketAddr::new(family, port)
     }
 
+    /// Real shared-listener demux and connected-socket rekeying, with four
+    /// different protocols behind the same source IP. Requires root and TUN.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn auto_imitation_live_listener_and_connected_sockets() {
+        use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationProtocol as P};
+        fn network(result: TunnResult<'_>) -> Vec<u8> {
+            match result {
+                TunnResult::WriteToNetwork(p) => p.to_vec(),
+                other => panic!("network output: {:?}", other),
+            }
+        }
+        for connected in [false, true] {
+            let config =
+                AmneziaConfig::new(128, 128, 128, 128).with_protocol_imitation(P::Auto, None);
+            let mut wg = WGHandle::init_with_config(
+                next_ip(),
+                next_ip_v6(),
+                DeviceConfig {
+                    n_threads: 2,
+                    use_connected_socket: connected,
+                    use_multi_queue: false,
+                    uapi_fd: -1,
+                    amnezia: config.clone(),
+                    ..Default::default()
+                },
+            );
+            let secret = StaticSecret::random_from_rng(OsRng);
+            let public = PublicKey::from(&secret);
+            assert_eq!(wg.wg_set_key(secret), UAPI_OK);
+            assert_eq!(wg.wg_set_port(next_port()), UAPI_OK);
+            wg.start();
+            let endpoint = device_listener(&wg, IpAddr::V4(Ipv4Addr::LOCALHOST));
+            let mut clients = Vec::new();
+            for (i, protocol) in [P::Dns, P::Quic, P::Sip, P::Stun]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                let secret = StaticSecret::random_from_rng(OsRng);
+                let key = PublicKey::from(&secret);
+                assert_eq!(
+                    wg.wg_set(&format!("public_key={}", encode(key.as_bytes()))),
+                    UAPI_OK
+                );
+                let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let client_config = config.clone().with_protocol_imitation(protocol, None);
+                let prelude = client_config
+                    .pre_handshake_imitation_datagrams(&mut OsRng)
+                    .pop_front()
+                    .unwrap()
+                    .1;
+                socket.send_to(&prelude, endpoint).unwrap();
+                let client = Tunn::new_with_obfuscation(
+                    secret,
+                    public,
+                    None,
+                    None,
+                    i as u32 + 1,
+                    None,
+                    Default::default(),
+                    client_config.as_responder(),
+                )
+                .unwrap();
+                clients.push((client, socket, key, protocol));
+            }
+            for (client, socket, key, protocol) in &mut clients {
+                let mut buf = [0u8; 2048];
+                for rekey in [false, true] {
+                    if rekey {
+                        let device = wg._device.device.read();
+                        let peer = device.peers[key].lock();
+                        assert_eq!(peer.tunnel.imitation_protocol(), *protocol);
+                        assert_eq!(peer.endpoint().conn.is_some(), connected);
+                    }
+                    let init = network(client.format_handshake_initiation(&mut buf, true));
+                    socket.send_to(&init, endpoint).unwrap();
+                    let (n, _) = socket
+                        .recv_from(&mut buf)
+                        .expect("an imitated handshake response");
+                    let response = buf[..n].to_vec();
+                    match protocol {
+                        P::Dns => assert_eq!(&response[4..12], &[0, 1, 0, 0, 0, 0, 0, 1]),
+                        P::Quic => assert_eq!(response[0] & 0xc0, 0x40),
+                        P::Sip => assert!(
+                            response.starts_with(b"OPTIONS ")
+                                || response.starts_with(b"REGISTER ")
+                                || response.starts_with(b"MESSAGE ")
+                        ),
+                        P::Stun => assert_eq!(&response[4..8], &[0x21, 0x12, 0xa4, 0x42]),
+                        _ => unreachable!(),
+                    }
+                    let keepalive = network(client.decapsulate(None, &response, &mut buf));
+                    socket.send_to(&keepalive, endpoint).unwrap();
+                }
+                if !connected {
+                    // A replacement peer on this exact UDP endpoint must learn
+                    // its new prelude, not reuse the old peer's cached hint.
+                    assert_eq!(
+                        wg.wg_set(&format!(
+                            "public_key={}\nremove=true",
+                            encode(key.as_bytes())
+                        )),
+                        UAPI_OK
+                    );
+                    assert_eq!(
+                        wg.wg_set(&format!("public_key={}", encode(key.as_bytes()))),
+                        UAPI_OK
+                    );
+                    let replacement = if *protocol == P::Dns { P::Stun } else { P::Dns };
+                    let changed = config.clone().with_protocol_imitation(replacement, None);
+                    let prelude = changed
+                        .pre_handshake_imitation_datagrams(&mut OsRng)
+                        .pop_front()
+                        .unwrap()
+                        .1;
+                    client
+                        .try_set_obfuscation(Default::default(), changed.as_responder())
+                        .unwrap();
+                    socket.send_to(&prelude, endpoint).unwrap();
+                    let init = network(client.format_handshake_initiation(&mut buf, true));
+                    socket.send_to(&init, endpoint).unwrap();
+                    socket
+                        .recv_from(&mut buf)
+                        .expect("replacement peer response");
+                    let device = wg._device.device.read();
+                    assert_eq!(
+                        device.peers[key].lock().tunnel.imitation_protocol(),
+                        replacement,
+                        "replacement must not inherit the retired peer's hint"
+                    );
+                    assert_eq!(
+                        device.imitation_hints.get(socket.local_addr().unwrap()),
+                        None,
+                        "successful selection consumes its hint"
+                    );
+                }
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     impl LoopbackPeer {
         /// Encrypt `packet` and send it to the device's listener port, from

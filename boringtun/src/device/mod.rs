@@ -5,6 +5,7 @@ pub mod allowed_ips;
 pub mod api;
 mod dev_lock;
 pub mod drop_privileges;
+mod imitation_auto;
 #[cfg(test)]
 mod integration_tests;
 pub mod peer;
@@ -321,6 +322,7 @@ pub struct Device {
     /// announces one stack and the outbound Binding Requests read the same
     /// value; it must not vary per worker, per reply, or per device.
     probe_responder: Option<ProbeResponder>,
+    imitation_hints: imitation_auto::ImitationHints,
 
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
@@ -513,10 +515,14 @@ fn commit_anonymous<'a>(
     peer: &mut Peer,
     packet: Authenticated,
     from: SocketAddr,
+    datagram: &[u8],
+    hint: Option<crate::noise::amnezia::AmneziaImitationProtocol>,
     dst: &'a mut [u8],
 ) -> TunnResult<'a> {
     let replaced = (peer.endpoint().addr != Some(from)).then(|| peer.tunnel.begin_new_path());
-    let result = peer.tunnel.commit(packet, dst);
+    let result = peer
+        .tunnel
+        .commit_with_imitation(packet, datagram, hint, dst);
     if let (TunnResult::Err(_), Some(window)) = (&result, replaced) {
         peer.tunnel.restore_udp_window(window);
     }
@@ -696,6 +702,9 @@ impl Device {
             // Found a peer to remove, now purge all references to it:
             {
                 let p = peer.lock();
+                if let Some(source) = p.endpoint().addr {
+                    self.imitation_hints.discard(source);
+                }
                 p.shutdown_endpoint(); // close open udp socket and free the closure
                 self.peers_by_idx.remove(&p.index());
             }
@@ -925,6 +934,7 @@ impl Device {
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
             probe_responder,
+            imitation_hints: Default::default(),
             #[cfg(target_os = "linux")]
             uapi_fd,
             #[cfg(all(
@@ -1045,6 +1055,7 @@ impl Device {
         self.udp4_gen = id4.gen;
         self.udp6_gen = id6.gen;
         self.listen_port = port;
+        self.imitation_hints.clear();
 
         // Peers' connected sockets are bound to the port just given up, so
         // they go with it -- only now, so a refused change leaves them alone.
@@ -1111,6 +1122,7 @@ impl Device {
         }
 
         self.key_pair = key_pair;
+        self.imitation_hints.clear();
         self.rate_limiter = Some(rate_limiter);
     }
 
@@ -1133,6 +1145,7 @@ impl Device {
 
         self.config.obf = obf;
         self.config.amnezia = amnezia;
+        self.imitation_hints.clear();
 
         // Push to every existing peer, exactly as `set_key` does above. Peers
         // snapshot these values when their `Tunn` is built, so without this a
@@ -1311,6 +1324,7 @@ impl Device {
     }
 
     fn clear_peers(&mut self) {
+        self.imitation_hints.clear();
         self.peers.clear();
         self.peers_by_idx.clear();
         self.peers_by_ip.clear();
@@ -1590,7 +1604,7 @@ impl Device {
                     // is the only one: an unmasked tag cannot pass for ours on a
                     // device that requires masking. It never modifies the
                     // datagram, so what probe detection sees is what arrived.
-                    let candidates = match probe_reply::classify(
+                    let candidates = match d.imitation_hints.classify(
                         &t.src_buf[..packet_len],
                         &d.config.amnezia,
                         obf,
@@ -1680,7 +1694,12 @@ impl Device {
                                     // and what comes out is checked again: the
                                     // bound shapes the draw, the check is the
                                     // guard.
-                                    if let Ok(out) = d.config.amnezia.prepend_outbound_with_trailer(
+                                    let cookie_config = d.imitation_hints.cookie_config(
+                                        &d.config.amnezia,
+                                        from,
+                                        datagram,
+                                    );
+                                    if let Ok(out) = cookie_config.prepend_outbound_with_trailer(
                                         obf,
                                         &mut t.dst_buf,
                                         cookie_len,
@@ -1727,7 +1746,16 @@ impl Device {
 
                     // We found a peer, use it to decapsulate the message+
                     let mut flush = false; // Are there packets to send from the queue?
-                    match commit_anonymous(&mut p, packet, from, &mut t.dst_buf[..]) {
+                    use crate::noise::amnezia::AmneziaImitationProtocol as P;
+                    let auto_initiation = d.config.amnezia.imitation.protocol == P::Auto
+                        && matches!(&packet, Authenticated::HandshakeInit(_));
+                    let hint = if auto_initiation {
+                        d.imitation_hints.get(from)
+                    } else {
+                        None
+                    };
+                    match commit_anonymous(&mut p, packet, from, datagram, hint, &mut t.dst_buf[..])
+                    {
                         TunnResult::Done => {}
                         TunnResult::Err(_) => continue,
                         TunnResult::WriteToNetwork(packet) => {
@@ -1754,6 +1782,10 @@ impl Device {
                             }
                         }
                     };
+
+                    if auto_initiation && p.tunnel.imitation_protocol() != P::None {
+                        d.imitation_hints.discard(from);
+                    }
 
                     if flush {
                         // Flush pending queue
@@ -2765,13 +2797,14 @@ mod ingress_tests {
             };
             // The same buffer the trial wrote the plaintext into, as the
             // handler uses `t.dst_buf` for both.
-            let delivered = match commit_anonymous(&mut guard, packet, from, &mut dst[..]) {
-                TunnResult::WriteToNetwork(d) => Delivered::Network(d.to_vec()),
-                TunnResult::WriteToTunnelV4(..) => Delivered::Tunnel,
-                TunnResult::WriteToTunnelV6(..) => Delivered::Tunnel,
-                TunnResult::Done => Delivered::Done,
-                TunnResult::Err(_) => return Delivered::Error,
-            };
+            let delivered =
+                match commit_anonymous(&mut guard, packet, from, &[], None, &mut dst[..]) {
+                    TunnResult::WriteToNetwork(d) => Delivered::Network(d.to_vec()),
+                    TunnResult::WriteToTunnelV4(..) => Delivered::Tunnel,
+                    TunnResult::WriteToTunnelV6(..) => Delivered::Tunnel,
+                    TunnResult::Done => Delivered::Done,
+                    TunnResult::Err(_) => return Delivered::Error,
+                };
             self.window_at_commit.set(guard.tunnel.udp_window());
             guard.adopt_endpoint(from);
             delivered
@@ -3096,7 +3129,7 @@ mod ingress_tests {
                 },
             ) {
                 inbound::Inbound::Accepted((_, mut guard, packet)) => {
-                    match commit_anonymous(&mut guard, packet, from, &mut dst[..]) {
+                    match commit_anonymous(&mut guard, packet, from, &[], None, &mut dst[..]) {
                         TunnResult::WriteToNetwork(d) => {
                             let d = d.to_vec();
                             guard.adopt_endpoint(from);

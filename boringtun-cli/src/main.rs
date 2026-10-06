@@ -101,7 +101,7 @@ fn main() {
                 .value_parser(PossibleValuesParser::new(
                     AmneziaImitationProtocol::ALL.map(|p| p.as_str()),
                 ))
-                .help("Protocol to imitate: shapes outbound cover traffic, and selects which probes the listen port answers")
+                .help("Protocol to imitate; auto learns separately per client on a responder. Also selects which probes the listen port answers")
                 .default_value(AmneziaImitationProtocol::None.as_str()),
             Arg::new("imitate-domain")
                 .long("imitate-domain")

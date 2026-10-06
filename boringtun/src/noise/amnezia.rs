@@ -88,6 +88,8 @@ pub enum AmneziaImitationProtocol {
     Quic = 2,
     Sip = 3,
     Stun = 4,
+    /// Responder: learn a concrete imitation protocol independently per peer.
+    Auto = 5,
 }
 
 impl TryFrom<u8> for AmneziaImitationProtocol {
@@ -100,6 +102,7 @@ impl TryFrom<u8> for AmneziaImitationProtocol {
             2 => Ok(Self::Quic),
             3 => Ok(Self::Sip),
             4 => Ok(Self::Stun),
+            5 => Ok(Self::Auto),
             _ => Err(()),
         }
     }
@@ -109,7 +112,14 @@ impl AmneziaImitationProtocol {
     /// Every variant, so a caller offering these as choices cannot fall behind
     /// the enum. `boringtun-cli` builds its `--imitate-protocol` value list from
     /// this rather than restating it.
-    pub const ALL: [Self; 5] = [Self::None, Self::Dns, Self::Quic, Self::Sip, Self::Stun];
+    pub const ALL: [Self; 6] = [
+        Self::None,
+        Self::Dns,
+        Self::Quic,
+        Self::Sip,
+        Self::Stun,
+        Self::Auto,
+    ];
 
     /// The name used on the command line and in `Ip =` config values.
     ///
@@ -124,6 +134,7 @@ impl AmneziaImitationProtocol {
             Self::Quic => "quic",
             Self::Sip => "sip",
             Self::Stun => "stun",
+            Self::Auto => "auto",
         }
     }
 
@@ -1138,9 +1149,9 @@ impl AmneziaConfig {
             return None;
         }
         Some(match self.imitation.protocol {
-            AmneziaImitationProtocol::None | AmneziaImitationProtocol::Quic => {
-                HeaderProtectionNonce::Full
-            }
+            AmneziaImitationProtocol::None
+            | AmneziaImitationProtocol::Auto
+            | AmneziaImitationProtocol::Quic => HeaderProtectionNonce::Full,
             AmneziaImitationProtocol::Stun => HeaderProtectionNonce::Bounded32,
             AmneziaImitationProtocol::Dns => HeaderProtectionNonce::Weak16,
             AmneziaImitationProtocol::Sip => match self.sip_request_line_prefix() {
@@ -1498,17 +1509,45 @@ impl AmneziaConfig {
         self
     }
 
+    /// Resolve only the outbound imitation; all configured framing remains intact.
+    /// An incompatible learned mode falls back to random prefixes, never bypassing
+    /// the header-protection policy. Fixed-mode configurations are borrowed unchanged.
+    pub(crate) fn resolve_imitation(
+        &self,
+        protocol: AmneziaImitationProtocol,
+    ) -> std::borrow::Cow<'_, Self> {
+        if self.imitation.protocol != AmneziaImitationProtocol::Auto {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut resolved = self.clone();
+        let protocol = if protocol == AmneziaImitationProtocol::Auto {
+            AmneziaImitationProtocol::None
+        } else {
+            protocol
+        };
+        resolved.imitation =
+            AmneziaImitation::new(protocol, None, AmneziaImitationBrowser::Default);
+        if resolved.check_header_protection_nonce().is_err() {
+            resolved.imitation = AmneziaImitation::default();
+        }
+        std::borrow::Cow::Owned(resolved)
+    }
+
     /// True when a full protocol-natural imitation sequence should be emitted
     /// for the pre-handshake phase. DNS/SIP/STUN/QUIC all qualify (QUIC's omitted
-    /// browser defaults to curl, matching wgbooster); only `None` does not.
+    /// browser defaults to curl, matching wgbooster); `None` and `Auto` do not.
     pub(crate) fn has_imitation_sequence(&self) -> bool {
-        self.imitation.protocol != AmneziaImitationProtocol::None
+        !matches!(
+            self.imitation.protocol,
+            AmneziaImitationProtocol::None | AmneziaImitationProtocol::Auto
+        )
     }
 
     /// True when this endpoint should emit a pre-handshake burst at all —
     /// false for a responder, and for a client with neither Jc nor imitation.
     pub(crate) fn emits_pre_handshake(&self) -> bool {
         !self.suppress_pre_handshake
+            && self.imitation.protocol != AmneziaImitationProtocol::Auto
             && (self.pre_handshake_junk.is_enabled() || self.has_imitation_sequence())
     }
 
@@ -1550,7 +1589,7 @@ impl AmneziaConfig {
                 );
                 (datagrams, &[])
             }
-            AmneziaImitationProtocol::None => (Vec::new(), &[]),
+            AmneziaImitationProtocol::None | AmneziaImitationProtocol::Auto => (Vec::new(), &[]),
         };
 
         datagrams
@@ -2376,7 +2415,9 @@ impl AmneziaConfig {
 
         let packet = &mut buffer[..size];
         match self.imitation.protocol {
-            AmneziaImitationProtocol::None => fill_random(packet, rng),
+            AmneziaImitationProtocol::None | AmneziaImitationProtocol::Auto => {
+                fill_random(packet, rng)
+            }
             AmneziaImitationProtocol::Dns => fill_dns(packet, 0, self.imitation.domain(), rng),
             AmneziaImitationProtocol::Quic => fill_quic_initial(packet, rng),
             AmneziaImitationProtocol::Sip => fill_sip(packet, self.imitation.domain(), rng),
@@ -2390,7 +2431,7 @@ impl AmneziaConfig {
     /// source both the draw and the capacity preflight read.
     fn pre_handshake_junk_size_range(&self) -> (usize, usize) {
         match self.imitation.protocol {
-            AmneziaImitationProtocol::None => (
+            AmneziaImitationProtocol::None | AmneziaImitationProtocol::Auto => (
                 self.pre_handshake_junk.packet_size_min as usize,
                 self.pre_handshake_junk.packet_size_max as usize,
             ),
@@ -2469,6 +2510,7 @@ impl AmneziaConfig {
 fn imitation_redraw_avoids_upstream_collisions(cfg: &AmneziaConfig) -> bool {
     match cfg.imitation.protocol {
         AmneziaImitationProtocol::None
+        | AmneziaImitationProtocol::Auto
         | AmneziaImitationProtocol::Quic
         | AmneziaImitationProtocol::Stun
         | AmneziaImitationProtocol::Dns => true,
@@ -2525,7 +2567,7 @@ fn fill_protocol_like(
     rng: &mut impl RngCore,
 ) {
     match protocol {
-        AmneziaImitationProtocol::None => fill_random(dst, rng),
+        AmneziaImitationProtocol::None | AmneziaImitationProtocol::Auto => fill_random(dst, rng),
         AmneziaImitationProtocol::Dns => fill_dns(dst, trailing_size, domain, rng),
         // Always a 1-RTT short header, for every packet kind. A long header
         // carries a length field that would have to frame the bytes that
