@@ -118,7 +118,10 @@ configuration updates. Fixed imitation modes retain their existing behavior.
 Configure matching S1–S4, H1–H4, keys and other required AmneziaWG parameters as usual: auto
 detects only imitation. Pending hints are keyed by source IP **and UDP port**, expire after
 30 seconds without refresh, and are capped at 1024 endpoints (oldest evicted first). They
-are consumed after successful selection and cleared when the peer is removed. The
+are consumed after successful selection and never follow a peer to a new endpoint: a roam or
+a configured endpoint change discards that peer's pending evidence. Removing a peer clears
+every pending hint on the device, so other unresolved clients may need to resend a prelude;
+learned peer modes are kept. The
 outer imitation bytes are not authenticated, so a hint is camouflage metadata, not identity.
 Unsolicited traffic cannot replace an already learned peer mode.
 

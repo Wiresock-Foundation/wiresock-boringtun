@@ -648,16 +648,13 @@ impl Tunn {
                 if resolved.imitation.protocol != protocol {
                     self.auto_imitation.learned = None;
                     tracing::warn!("clearing learned imitation: incompatible with new header-protection settings");
-                } else {
-                    #[cfg(any(feature = "device", feature = "ffi-bindings"))]
-                    if self
-                        .amnezia
-                        .resolve_imitation(protocol)
-                        .header_protection_nonce()
-                        != resolved.header_protection_nonce()
-                    {
-                        resolved.warn_header_protection_nonce();
-                    }
+                } else if self
+                    .amnezia
+                    .resolve_imitation(protocol)
+                    .header_protection_nonce()
+                    != resolved.header_protection_nonce()
+                {
+                    resolved.warn_header_protection_nonce();
                 }
             }
         }
@@ -715,11 +712,27 @@ impl Tunn {
         self.udp_window.store(window, AtomicOrdering::Relaxed);
     }
 
+    /// Drop unverified auto-imitation evidence; a learned mode is kept. For
+    /// the device, when the peer's endpoint moves: the tunnel binds evidence
+    /// only to a source IP, so it would otherwise follow the peer to another
+    /// UDP port of the same host and shape a rekey there.
+    #[cfg(feature = "device")]
+    pub(crate) fn discard_imitation_hint(&mut self) {
+        self.auto_imitation.clear_pending();
+    }
+
     /// Whether a pre-handshake burst is queued, the initiation behind it not
     /// yet sent. For the device tests, which cannot see the field.
     #[cfg(all(test, feature = "device"))]
     pub(crate) fn has_pending_burst(&self) -> bool {
         self.pending_amnezia_junk.is_some()
+    }
+
+    /// Whether unverified auto-imitation evidence is held for this peer. For
+    /// the device tests, which cannot see the field.
+    #[cfg(all(test, feature = "device"))]
+    pub(crate) fn has_imitation_hint(&self) -> bool {
+        self.auto_imitation.has_pending()
     }
 
     /// This tunnel's AmneziaWG configuration. For the device and FFI tests,
@@ -1324,7 +1337,6 @@ impl Tunn {
                 protocol = self.imitation_protocol().as_str(),
                 "learned peer imitation protocol"
             );
-            #[cfg(any(feature = "device", feature = "ffi-bindings"))]
             self.amnezia
                 .resolve_imitation(self.imitation_protocol())
                 .warn_header_protection_nonce();

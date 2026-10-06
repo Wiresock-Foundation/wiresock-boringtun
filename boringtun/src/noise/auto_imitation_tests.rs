@@ -220,9 +220,9 @@ fn auto_imitation_cookie_uses_hint_without_pinning() {
     assert_eq!(server.imitation_protocol(), P::None);
 }
 
-#[test]
-#[cfg(any(feature = "device", feature = "ffi-bindings"))]
-fn auto_imitation_live_header_protection_update_reports_resolved_nonce_warning() {
+/// Run `f` with WARN events captured; returns the number of header-protection
+/// nonce warnings it logged, each also checked to name `protocol`.
+fn nonce_warnings(protocol: P, f: impl FnOnce()) -> usize {
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
     struct Capture(Arc<Mutex<Vec<u8>>>);
@@ -235,42 +235,95 @@ fn auto_imitation_live_header_protection_update_reports_resolved_nonce_warning()
             Ok(())
         }
     }
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || Capture(writer.clone()))
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    let warnings: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("protocol imitation weakens AmneziaWG header protection"))
+        .collect();
+    for line in &warnings {
+        assert!(
+            line.contains(&format!("protocol=\"{}\"", protocol.as_str()))
+                || line.contains(&format!("protocol={}", protocol.as_str())),
+            "warning names the learned protocol {:?}: {}",
+            protocol,
+            line
+        );
+    }
+    warnings.len()
+}
+
+/// Deliberately ungated: ordinary Rust library builds (no `device`, no
+/// `ffi-bindings`) embed `Tunn` directly, and an auto responder learning DNS
+/// or STUN under header protection must warn there too.
+#[test]
+fn auto_imitation_reports_learned_nonce_warning_in_every_build() {
     for protocol in [P::Dns, P::Stun] {
+        // Header protection on before learning: one warning when the mode is
+        // learned, none for repeated identical updates afterwards.
+        let protected = auto_config().with_header_protection([9; 32]);
+        let (mut client, mut server) = pair(&protected, None);
+        let mut buf = [0u8; 2048];
+        let warnings = nonce_warnings(protocol, || {
+            let _ = server.decapsulate(None, &prelude(protocol), &mut buf);
+            let init = network(client.format_handshake_initiation(&mut buf, false));
+            let _ = network(server.decapsulate(None, &init, &mut buf));
+            for _ in 0..2 {
+                server
+                    .try_set_obfuscation(Default::default(), protected.clone())
+                    .unwrap();
+            }
+        });
+        assert_eq!(server.imitation_protocol(), protocol);
+        assert_eq!(
+            warnings, 1,
+            "masking enabled before learning {:?}",
+            protocol
+        );
+
+        // Header protection enabled by a live update after learning: one
+        // warning for the update, none for repeating it.
         let config = auto_config();
         let (mut client, mut server) = pair(&config, None);
-        let mut buf = [0u8; 2048];
         let _ = server.decapsulate(None, &prelude(protocol), &mut buf);
         let init = network(client.format_handshake_initiation(&mut buf, false));
         let _ = network(server.decapsulate(None, &init, &mut buf));
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let writer = output.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || Capture(writer.clone()))
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            let protected = config.with_header_protection([9; 32]);
-            server
-                .try_set_obfuscation(Default::default(), protected.clone())
-                .unwrap();
-            server
-                .try_set_obfuscation(Default::default(), protected)
-                .unwrap();
-        });
-        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-        assert_eq!(
-            log.lines()
-                .filter(
-                    |line| line.contains("protocol imitation weakens AmneziaWG header protection")
-                )
-                .count(),
-            1,
-            "one warning when masking is enabled for {:?}: {}",
-            protocol,
-            log
-        );
         assert_eq!(server.imitation_protocol(), protocol);
+        let protected = config.with_header_protection([9; 32]);
+        let warnings = nonce_warnings(protocol, || {
+            for _ in 0..3 {
+                server
+                    .try_set_obfuscation(Default::default(), protected.clone())
+                    .unwrap();
+            }
+        });
+        assert_eq!(server.imitation_protocol(), protocol);
+        assert_eq!(warnings, 1, "masking enabled after learning {:?}", protocol);
+
+        // Fixed modes keep their door-only reporting: `Tunn` stays silent and
+        // the accepting door (UAPI `set=1`, the C constructor) warns once.
+        let fixed = AmneziaConfig::new(128, 128, 128, 128)
+            .with_protocol_imitation(protocol, None)
+            .as_responder();
+        let (_, mut server) = pair(&fixed, None);
+        let warnings = nonce_warnings(protocol, || {
+            for _ in 0..2 {
+                server
+                    .try_set_obfuscation(
+                        Default::default(),
+                        fixed.clone().with_header_protection([9; 32]),
+                    )
+                    .unwrap();
+            }
+        });
+        assert_eq!(warnings, 0, "fixed {:?} warns only at its door", protocol);
     }
 }

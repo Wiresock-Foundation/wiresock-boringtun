@@ -1139,7 +1139,8 @@ impl AmneziaConfig {
     /// The single source of the header-protection policy under imitation:
     /// [`Self::check_header_protection_nonce`] refuses
     /// [`HeaderProtectionNonce::Degenerate`] for every door, and
-    /// `header_protection_nonce_complaint` words the warnings the doors log.
+    /// `header_protection_nonce_complaint` words the warnings logged by the
+    /// doors and, for a learned auto-imitation mode, by `Tunn`.
     /// Decided by the key, the imitation protocol and -- for SIP only -- the S
     /// sizes, since the imitation filler shapes every packet kind's prefix.
     /// An exhaustive match: a new imitation protocol does not compile until
@@ -1171,14 +1172,14 @@ impl AmneziaConfig {
             .find(|&(_, size)| size as usize >= SIP_REQUEST_LINE_MIN)
     }
 
-    /// The warning a configuration door logs for an accepted header-protection
-    /// nonce weaker than random, or `None` when there is nothing to say --
-    /// no key, a random nonce, or a SIP request line (refused, not warned).
+    /// The warning logged for an accepted header-protection nonce weaker than
+    /// random, or `None` when there is nothing to say -- no key, a random
+    /// nonce, or a SIP request line (refused, not warned).
     ///
-    /// Gated like [`Self::cookie_amplification_complaint`], for the same
-    /// reason: the doors that log it are `device::api` and the C struct
-    /// constructor, so without either feature it would be dead code.
-    #[cfg(any(test, feature = "device", feature = "ffi-bindings"))]
+    /// Ungated, unlike [`Self::cookie_amplification_complaint`]: besides the
+    /// `device::api` and C struct doors, an auto-imitation `Tunn` reports it
+    /// in every build, including ordinary Rust library builds without either
+    /// feature. See [`Self::warn_header_protection_nonce`].
     pub(crate) fn header_protection_nonce_complaint(&self) -> Option<String> {
         match self.header_protection_nonce()? {
             HeaderProtectionNonce::Full | HeaderProtectionNonce::Degenerate => None,
@@ -1207,11 +1208,19 @@ impl AmneziaConfig {
     }
 
     /// Log [`Self::header_protection_nonce_complaint`] at WARN, if there is
-    /// one. The one reporter the configuration doors share, so the wording and
-    /// the fields live here rather than in each door. Called once per
-    /// accepted configuration by the door that accepted it, not by `Tunn`,
-    /// which a device builds and reconfigures once per peer.
-    #[cfg(any(feature = "device", feature = "ffi-bindings"))]
+    /// one. The one reporter shared by every caller, so the wording and the
+    /// fields live here rather than at each call site.
+    ///
+    /// For a fixed imitation protocol the configuration is known when it is
+    /// accepted, so the door that accepted it calls this once per accepted
+    /// configuration -- UAPI `set=1` and the C struct constructor -- and
+    /// `Tunn`, which a device builds and reconfigures once per peer, does not.
+    /// An `auto` responder's effective protocol is only known per peer, so
+    /// there `Tunn` calls this with the resolved configuration: once when a
+    /// DNS or STUN mode is learned under header protection, and once when a
+    /// live update changes a learned mode's nonce class. Repeating an
+    /// identical update does not warn again. Available in every build, so
+    /// embedders of the plain Rust library see the same warnings.
     pub(crate) fn warn_header_protection_nonce(&self) {
         if let Some(complaint) = self.header_protection_nonce_complaint() {
             tracing::warn!(
@@ -1290,7 +1299,8 @@ impl AmneziaConfig {
     /// and the masking it stands for is effectively absent, which an operator
     /// could not tell from a working setup. Every other imitation loads -- the
     /// weaker STUN and DNS nonces with a warning from the door that accepts
-    /// them (`header_protection_nonce_complaint`). Here rather than in
+    /// them, or from `Tunn` when an auto responder learns or keeps one
+    /// (`header_protection_nonce_complaint`). Here rather than in
     /// [`Self::validate`] alone because this is the check every door runs:
     /// the `Tunn` constructors, `Tunn::set_obfuscation`, and through
     /// `validate` the UAPI `set=1` and the C struct constructor behind JNI.
@@ -1398,7 +1408,8 @@ impl AmneziaConfig {
         // `header_protection_nonce`, not here: its one refusal (a SIP request
         // line in the prefix) is in `check_header_protection_nonce` above, and
         // the weaker-but-working STUN and DNS nonces are warnings the accepting
-        // door logs through `warn_header_protection_nonce` -- `validate` stays
+        // door (or, for a learned auto mode, `Tunn`) logs through
+        // `warn_header_protection_nonce` -- `validate` stays
         // silent and says only what is valid. Nothing under the mask is
         // secret: a repeated nonce repeats the mask, which weakens header
         // masking, and leaks no payload plaintext or key material.

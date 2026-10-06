@@ -65,4 +65,9 @@ impl AutoImitation {
     pub(crate) fn clear_pending(&mut self) {
         self.pending = None;
     }
+
+    #[cfg(all(test, feature = "device"))]
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
 }

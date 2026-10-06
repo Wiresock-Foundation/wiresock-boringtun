@@ -381,4 +381,289 @@ mod tests {
             assert_eq!(peers[pubkey].lock().tunnel.imitation_protocol(), *protocol);
         }
     }
+
+    type SharedPeer = std::sync::Arc<Mutex<crate::device::peer::Peer>>;
+
+    /// One authenticated server peer behind the shared listener and its
+    /// connected socket, for following a single client across endpoints.
+    struct Roaming {
+        secret: crate::x25519::StaticSecret,
+        public: crate::x25519::PublicKey,
+        config: AmneziaConfig,
+        peer: SharedPeer,
+        peers: HashMap<crate::x25519::PublicKey, SharedPeer>,
+        indices: HashMap<u32, SharedPeer>,
+        hints: ImitationHints,
+        limiter: crate::noise::rate_limiter::RateLimiter,
+    }
+
+    /// What the server sent back, if anything; `Err` for a refused packet or
+    /// a failed commit, neither of which may move the endpoint.
+    type Reply = Result<Option<Vec<u8>>, ()>;
+
+    impl Roaming {
+        fn new() -> (Self, crate::noise::Tunn) {
+            use crate::device::peer::Peer;
+            use crate::noise::{rate_limiter::RateLimiter, Tunn};
+            use crate::x25519::{PublicKey, StaticSecret};
+            use std::sync::Arc;
+            let secret = StaticSecret::random_from_rng(OsRng);
+            let public = PublicKey::from(&secret);
+            let config =
+                AmneziaConfig::new(128, 128, 128, 128).with_protocol_imitation(P::Auto, None);
+            let key = StaticSecret::random_from_rng(OsRng);
+            let pubkey = PublicKey::from(&key);
+            // A client with no prelude of its own: plain random S padding.
+            let client = Tunn::new_with_obfuscation(
+                key,
+                public,
+                None,
+                None,
+                1,
+                None,
+                Default::default(),
+                AmneziaConfig::new(128, 128, 128, 128).as_responder(),
+            )
+            .unwrap();
+            let server = Tunn::new_with_obfuscation(
+                secret.clone(),
+                pubkey,
+                None,
+                None,
+                1,
+                None,
+                Default::default(),
+                config.clone(),
+            )
+            .unwrap();
+            let peer = Arc::new(Mutex::new(Peer::new(server, 1, None, None)));
+            let roaming = Self {
+                limiter: RateLimiter::new(&public, 100),
+                secret,
+                public,
+                config,
+                peers: HashMap::from([(pubkey, peer.clone())]),
+                indices: HashMap::from([(1, peer.clone())]),
+                peer,
+                hints: ImitationHints::default(),
+            };
+            (roaming, client)
+        }
+
+        /// The shared listener's door, as the device handler drives it.
+        fn listener(&self, from: SocketAddr, datagram: &[u8], dst_len: usize) -> Reply {
+            use crate::device::{authenticate_anonymous, commit_anonymous};
+            use crate::noise::{inbound, TunnResult};
+            let Ingress::Wireguard(candidates) = self.hints.classify(
+                datagram,
+                &self.config,
+                Default::default(),
+                from,
+                None,
+                &mut OsRng,
+            ) else {
+                return Ok(None);
+            };
+            let mut scratch = [0u8; 2048];
+            let inbound::Inbound::Accepted((_, mut peer, packet)) = inbound::receive(
+                &self.config,
+                Default::default(),
+                &self.limiter,
+                Some(from.ip()),
+                &candidates,
+                datagram,
+                |p| {
+                    authenticate_anonymous(
+                        &self.peers,
+                        &self.indices,
+                        &self.secret,
+                        &self.public,
+                        p,
+                        &mut scratch,
+                    )
+                },
+            ) else {
+                return Err(());
+            };
+            let mut dst = vec![0u8; dst_len];
+            let reply = match commit_anonymous(
+                &mut peer,
+                packet,
+                from,
+                datagram,
+                self.hints.get(from),
+                &mut dst,
+            ) {
+                TunnResult::Err(_) => return Err(()),
+                TunnResult::WriteToNetwork(reply) => Some(reply.to_vec()),
+                _ => None,
+            };
+            peer.adopt_endpoint(from);
+            Ok(reply)
+        }
+
+        /// The peer's connected socket: the tunnel sees only the source IP.
+        fn connected(&self, from: SocketAddr, datagram: &[u8]) -> Reply {
+            use crate::noise::TunnResult;
+            let mut dst = [0u8; 2048];
+            match self
+                .peer
+                .lock()
+                .tunnel
+                .decapsulate(Some(from.ip()), datagram, &mut dst)
+            {
+                TunnResult::Err(_) => Err(()),
+                TunnResult::WriteToNetwork(reply) => Ok(Some(reply.to_vec())),
+                _ => Ok(None),
+            }
+        }
+
+        fn endpoint(&self) -> Option<SocketAddr> {
+            self.peer.lock().endpoint().addr
+        }
+
+        fn protocol(&self) -> P {
+            self.peer.lock().tunnel.imitation_protocol()
+        }
+    }
+
+    fn is_stun(packet: &[u8]) -> bool {
+        packet[4..8] == [0x21, 0x12, 0xa4, 0x42]
+    }
+
+    /// Complete a handshake the server answered and return the client's
+    /// confirming keepalive.
+    fn confirm(client: &mut crate::noise::Tunn, response: &[u8]) -> Vec<u8> {
+        use crate::noise::TunnResult;
+        let mut buf = [0u8; 2048];
+        match client.decapsulate(None, response, &mut buf) {
+            TunnResult::WriteToNetwork(keepalive) => keepalive.to_vec(),
+            other => panic!("client keepalive: {:?}", other),
+        }
+    }
+
+    fn initiation(client: &mut crate::noise::Tunn) -> Vec<u8> {
+        use crate::noise::TunnResult;
+        // A mocked clock stands still, and a responder refuses an initiation
+        // whose timestamp does not advance as a replay.
+        #[cfg(feature = "mock-instant")]
+        mock_instant::thread_local::MockClock::advance(std::time::Duration::from_millis(1));
+        let mut buf = [0u8; 2048];
+        match client.format_handshake_initiation(&mut buf, true) {
+            TunnResult::WriteToNetwork(init) => init.to_vec(),
+            other => panic!("initiation: {:?}", other),
+        }
+    }
+
+    fn keepalive(client: &mut crate::noise::Tunn) -> Vec<u8> {
+        use crate::noise::TunnResult;
+        let mut buf = [0u8; 2048];
+        match client.encapsulate(&[], &mut buf) {
+            TunnResult::WriteToNetwork(keepalive) => keepalive.to_vec(),
+            other => panic!("keepalive: {:?}", other),
+        }
+    }
+
+    /// The tunnel's own pending hint is bound only to a source IP. A prelude
+    /// on endpoint A must not select the imitation for a rekey on endpoint B
+    /// of the same host after the peer roamed there without a prelude.
+    #[test]
+    fn auto_imitation_pending_tunnel_hint_does_not_follow_a_roam() {
+        let (server, mut client) = Roaming::new();
+        let a = source(1000);
+        let b = source(2000);
+
+        // Unresolved handshake on A: random.
+        let first = server
+            .listener(a, &initiation(&mut client), 2048)
+            .unwrap()
+            .expect("first response");
+        assert!(!is_stun(&first));
+        let ack = confirm(&mut client, &first);
+        server.listener(a, &ack, 2048).unwrap();
+        assert_eq!(server.endpoint(), Some(a));
+
+        // STUN prelude on A's connected socket, with no initiation behind it.
+        assert_eq!(server.connected(a, &prelude(P::Stun)), Ok(None));
+
+        // Roam to B without a prelude: an authenticated keepalive.
+        server.listener(b, &keepalive(&mut client), 2048).unwrap();
+        assert_eq!(server.endpoint(), Some(b));
+
+        // Rekey on B's connected socket, then on the listener: still random.
+        let second = server
+            .connected(b, &initiation(&mut client))
+            .unwrap()
+            .expect("rekey on B's connected socket");
+        assert!(
+            !is_stun(&second),
+            "A's prelude must not select the imitation on B"
+        );
+        assert_eq!(server.protocol(), P::None);
+        confirm(&mut client, &second);
+        let third = server
+            .listener(b, &initiation(&mut client), 2048)
+            .unwrap()
+            .expect("rekey on the listener");
+        assert!(!is_stun(&third));
+        assert_eq!(server.protocol(), P::None);
+        confirm(&mut client, &third);
+
+        // Fresh evidence from B itself is still honoured...
+        assert_eq!(server.connected(b, &prelude(P::Stun)), Ok(None));
+        let learned = server
+            .connected(b, &initiation(&mut client))
+            .unwrap()
+            .expect("rekey with B's own prelude");
+        assert!(is_stun(&learned));
+        assert_eq!(server.protocol(), P::Stun);
+        confirm(&mut client, &learned);
+
+        // ...and a learned mode survives roaming back to A, whatever A says.
+        server.listener(a, &keepalive(&mut client), 2048).unwrap();
+        assert_eq!(server.endpoint(), Some(a));
+        assert_eq!(server.listener(a, &prelude(P::Dns), 2048), Ok(None));
+        let after = server
+            .listener(a, &initiation(&mut client), 2048)
+            .unwrap()
+            .expect("rekey after roaming back");
+        assert!(is_stun(&after));
+        assert_eq!(server.protocol(), P::Stun);
+    }
+
+    /// Neither a refused packet nor a failed commit from another endpoint
+    /// moves the peer, so neither may discard the evidence on its endpoint.
+    #[test]
+    fn auto_imitation_rejected_roams_keep_pending_tunnel_hint() {
+        let (server, mut client) = Roaming::new();
+        let a = source(1000);
+        let b = source(2000);
+        let first = server
+            .listener(a, &initiation(&mut client), 2048)
+            .unwrap()
+            .expect("first response");
+        let ack = confirm(&mut client, &first);
+        server.listener(a, &ack, 2048).unwrap();
+        assert_eq!(server.connected(a, &prelude(P::Stun)), Ok(None));
+
+        // A forged initiation from B is refused before any commit.
+        let mut forged = initiation(&mut client);
+        forged[128 + 20] ^= 1;
+        assert_eq!(server.listener(b, &forged, 2048), Err(()));
+        assert_eq!(server.endpoint(), Some(a));
+
+        // An authenticated initiation from B whose response does not fit the
+        // caller's buffer fails its commit.
+        assert_eq!(server.listener(b, &initiation(&mut client), 219), Err(()));
+        assert_eq!(server.endpoint(), Some(a));
+        assert_eq!(server.protocol(), P::None);
+
+        // A's evidence is intact.
+        let learned = server
+            .connected(a, &initiation(&mut client))
+            .unwrap()
+            .expect("rekey on A");
+        assert!(is_stun(&learned));
+        assert_eq!(server.protocol(), P::Stun);
+    }
 }

@@ -509,6 +509,13 @@ fn authenticate_anonymous<'m>(
 /// would have it describe a path nothing uses, and the next packet from
 /// `from` would find it already "fresh" and skip the reset.
 ///
+/// Unverified imitation evidence the tunnel holds follows the same rule, but
+/// is dropped only once the commit has succeeded: it is bound to a source IP
+/// alone and arrived on the endpoint being left, so kept across the move it
+/// would shape a later rekey on another port of the same host. A failed
+/// commit leaves the endpoint, and so the evidence, where they were. A learned
+/// mode is authenticated peer state and moves with the peer.
+///
 /// The peer's lock is held from here to the endpoint update, so nothing else
 /// sees the window and the endpoint disagree.
 fn commit_anonymous<'a>(
@@ -523,8 +530,12 @@ fn commit_anonymous<'a>(
     let result = peer
         .tunnel
         .commit_with_imitation(packet, datagram, hint, dst);
-    if let (TunnResult::Err(_), Some(window)) = (&result, replaced) {
-        peer.tunnel.restore_udp_window(window);
+    if let Some(window) = replaced {
+        if matches!(result, TunnResult::Err(_)) {
+            peer.tunnel.restore_udp_window(window);
+        } else {
+            peer.tunnel.discard_imitation_hint();
+        }
     }
     result
 }
@@ -702,9 +713,15 @@ impl Device {
             // Found a peer to remove, now purge all references to it:
             {
                 let p = peer.lock();
-                if let Some(source) = p.endpoint().addr {
-                    self.imitation_hints.discard(source);
-                }
+                // The whole cache, not just the current endpoint's hint: the
+                // peer may have left evidence at endpoints it roamed away
+                // from, and a replacement on one of them must not inherit it.
+                // Tracking each peer's past endpoints is not worth it for a
+                // bounded 30-second cache. This also discards other peers'
+                // unverified hints -- at worst their next handshake stays
+                // random until another prelude -- but never a learned mode,
+                // which is per-tunnel state.
+                self.imitation_hints.clear();
                 p.shutdown_endpoint(); // close open udp socket and free the closure
                 self.peers_by_idx.remove(&p.index());
             }
@@ -755,6 +772,11 @@ impl Device {
             let mut p = peer.lock();
 
             if let Some(addr) = endpoint {
+                if p.endpoint().addr != Some(addr) {
+                    // As for a roam in `commit_anonymous`: the tunnel's
+                    // unverified evidence describes the endpoint being left.
+                    p.tunnel.discard_imitation_hint();
+                }
                 p.set_endpoint(addr);
             }
             if keepalive.is_some() {
