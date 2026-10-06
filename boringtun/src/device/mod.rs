@@ -323,6 +323,10 @@ pub struct Device {
     /// value; it must not vary per worker, per reply, or per device.
     probe_responder: Option<ProbeResponder>,
     imitation_hints: imitation_auto::ImitationHints,
+    /// Lets a test stop a connected-socket callback between its receive and
+    /// the peer lock, the window a roam can retire the socket in.
+    #[cfg(test)]
+    conn_recv_hook: Mutex<Option<ConnRecvHook>>,
 
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
@@ -394,6 +398,20 @@ impl MarkFaults {
         Some(io::Error::from_raw_os_error(plan.remove(at).1))
     }
 }
+
+/// Where a connected-socket callback calls [`Device::conn_recv_hook`]: once a
+/// datagram has been received (before the peer lock), and once it has been
+/// handled or dropped (before the next receive). With the endpoint the
+/// callback's socket is connected to.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConnRecvPoint {
+    Received,
+    Handled,
+}
+
+#[cfg(test)]
+type ConnRecvHook = Arc<dyn Fn(ConnRecvPoint, SocketAddr) + Send + Sync>;
 
 struct ThreadData {
     iface: Arc<TunSocket>,
@@ -957,6 +975,8 @@ impl Device {
             rate_limiter: None,
             probe_responder,
             imitation_hints: Default::default(),
+            #[cfg(test)]
+            conn_recv_hook: Mutex::new(None),
             #[cfg(target_os = "linux")]
             uapi_fd,
             #[cfg(all(
@@ -1887,6 +1907,9 @@ impl Device {
                             // handler exists: nothing can observe it under the
                             // generation it replaces.
                             let gen = udp_diagnostics::commit_connected_socket(&d.udp_diag, &mut p);
+                            // Likewise its lifetime, which its handler checks
+                            // before acting on anything it receives.
+                            let lifetime = p.commit_connection_lifetime();
                             // Not `unwrap`: this is `epoll_ctl(EPOLL_CTL_ADD)`,
                             // which fails with ENOSPC once this UID is out of
                             // `max_user_watches` -- reachable on a server with
@@ -1898,7 +1921,7 @@ impl Device {
                             // datagram. Note the sibling `Result` one line
                             // above is already handled this way.
                             if let Err(e) =
-                                d.register_conn_handler(Arc::clone(peer), sock, from, gen)
+                                d.register_conn_handler(Arc::clone(peer), sock, from, gen, lifetime)
                             {
                                 // `swap`, not `store`: four worker threads can
                                 // race into this block on different peers.
@@ -1953,14 +1976,15 @@ impl Device {
         Ok(fd)
     }
 
-    /// `endpoint` is the address `udp` is connected to and `gen` its
-    /// diagnostic generation.
+    /// `endpoint` is the address `udp` is connected to, `gen` its diagnostic
+    /// generation and `lifetime` its identity as the peer's current socket.
     fn register_conn_handler(
         &self,
         peer: Arc<Mutex<Peer>>,
         udp: socket2::Socket,
         endpoint: SocketAddr,
         gen: DiagGen,
+        lifetime: peer::ConnLifetime,
     ) -> Result<(), Error> {
         let peer_addr = endpoint.ip();
         self.queue.new_event(
@@ -1987,8 +2011,26 @@ impl Device {
                     endpoint,
                     src_buf,
                 ) {
+                    #[cfg(test)]
+                    d.conn_recv_point(ConnRecvPoint::Received, endpoint);
                     let mut flush = false;
                     let mut p = peer.lock();
+                    // A datagram received before a roam, an endpoint change or
+                    // an expiry retired this socket is stale: acting on it
+                    // could restore evidence the move discarded, consume an
+                    // initiation, deliver a packet or answer through a socket
+                    // the peer no longer uses. Checked under the lock the
+                    // datagram would be processed under, so nothing can retire
+                    // the socket in between. Every datagram, not only auto
+                    // preludes. Ending the batch is enough: retiring shut the
+                    // socket down, so once this handler returns the poller
+                    // reports the hang-up and drops it, as it always has.
+                    if !p.is_current_connection(&lifetime, endpoint) {
+                        drop(p);
+                        #[cfg(test)]
+                        d.conn_recv_point(ConnRecvPoint::Handled, endpoint);
+                        break;
+                    }
                     match p.tunnel.decapsulate(
                         Some(peer_addr),
                         &t.src_buf[..read_bytes],
@@ -2036,6 +2078,9 @@ impl Device {
                             );
                         }
                     }
+                    drop(p);
+                    #[cfg(test)]
+                    d.conn_recv_point(ConnRecvPoint::Handled, endpoint);
 
                     iter -= 1;
                     if iter == 0 {
@@ -2046,6 +2091,15 @@ impl Device {
             }),
         )?;
         Ok(())
+    }
+
+    /// Run the test hook, if one is installed, outside its own lock.
+    #[cfg(test)]
+    fn conn_recv_point(&self, point: ConnRecvPoint, endpoint: SocketAddr) {
+        let hook = self.conn_recv_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(point, endpoint);
+        }
     }
 
     fn register_iface_handler(&self, iface: Arc<TunSocket>) -> Result<(), Error> {

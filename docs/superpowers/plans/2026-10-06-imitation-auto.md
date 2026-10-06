@@ -97,3 +97,43 @@ Each fix was preceded by a regression that was run and failed for the reported r
   - Live WSL: `cargo test -p boringtun --lib --features device auto_imitation_live -- --ignored` passed 4/4, both serially and in parallel. The parallel run was repeated 10× before the final comment-only edits, 10/10 passing.
   - Verification: `cargo fmt --all -- --check` and `git diff --check` passed. Linux `cargo clippy --workspace --all-targets --all-features -- -D clippy::incompatible_msrv` exited 0. Its warnings are pre-existing and none are in changed files.
 - **Not performed:** C/C++ header probes (the header is unchanged), CLI `--help` smoke test, and a full Rust 1.75 build. The Rust 1.75 build has the known lockfile limitation; Cargo.lock and dependencies are unchanged.
+
+### Review follow-up: stale connected-socket callbacks (on 9e4e370)
+
+Findings 2 and 3 above are resolved. This change addresses only the remaining P2 race in finding 1.
+
+- **Race.** The connected handler received a datagram first, then took the peer lock and decapsulated it. Nothing checked that its socket was still the peer's. Failing sequence:
+  1. A worker receives A's STUN prelude on A's connected socket and pauses before the peer lock.
+  2. Another worker completes an authenticated roam to B. This clears pending evidence and shuts down A's socket.
+  3. The retired callback resumes, calls `Tunn::decapsulate` and restores the IP-bound hint.
+  4. B's next rekey on its connected socket pins STUN.
+
+  The generation checks in `udp_diagnostics` covered only receive and send errors.
+- **Identity and lifetime.** `peer::ConnLifetime` wraps an `Arc<()>` and is compared with `Arc::ptr_eq`.
+  - **Commit:** one is allocated for each socket committed to `endpoint.conn`, under the same peer lock as `commit_connected_socket`, before the handler is registered.
+  - **Hand-off:** it is passed to `register_conn_handler`, and the handler keeps its own clone.
+  - **Uniqueness:** a live allocation's address cannot be reused, so no later token can equal a token that a handler still holds. There is no counter to exhaust or wrap.
+  - **Not `DiagGen`:** `DiagGen::Untracked` is shared once the generation allocator is spent, so it is not a lifetime identity. Its diagnostic fallback is unchanged.
+  - **Not address equality:** after A → B → A, a replacement socket sits at the retired socket's address.
+
+  `Peer::is_current_connection` requires all three: `conn` present, `endpoint.addr` equal to the socket's endpoint, and the token identical.
+- **Fix.** After acquiring the peer lock, and before any decapsulation, the handler checks `is_current_connection` under that same lock. A retired callback drops the datagram and ends the batch. It does not mutate the tunnel, deliver packets, reply or flush, and this applies to every connected datagram. No busy loop is added: retiring a socket always shuts it down first (`move_endpoint` and `shutdown_endpoint`). Once the handler returns, the existing EPOLLHUP → EoF → `cancel` path frees it. Receive-error diagnostics still run before the check, unchanged.
+- **Test hook.** A `#[cfg(test)]` `Device::conn_recv_hook` is called by the production handler at two points: after a datagram is received (before the peer lock), and after it has been handled or dropped. `PausedCallback` drives it with channels to force receive → pause → successful roam → resume deterministically. There are no sleeps or retry loops. Every wait is bounded, and dropping the helper releases a held worker at once.
+- **A kernel detail the test works around.** While a callback holds its fd, the shut-down socket stays hashed with A's 4-tuple and outranks the listener, so A's datagrams to the device address queue on it. The A → B → A tests therefore send the return keepalive to `127.0.0.2`, which only the wildcard listener matches. They then wait, bounded, on `/proc/net/udp` until the retired socket has closed before using A's replacement socket.
+- **Regressions.** These are live tests (root and TUN, `--ignored`), each red before the fix:
+  - `auto_imitation_live_retired_callback_cannot_restore_hint` (A → B). Red: "a retired callback restored A's evidence". Green: no pending hint; random → random → random (A, then B twice); B's own prelude then teaches STUN.
+  - `auto_imitation_live_retired_callback_at_reused_endpoint_is_dropped` (A → B → A, replacement socket at the retired socket's endpoint). Red: "the retired socket's evidence predates two endpoint changes". Green: no hint; random on the replacement; its prelude teaches STUN.
+  - `auto_imitation_live_retired_callback_keeps_tunnel_state`. A learned-STUN peer's authenticated initiation is held across A → B → A. Red: resending it on the current socket got no answer (`WouldBlock`), because the retired callback had consumed it. Green: learned STUN survives, and the same initiation is answered STUN-shaped.
+- **Results (final tree):**
+  - Live WSL `auto_imitation_live` (7 tests): 7/7 passed serially (three runs) and in parallel (10/10 runs).
+  - WSL `cargo test -p boringtun --lib --features device -- --ignored --test-threads=1`: all 61 ignored tests passed. This includes connected-socket lifecycle (`a_retired_connected_handler_reports_teardown_not_a_defect`, `a_connected_recv_error_keeps_the_socket_and_its_handler`, `a_refused_connected_socket_registration_returns_the_peer_to_the_shared_socket`, `a_peer_whose_upgrade_cannot_succeed_does_not_retry_it_per_datagram`), UDP diagnostics site coverage, the kernel ICMP tests and the `test_wg_*` tests.
+  - WSL `cargo test --workspace --features device,ffi-bindings,mock-instant`: 652 passed, 0 failed, 61 ignored (+3 live).
+  - Windows `cargo test -p boringtun --features ffi-bindings,mock-instant`: 402 passed, 0 failed.
+  - Default build: `cargo test -p boringtun --lib auto_imitation` passed 7; `cargo check -p boringtun` showed the same 4 pre-existing warnings.
+  - `cargo fmt --all -- --check` and `git diff --check` passed. Linux `cargo clippy --workspace --all-targets --all-features -- -D clippy::incompatible_msrv` exited 0, with the same pre-existing warning locations and none in changed files.
+- **Limitations:**
+  - A datagram that a socket received just before it was retired is now dropped rather than processed; WireGuard retransmits.
+  - The regressions need root and TUN, so they are ignored in the ordinary suite.
+  - The test's `127.0.0.2` routing and `/proc/net/udp` wait are Linux-specific.
+  - JNI was not rerun because this change is device-only.
+  - Not performed: a full Rust 1.75 build (known lockfile limitation), C header probes and the CLI smoke test.
