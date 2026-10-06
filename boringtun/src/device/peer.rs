@@ -7,6 +7,7 @@ use socket2::{Domain, Protocol, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::device::udp_diagnostics::{
     self, DiagGen, GenAllocator, PeerUdpDiagnostics, ReplacementDecision,
@@ -82,7 +83,26 @@ pub struct Peer {
     /// `endpoint.conn`; `Untracked` until the device assigns one. Kept here
     /// rather than on `Endpoint`, whose fields are public.
     conn_gen: DiagGen,
+    /// The lifetime of the connected socket last committed to
+    /// `endpoint.conn`; current only while `conn` is present.
+    conn_lifetime: Option<ConnLifetime>,
 }
+
+/// The lifetime of one connected socket committed to `endpoint.conn`, so its
+/// receive handler can tell, under the peer lock, whether that socket is still
+/// the one the peer uses. A handler outlives its socket's commitment: a roam,
+/// an endpoint change or an expiry takes `endpoint.conn` and shuts the socket
+/// down, but a handler that already received a datagram still runs.
+///
+/// Identity is the allocation, compared with `Arc::ptr_eq`: each commit
+/// allocates a new token and the handler keeps its own clone alive, so while
+/// a handler can ask, no later token can share its address -- no counter to
+/// spend and nothing to wrap. Not a [`DiagGen`]: those are unique only until
+/// the allocator is spent, after which every socket is `DiagGen::Untracked`,
+/// and diagnostics keep that fallback unchanged. Nor the address: a peer that
+/// goes A -> B -> A has a replacement socket at the retired one's address.
+#[derive(Clone)]
+pub(crate) struct ConnLifetime(Arc<()>);
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
 pub struct AllowedIP {
@@ -127,6 +147,7 @@ impl Peer {
             upgrade_suppressed: AtomicBool::new(false),
             udp_diag: PeerUdpDiagnostics::default(),
             conn_gen: DiagGen::Untracked,
+            conn_lifetime: None,
         }
     }
 
@@ -353,6 +374,34 @@ impl Peer {
     /// guard of this peer; failure paths only.
     pub(super) fn connected_generation(&self) -> Option<DiagGen> {
         self.endpoint.read().conn.as_ref().map(|_| self.conn_gen)
+    }
+
+    /// Start the lifetime of the connected socket just committed to
+    /// `endpoint.conn`, retiring every earlier one; its handler keeps the
+    /// returned token. Called under the same peer lock as the commit, before
+    /// the handler exists.
+    pub(crate) fn commit_connection_lifetime(&mut self) -> ConnLifetime {
+        let lifetime = ConnLifetime(Arc::new(()));
+        self.conn_lifetime = Some(lifetime.clone());
+        lifetime
+    }
+
+    /// Is `lifetime` the connected socket this peer uses now, still connected
+    /// to `endpoint`? A handler whose socket it is not is retired: it may have
+    /// received a datagram before a roam or an expiry took its socket, and it
+    /// must not act on it. Takes the endpoint lock.
+    pub(crate) fn is_current_connection(
+        &self,
+        lifetime: &ConnLifetime,
+        endpoint: SocketAddr,
+    ) -> bool {
+        let current = self.endpoint.read();
+        current.conn.is_some()
+            && current.addr == Some(endpoint)
+            && self
+                .conn_lifetime
+                .as_ref()
+                .is_some_and(|committed| Arc::ptr_eq(&committed.0, &lifetime.0))
     }
 
     /// The generation last assigned, without the endpoint lock: for a caller

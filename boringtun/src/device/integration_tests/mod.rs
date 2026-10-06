@@ -4689,6 +4689,702 @@ allowed_ip=10.66.66.2/32",
         SocketAddr::new(family, port)
     }
 
+    /// Real shared-listener demux and connected-socket rekeying, with four
+    /// different protocols behind the same source IP. Requires root and TUN.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn auto_imitation_live_listener_and_connected_sockets() {
+        use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationProtocol as P};
+        fn network(result: TunnResult<'_>) -> Vec<u8> {
+            match result {
+                TunnResult::WriteToNetwork(p) => p.to_vec(),
+                other => panic!("network output: {:?}", other),
+            }
+        }
+        for connected in [false, true] {
+            let config =
+                AmneziaConfig::new(128, 128, 128, 128).with_protocol_imitation(P::Auto, None);
+            let mut wg = WGHandle::init_with_config(
+                next_ip(),
+                next_ip_v6(),
+                DeviceConfig {
+                    n_threads: 2,
+                    use_connected_socket: connected,
+                    use_multi_queue: false,
+                    uapi_fd: -1,
+                    amnezia: config.clone(),
+                    ..Default::default()
+                },
+            );
+            let secret = StaticSecret::random_from_rng(OsRng);
+            let public = PublicKey::from(&secret);
+            assert_eq!(wg.wg_set_key(secret), UAPI_OK);
+            assert_eq!(wg.wg_set_port(next_port()), UAPI_OK);
+            wg.start();
+            let endpoint = device_listener(&wg, IpAddr::V4(Ipv4Addr::LOCALHOST));
+            let mut clients = Vec::new();
+            for (i, protocol) in [P::Dns, P::Quic, P::Sip, P::Stun]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                let secret = StaticSecret::random_from_rng(OsRng);
+                let key = PublicKey::from(&secret);
+                assert_eq!(
+                    wg.wg_set(&format!("public_key={}", encode(key.as_bytes()))),
+                    UAPI_OK
+                );
+                let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let client_config = config.clone().with_protocol_imitation(protocol, None);
+                let prelude = client_config
+                    .pre_handshake_imitation_datagrams(&mut OsRng)
+                    .pop_front()
+                    .unwrap()
+                    .1;
+                socket.send_to(&prelude, endpoint).unwrap();
+                let client = Tunn::new_with_obfuscation(
+                    secret,
+                    public,
+                    None,
+                    None,
+                    i as u32 + 1,
+                    None,
+                    Default::default(),
+                    client_config.as_responder(),
+                )
+                .unwrap();
+                clients.push((client, socket, key, protocol, prelude));
+            }
+            for (client, socket, key, protocol, prelude) in &mut clients {
+                let mut buf = [0u8; 2048];
+                for rekey in [false, true] {
+                    if !rekey {
+                        // Again, as a client does before its initiation: the
+                        // previous client's peer replacement below cleared the
+                        // whole device cache, including the hints the first
+                        // round left for clients not yet served.
+                        socket.send_to(prelude, endpoint).unwrap();
+                    }
+                    if rekey {
+                        let device = wg._device.device.read();
+                        let peer = device.peers[key].lock();
+                        assert_eq!(peer.tunnel.imitation_protocol(), *protocol);
+                        assert_eq!(peer.endpoint().conn.is_some(), connected);
+                    }
+                    let init = network(client.format_handshake_initiation(&mut buf, true));
+                    socket.send_to(&init, endpoint).unwrap();
+                    let (n, _) = socket
+                        .recv_from(&mut buf)
+                        .expect("an imitated handshake response");
+                    let response = buf[..n].to_vec();
+                    match protocol {
+                        P::Dns => assert_eq!(&response[4..12], &[0, 1, 0, 0, 0, 0, 0, 1]),
+                        P::Quic => assert_eq!(response[0] & 0xc0, 0x40),
+                        P::Sip => assert!(
+                            response.starts_with(b"OPTIONS ")
+                                || response.starts_with(b"REGISTER ")
+                                || response.starts_with(b"MESSAGE ")
+                        ),
+                        P::Stun => assert_eq!(&response[4..8], &[0x21, 0x12, 0xa4, 0x42]),
+                        _ => unreachable!(),
+                    }
+                    let keepalive = network(client.decapsulate(None, &response, &mut buf));
+                    socket.send_to(&keepalive, endpoint).unwrap();
+                }
+                if !connected {
+                    // A replacement peer on this exact UDP endpoint must learn
+                    // its new prelude, not reuse the old peer's cached hint.
+                    assert_eq!(
+                        wg.wg_set(&format!(
+                            "public_key={}\nremove=true",
+                            encode(key.as_bytes())
+                        )),
+                        UAPI_OK
+                    );
+                    assert_eq!(
+                        wg.wg_set(&format!("public_key={}", encode(key.as_bytes()))),
+                        UAPI_OK
+                    );
+                    let replacement = if *protocol == P::Dns { P::Stun } else { P::Dns };
+                    let changed = config.clone().with_protocol_imitation(replacement, None);
+                    let prelude = changed
+                        .pre_handshake_imitation_datagrams(&mut OsRng)
+                        .pop_front()
+                        .unwrap()
+                        .1;
+                    client
+                        .try_set_obfuscation(Default::default(), changed.as_responder())
+                        .unwrap();
+                    socket.send_to(&prelude, endpoint).unwrap();
+                    let init = network(client.format_handshake_initiation(&mut buf, true));
+                    socket.send_to(&init, endpoint).unwrap();
+                    socket
+                        .recv_from(&mut buf)
+                        .expect("replacement peer response");
+                    let device = wg._device.device.read();
+                    assert_eq!(
+                        device.peers[key].lock().tunnel.imitation_protocol(),
+                        replacement,
+                        "replacement must not inherit the retired peer's hint"
+                    );
+                    assert_eq!(
+                        device.imitation_hints.get(socket.local_addr().unwrap()),
+                        None,
+                        "successful selection consumes its hint"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An auto-imitation device on a fresh port, and its listener address.
+    #[cfg(target_os = "linux")]
+    fn auto_device(connected: bool) -> (WGHandle, PublicKey, SocketAddr) {
+        use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationProtocol as P};
+        let mut wg = WGHandle::init_with_config(
+            next_ip(),
+            next_ip_v6(),
+            DeviceConfig {
+                n_threads: 2,
+                use_connected_socket: connected,
+                use_multi_queue: false,
+                uapi_fd: -1,
+                amnezia: AmneziaConfig::new(128, 128, 128, 128)
+                    .with_protocol_imitation(P::Auto, None),
+                ..Default::default()
+            },
+        );
+        let secret = StaticSecret::random_from_rng(OsRng);
+        let public = PublicKey::from(&secret);
+        assert_eq!(wg.wg_set_key(secret), UAPI_OK);
+        assert_eq!(wg.wg_set_port(next_port()), UAPI_OK);
+        wg.start();
+        let listener = device_listener(&wg, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        (wg, public, listener)
+    }
+
+    /// One client of an auto device, with two UDP endpoints on the same IP.
+    /// Sends no prelude of its own: only the ones a test asks for.
+    #[cfg(target_os = "linux")]
+    struct AutoClient {
+        tunn: Tunn,
+        key: PublicKey,
+        a: UdpSocket,
+        b: UdpSocket,
+        server: SocketAddr,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl AutoClient {
+        fn new(wg: &WGHandle, server_key: PublicKey, server: SocketAddr) -> Self {
+            use crate::noise::amnezia::AmneziaConfig;
+            let secret = StaticSecret::random_from_rng(OsRng);
+            let key = PublicKey::from(&secret);
+            assert_eq!(
+                wg.wg_set(&format!("public_key={}", encode(key.as_bytes()))),
+                UAPI_OK
+            );
+            let socket = || {
+                let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                socket
+            };
+            let tunn = Tunn::new_with_obfuscation(
+                secret,
+                server_key,
+                None,
+                None,
+                1,
+                None,
+                Default::default(),
+                AmneziaConfig::new(128, 128, 128, 128).as_responder(),
+            )
+            .unwrap();
+            Self {
+                tunn,
+                key,
+                a: socket(),
+                b: socket(),
+                server,
+            }
+        }
+
+        fn socket(&self, on_b: bool) -> &UdpSocket {
+            if on_b {
+                &self.b
+            } else {
+                &self.a
+            }
+        }
+
+        fn addr(&self, on_b: bool) -> SocketAddr {
+            self.socket(on_b).local_addr().unwrap()
+        }
+
+        fn prelude(&self, on_b: bool, protocol: crate::noise::amnezia::AmneziaImitationProtocol) {
+            use crate::noise::amnezia::AmneziaConfig;
+            let prelude = AmneziaConfig::default()
+                .with_protocol_imitation(protocol, None)
+                .pre_handshake_imitation_datagrams(&mut OsRng)
+                .pop_front()
+                .unwrap()
+                .1;
+            self.socket(on_b).send_to(&prelude, self.server).unwrap();
+        }
+
+        /// A full handshake from one endpoint; returns the device's response.
+        fn handshake(&mut self, on_b: bool) -> Vec<u8> {
+            let init = self.initiation();
+            self.answer(on_b, &init)
+        }
+
+        fn initiation(&mut self) -> Vec<u8> {
+            let mut buf = [0u8; 2048];
+            match self.tunn.format_handshake_initiation(&mut buf, true) {
+                TunnResult::WriteToNetwork(p) => p.to_vec(),
+                other => panic!("initiation: {:?}", other),
+            }
+        }
+
+        /// Send `init` from one endpoint, then complete the handshake with
+        /// the device's response, which it returns.
+        fn answer(&mut self, on_b: bool, init: &[u8]) -> Vec<u8> {
+            let mut buf = [0u8; 2048];
+            self.socket(on_b).send_to(init, self.server).unwrap();
+            let (n, _) = self
+                .socket(on_b)
+                .recv_from(&mut buf)
+                .expect("handshake response");
+            let response = buf[..n].to_vec();
+            let keepalive = match self.tunn.decapsulate(None, &response, &mut buf) {
+                TunnResult::WriteToNetwork(p) => p.to_vec(),
+                other => panic!("confirming keepalive: {:?}", other),
+            };
+            self.socket(on_b).send_to(&keepalive, self.server).unwrap();
+            response
+        }
+
+        /// An authenticated keepalive from one endpoint: roams the peer there.
+        fn keepalive(&mut self, on_b: bool) {
+            let server = self.server;
+            self.keepalive_to(on_b, server);
+        }
+
+        /// [`Self::keepalive`], sent to `server` instead of the usual address.
+        fn keepalive_to(&mut self, on_b: bool, server: SocketAddr) {
+            let mut buf = [0u8; 2048];
+            let keepalive = match self.tunn.encapsulate(&[], &mut buf) {
+                TunnResult::WriteToNetwork(p) => p.to_vec(),
+                other => panic!("keepalive: {:?}", other),
+            };
+            self.socket(on_b).send_to(&keepalive, server).unwrap();
+        }
+
+        fn peer<R>(&self, wg: &WGHandle, f: impl FnOnce(&crate::device::peer::Peer) -> R) -> R {
+            let device = wg._device.device.read();
+            let peer = device.peers[&self.key].lock();
+            f(&peer)
+        }
+
+        /// Wait until the device has moved the peer to `addr`, and, when
+        /// `connected`, opened its connected socket there.
+        fn wait_at(&self, wg: &WGHandle, addr: SocketAddr, connected: bool) {
+            wait_until("the peer's endpoint", Duration::from_secs(3), || {
+                self.peer(wg, |p| {
+                    let endpoint = p.endpoint();
+                    endpoint.addr == Some(addr) && endpoint.conn.is_some() == connected
+                })
+            });
+        }
+
+        fn wait_for_tunnel_hint(&self, wg: &WGHandle) {
+            wait_until("a pending tunnel hint", Duration::from_secs(3), || {
+                self.peer(wg, |p| p.tunnel.has_imitation_hint())
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_stun(packet: &[u8]) -> bool {
+        packet[4..8] == [0x21, 0x12, 0xa4, 0x42]
+    }
+
+    /// A connected peer's tunnel hint is bound only to the source IP. After
+    /// a prelude on endpoint A and an authenticated roam to endpoint B of the
+    /// same host, rekeys on B stay random until B supplies its own prelude,
+    /// and the learned mode then survives roaming back. Requires root and TUN.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn auto_imitation_live_roam_does_not_carry_pending_hint() {
+        use crate::noise::amnezia::AmneziaImitationProtocol as P;
+        let (wg, server_key, server) = auto_device(true);
+        let mut client = AutoClient::new(&wg, server_key, server);
+        let (a, b) = (client.addr(false), client.addr(true));
+
+        let first = client.handshake(false);
+        assert!(!is_stun(&first), "unresolved handshake on A");
+        client.wait_at(&wg, a, true);
+        // On A's connected socket: the tunnel keeps it, not the device cache.
+        client.prelude(false, P::Stun);
+        client.wait_for_tunnel_hint(&wg);
+
+        client.keepalive(true);
+        client.wait_at(&wg, b, true);
+        let second = client.handshake(true);
+        assert!(
+            !is_stun(&second),
+            "A's prelude must not select the imitation on B"
+        );
+        let third = client.handshake(true);
+        assert!(!is_stun(&third));
+        assert_eq!(client.peer(&wg, |p| p.tunnel.imitation_protocol()), P::None);
+        assert!(!client.peer(&wg, |p| p.tunnel.has_imitation_hint()));
+
+        // B's own evidence still teaches the peer...
+        client.prelude(true, P::Stun);
+        client.wait_for_tunnel_hint(&wg);
+        assert!(is_stun(&client.handshake(true)));
+        assert_eq!(client.peer(&wg, |p| p.tunnel.imitation_protocol()), P::Stun);
+
+        // ...and the learned mode survives a roam back to A.
+        client.keepalive(false);
+        client.wait_at(&wg, a, true);
+        client.prelude(false, P::Dns);
+        assert!(is_stun(&client.handshake(false)));
+        assert_eq!(client.peer(&wg, |p| p.tunnel.imitation_protocol()), P::Stun);
+    }
+
+    /// The same for an operator moving the peer's endpoint: evidence the
+    /// tunnel held for the old endpoint does not shape rekeys on the new one.
+    /// Requires root and TUN.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn auto_imitation_live_configured_endpoint_drops_pending_hint() {
+        use crate::noise::amnezia::AmneziaImitationProtocol as P;
+        let (wg, server_key, server) = auto_device(true);
+        let mut client = AutoClient::new(&wg, server_key, server);
+        let (a, b) = (client.addr(false), client.addr(true));
+
+        assert!(!is_stun(&client.handshake(false)));
+        client.wait_at(&wg, a, true);
+        client.prelude(false, P::Stun);
+        client.wait_for_tunnel_hint(&wg);
+
+        assert_eq!(
+            wg.wg_set(&format!(
+                "public_key={}\nendpoint={}",
+                encode(client.key.as_bytes()),
+                b
+            )),
+            UAPI_OK
+        );
+        client.wait_at(&wg, b, false);
+        // On the listener, then on B's connected socket.
+        assert!(!is_stun(&client.handshake(true)));
+        client.wait_at(&wg, b, true);
+        assert!(
+            !is_stun(&client.handshake(true)),
+            "A's prelude must not select the imitation on B"
+        );
+        assert_eq!(client.peer(&wg, |p| p.tunnel.imitation_protocol()), P::None);
+        assert!(!client.peer(&wg, |p| p.tunnel.has_imitation_hint()));
+    }
+
+    /// A replacement peer must not inherit device-cache evidence from an
+    /// endpoint its predecessor left: learn STUN on A, repopulate A's hint
+    /// with another prelude, roam to B, remove and re-add the peer, then a
+    /// DNS prelude and an initiation from A select DNS. Requires root and TUN.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn auto_imitation_live_replacement_ignores_previous_endpoint_hint() {
+        use crate::noise::amnezia::AmneziaImitationProtocol as P;
+        let (wg, server_key, server) = auto_device(false);
+        let mut client = AutoClient::new(&wg, server_key, server);
+        let (a, b) = (client.addr(false), client.addr(true));
+        let hint_at = |addr| wg._device.device.read().imitation_hints.get(addr);
+
+        client.prelude(false, P::Stun);
+        assert!(is_stun(&client.handshake(false)));
+        assert_eq!(client.peer(&wg, |p| p.tunnel.imitation_protocol()), P::Stun);
+        client.wait_at(&wg, a, false);
+        assert_eq!(hint_at(a), None, "selection consumed A's hint");
+
+        client.prelude(false, P::Stun);
+        wait_until("A's repopulated hint", Duration::from_secs(3), || {
+            hint_at(a) == Some(P::Stun)
+        });
+        client.keepalive(true);
+        client.wait_at(&wg, b, false);
+
+        // Another peer: one learned mode, one unverified hint at its B.
+        let mut other = AutoClient::new(&wg, server_key, server);
+        other.prelude(false, P::Quic);
+        assert_eq!(other.handshake(false)[0] & 0xc0, 0x40);
+        other.prelude(true, P::Stun);
+        wait_until("the other peer's hint", Duration::from_secs(3), || {
+            hint_at(other.addr(true)) == Some(P::Stun)
+        });
+
+        let key = encode(client.key.as_bytes());
+        assert_eq!(
+            wg.wg_set(&format!("public_key={}\nremove=true", key)),
+            UAPI_OK
+        );
+        assert_eq!(wg.wg_set(&format!("public_key={}", key)), UAPI_OK);
+
+        // Removal clears the whole device cache: the other peer loses its
+        // unverified hint but keeps its learned mode.
+        assert_eq!(hint_at(other.addr(true)), None);
+        assert_eq!(other.peer(&wg, |p| p.tunnel.imitation_protocol()), P::Quic);
+        assert_eq!(other.handshake(false)[0] & 0xc0, 0x40);
+
+        client.prelude(false, P::Dns);
+        // Best effort: the DNS prelude is on the listener before the
+        // initiation either way; a stale STUN hint would keep it out.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while hint_at(a) != Some(P::Dns) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let response = client.handshake(false);
+        assert_eq!(
+            client.peer(&wg, |p| p.tunnel.imitation_protocol()),
+            P::Dns,
+            "the replacement must not inherit STUN from A's stale hint"
+        );
+        assert_eq!(&response[4..12], &[0, 1, 0, 0, 0, 0, 0, 1]);
+    }
+
+    /// Holds the next connected-socket callback for `endpoint` after its
+    /// receive and before the peer lock, through the production handler's
+    /// test hook, until [`Self::resume`]. Every wait is bounded, and dropping
+    /// this releases a held worker at once.
+    #[cfg(target_os = "linux")]
+    struct PausedCallback {
+        paused: std::sync::mpsc::Receiver<()>,
+        resume: std::sync::mpsc::Sender<()>,
+        handled: std::sync::mpsc::Receiver<()>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl PausedCallback {
+        fn arm(wg: &WGHandle, endpoint: SocketAddr) -> Self {
+            use crate::device::ConnRecvPoint;
+            use std::sync::atomic::AtomicBool;
+            use std::sync::mpsc::channel;
+            let (paused_tx, paused) = channel();
+            let (resume, resume_rx) = channel::<()>();
+            let (handled_tx, handled) = channel();
+            let channels = parking_lot::Mutex::new((paused_tx, resume_rx, handled_tx));
+            let armed = AtomicBool::new(true);
+            let holding = AtomicBool::new(false);
+            let hook = move |point, at| {
+                if at != endpoint {
+                    return;
+                }
+                match point {
+                    ConnRecvPoint::Received if armed.swap(false, Ordering::SeqCst) => {
+                        let channels = channels.lock();
+                        let _ = channels.0.send(());
+                        let _ = channels.1.recv_timeout(Duration::from_secs(10));
+                        holding.store(true, Ordering::SeqCst);
+                    }
+                    ConnRecvPoint::Handled if holding.swap(false, Ordering::SeqCst) => {
+                        let _ = channels.lock().2.send(());
+                    }
+                    _ => {}
+                }
+            };
+            *wg._device.device.read().conn_recv_hook.lock() = Some(Arc::new(hook));
+            PausedCallback {
+                paused,
+                resume,
+                handled,
+            }
+        }
+
+        fn wait_paused(&self) {
+            self.paused
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a connected callback held after its receive");
+        }
+
+        /// Release the held callback and wait until it has handled, or
+        /// dropped, its datagram.
+        fn resume(self) {
+            self.resume.send(()).unwrap();
+            self.handled
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the held callback finished its datagram");
+        }
+    }
+
+    /// The IPv4 UDP sockets on this host connected to `remote`, from
+    /// `/proc/net/udp`.
+    #[cfg(target_os = "linux")]
+    fn udp_sockets_connected_to(remote: SocketAddr) -> usize {
+        let table = std::fs::read_to_string("/proc/net/udp").unwrap();
+        table
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_whitespace().nth(2))
+            .filter(|rem| {
+                let (ip, port) = rem.split_once(':').unwrap();
+                let ip = u32::from_str_radix(ip, 16).unwrap().to_le_bytes();
+                let port = u16::from_str_radix(port, 16).unwrap();
+                SocketAddr::from((ip, port)) == remote
+            })
+            .count()
+    }
+
+    /// Roam a held callback's peer A -> B -> A. While the callback holds its
+    /// socket's descriptor, that socket is still hashed with A's 4-tuple and
+    /// would take A's datagrams to the device address, so the return to A is
+    /// sent to another loopback address, which only the wildcard listener
+    /// matches. The peer then has a replacement connected socket at A.
+    #[cfg(target_os = "linux")]
+    fn roam_away_and_back(wg: &WGHandle, client: &mut AutoClient) {
+        let (a, b) = (client.addr(false), client.addr(true));
+        client.keepalive(true);
+        client.wait_at(wg, b, true);
+        let alias = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 2).into(), client.server.port());
+        client.keepalive_to(false, alias);
+        client.wait_at(wg, a, true);
+    }
+
+    /// After [`PausedCallback::resume`]: wait until the event loop has closed
+    /// the retired socket, so only the replacement is connected to `remote`.
+    #[cfg(target_os = "linux")]
+    fn wait_retired_socket_closed(remote: SocketAddr) {
+        wait_until(
+            "the retired socket to close",
+            Duration::from_secs(3),
+            || udp_sockets_connected_to(remote) == 1,
+        );
+    }
+
+    /// A connected-socket callback that received A's STUN prelude and then
+    /// lost the race to an authenticated roam to B must not restore that
+    /// evidence: B's rekeys stay random until B sends a prelude of its own.
+    /// The ordering is forced through the handler's test hook. Requires root
+    /// and TUN.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn auto_imitation_live_retired_callback_cannot_restore_hint() {
+        use crate::noise::amnezia::AmneziaImitationProtocol as P;
+        let (wg, server_key, server) = auto_device(true);
+        let mut client = AutoClient::new(&wg, server_key, server);
+        let (a, b) = (client.addr(false), client.addr(true));
+
+        assert!(!is_stun(&client.handshake(false)), "unresolved on A");
+        client.wait_at(&wg, a, true);
+
+        // Receive A's prelude on A's connected socket, then hold it.
+        let held = PausedCallback::arm(&wg, a);
+        client.prelude(false, P::Stun);
+        held.wait_paused();
+        // Another worker completes the roam to B meanwhile.
+        client.keepalive(true);
+        client.wait_at(&wg, b, true);
+        held.resume();
+
+        assert!(
+            !client.peer(&wg, |p| p.tunnel.has_imitation_hint()),
+            "a retired callback restored A's evidence"
+        );
+        assert!(
+            !is_stun(&client.handshake(true)),
+            "A's prelude must not select the imitation on B"
+        );
+        assert!(!is_stun(&client.handshake(true)));
+        assert_eq!(client.peer(&wg, |p| p.tunnel.imitation_protocol()), P::None);
+
+        // B's own prelude still teaches the peer.
+        client.prelude(true, P::Stun);
+        client.wait_for_tunnel_hint(&wg);
+        assert!(is_stun(&client.handshake(true)));
+        assert_eq!(client.peer(&wg, |p| p.tunnel.imitation_protocol()), P::Stun);
+    }
+
+    /// The same race when the peer comes back: A -> B -> A gives A a new
+    /// connected socket at the very address the held callback's socket was
+    /// connected to, so matching addresses must not make it current. Requires
+    /// root and TUN.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn auto_imitation_live_retired_callback_at_reused_endpoint_is_dropped() {
+        use crate::noise::amnezia::AmneziaImitationProtocol as P;
+        let (wg, server_key, server) = auto_device(true);
+        let mut client = AutoClient::new(&wg, server_key, server);
+        let a = client.addr(false);
+
+        assert!(!is_stun(&client.handshake(false)));
+        client.wait_at(&wg, a, true);
+
+        let held = PausedCallback::arm(&wg, a);
+        client.prelude(false, P::Stun);
+        held.wait_paused();
+        roam_away_and_back(&wg, &mut client);
+        held.resume();
+
+        assert!(
+            !client.peer(&wg, |p| p.tunnel.has_imitation_hint()),
+            "the retired socket's evidence predates two endpoint changes"
+        );
+        wait_retired_socket_closed(a);
+        assert!(!is_stun(&client.handshake(false)));
+        assert_eq!(client.peer(&wg, |p| p.tunnel.imitation_protocol()), P::None);
+
+        // The replacement socket at A is current: its prelude teaches STUN.
+        client.prelude(false, P::Stun);
+        client.wait_for_tunnel_hint(&wg);
+        assert!(is_stun(&client.handshake(false)));
+        assert_eq!(client.peer(&wg, |p| p.tunnel.imitation_protocol()), P::Stun);
+    }
+
+    /// Every datagram on a retired socket is dropped, not only preludes: an
+    /// authenticated initiation held across A -> B -> A is neither consumed
+    /// nor answered, the learned mode survives, and the same initiation is
+    /// then answered with it on A's current socket. Requires root and TUN.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn auto_imitation_live_retired_callback_keeps_tunnel_state() {
+        use crate::noise::amnezia::AmneziaImitationProtocol as P;
+        let (wg, server_key, server) = auto_device(true);
+        let mut client = AutoClient::new(&wg, server_key, server);
+        let a = client.addr(false);
+
+        client.prelude(false, P::Stun);
+        assert!(is_stun(&client.handshake(false)));
+        client.wait_at(&wg, a, true);
+        assert_eq!(client.peer(&wg, |p| p.tunnel.imitation_protocol()), P::Stun);
+
+        let init = client.initiation();
+        let held = PausedCallback::arm(&wg, a);
+        client.socket(false).send_to(&init, server).unwrap();
+        held.wait_paused();
+        roam_away_and_back(&wg, &mut client);
+        held.resume();
+        assert_eq!(client.peer(&wg, |p| p.tunnel.imitation_protocol()), P::Stun);
+        wait_retired_socket_closed(a);
+
+        // Unconsumed: not a replay on the current socket, and answered in
+        // the learned mode.
+        assert!(is_stun(&client.answer(false, &init)));
+        assert_eq!(client.peer(&wg, |p| p.tunnel.imitation_protocol()), P::Stun);
+    }
+
     #[cfg(target_os = "linux")]
     impl LoopbackPeer {
         /// Encrypt `packet` and send it to the device's listener port, from

@@ -20,7 +20,7 @@ and the responder path:
 
 **WireSock extensions** — beyond what AmneziaWG specifies:
 
-- **Protocol imitation** (`--imitate-protocol dns\|quic\|sip\|stun`). The S-junk is not random
+- **Protocol imitation** (`--imitate-protocol dns\|quic\|sip\|stun\|auto`). The S-junk is not random
   filler but a well-formed message of the chosen protocol, so the prefix survives a parser
   rather than merely a length check. AmneziaWG implementations fill this with random bytes.
 - **A probe responder.** The listen port answers an unsolicited probe with a plausible reply for
@@ -102,6 +102,49 @@ searches the first and `awg` the second.
 
 Logging goes to `WG_LOG_FILE` at `WG_LOG_LEVEL`. Note that a daemonised process loses its log
 writer — use `--foreground` when you need output.
+
+### Server imitation auto mode
+
+```bash
+boringtun-cli --foreground --imitate-protocol auto <INTERFACE-NAME>
+```
+
+`WG_IMITATE_PROTOCOL=auto` selects the same mode. Each client can use DNS, QUIC, SIP or STUN
+independently on the same server port. The first recognizable client pre-handshake datagrams
+provide a temporary hint; an authenticated handshake initiation pins it to that peer before
+the server frames its response. The choice survives endpoint roaming and unrelated live
+configuration updates. Fixed imitation modes retain their existing behavior.
+
+Configure matching S1–S4, H1–H4, keys and other required AmneziaWG parameters as usual: auto
+detects only imitation. Pending hints are keyed by source IP **and UDP port**, expire after
+30 seconds without refresh, and are capped at 1024 endpoints (oldest evicted first). They
+are consumed after successful selection and never follow a peer to a new endpoint: a roam or
+a configured endpoint change discards that peer's pending evidence. Removing a peer clears
+every pending hint on the device, so other unresolved clients may need to resend a prelude;
+learned peer modes are kept. The
+outer imitation bytes are not authenticated, so a hint is camouflage metadata, not identity.
+Unsolicited traffic cannot replace an already learned peer mode.
+
+Until a protocol can be recognized, the server uses random S padding and remains unresolved.
+Deliver the client's pre-handshake imitation packets to the server, especially for QUIC/STUN
+or small S prefixes; a lost prelude may leave auto unresolved until a later handshake. A
+recognizable complete DNS/SIP-shaped initiation can also supply the hint. Auto never sends
+standalone imitation or Jc bursts. Rust/C configuration ignores domain/browser values in
+auto mode; the CLI rejects `--imitate-domain` with auto. It retains
+the existing header-protection policy: incompatible SIP imitation is refused with a warning,
+leaving random padding; DNS/STUN retain their nonce-strength warnings when learned or
+when header protection is enabled later.
+
+In auto mode, the probe responder may answer any supported detected protocol within the
+existing aggregate reply budget. SIP probes and QUIC v1/v2 Initials remain unanswered, as
+in fixed mode. `--probe-reply-rate 0` disables probe replies while keeping mode detection.
+
+Rust embedders select `AmneziaImitationProtocol::Auto` and can read the effective per-peer
+choice with `Tunn::imitation_protocol()`. C/JNI callers use imitation protocol value **5**
+(`WIREGUARD_AMNEZIA_IMITATION_AUTO` in the C header). Feed the initial camouflage datagrams
+to the peer's normal receive function as well as its WireGuard packets. Each `Tunn` represents
+one peer; embedders must route sources to the appropriate tunnel. Replacing the local private
+key, replacing the peer, or switching out of auto clears the learned choice.
 
 ## Testing
 

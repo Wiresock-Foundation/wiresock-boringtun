@@ -2537,6 +2537,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn auto_imitation_ffi_accepts_five_and_rejects_unknown_values() {
+        let mut params = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            imitation_protocol: 5,
+            imitation_browser: u32::MAX,
+            ..Default::default()
+        };
+        let config = awg_params_to_config(&params, Some("ignored.example".into())).unwrap();
+        assert_eq!(config.imitation.protocol, AmneziaImitationProtocol::Auto);
+        assert_eq!(config.imitation.browser, AmneziaImitationBrowser::Default);
+        assert!(config.imitation.domain().is_none());
+        params.imitation_protocol = 6;
+        assert!(awg_params_to_config(&params, None).is_none());
+        last_tunnel_error_free();
+    }
+
     /// The forward-compatibility clamp, checked directly.
     ///
     /// A caller shorter than this build is the case the versioning exists for,

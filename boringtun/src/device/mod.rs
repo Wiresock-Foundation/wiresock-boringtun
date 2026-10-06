@@ -5,6 +5,7 @@ pub mod allowed_ips;
 pub mod api;
 mod dev_lock;
 pub mod drop_privileges;
+mod imitation_auto;
 #[cfg(test)]
 mod integration_tests;
 pub mod peer;
@@ -321,6 +322,11 @@ pub struct Device {
     /// announces one stack and the outbound Binding Requests read the same
     /// value; it must not vary per worker, per reply, or per device.
     probe_responder: Option<ProbeResponder>,
+    imitation_hints: imitation_auto::ImitationHints,
+    /// Lets a test stop a connected-socket callback between its receive and
+    /// the peer lock, the window a roam can retire the socket in.
+    #[cfg(test)]
+    conn_recv_hook: Mutex<Option<ConnRecvHook>>,
 
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
@@ -392,6 +398,20 @@ impl MarkFaults {
         Some(io::Error::from_raw_os_error(plan.remove(at).1))
     }
 }
+
+/// Where a connected-socket callback calls [`Device::conn_recv_hook`]: once a
+/// datagram has been received (before the peer lock), and once it has been
+/// handled or dropped (before the next receive). With the endpoint the
+/// callback's socket is connected to.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConnRecvPoint {
+    Received,
+    Handled,
+}
+
+#[cfg(test)]
+type ConnRecvHook = Arc<dyn Fn(ConnRecvPoint, SocketAddr) + Send + Sync>;
 
 struct ThreadData {
     iface: Arc<TunSocket>,
@@ -507,18 +527,33 @@ fn authenticate_anonymous<'m>(
 /// would have it describe a path nothing uses, and the next packet from
 /// `from` would find it already "fresh" and skip the reset.
 ///
+/// Unverified imitation evidence the tunnel holds follows the same rule, but
+/// is dropped only once the commit has succeeded: it is bound to a source IP
+/// alone and arrived on the endpoint being left, so kept across the move it
+/// would shape a later rekey on another port of the same host. A failed
+/// commit leaves the endpoint, and so the evidence, where they were. A learned
+/// mode is authenticated peer state and moves with the peer.
+///
 /// The peer's lock is held from here to the endpoint update, so nothing else
 /// sees the window and the endpoint disagree.
 fn commit_anonymous<'a>(
     peer: &mut Peer,
     packet: Authenticated,
     from: SocketAddr,
+    datagram: &[u8],
+    hint: Option<crate::noise::amnezia::AmneziaImitationProtocol>,
     dst: &'a mut [u8],
 ) -> TunnResult<'a> {
     let replaced = (peer.endpoint().addr != Some(from)).then(|| peer.tunnel.begin_new_path());
-    let result = peer.tunnel.commit(packet, dst);
-    if let (TunnResult::Err(_), Some(window)) = (&result, replaced) {
-        peer.tunnel.restore_udp_window(window);
+    let result = peer
+        .tunnel
+        .commit_with_imitation(packet, datagram, hint, dst);
+    if let Some(window) = replaced {
+        if matches!(result, TunnResult::Err(_)) {
+            peer.tunnel.restore_udp_window(window);
+        } else {
+            peer.tunnel.discard_imitation_hint();
+        }
     }
     result
 }
@@ -696,6 +731,15 @@ impl Device {
             // Found a peer to remove, now purge all references to it:
             {
                 let p = peer.lock();
+                // The whole cache, not just the current endpoint's hint: the
+                // peer may have left evidence at endpoints it roamed away
+                // from, and a replacement on one of them must not inherit it.
+                // Tracking each peer's past endpoints is not worth it for a
+                // bounded 30-second cache. This also discards other peers'
+                // unverified hints -- at worst their next handshake stays
+                // random until another prelude -- but never a learned mode,
+                // which is per-tunnel state.
+                self.imitation_hints.clear();
                 p.shutdown_endpoint(); // close open udp socket and free the closure
                 self.peers_by_idx.remove(&p.index());
             }
@@ -746,6 +790,11 @@ impl Device {
             let mut p = peer.lock();
 
             if let Some(addr) = endpoint {
+                if p.endpoint().addr != Some(addr) {
+                    // As for a roam in `commit_anonymous`: the tunnel's
+                    // unverified evidence describes the endpoint being left.
+                    p.tunnel.discard_imitation_hint();
+                }
                 p.set_endpoint(addr);
             }
             if keepalive.is_some() {
@@ -925,6 +974,9 @@ impl Device {
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
             probe_responder,
+            imitation_hints: Default::default(),
+            #[cfg(test)]
+            conn_recv_hook: Mutex::new(None),
             #[cfg(target_os = "linux")]
             uapi_fd,
             #[cfg(all(
@@ -1045,6 +1097,7 @@ impl Device {
         self.udp4_gen = id4.gen;
         self.udp6_gen = id6.gen;
         self.listen_port = port;
+        self.imitation_hints.clear();
 
         // Peers' connected sockets are bound to the port just given up, so
         // they go with it -- only now, so a refused change leaves them alone.
@@ -1111,6 +1164,7 @@ impl Device {
         }
 
         self.key_pair = key_pair;
+        self.imitation_hints.clear();
         self.rate_limiter = Some(rate_limiter);
     }
 
@@ -1133,6 +1187,7 @@ impl Device {
 
         self.config.obf = obf;
         self.config.amnezia = amnezia;
+        self.imitation_hints.clear();
 
         // Push to every existing peer, exactly as `set_key` does above. Peers
         // snapshot these values when their `Tunn` is built, so without this a
@@ -1311,6 +1366,7 @@ impl Device {
     }
 
     fn clear_peers(&mut self) {
+        self.imitation_hints.clear();
         self.peers.clear();
         self.peers_by_idx.clear();
         self.peers_by_ip.clear();
@@ -1590,7 +1646,7 @@ impl Device {
                     // is the only one: an unmasked tag cannot pass for ours on a
                     // device that requires masking. It never modifies the
                     // datagram, so what probe detection sees is what arrived.
-                    let candidates = match probe_reply::classify(
+                    let candidates = match d.imitation_hints.classify(
                         &t.src_buf[..packet_len],
                         &d.config.amnezia,
                         obf,
@@ -1680,7 +1736,12 @@ impl Device {
                                     // and what comes out is checked again: the
                                     // bound shapes the draw, the check is the
                                     // guard.
-                                    if let Ok(out) = d.config.amnezia.prepend_outbound_with_trailer(
+                                    let cookie_config = d.imitation_hints.cookie_config(
+                                        &d.config.amnezia,
+                                        from,
+                                        datagram,
+                                    );
+                                    if let Ok(out) = cookie_config.prepend_outbound_with_trailer(
                                         obf,
                                         &mut t.dst_buf,
                                         cookie_len,
@@ -1727,7 +1788,16 @@ impl Device {
 
                     // We found a peer, use it to decapsulate the message+
                     let mut flush = false; // Are there packets to send from the queue?
-                    match commit_anonymous(&mut p, packet, from, &mut t.dst_buf[..]) {
+                    use crate::noise::amnezia::AmneziaImitationProtocol as P;
+                    let auto_initiation = d.config.amnezia.imitation.protocol == P::Auto
+                        && matches!(&packet, Authenticated::HandshakeInit(_));
+                    let hint = if auto_initiation {
+                        d.imitation_hints.get(from)
+                    } else {
+                        None
+                    };
+                    match commit_anonymous(&mut p, packet, from, datagram, hint, &mut t.dst_buf[..])
+                    {
                         TunnResult::Done => {}
                         TunnResult::Err(_) => continue,
                         TunnResult::WriteToNetwork(packet) => {
@@ -1754,6 +1824,10 @@ impl Device {
                             }
                         }
                     };
+
+                    if auto_initiation && p.tunnel.imitation_protocol() != P::None {
+                        d.imitation_hints.discard(from);
+                    }
 
                     if flush {
                         // Flush pending queue
@@ -1833,6 +1907,9 @@ impl Device {
                             // handler exists: nothing can observe it under the
                             // generation it replaces.
                             let gen = udp_diagnostics::commit_connected_socket(&d.udp_diag, &mut p);
+                            // Likewise its lifetime, which its handler checks
+                            // before acting on anything it receives.
+                            let lifetime = p.commit_connection_lifetime();
                             // Not `unwrap`: this is `epoll_ctl(EPOLL_CTL_ADD)`,
                             // which fails with ENOSPC once this UID is out of
                             // `max_user_watches` -- reachable on a server with
@@ -1844,7 +1921,7 @@ impl Device {
                             // datagram. Note the sibling `Result` one line
                             // above is already handled this way.
                             if let Err(e) =
-                                d.register_conn_handler(Arc::clone(peer), sock, from, gen)
+                                d.register_conn_handler(Arc::clone(peer), sock, from, gen, lifetime)
                             {
                                 // `swap`, not `store`: four worker threads can
                                 // race into this block on different peers.
@@ -1899,14 +1976,15 @@ impl Device {
         Ok(fd)
     }
 
-    /// `endpoint` is the address `udp` is connected to and `gen` its
-    /// diagnostic generation.
+    /// `endpoint` is the address `udp` is connected to, `gen` its diagnostic
+    /// generation and `lifetime` its identity as the peer's current socket.
     fn register_conn_handler(
         &self,
         peer: Arc<Mutex<Peer>>,
         udp: socket2::Socket,
         endpoint: SocketAddr,
         gen: DiagGen,
+        lifetime: peer::ConnLifetime,
     ) -> Result<(), Error> {
         let peer_addr = endpoint.ip();
         self.queue.new_event(
@@ -1933,8 +2011,26 @@ impl Device {
                     endpoint,
                     src_buf,
                 ) {
+                    #[cfg(test)]
+                    d.conn_recv_point(ConnRecvPoint::Received, endpoint);
                     let mut flush = false;
                     let mut p = peer.lock();
+                    // A datagram received before a roam, an endpoint change or
+                    // an expiry retired this socket is stale: acting on it
+                    // could restore evidence the move discarded, consume an
+                    // initiation, deliver a packet or answer through a socket
+                    // the peer no longer uses. Checked under the lock the
+                    // datagram would be processed under, so nothing can retire
+                    // the socket in between. Every datagram, not only auto
+                    // preludes. Ending the batch is enough: retiring shut the
+                    // socket down, so once this handler returns the poller
+                    // reports the hang-up and drops it, as it always has.
+                    if !p.is_current_connection(&lifetime, endpoint) {
+                        drop(p);
+                        #[cfg(test)]
+                        d.conn_recv_point(ConnRecvPoint::Handled, endpoint);
+                        break;
+                    }
                     match p.tunnel.decapsulate(
                         Some(peer_addr),
                         &t.src_buf[..read_bytes],
@@ -1982,6 +2078,9 @@ impl Device {
                             );
                         }
                     }
+                    drop(p);
+                    #[cfg(test)]
+                    d.conn_recv_point(ConnRecvPoint::Handled, endpoint);
 
                     iter -= 1;
                     if iter == 0 {
@@ -1992,6 +2091,15 @@ impl Device {
             }),
         )?;
         Ok(())
+    }
+
+    /// Run the test hook, if one is installed, outside its own lock.
+    #[cfg(test)]
+    fn conn_recv_point(&self, point: ConnRecvPoint, endpoint: SocketAddr) {
+        let hook = self.conn_recv_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(point, endpoint);
+        }
     }
 
     fn register_iface_handler(&self, iface: Arc<TunSocket>) -> Result<(), Error> {
@@ -2765,13 +2873,14 @@ mod ingress_tests {
             };
             // The same buffer the trial wrote the plaintext into, as the
             // handler uses `t.dst_buf` for both.
-            let delivered = match commit_anonymous(&mut guard, packet, from, &mut dst[..]) {
-                TunnResult::WriteToNetwork(d) => Delivered::Network(d.to_vec()),
-                TunnResult::WriteToTunnelV4(..) => Delivered::Tunnel,
-                TunnResult::WriteToTunnelV6(..) => Delivered::Tunnel,
-                TunnResult::Done => Delivered::Done,
-                TunnResult::Err(_) => return Delivered::Error,
-            };
+            let delivered =
+                match commit_anonymous(&mut guard, packet, from, &[], None, &mut dst[..]) {
+                    TunnResult::WriteToNetwork(d) => Delivered::Network(d.to_vec()),
+                    TunnResult::WriteToTunnelV4(..) => Delivered::Tunnel,
+                    TunnResult::WriteToTunnelV6(..) => Delivered::Tunnel,
+                    TunnResult::Done => Delivered::Done,
+                    TunnResult::Err(_) => return Delivered::Error,
+                };
             self.window_at_commit.set(guard.tunnel.udp_window());
             guard.adopt_endpoint(from);
             delivered
@@ -3096,7 +3205,7 @@ mod ingress_tests {
                 },
             ) {
                 inbound::Inbound::Accepted((_, mut guard, packet)) => {
-                    match commit_anonymous(&mut guard, packet, from, &mut dst[..]) {
+                    match commit_anonymous(&mut guard, packet, from, &[], None, &mut dst[..]) {
                         TunnResult::WriteToNetwork(d) => {
                             let d = d.to_vec();
                             guard.adopt_endpoint(from);

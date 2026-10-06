@@ -23,12 +23,12 @@
 //! the imitation becomes, which is why the order lives in one tested function
 //! and not in the event loop.
 //!
-//! # One protocol, not four
+//! # Fixed mode and auto mode
 //!
 //! A reply is built only when the detected protocol matches the configured
-//! imitation protocol. Answering DNS *and* STUN *and* QUIC on one port would
-//! describe a host that does not exist; the point is to look like the one
-//! service the operator chose.
+//! imitation protocol in fixed mode. The explicit `auto` responder accepts
+//! clients using different protocols and may answer any supported detected
+//! probe, under the same aggregate reply budget.
 //!
 //! [`AmneziaConfig::inbound_candidates`]: crate::noise::amnezia::AmneziaConfig
 
@@ -204,9 +204,9 @@ fn reply_to(
     // why the check and the unmapping are one call rather than two.
     let from = reply_target(from, Door::Probe)?;
 
-    // One protocol, not four: only answer as the service we are imitating.
+    // Fixed modes answer only their service; auto accepts any detected protocol.
     let probe = detect(request)?;
-    if !probe.is(imitation) {
+    if imitation != AmneziaImitationProtocol::Auto && !probe.is(imitation) {
         return None;
     }
 
@@ -297,6 +297,36 @@ mod tests {
     /// mean to exercise it build their own.
     fn responder() -> ProbeResponder {
         ProbeResponder::new(1 << 20)
+    }
+
+    #[test]
+    fn auto_imitation_answers_supported_probes_with_existing_guards() {
+        use AmneziaImitationProtocol as P;
+        for request in [dns_query(), stun_request(), quic_initial(0x1a2a3a4a, 8)] {
+            assert!(
+                reply(&request, "192.0.2.1:40000", P::Auto).is_some(),
+                "detected {:?}",
+                detect(&request)
+            );
+            assert!(reply(&request, "127.0.0.1:40000", P::Auto).is_none());
+            let mut rng = ChaCha8Rng::seed_from_u64(1);
+            assert!(reply_to(
+                &request,
+                peer("192.0.2.1:40000"),
+                P::Auto,
+                &ProbeResponder::new(0),
+                &mut rng
+            )
+            .is_none());
+        }
+        assert!(reply(
+            b"OPTIONS sip:example.com SIP/2.0\r\n",
+            "192.0.2.1:40000",
+            P::Auto
+        )
+        .is_none());
+        assert!(reply(&quic_initial(1, 8), "192.0.2.1:40000", P::Auto).is_none());
+        assert!(reply(&dns_query(), "192.0.2.1:40000", P::Stun).is_none());
     }
 
     fn cfg(protocol: AmneziaImitationProtocol) -> AmneziaConfig {

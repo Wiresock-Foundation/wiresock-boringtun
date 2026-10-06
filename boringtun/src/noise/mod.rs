@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 pub mod amnezia;
+#[cfg(test)]
+mod auto_imitation_tests;
 pub mod errors;
 pub mod handshake;
 // `pub(crate)` rather than private: `device::probe_reply` builds the replies
@@ -114,6 +116,7 @@ pub struct Tunn {
     tx_bytes: usize,
     rx_bytes: usize,
     amnezia: AmneziaConfig,
+    auto_imitation: imitation::auto::AutoImitation,
     pending_amnezia_junk: Option<PendingAmneziaJunk>,
     rate_limiter: Arc<RateLimiter>,
     /// The largest transport frame this tunnel has sent or authenticated, in
@@ -506,6 +509,7 @@ impl Tunn {
             tx_bytes: Default::default(),
             rx_bytes: Default::default(),
             amnezia,
+            auto_imitation: Default::default(),
             pending_amnezia_junk: None,
             udp_window: AtomicU32::new(amnezia::DEFAULT_UDP_WINDOW),
 
@@ -536,6 +540,7 @@ impl Tunn {
         });
         self.handshake
             .set_static_private(static_private, static_public);
+        self.auto_imitation = Default::default();
         for s in &mut self.sessions {
             *s = None;
         }
@@ -633,6 +638,26 @@ impl Tunn {
     /// [`Self::try_set_obfuscation`], and directly in tests that need a
     /// configuration no door lets in, to pin the send-time backstops.
     fn apply_obfuscation(&mut self, obf: ObfuscationRanges, amnezia: AmneziaConfig) {
+        use amnezia::AmneziaImitationProtocol as P;
+        if self.amnezia.imitation.protocol != P::Auto || amnezia.imitation.protocol != P::Auto {
+            self.auto_imitation = Default::default();
+        } else if self.amnezia != amnezia || self.handshake.obf != obf {
+            self.auto_imitation.clear_pending();
+            if let Some(protocol) = self.auto_imitation.learned {
+                let resolved = amnezia.resolve_imitation(protocol);
+                if resolved.imitation.protocol != protocol {
+                    self.auto_imitation.learned = None;
+                    tracing::warn!("clearing learned imitation: incompatible with new header-protection settings");
+                } else if self
+                    .amnezia
+                    .resolve_imitation(protocol)
+                    .header_protection_nonce()
+                    != resolved.header_protection_nonce()
+                {
+                    resolved.warn_header_protection_nonce();
+                }
+            }
+        }
         let timers_changed = self.amnezia.timers != amnezia.timers;
         let burst = self.amnezia.pending_burst_change(&amnezia);
         self.handshake.set_obfuscation(obf);
@@ -687,11 +712,27 @@ impl Tunn {
         self.udp_window.store(window, AtomicOrdering::Relaxed);
     }
 
+    /// Drop unverified auto-imitation evidence; a learned mode is kept. For
+    /// the device, when the peer's endpoint moves: the tunnel binds evidence
+    /// only to a source IP, so it would otherwise follow the peer to another
+    /// UDP port of the same host and shape a rekey there.
+    #[cfg(feature = "device")]
+    pub(crate) fn discard_imitation_hint(&mut self) {
+        self.auto_imitation.clear_pending();
+    }
+
     /// Whether a pre-handshake burst is queued, the initiation behind it not
     /// yet sent. For the device tests, which cannot see the field.
     #[cfg(all(test, feature = "device"))]
     pub(crate) fn has_pending_burst(&self) -> bool {
         self.pending_amnezia_junk.is_some()
+    }
+
+    /// Whether unverified auto-imitation evidence is held for this peer. For
+    /// the device tests, which cannot see the field.
+    #[cfg(all(test, feature = "device"))]
+    pub(crate) fn has_imitation_hint(&self) -> bool {
+        self.auto_imitation.has_pending()
     }
 
     /// This tunnel's AmneziaWG configuration. For the device and FFI tests,
@@ -979,6 +1020,12 @@ impl Tunn {
         // when a key is set; the unprotected path borrows.
         let obf = self.handshake.obf;
         let candidates = self.amnezia.inbound_candidates(obf, datagram);
+        if candidates.iter().next().is_none()
+            && self.amnezia.imitation.protocol == amnezia::AmneziaImitationProtocol::Auto
+            && self.auto_imitation.observe(src_addr, datagram)
+        {
+            return TunnResult::Done;
+        }
         let outcome = {
             let this = &*self;
             inbound::receive(
@@ -993,7 +1040,10 @@ impl Tunn {
         };
 
         match outcome {
-            Inbound::Accepted(packet) => self.commit(packet, dst),
+            Inbound::Accepted(packet) => {
+                let hint = self.auto_imitation.hint(src_addr);
+                self.commit_with_imitation(packet, datagram, hint, dst)
+            }
             Inbound::NotOurs => TunnResult::Err(WireGuardError::InvalidPacket),
             Inbound::Refused(e) => TunnResult::Err(e),
             Inbound::Cookie(demand) => {
@@ -1088,10 +1138,17 @@ impl Tunn {
                 // turn an attenuating reply into an amplifying one. The check
                 // on what actually came out stays anyway: it is the guard, and
                 // the bound above is only how the draw avoids tripping it.
-                match self.write_to_network_with(
+                let protocol = self
+                    .auto_imitation
+                    .learned
+                    .or_else(|| self.auto_imitation.hint(src_addr))
+                    .or_else(|| imitation::detect::detect(datagram).map(|p| p.protocol()))
+                    .unwrap_or(amnezia::AmneziaImitationProtocol::None);
+                match self.write_to_network_with_imitation(
                     dst,
                     packet_size,
                     amnezia::TrailerRoom::cookie_reply(wire_len),
+                    protocol,
                 ) {
                     TunnResult::WriteToNetwork(reply)
                         if amnezia::reply_amplifies(wire_len, reply.len()) =>
@@ -1220,6 +1277,71 @@ impl Tunn {
             Authenticated::Data { receiver_idx, len } => self.commit_data(receiver_idx, len, dst),
         }
         .unwrap_or_else(TunnResult::from)
+    }
+
+    /// Effective outbound imitation. An unresolved auto responder reports `None`.
+    /// The requested configuration remains `Auto`; this choice belongs to this peer.
+    pub fn imitation_protocol(&self) -> amnezia::AmneziaImitationProtocol {
+        use amnezia::AmneziaImitationProtocol as P;
+        if self.amnezia.imitation.protocol == P::Auto {
+            self.auto_imitation.learned.unwrap_or(P::None)
+        } else {
+            self.amnezia.imitation.protocol
+        }
+    }
+
+    /// Pin camouflage only while committing an authenticated initiation. The
+    /// hint and outer datagram are untrusted metadata, never authentication.
+    pub(crate) fn commit_with_imitation<'a>(
+        &mut self,
+        packet: Authenticated,
+        datagram: &[u8],
+        hint: Option<amnezia::AmneziaImitationProtocol>,
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        use amnezia::AmneziaImitationProtocol as P;
+        let previous = self.auto_imitation.learned;
+        // Auto must not consume an initiation or pin its hint when the caller
+        // cannot hold the imitated response. Preserve fixed-mode commit semantics.
+        if self.amnezia.imitation.protocol == P::Auto
+            && matches!(&packet, Authenticated::HandshakeInit(_))
+            && dst.len() < HANDSHAKE_RESP_SZ + self.amnezia.response_packet_junk_size as usize
+        {
+            return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+        }
+        if self.amnezia.imitation.protocol == P::Auto
+            && previous.is_none()
+            && matches!(&packet, Authenticated::HandshakeInit(_))
+        {
+            if let Some(protocol) =
+                hint.or_else(|| imitation::detect::detect(datagram).map(|p| p.protocol()))
+            {
+                let resolved = self.amnezia.resolve_imitation(protocol);
+                if resolved.imitation.protocol == protocol
+                    && protocol != P::None
+                    && protocol != P::Auto
+                {
+                    self.auto_imitation.learned = Some(protocol);
+                } else if !self.auto_imitation.warned {
+                    tracing::warn!(protocol = protocol.as_str(), "auto imitation refused by header-protection policy; retaining random prefixes");
+                    self.auto_imitation.warned = true;
+                }
+            }
+        }
+        let result = self.commit(packet, dst);
+        if matches!(&result, TunnResult::Err(_)) {
+            self.auto_imitation.learned = previous;
+        } else if previous != self.auto_imitation.learned {
+            self.auto_imitation.clear_pending();
+            tracing::debug!(
+                protocol = self.imitation_protocol().as_str(),
+                "learned peer imitation protocol"
+            );
+            self.amnezia
+                .resolve_imitation(self.imitation_protocol())
+                .warn_header_protection_nonce();
+        }
+        result
     }
 
     fn commit_handshake_init<'a>(
@@ -1771,13 +1893,26 @@ impl Tunn {
         packet_size: usize,
         room: amnezia::TrailerRoom,
     ) -> TunnResult<'a> {
-        match self.amnezia.prepend_outbound_with_trailer(
-            self.handshake.obf,
-            dst,
-            packet_size,
-            Some(room),
-            &mut self.handshake.rng,
-        ) {
+        self.write_to_network_with_imitation(dst, packet_size, room, self.imitation_protocol())
+    }
+
+    fn write_to_network_with_imitation<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+        packet_size: usize,
+        room: amnezia::TrailerRoom,
+        protocol: amnezia::AmneziaImitationProtocol,
+    ) -> TunnResult<'a> {
+        match self
+            .amnezia
+            .resolve_imitation(protocol)
+            .prepend_outbound_with_trailer(
+                self.handshake.obf,
+                dst,
+                packet_size,
+                Some(room),
+                &mut self.handshake.rng,
+            ) {
             Ok(packet) => TunnResult::WriteToNetwork(packet),
             Err(e) => TunnResult::Err(e),
         }
@@ -2231,7 +2366,7 @@ mod tests {
                 P::Dns => 3,
                 P::Sip | P::Stun => 2,
                 P::Quic => 1,
-                P::None => 0,
+                P::None | P::Auto => 0,
             };
             let mut dst = vec![0u8; 2048];
             let mut result = my_tun.format_handshake_initiation(&mut dst, false);

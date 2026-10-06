@@ -88,6 +88,8 @@ pub enum AmneziaImitationProtocol {
     Quic = 2,
     Sip = 3,
     Stun = 4,
+    /// Responder: learn a concrete imitation protocol independently per peer.
+    Auto = 5,
 }
 
 impl TryFrom<u8> for AmneziaImitationProtocol {
@@ -100,6 +102,7 @@ impl TryFrom<u8> for AmneziaImitationProtocol {
             2 => Ok(Self::Quic),
             3 => Ok(Self::Sip),
             4 => Ok(Self::Stun),
+            5 => Ok(Self::Auto),
             _ => Err(()),
         }
     }
@@ -109,7 +112,14 @@ impl AmneziaImitationProtocol {
     /// Every variant, so a caller offering these as choices cannot fall behind
     /// the enum. `boringtun-cli` builds its `--imitate-protocol` value list from
     /// this rather than restating it.
-    pub const ALL: [Self; 5] = [Self::None, Self::Dns, Self::Quic, Self::Sip, Self::Stun];
+    pub const ALL: [Self; 6] = [
+        Self::None,
+        Self::Dns,
+        Self::Quic,
+        Self::Sip,
+        Self::Stun,
+        Self::Auto,
+    ];
 
     /// The name used on the command line and in `Ip =` config values.
     ///
@@ -124,6 +134,7 @@ impl AmneziaImitationProtocol {
             Self::Quic => "quic",
             Self::Sip => "sip",
             Self::Stun => "stun",
+            Self::Auto => "auto",
         }
     }
 
@@ -1128,7 +1139,8 @@ impl AmneziaConfig {
     /// The single source of the header-protection policy under imitation:
     /// [`Self::check_header_protection_nonce`] refuses
     /// [`HeaderProtectionNonce::Degenerate`] for every door, and
-    /// `header_protection_nonce_complaint` words the warnings the doors log.
+    /// `header_protection_nonce_complaint` words the warnings logged by the
+    /// doors and, for a learned auto-imitation mode, by `Tunn`.
     /// Decided by the key, the imitation protocol and -- for SIP only -- the S
     /// sizes, since the imitation filler shapes every packet kind's prefix.
     /// An exhaustive match: a new imitation protocol does not compile until
@@ -1138,9 +1150,9 @@ impl AmneziaConfig {
             return None;
         }
         Some(match self.imitation.protocol {
-            AmneziaImitationProtocol::None | AmneziaImitationProtocol::Quic => {
-                HeaderProtectionNonce::Full
-            }
+            AmneziaImitationProtocol::None
+            | AmneziaImitationProtocol::Auto
+            | AmneziaImitationProtocol::Quic => HeaderProtectionNonce::Full,
             AmneziaImitationProtocol::Stun => HeaderProtectionNonce::Bounded32,
             AmneziaImitationProtocol::Dns => HeaderProtectionNonce::Weak16,
             AmneziaImitationProtocol::Sip => match self.sip_request_line_prefix() {
@@ -1160,14 +1172,14 @@ impl AmneziaConfig {
             .find(|&(_, size)| size as usize >= SIP_REQUEST_LINE_MIN)
     }
 
-    /// The warning a configuration door logs for an accepted header-protection
-    /// nonce weaker than random, or `None` when there is nothing to say --
-    /// no key, a random nonce, or a SIP request line (refused, not warned).
+    /// The warning logged for an accepted header-protection nonce weaker than
+    /// random, or `None` when there is nothing to say -- no key, a random
+    /// nonce, or a SIP request line (refused, not warned).
     ///
-    /// Gated like [`Self::cookie_amplification_complaint`], for the same
-    /// reason: the doors that log it are `device::api` and the C struct
-    /// constructor, so without either feature it would be dead code.
-    #[cfg(any(test, feature = "device", feature = "ffi-bindings"))]
+    /// Ungated, unlike [`Self::cookie_amplification_complaint`]: besides the
+    /// `device::api` and C struct doors, an auto-imitation `Tunn` reports it
+    /// in every build, including ordinary Rust library builds without either
+    /// feature. See [`Self::warn_header_protection_nonce`].
     pub(crate) fn header_protection_nonce_complaint(&self) -> Option<String> {
         match self.header_protection_nonce()? {
             HeaderProtectionNonce::Full | HeaderProtectionNonce::Degenerate => None,
@@ -1196,11 +1208,19 @@ impl AmneziaConfig {
     }
 
     /// Log [`Self::header_protection_nonce_complaint`] at WARN, if there is
-    /// one. The one reporter the configuration doors share, so the wording and
-    /// the fields live here rather than in each door. Called once per
-    /// accepted configuration by the door that accepted it, not by `Tunn`,
-    /// which a device builds and reconfigures once per peer.
-    #[cfg(any(feature = "device", feature = "ffi-bindings"))]
+    /// one. The one reporter shared by every caller, so the wording and the
+    /// fields live here rather than at each call site.
+    ///
+    /// For a fixed imitation protocol the configuration is known when it is
+    /// accepted, so the door that accepted it calls this once per accepted
+    /// configuration -- UAPI `set=1` and the C struct constructor -- and
+    /// `Tunn`, which a device builds and reconfigures once per peer, does not.
+    /// An `auto` responder's effective protocol is only known per peer, so
+    /// there `Tunn` calls this with the resolved configuration: once when a
+    /// DNS or STUN mode is learned under header protection, and once when a
+    /// live update changes a learned mode's nonce class. Repeating an
+    /// identical update does not warn again. Available in every build, so
+    /// embedders of the plain Rust library see the same warnings.
     pub(crate) fn warn_header_protection_nonce(&self) {
         if let Some(complaint) = self.header_protection_nonce_complaint() {
             tracing::warn!(
@@ -1279,7 +1299,8 @@ impl AmneziaConfig {
     /// and the masking it stands for is effectively absent, which an operator
     /// could not tell from a working setup. Every other imitation loads -- the
     /// weaker STUN and DNS nonces with a warning from the door that accepts
-    /// them (`header_protection_nonce_complaint`). Here rather than in
+    /// them, or from `Tunn` when an auto responder learns or keeps one
+    /// (`header_protection_nonce_complaint`). Here rather than in
     /// [`Self::validate`] alone because this is the check every door runs:
     /// the `Tunn` constructors, `Tunn::set_obfuscation`, and through
     /// `validate` the UAPI `set=1` and the C struct constructor behind JNI.
@@ -1387,7 +1408,8 @@ impl AmneziaConfig {
         // `header_protection_nonce`, not here: its one refusal (a SIP request
         // line in the prefix) is in `check_header_protection_nonce` above, and
         // the weaker-but-working STUN and DNS nonces are warnings the accepting
-        // door logs through `warn_header_protection_nonce` -- `validate` stays
+        // door (or, for a learned auto mode, `Tunn`) logs through
+        // `warn_header_protection_nonce` -- `validate` stays
         // silent and says only what is valid. Nothing under the mask is
         // secret: a repeated nonce repeats the mask, which weakens header
         // masking, and leaks no payload plaintext or key material.
@@ -1498,17 +1520,45 @@ impl AmneziaConfig {
         self
     }
 
+    /// Resolve only the outbound imitation; all configured framing remains intact.
+    /// An incompatible learned mode falls back to random prefixes, never bypassing
+    /// the header-protection policy. Fixed-mode configurations are borrowed unchanged.
+    pub(crate) fn resolve_imitation(
+        &self,
+        protocol: AmneziaImitationProtocol,
+    ) -> std::borrow::Cow<'_, Self> {
+        if self.imitation.protocol != AmneziaImitationProtocol::Auto {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut resolved = self.clone();
+        let protocol = if protocol == AmneziaImitationProtocol::Auto {
+            AmneziaImitationProtocol::None
+        } else {
+            protocol
+        };
+        resolved.imitation =
+            AmneziaImitation::new(protocol, None, AmneziaImitationBrowser::Default);
+        if resolved.check_header_protection_nonce().is_err() {
+            resolved.imitation = AmneziaImitation::default();
+        }
+        std::borrow::Cow::Owned(resolved)
+    }
+
     /// True when a full protocol-natural imitation sequence should be emitted
     /// for the pre-handshake phase. DNS/SIP/STUN/QUIC all qualify (QUIC's omitted
-    /// browser defaults to curl, matching wgbooster); only `None` does not.
+    /// browser defaults to curl, matching wgbooster); `None` and `Auto` do not.
     pub(crate) fn has_imitation_sequence(&self) -> bool {
-        self.imitation.protocol != AmneziaImitationProtocol::None
+        !matches!(
+            self.imitation.protocol,
+            AmneziaImitationProtocol::None | AmneziaImitationProtocol::Auto
+        )
     }
 
     /// True when this endpoint should emit a pre-handshake burst at all —
     /// false for a responder, and for a client with neither Jc nor imitation.
     pub(crate) fn emits_pre_handshake(&self) -> bool {
         !self.suppress_pre_handshake
+            && self.imitation.protocol != AmneziaImitationProtocol::Auto
             && (self.pre_handshake_junk.is_enabled() || self.has_imitation_sequence())
     }
 
@@ -1550,7 +1600,7 @@ impl AmneziaConfig {
                 );
                 (datagrams, &[])
             }
-            AmneziaImitationProtocol::None => (Vec::new(), &[]),
+            AmneziaImitationProtocol::None | AmneziaImitationProtocol::Auto => (Vec::new(), &[]),
         };
 
         datagrams
@@ -2376,7 +2426,9 @@ impl AmneziaConfig {
 
         let packet = &mut buffer[..size];
         match self.imitation.protocol {
-            AmneziaImitationProtocol::None => fill_random(packet, rng),
+            AmneziaImitationProtocol::None | AmneziaImitationProtocol::Auto => {
+                fill_random(packet, rng)
+            }
             AmneziaImitationProtocol::Dns => fill_dns(packet, 0, self.imitation.domain(), rng),
             AmneziaImitationProtocol::Quic => fill_quic_initial(packet, rng),
             AmneziaImitationProtocol::Sip => fill_sip(packet, self.imitation.domain(), rng),
@@ -2390,7 +2442,7 @@ impl AmneziaConfig {
     /// source both the draw and the capacity preflight read.
     fn pre_handshake_junk_size_range(&self) -> (usize, usize) {
         match self.imitation.protocol {
-            AmneziaImitationProtocol::None => (
+            AmneziaImitationProtocol::None | AmneziaImitationProtocol::Auto => (
                 self.pre_handshake_junk.packet_size_min as usize,
                 self.pre_handshake_junk.packet_size_max as usize,
             ),
@@ -2469,6 +2521,7 @@ impl AmneziaConfig {
 fn imitation_redraw_avoids_upstream_collisions(cfg: &AmneziaConfig) -> bool {
     match cfg.imitation.protocol {
         AmneziaImitationProtocol::None
+        | AmneziaImitationProtocol::Auto
         | AmneziaImitationProtocol::Quic
         | AmneziaImitationProtocol::Stun
         | AmneziaImitationProtocol::Dns => true,
@@ -2525,7 +2578,7 @@ fn fill_protocol_like(
     rng: &mut impl RngCore,
 ) {
     match protocol {
-        AmneziaImitationProtocol::None => fill_random(dst, rng),
+        AmneziaImitationProtocol::None | AmneziaImitationProtocol::Auto => fill_random(dst, rng),
         AmneziaImitationProtocol::Dns => fill_dns(dst, trailing_size, domain, rng),
         // Always a 1-RTT short header, for every packet kind. A long header
         // carries a length field that would have to frame the bytes that
