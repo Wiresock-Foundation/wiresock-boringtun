@@ -3,6 +3,8 @@
 
 pub mod amnezia;
 #[cfg(test)]
+pub(crate) mod auto_imitation_fixtures;
+#[cfg(test)]
 mod auto_imitation_tests;
 pub mod errors;
 pub mod handshake;
@@ -729,8 +731,8 @@ impl Tunn {
     }
 
     /// Whether unverified auto-imitation evidence is held for this peer. For
-    /// the device tests, which cannot see the field.
-    #[cfg(all(test, feature = "device"))]
+    /// the tests, which cannot all see the field.
+    #[cfg(test)]
     pub(crate) fn has_imitation_hint(&self) -> bool {
         self.auto_imitation.has_pending()
     }
@@ -1045,7 +1047,19 @@ impl Tunn {
                 self.commit_with_imitation(packet, datagram, hint, dst)
             }
             Inbound::NotOurs => TunnResult::Err(WireGuardError::InvalidPacket),
-            Inbound::Refused(e) => TunnResult::Err(e),
+            Inbound::Refused(refusal) => {
+                // A prelude whose bytes happen to fit a packet shape was
+                // offered to Auto detection above only if it fit none. Its
+                // readings have now failed for reasons that established
+                // nothing, so it is still evidence -- recorded only, under
+                // `observe`'s rules, and the refusal is reported unchanged.
+                if self.amnezia.imitation.protocol == amnezia::AmneziaImitationProtocol::Auto
+                    && refusal.allows_imitation_hint
+                {
+                    let _ = self.auto_imitation.observe(src_addr, datagram);
+                }
+                TunnResult::Err(refusal.error)
+            }
             Inbound::Cookie(demand) => {
                 let mut cookie = [0u8; COOKIE_REPLY_SZ];
                 let cookie = match self.rate_limiter.format_cookie_demand(

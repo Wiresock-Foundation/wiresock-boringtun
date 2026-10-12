@@ -6,10 +6,39 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use super::super::{amnezia::AmneziaImitationProtocol, Instant};
+use super::super::{amnezia::AmneziaImitationProtocol, errors::WireGuardError, Instant};
 use super::detect::detect;
 
 pub(crate) const HINT_LIFETIME: Duration = Duration::from_secs(30);
+
+/// Whether a candidate reading refused with `error` still lets Auto mode
+/// inspect the datagram as a camouflage hint.
+///
+/// A prelude datagram can fit an AmneziaWG packet shape by chance -- a STUN
+/// USERNAME whose bytes at S4 fall in H4 -- and its reading then fails like
+/// any stranger's datagram. These errors say only that the reading
+/// established nothing: its mac1 did not hold (`InvalidMac`), no peer, index,
+/// session or in-flight handshake matched (`WrongKey`, `WrongIndex`,
+/// `NoCurrentSession`, `UnexpectedPacket`), or its AEAD did not open
+/// (`InvalidAeadTag`). Every other error vetoes: timestamp and replay-window
+/// refusals come after decryption, a short destination buffer is a local
+/// failure that verified nothing, and anything else is excluded by default.
+///
+/// This is policy, not an authentication statement: an allowed refusal
+/// proves nothing about who sent the datagram, and a hint it yields stays
+/// unauthenticated evidence, used only under the rules of
+/// [`AutoImitation::observe`]. It never selects a mode by itself.
+pub(crate) fn allows_imitation_hint(error: &WireGuardError) -> bool {
+    matches!(
+        error,
+        WireGuardError::InvalidMac
+            | WireGuardError::WrongKey
+            | WireGuardError::WrongIndex
+            | WireGuardError::NoCurrentSession
+            | WireGuardError::UnexpectedPacket
+            | WireGuardError::InvalidAeadTag
+    )
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct Hint {
@@ -66,7 +95,7 @@ impl AutoImitation {
         self.pending = None;
     }
 
-    #[cfg(all(test, feature = "device"))]
+    #[cfg(test)]
     pub(crate) fn has_pending(&self) -> bool {
         self.pending.is_some()
     }

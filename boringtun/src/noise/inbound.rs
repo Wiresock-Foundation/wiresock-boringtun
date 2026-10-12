@@ -31,6 +31,7 @@ use std::net::IpAddr;
 use super::amnezia::{AmneziaConfig, InboundCandidates};
 use super::errors::WireGuardError;
 use super::handshake::ObfuscationRanges;
+use super::imitation::auto::allows_imitation_hint;
 use super::rate_limiter::{CookieDemand, HandshakeGate, LoadDecision, RateLimiter};
 use super::{HandshakeInit, HandshakeResponse, Packet, Tunn};
 
@@ -45,7 +46,17 @@ pub(crate) enum Inbound<T> {
     /// a valid mac1, under load, without a valid mac2 -- is owed a cookie reply.
     Cookie(CookieDemand),
     /// No candidate was accepted; this is the reason to report.
-    Refused(WireGuardError),
+    Refused(Refusal),
+}
+
+/// Why no candidate reading was accepted.
+pub(crate) struct Refusal {
+    /// The first reading's error, or `UnderLoad`: what the caller reports.
+    pub(crate) error: WireGuardError,
+    /// Whether every reading was refused with an error
+    /// [`allows_imitation_hint`] allows, so Auto mode may still inspect the
+    /// datagram as camouflage evidence. False after a load refusal.
+    pub(crate) allows_imitation_hint: bool,
 }
 
 /// Try each candidate reading of `datagram` in order, and accept the first
@@ -64,6 +75,11 @@ pub(crate) enum Inbound<T> {
 /// reading that does authenticate wins. When none does, the outcome is the one
 /// the datagram got when a single reading was all there was -- a cookie reply
 /// if any reading earned one, then `UnderLoad`, then the first refusal.
+///
+/// A refusal also says whether every reading was refused for a reason
+/// [`allows_imitation_hint`] allows. Accumulated over all of them, so an early
+/// allowed error cannot hide a later veto; it decides nothing about which
+/// reading is tried or which error is reported.
 ///
 /// With AmneziaWG `DisableCookies` on (`amnezia.cookie_defense()`), there is no
 /// load decision, no cookie and no `UnderLoad` to hold back: a handshake
@@ -88,10 +104,15 @@ pub(crate) fn receive<T>(
     let mut cookie = None;
     let mut under_load = false;
     let mut refusal = None;
+    let mut hint_allowed = true;
+    let mut refuse = |e: WireGuardError| {
+        hint_allowed &= allows_imitation_hint(&e);
+        refusal.get_or_insert(e);
+    };
 
     for candidate in candidates.iter() {
         let Some(message) = amnezia.candidate_message(datagram, candidate, &mut scratch) else {
-            refusal.get_or_insert(WireGuardError::InvalidPacket);
+            refuse(WireGuardError::InvalidPacket);
             continue;
         };
         // The canonical message goes through the strict parser, which applies
@@ -100,7 +121,7 @@ pub(crate) fn receive<T>(
         let packet = match Tunn::parse_incoming_packet(obf, message) {
             Ok(packet) => packet,
             Err(e) => {
-                refusal.get_or_insert(e);
+                refuse(e);
                 continue;
             }
         };
@@ -117,7 +138,7 @@ pub(crate) fn receive<T>(
             ) {
                 HandshakeGate::Pass => {}
                 HandshakeGate::BadMac => {
-                    refusal.get_or_insert(WireGuardError::InvalidMac);
+                    refuse(WireGuardError::InvalidMac);
                     continue;
                 }
                 HandshakeGate::UnderLoad => {
@@ -133,9 +154,7 @@ pub(crate) fn receive<T>(
 
         match trial(packet) {
             Ok(accepted) => return Inbound::Accepted(accepted),
-            Err(e) => {
-                refusal.get_or_insert(e);
-            }
+            Err(e) => refuse(e),
         }
     }
 
@@ -143,10 +162,16 @@ pub(crate) fn receive<T>(
         return Inbound::Cookie(demand);
     }
     if under_load {
-        return Inbound::Refused(WireGuardError::UnderLoad);
+        return Inbound::Refused(Refusal {
+            error: WireGuardError::UnderLoad,
+            allows_imitation_hint: false,
+        });
     }
     match refusal {
-        Some(e) => Inbound::Refused(e),
+        Some(error) => Inbound::Refused(Refusal {
+            error,
+            allows_imitation_hint: hint_allowed,
+        }),
         None => Inbound::NotOurs,
     }
 }
@@ -244,6 +269,111 @@ pub(crate) mod fixtures {
     pub(crate) const SRC: Option<IpAddr> =
         Some(IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)));
 
+    /// Overwrite the first 20 bytes of `wire` with a STUN Binding Request
+    /// header whose length is the rest of `wire`, so the detector reads the
+    /// whole datagram as one request. Write it before any [`plant`]: with a
+    /// key, a plant masks against the first 12 bytes.
+    pub(crate) fn stun_header(wire: &mut [u8]) {
+        let msg_len = (wire.len() - 20) as u16;
+        wire[..2].copy_from_slice(&1u16.to_be_bytes());
+        wire[2..4].copy_from_slice(&msg_len.to_be_bytes());
+        wire[4..8].copy_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+        wire[8..20].copy_from_slice(b"collision-tx");
+    }
+
+    /// A [`WIRE`]-byte STUN Binding Request that also carries each kind's
+    /// tag at its offset, naming `indices`, masked under `amnezia`. Checked to
+    /// be both: a detected STUN request, and four readings.
+    pub(crate) fn four_candidate_stun(amnezia: &AmneziaConfig, indices: [u32; 4]) -> Vec<u8> {
+        let mut wire = vec![0xeeu8; WIRE];
+        stun_header(&mut wire);
+        let tags = [(INIT_AT, 1), (RESPONSE_AT, 2), (COOKIE_AT, 3), (DATA_AT, 4)];
+        for (&(offset, tag), &index) in tags.iter().zip(indices.iter()) {
+            plant(&mut wire, amnezia, offset, tag, index);
+        }
+        assert_detected_readings(amnezia, &wire, &[INIT_AT, RESPONSE_AT, COOKIE_AT, DATA_AT]);
+        wire
+    }
+
+    /// The precondition every collision fixture states before it is used:
+    /// the detector reads `wire` as STUN, and `amnezia` reads it at exactly
+    /// `offsets` under the default H ranges.
+    pub(crate) fn assert_detected_readings(
+        amnezia: &AmneziaConfig,
+        wire: &[u8],
+        offsets: &[usize],
+    ) {
+        use crate::noise::imitation::detect::{detect, Probe};
+        assert_eq!(
+            detect(wire),
+            Some(Probe::Stun),
+            "the fixture is a STUN request"
+        );
+        assert_eq!(
+            amnezia
+                .inbound_candidates(ObfuscationRanges::default(), wire)
+                .offsets(),
+            offsets,
+            "the fixture's readings"
+        );
+    }
+
+    /// Set the initiation reading's mac1 in `wire` valid for `public`, the
+    /// receiving side's static key. Last, because mac1 covers what is planted.
+    pub(crate) fn sign_initiation_mac1(wire: &mut [u8], public: &x25519::PublicKey) {
+        use crate::noise::handshake::{b2s_hash, b2s_keyed_mac_16, LABEL_MAC1};
+        use crate::noise::HANDSHAKE_INIT_SZ;
+        let mac1_at = INIT_AT + HANDSHAKE_INIT_SZ - 32;
+        let mac1 = b2s_keyed_mac_16(
+            &b2s_hash(LABEL_MAC1, public.as_bytes()),
+            &wire[INIT_AT..mac1_at],
+        );
+        wire[mac1_at..mac1_at + 16].copy_from_slice(&mac1);
+    }
+
+    /// A 200-byte datagram whose initiation reading carries a valid mac1 for
+    /// `public`, and whose other three readings are only shapes.
+    pub(crate) fn gated_initiation_and_three_shapes(public: &x25519::PublicKey) -> Vec<u8> {
+        let amnezia = colliding(None);
+        let mut wire = vec![0xeeu8; WIRE];
+        for (offset, tag) in [(INIT_AT, 1), (RESPONSE_AT, 2), (COOKIE_AT, 3), (DATA_AT, 4)] {
+            plant(&mut wire, &amnezia, offset, tag, 0);
+        }
+        sign_initiation_mac1(&mut wire, public);
+        wire
+    }
+
+    /// [`gated_initiation_and_three_shapes`] that is also a STUN request.
+    pub(crate) fn stun_gated_initiation(public: &x25519::PublicKey) -> Vec<u8> {
+        let mut wire = four_candidate_stun(&colliding(None), [0; 4]);
+        sign_initiation_mac1(&mut wire, public);
+        assert_detected_readings(
+            &colliding(None),
+            &wire,
+            &[INIT_AT, RESPONSE_AT, COOKIE_AT, DATA_AT],
+        );
+        wire
+    }
+
+    /// Assert that `limiter`, under its normal budget, lets the initiation
+    /// reading of `wire` through to its trial: its mac1 holds.
+    pub(crate) fn assert_initiation_gate_passes(limiter: &RateLimiter, wire: &[u8]) {
+        use crate::noise::rate_limiter::CookieDefense;
+        assert!(
+            matches!(
+                limiter.gate_handshake(
+                    SRC,
+                    &wire[INIT_AT..],
+                    0,
+                    CookieDefense::Armed,
+                    &mut LoadDecision::default()
+                ),
+                HandshakeGate::Pass
+            ),
+            "the fixture's mac1 must hold for this limiter"
+        );
+    }
+
     /// An initiator and a responder under `amnezia`, the responder's rate
     /// limiter given `their_budget` (`None` for the default).
     pub(crate) fn pair(amnezia: &AmneziaConfig, their_budget: Option<u64>) -> (Tunn, Tunn) {
@@ -333,9 +463,9 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
-    use crate::noise::handshake::{b2s_hash, b2s_keyed_mac_16, LABEL_MAC1};
+    use crate::noise::amnezia::AmneziaImitationProtocol as P;
     use crate::noise::rate_limiter::CookieDefense;
-    use crate::noise::{Authenticated, TunnResult, HANDSHAKE_INIT_SZ};
+    use crate::noise::{Authenticated, TunnResult};
     use crate::x25519;
     use rand_core::OsRng;
 
@@ -356,6 +486,18 @@ mod tests {
 
     fn keys() -> [Option<[u8; 32]>; 2] {
         [None, Some(KEY)]
+    }
+
+    /// The layouts the later-reading regressions run under: unprotected,
+    /// protected, and unprotected under Auto with the datagram also made a
+    /// STUN request -- where an accepted reading must leave no hint behind.
+    /// Auto runs unprotected only: the STUN header overwrites the nonce.
+    fn layouts() -> [(AmneziaConfig, bool); 3] {
+        [
+            (colliding(None), false),
+            (colliding(Some(KEY)), false),
+            (colliding(None).with_protocol_imitation(P::Auto, None), true),
+        ]
     }
 
     /// Every kind whose canonical size and H range fit is a candidate, each at
@@ -419,14 +561,17 @@ mod tests {
     /// not carry must not be stored.
     #[test]
     fn transport_is_accepted_behind_three_false_readings_of_its_bytes() {
-        for key in keys() {
-            let amnezia = colliding(key);
+        for (amnezia, auto) in layouts() {
+            let key = amnezia.header_protection_enabled().then_some(KEY);
             let (mut mine, mut theirs) = pair(&amnezia, None);
             let their_idx = handshake(&mut mine, &mut theirs);
 
             let mut buf = vec![0u8; 2048];
             let mut wire = network(mine.encapsulate(&bare_ipv4(), &mut [0u8; WIRE]));
             assert_eq!(wire.len(), WIRE, "the fixture's arithmetic");
+            if auto {
+                stun_header(&mut wire);
+            }
             plant(&mut wire, &amnezia, INIT_AT, 1, 0x0bad_0001);
             plant(&mut wire, &amnezia, RESPONSE_AT, 2, 0x0bad_0002);
             plant(&mut wire, &amnezia, COOKIE_AT, 3, their_idx);
@@ -468,6 +613,17 @@ mod tests {
                 !theirs.handshake.has_cookie(),
                 "a false cookie reading must not store a cookie"
             );
+            if auto {
+                assert_detected_readings(
+                    &amnezia,
+                    &wire,
+                    &[INIT_AT, RESPONSE_AT, COOKIE_AT, DATA_AT],
+                );
+                assert!(
+                    !theirs.has_imitation_hint(),
+                    "an accepted transport is never evidence"
+                );
+            }
             assert!(
                 matches!(theirs.decapsulate(SRC, &wire, &mut buf), TunnResult::Err(_)),
                 "one datagram is accepted at most once"
@@ -479,13 +635,15 @@ mod tests {
     /// completes the handshake.
     #[test]
     fn a_response_is_accepted_behind_a_false_initiation() {
-        for key in keys() {
-            let amnezia = colliding(key);
+        for (amnezia, auto) in layouts() {
             let (mut mine, mut theirs) = pair(&amnezia, None);
             let mut buf = vec![0u8; 2048];
             let init = network(mine.format_handshake_initiation(&mut buf, false));
             let mut response = network(theirs.decapsulate(SRC, &init, &mut buf));
             assert_eq!(response.len(), WIRE);
+            if auto {
+                stun_header(&mut response);
+            }
             plant(&mut response, &amnezia, INIT_AT, 1, 0);
             assert_eq!(
                 amnezia
@@ -494,12 +652,20 @@ mod tests {
                 vec![INIT_AT, RESPONSE_AT]
             );
 
+            if auto {
+                assert_detected_readings(&amnezia, &response, &[INIT_AT, RESPONSE_AT]);
+            }
+
             let keepalive = network(mine.decapsulate(SRC, &response, &mut buf));
             assert!(matches!(
                 theirs.decapsulate(SRC, &keepalive, &mut buf),
                 TunnResult::Done
             ));
             assert!(mine.time_since_last_handshake().is_some());
+            assert!(
+                !mine.has_imitation_hint(),
+                "an accepted response is never evidence"
+            );
         }
     }
 
@@ -507,8 +673,7 @@ mod tests {
     /// response -- the response naming our in-flight handshake -- is stored.
     #[test]
     fn a_cookie_reply_is_accepted_behind_false_handshake_readings() {
-        for key in keys() {
-            let amnezia = colliding(key);
+        for (amnezia, auto) in layouts() {
             let (mut mine, mut theirs) = pair(&amnezia, Some(0));
             let mut buf = vec![0u8; 2048];
             let init = network(mine.format_handshake_initiation(&mut buf, false));
@@ -524,6 +689,9 @@ mod tests {
                 WIRE,
                 "a starved responder answers with a cookie"
             );
+            if auto {
+                stun_header(&mut cookie);
+            }
             plant(&mut cookie, &amnezia, INIT_AT, 1, 0);
             plant(&mut cookie, &amnezia, RESPONSE_AT, 2, my_idx);
             assert_eq!(
@@ -542,24 +710,14 @@ mod tests {
                 mine.handshake.has_cookie(),
                 "the real cookie was not stored"
             );
+            if auto {
+                assert_detected_readings(&amnezia, &cookie, &[INIT_AT, RESPONSE_AT, COOKIE_AT]);
+                assert!(
+                    !mine.has_imitation_hint(),
+                    "an accepted cookie is never evidence"
+                );
+            }
         }
-    }
-
-    /// A 200-byte datagram whose initiation reading carries a valid mac1 for
-    /// `public`, and whose other three readings are only shapes.
-    fn gated_initiation_and_three_shapes(public: &x25519::PublicKey) -> Vec<u8> {
-        let amnezia = colliding(None);
-        let mut wire = vec![0xeeu8; WIRE];
-        for (offset, tag) in [(INIT_AT, 1), (RESPONSE_AT, 2), (COOKIE_AT, 3), (DATA_AT, 4)] {
-            plant(&mut wire, &amnezia, offset, tag, 0);
-        }
-        let mac1_at = INIT_AT + HANDSHAKE_INIT_SZ - 32;
-        let mac1 = b2s_keyed_mac_16(
-            &b2s_hash(LABEL_MAC1, public.as_bytes()),
-            &wire[INIT_AT..mac1_at],
-        );
-        wire[mac1_at..mac1_at + 16].copy_from_slice(&mac1);
-        wire
     }
 
     fn kind(packet: &Packet) -> &'static str {
@@ -635,7 +793,13 @@ mod tests {
                 receive(&amnezia, obf, &starved, src, &candidates, &wire, nothing),
             ) {
                 (Some(_), Inbound::Cookie(_)) => {}
-                (None, Inbound::Refused(WireGuardError::UnderLoad)) => {}
+                (
+                    None,
+                    Inbound::Refused(Refusal {
+                        error: WireGuardError::UnderLoad,
+                        allows_imitation_hint: false,
+                    }),
+                ) => {}
                 (_, Inbound::Accepted(_)) => panic!("nothing authenticated"),
                 (src, _) => panic!("with src {:?}, the deferred outcome was lost", src),
             }
@@ -837,6 +1001,221 @@ mod tests {
                 ),
                 "the initiation was accepted before its answer failed"
             );
+        }
+    }
+
+    /// Every error, in discriminant order. Its length is checked against the
+    /// last discriminant, so a new variant fails here until it is classified.
+    fn every_error() -> Vec<WireGuardError> {
+        use WireGuardError::*;
+        vec![
+            DestinationBufferTooSmall,
+            IncorrectPacketLength,
+            UnexpectedPacket,
+            WrongPacketType,
+            WrongIndex,
+            WrongKey,
+            InvalidTai64nTimestamp,
+            WrongTai64nTimestamp,
+            InvalidMac,
+            InvalidAeadTag,
+            InvalidCounter,
+            DuplicateCounter,
+            InvalidPacket,
+            NoCurrentSession,
+            LockFailed,
+            ConnectionExpired,
+            UnderLoad,
+            PacketQueueFull,
+        ]
+    }
+
+    /// The policy, restated exhaustively: adding a variant does not compile
+    /// until it is placed on one side.
+    fn expected_policy(error: &WireGuardError) -> bool {
+        use WireGuardError::*;
+        match error {
+            InvalidMac | WrongKey | WrongIndex | NoCurrentSession | UnexpectedPacket
+            | InvalidAeadTag => true,
+            DestinationBufferTooSmall
+            | IncorrectPacketLength
+            | WrongPacketType
+            | InvalidTai64nTimestamp
+            | WrongTai64nTimestamp
+            | InvalidCounter
+            | DuplicateCounter
+            | InvalidPacket
+            | LockFailed
+            | ConnectionExpired
+            | UnderLoad
+            | PacketQueueFull => false,
+        }
+    }
+
+    fn same(a: &WireGuardError, b: &WireGuardError) -> bool {
+        std::mem::discriminant(a) == std::mem::discriminant(b)
+    }
+
+    /// A fixture on which three readings reach their trial -- initiation,
+    /// cookie and transport -- and the response reading fails mac1, which is
+    /// `InvalidMac`, an allowed refusal, before its trial.
+    fn trial_reaching() -> (x25519::PublicKey, Vec<u8>, InboundCandidates) {
+        let public = x25519::PublicKey::from(&x25519::StaticSecret::random_from_rng(OsRng));
+        let wire = gated_initiation_and_three_shapes(&public);
+        assert_initiation_gate_passes(&RateLimiter::new(&public, 100), &wire);
+        let candidates = colliding(None).inbound_candidates(ObfuscationRanges::default(), &wire);
+        assert_eq!(
+            candidates.offsets(),
+            vec![INIT_AT, RESPONSE_AT, COOKIE_AT, DATA_AT]
+        );
+        (public, wire, candidates)
+    }
+
+    /// Each error's place in the hint policy, as `receive` reports it: the
+    /// first reading's error is the one reported, and the datagram allows a
+    /// hint only if every reading's error did.
+    #[test]
+    fn every_refusal_error_has_a_place_in_the_hint_policy() {
+        use crate::noise::imitation::auto::allows_imitation_hint;
+        assert_eq!(
+            every_error().len(),
+            WireGuardError::PacketQueueFull as usize + 1
+        );
+        let (public, wire, candidates) = trial_reaching();
+        let amnezia = colliding(None);
+        let obf = ObfuscationRanges::default();
+        let refused = |trial: &mut dyn FnMut(&Packet<'_>) -> WireGuardError| {
+            let limiter = RateLimiter::new(&public, 100);
+            let mut tried = Vec::new();
+            let outcome = receive(&amnezia, obf, &limiter, SRC, &candidates, &wire, |p| {
+                tried.push(kind(&p));
+                Err::<(), _>(trial(&p))
+            });
+            assert_eq!(tried, vec!["init", "cookie", "data"]);
+            match outcome {
+                Inbound::Refused(refusal) => refusal,
+                _ => panic!("every reading was refused"),
+            }
+        };
+
+        for (i, error) in every_error().iter().enumerate() {
+            assert_eq!(
+                allows_imitation_hint(error),
+                expected_policy(error),
+                "{:?}",
+                error
+            );
+            // The same error from every reading.
+            let refusal = refused(&mut |_| every_error().swap_remove(i));
+            assert!(same(&refusal.error, error), "{:?}", refusal.error);
+            assert_eq!(
+                refusal.allows_imitation_hint,
+                expected_policy(error),
+                "{:?}",
+                error
+            );
+
+            // An allowed first error does not hide this one later.
+            let refusal = refused(&mut |p| match p {
+                Packet::PacketData(_) => every_error().swap_remove(i),
+                _ => WireGuardError::InvalidAeadTag,
+            });
+            assert!(same(&refusal.error, &WireGuardError::InvalidAeadTag));
+            assert_eq!(
+                refusal.allows_imitation_hint,
+                expected_policy(error),
+                "late {:?}",
+                error
+            );
+
+            // Nor does this one, first, stop the readings after it.
+            let refusal = refused(&mut |p| match p {
+                Packet::HandshakeInit(_) => every_error().swap_remove(i),
+                _ => WireGuardError::WrongIndex,
+            });
+            assert!(same(&refusal.error, error));
+            assert_eq!(
+                refusal.allows_imitation_hint,
+                expected_policy(error),
+                "early {:?}",
+                error
+            );
+        }
+
+        // Dispositions that are not refusals carry no policy at all.
+        let limiter = RateLimiter::new(&public, 100);
+        assert!(matches!(
+            receive(
+                &amnezia,
+                obf,
+                &limiter,
+                SRC,
+                &candidates,
+                &wire,
+                |p| match p {
+                    Packet::PacketData(_) => Ok(()),
+                    _ => Err(WireGuardError::DestinationBufferTooSmall),
+                }
+            ),
+            Inbound::Accepted(())
+        ));
+        let starved = RateLimiter::new(&public, 0);
+        assert!(matches!(
+            receive(&amnezia, obf, &starved, SRC, &candidates, &wire, |_| {
+                Err::<(), _>(WireGuardError::InvalidAeadTag)
+            }),
+            Inbound::Cookie(_)
+        ));
+        let starved = RateLimiter::new(&public, 0);
+        match receive(&amnezia, obf, &starved, None, &candidates, &wire, |_| {
+            Err::<(), _>(WireGuardError::InvalidAeadTag)
+        }) {
+            Inbound::Refused(Refusal {
+                error: WireGuardError::UnderLoad,
+                allows_imitation_hint: false,
+            }) => {}
+            _ => panic!("a load refusal never allows a hint"),
+        }
+        assert!(matches!(
+            receive(
+                &amnezia,
+                obf,
+                &limiter,
+                SRC,
+                &InboundCandidates::default(),
+                &wire,
+                |_| Ok::<(), _>(())
+            ),
+            Inbound::NotOurs
+        ));
+    }
+
+    /// A veto decides nothing about the search: a later reading that
+    /// authenticates is still tried, and accepted.
+    #[test]
+    fn receive_stops_only_at_acceptance_after_an_earlier_veto() {
+        let (public, wire, candidates) = trial_reaching();
+        let amnezia = colliding(None);
+        let obf = ObfuscationRanges::default();
+        for accept in ["cookie", "data"] {
+            let limiter = RateLimiter::new(&public, 100);
+            let mut tried = Vec::new();
+            let outcome = receive(&amnezia, obf, &limiter, SRC, &candidates, &wire, |p| {
+                let k = kind(&p);
+                tried.push(k);
+                match k {
+                    "init" => Err(WireGuardError::DestinationBufferTooSmall),
+                    k if k == accept => Ok(k),
+                    _ => Err(WireGuardError::InvalidAeadTag),
+                }
+            });
+            assert!(matches!(outcome, Inbound::Accepted(k) if k == accept));
+            let expected: &[&str] = if accept == "cookie" {
+                &["init", "cookie"]
+            } else {
+                &["init", "cookie", "data"]
+            };
+            assert_eq!(tried, expected);
         }
     }
 }

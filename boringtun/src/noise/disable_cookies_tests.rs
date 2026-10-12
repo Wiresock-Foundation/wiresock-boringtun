@@ -14,7 +14,7 @@ use super::amnezia::{AmneziaConfig, AwgTimers};
 use super::errors::WireGuardError;
 use super::handshake::{b2s_hash, b2s_keyed_mac_16, ObfuscationRanges, LABEL_MAC1};
 use super::inbound::fixtures::*;
-use super::inbound::{receive, Inbound};
+use super::inbound::{receive, Inbound, Refusal};
 use super::rate_limiter::{CookieDefense, HandshakeGate, LoadDecision, RateLimiter};
 use super::{Packet, Tunn, TunnResult, COOKIE_REPLY_SZ, HANDSHAKE_INIT_SZ, HANDSHAKE_RESP_SZ};
 use crate::x25519;
@@ -694,7 +694,10 @@ fn the_driver_hands_a_bypassed_reading_to_its_trial() {
         |_: Packet<'_>| -> Result<(), WireGuardError> { Err(WireGuardError::InvalidAeadTag) };
     assert!(matches!(
         receive(&amnezia, obf, &starved, SRC, &candidates, &wire, fails),
-        Inbound::Refused(WireGuardError::InvalidAeadTag)
+        Inbound::Refused(Refusal {
+            error: WireGuardError::InvalidAeadTag,
+            allows_imitation_hint: true
+        })
     ));
     assert!(matches!(
         receive(&armed, obf, &starved, SRC, &candidates, &wire, fails),
