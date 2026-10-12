@@ -34,6 +34,7 @@ Checked before writing test 18: the existing `site_coverage_probe_and_cookie_rep
 ## Deviations and fixture notes
 
 - Test 7 (core slot): once the first initiation has created a session, the recorded bytes' receiver index can name an occupied slot, so the transport reading is refused `WrongIndex` instead of `NoCurrentSession`. Both are allowlisted routing refusals; the helper accepts either and prints the actual outcome. Policy unchanged.
+- Test 1: CI on 0aa0d3b (`cargo hack test`, `--features ffi-bindings`) failed one run because the genuine STUN client's initiation had S1 filler whose bytes at 36 fell in the colliding H4, giving readings `[110, 36]` instead of `[110]`. The precondition now asserts that the initiation reading is the first, which is what makes it the one accepted; the filler is random. Fixture only.
 - `is_shaped` is a plain predicate beside the existing asserting `shaped`.
 - Device harness: `Roaming::listener` authenticated into a scratch buffer and committed from a second, zeroed one, so an accepted transport could never be delivered. Production authenticates and commits through the one `dst_buf`; the harness now does the same. Needed for the bidirectional plaintext checks; no production change.
 - Device harness: `Roaming` records tunnel plaintext from either door (`take_delivered`) and gains `listener_with` (probe responder), `receive` (the decision without a commit), `send` and `has_tunnel_hint`.

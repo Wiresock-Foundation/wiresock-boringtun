@@ -465,9 +465,14 @@ fn auto_imitation_learns_from_a_prelude_that_fits_a_transport_reading() {
 
         let init = network(client.format_handshake_initiation(&mut buf, false));
         assert_eq!(detect(&init), None, "the initiation cannot detect itself");
+        // The initiation reading comes first, so it is the one accepted. Its
+        // S1 filler is random, and can also fit a transport reading after it.
         assert_eq!(
-            server_config.inbound_candidates(obf, &init).offsets(),
-            vec![110]
+            server_config
+                .inbound_candidates(obf, &init)
+                .offsets()
+                .first(),
+            Some(&110)
         );
         let response = network(server.decapsulate(src, &init, &mut buf));
         assert_eq!(server.imitation_protocol(), P::Stun);
