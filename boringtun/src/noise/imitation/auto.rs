@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Temporary camouflage evidence, kept separate from authenticated peer state.
+//!
+//! Evidence comes from datagrams that fit no AmneziaWG packet shape, and from
+//! ones that fit a shape by chance but whose every reading was refused for a
+//! reason [`allows_imitation_hint`] allows. Either way it is only recorded.
 
 use std::net::IpAddr;
 use std::time::Duration;

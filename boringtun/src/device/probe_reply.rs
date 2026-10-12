@@ -30,6 +30,13 @@
 //! clients using different protocols and may answer any supported detected
 //! probe, under the same aggregate reply budget.
 //!
+//! A datagram classified as AmneziaWG here is never answered, in either mode,
+//! even when none of its readings authenticates. In auto mode the listener may
+//! still record it as camouflage evidence once every reading has been refused
+//! for a reason that established nothing (`ImitationHints::observe_refused`):
+//! a prelude whose bytes merely fit a packet shape. That sends nothing and
+//! charges no budget.
+//!
 //! [`AmneziaConfig::inbound_candidates`]: crate::noise::amnezia::AmneziaConfig
 
 use std::net::SocketAddr;

@@ -135,6 +135,18 @@ the existing header-protection policy: incompatible SIP imitation is refused wit
 leaving random padding; DNS/STUN retain their nonce-strength warnings when learned or
 when header protection is enabled later.
 
+A recognizable prelude can also fit an AmneziaWG packet shape by chance — for example when
+the bytes a STUN request carries at S4 fall in H4 — and is then tried as that packet first.
+If every such reading is refused for a reason that establishes nothing (a failed mac1; an
+unknown peer, index or session; no matching handshake in flight; a failed AEAD), the datagram
+still becomes evidence for its source under the rules above. The receive call reports the
+same error as before, and such a datagram is never answered as a probe. Refusals after
+decryption (stale timestamps, replayed or out-of-window counters), a destination buffer too
+small to verify, any other error, and cookie or load dispositions record nothing. Remaining
+limitations: the evidence is no more authenticated than any other hint, and a refused replay
+can still supply one (with header protection off, its prefix can be rewritten); colliding
+probes stay unanswered; and a datagram that a peer actually accepts is never reinterpreted.
+
 In auto mode, the probe responder may answer any supported detected protocol within the
 existing aggregate reply budget. SIP probes and QUIC v1/v2 Initials remain unanswered, as
 in fixed mode. `--probe-reply-rate 0` disables probe replies while keeping mode detection.

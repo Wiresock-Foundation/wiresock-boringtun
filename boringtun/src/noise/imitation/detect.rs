@@ -37,6 +37,9 @@
 //! is testable on every platform rather than only where `device` compiles.
 
 // Both core auto-mode learning and the device probe responder use this parser.
+// Auto learning consults it for a datagram that fits no AmneziaWG shape, and
+// for one whose every reading was refused for a reason that established
+// nothing (`inbound::Refusal`); the responder only for the former.
 
 use super::super::amnezia::AmneziaImitationProtocol;
 
