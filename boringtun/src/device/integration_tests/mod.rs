@@ -5660,7 +5660,8 @@ allowed_ip=10.66.66.2/32",
                     i + 1
                 );
             }
-            let (wg, server_key, server) = auto_device_with(false, server_config, obf, None);
+            let (wg, server_key, server) =
+                auto_device_with(false, server_config.clone(), obf, None);
             let mut client = AutoClient::with(
                 &wg,
                 server_key,
@@ -5693,6 +5694,37 @@ allowed_ip=10.66.66.2/32",
             );
             assert_eq!(hint_at(a), None, "nothing left at A");
             client.exchange(&wg, false, |d| is_stun(d) == send);
+
+            if colliding && send {
+                // A transport that is also a STUN request, accepted from A
+                // and then replayed from B: refused for its counter, which
+                // vetoes evidence. B's later DNS prelude is then the first
+                // evidence there, which a recorded replay would have beaten.
+                use crate::noise::imitation::detect::Probe;
+                use crate::noise::inbound::fixtures::stun_header;
+                let b = client.addr(true);
+                let inner = packet_v4(client.v4, Ipv4Addr::new(198, 51, 100, 202), 64, 0x5a03);
+                let mut buf = vec![0u8; MAX_UDP_SIZE];
+                let mut data = match client.tunn.encapsulate(&inner, &mut buf) {
+                    TunnResult::WriteToNetwork(d) => d.to_vec(),
+                    other => panic!("client transport: {:?}", other),
+                };
+                stun_header(&mut data);
+                assert_eq!(detect(&data), Some(Probe::Stun));
+                assert_eq!(
+                    server_config.inbound_candidates(obf, &data).offsets(),
+                    vec![36]
+                );
+                let capture = TunCapture::new(&wg.name);
+                client.prelude_raw(false, &data);
+                assert!(capture.saw(&inner), "accepted from A");
+                client.prelude_raw(true, &data);
+                client.prelude(true, P::Dns);
+                wait_until("B's DNS evidence", Duration::from_secs(3), || {
+                    hint_at(b).is_some()
+                });
+                assert_eq!(hint_at(b), Some(P::Dns), "the replay was recorded");
+            }
         }
     }
 
@@ -5727,6 +5759,11 @@ allowed_ip=10.66.66.2/32",
         assert_eq!(&buf[4..8], &[0x21, 0x12, 0xa4, 0x42]);
         assert_eq!(&buf[8..20], &control[8..20], "the control's transaction");
         assert!(n > 20);
+        assert_eq!(
+            hint_at(b),
+            Some(P::Stun),
+            "answered and kept as B's evidence"
+        );
 
         let response = client.handshake(false);
         assert!(is_stun(&response));
