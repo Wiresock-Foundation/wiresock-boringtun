@@ -24,8 +24,11 @@
 ## Progress
 
 1. Core policy and receive hook: `allows_imitation_hint`, `inbound::Refusal`, accumulation at every refusal site, `Tunn::decapsulate` hint-only observation. Tests 1-10 and the inbound policy tests.
+2. Device listener: `ImitationHints::observe_refused` behind `Refused` with `allows_imitation_hint`, after the receive and before any send; the successful-selection discard is unchanged. `Roaming::with_layout`, eligibility-gated refusal handling and the production discard in the harness. Tests 11-15.
 
 ## Deviations and fixture notes
 
 - Test 7 (core slot): once the first initiation has created a session, the recorded bytes' receiver index can name an occupied slot, so the transport reading is refused `WrongIndex` instead of `NoCurrentSession`. Both are allowlisted routing refusals; the helper accepts either and prints the actual outcome. Policy unchanged.
 - `is_shaped` is a plain predicate beside the existing asserting `shaped`.
+- Device harness: `Roaming::listener` authenticated into a scratch buffer and committed from a second, zeroed one, so an accepted transport could never be delivered. Production authenticates and commits through the one `dst_buf`; the harness now does the same. Needed for the bidirectional plaintext checks; no production change.
+- Device harness: `Roaming` records tunnel plaintext from either door (`take_delivered`) and gains `listener_with` (probe responder), `receive` (the decision without a commit), `send` and `has_tunnel_hint`.

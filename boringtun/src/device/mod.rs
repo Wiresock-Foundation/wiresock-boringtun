@@ -1782,8 +1782,22 @@ impl Device {
                         }
                         // Recognised framing that no peer authenticated -- an
                         // unknown peer, a stale index, a forgery. Dropped, not
-                        // handed back to probe detection.
-                        inbound::Inbound::Refused(_) | inbound::Inbound::NotOurs => continue,
+                        // handed back to probe detection: nothing is answered.
+                        // An Auto prelude whose bytes merely fit a packet shape
+                        // is refused here too, so when every reading failed for
+                        // a reason that established nothing, it may still be
+                        // recorded as evidence for this source.
+                        inbound::Inbound::Refused(refusal) => {
+                            if refusal.allows_imitation_hint {
+                                d.imitation_hints.observe_refused(
+                                    datagram,
+                                    &d.config.amnezia,
+                                    from,
+                                );
+                            }
+                            continue;
+                        }
+                        inbound::Inbound::NotOurs => continue,
                     };
 
                     // We found a peer, use it to decapsulate the message+

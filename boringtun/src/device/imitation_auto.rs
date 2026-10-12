@@ -41,7 +41,10 @@ pub(super) struct ImitationHints(Mutex<Pending>);
 
 impl ImitationHints {
     /// The listener's classification door: only non-WireGuard traffic supplies
-    /// hints, including when probe replies are disabled or the budget is empty.
+    /// hints here, including when probe replies are disabled or the budget is
+    /// empty. WireGuard-shaped traffic is classified first and never answered
+    /// as a probe; if no reading of it is accepted, [`Self::observe_refused`]
+    /// may still record it.
     pub(super) fn classify(
         &self,
         datagram: &[u8],
@@ -58,6 +61,22 @@ impl ImitationHints {
             self.observe(source, datagram);
         }
         ingress
+    }
+
+    /// The listener's second door, after `classify` called the datagram
+    /// WireGuard and every reading of it was refused for a reason
+    /// [`crate::noise::inbound::Refusal`] allows: a recognizable prelude whose
+    /// bytes merely fit a packet shape. Records evidence only, under the same
+    /// rules as the first door; it never replies, selects or logs.
+    pub(super) fn observe_refused(
+        &self,
+        datagram: &[u8],
+        amnezia: &AmneziaConfig,
+        source: SocketAddr,
+    ) {
+        if amnezia.imitation.protocol == AmneziaImitationProtocol::Auto {
+            self.observe(source, datagram);
+        }
     }
 
     fn observe(&self, source: SocketAddr, datagram: &[u8]) {
@@ -233,6 +252,23 @@ mod tests {
             None,
             "fixed modes never allocate hints"
         );
+
+        // A prelude whose bytes fit a packet shape is WireGuard to this door,
+        // which records nothing for it; only a refusal later may.
+        use crate::noise::auto_imitation_fixtures::*;
+        let request = recorded_stun_prelude()[0].clone();
+        assert!(matches!(
+            hints.classify(
+                &request,
+                &recorded_layout(P::Auto),
+                recorded_obf(COLLIDING_H4),
+                source(1),
+                None,
+                &mut OsRng
+            ),
+            Ingress::Wireguard(_)
+        ));
+        assert_eq!(hints.get(source(1)), None);
     }
 
     #[test]
@@ -390,11 +426,14 @@ mod tests {
         secret: crate::x25519::StaticSecret,
         public: crate::x25519::PublicKey,
         config: AmneziaConfig,
+        obf: ObfuscationRanges,
         peer: SharedPeer,
         peers: HashMap<crate::x25519::PublicKey, SharedPeer>,
         indices: HashMap<u32, SharedPeer>,
         hints: ImitationHints,
         limiter: crate::noise::rate_limiter::RateLimiter,
+        /// Plaintext either door wrote to the tunnel, oldest first.
+        delivered: Mutex<Vec<Vec<u8>>>,
     }
 
     /// What the server sent back, if anything; `Err` for a refused packet or
@@ -402,18 +441,29 @@ mod tests {
     type Reply = Result<Option<Vec<u8>>, ()>;
 
     impl Roaming {
+        /// The default layout: S1..S4 = 128, default H ranges, Auto.
         fn new() -> (Self, crate::noise::Tunn) {
+            Self::with_layout(
+                AmneziaConfig::new(128, 128, 128, 128).with_protocol_imitation(P::Auto, None),
+                ObfuscationRanges::default(),
+            )
+        }
+
+        /// A server under `config` and `obf` -- Auto unless a test means a
+        /// fixed mode -- and a client under the same layout imitating
+        /// nothing: plain random S padding, no prelude of its own.
+        fn with_layout(
+            config: AmneziaConfig,
+            obf: ObfuscationRanges,
+        ) -> (Self, crate::noise::Tunn) {
             use crate::device::peer::Peer;
             use crate::noise::{rate_limiter::RateLimiter, Tunn};
             use crate::x25519::{PublicKey, StaticSecret};
             use std::sync::Arc;
             let secret = StaticSecret::random_from_rng(OsRng);
             let public = PublicKey::from(&secret);
-            let config =
-                AmneziaConfig::new(128, 128, 128, 128).with_protocol_imitation(P::Auto, None);
             let key = StaticSecret::random_from_rng(OsRng);
             let pubkey = PublicKey::from(&key);
-            // A client with no prelude of its own: plain random S padding.
             let client = Tunn::new_with_obfuscation(
                 key,
                 public,
@@ -421,8 +471,11 @@ mod tests {
                 None,
                 1,
                 None,
-                Default::default(),
-                AmneziaConfig::new(128, 128, 128, 128).as_responder(),
+                obf,
+                config
+                    .clone()
+                    .with_protocol_imitation(P::None, None)
+                    .as_responder(),
             )
             .unwrap();
             let server = Tunn::new_with_obfuscation(
@@ -432,7 +485,7 @@ mod tests {
                 None,
                 1,
                 None,
-                Default::default(),
+                obf,
                 config.clone(),
             )
             .unwrap();
@@ -442,32 +495,94 @@ mod tests {
                 secret,
                 public,
                 config,
+                obf,
                 peers: HashMap::from([(pubkey, peer.clone())]),
                 indices: HashMap::from([(1, peer.clone())]),
                 peer,
                 hints: ImitationHints::default(),
+                delivered: Mutex::default(),
             };
             (roaming, client)
         }
 
-        /// The shared listener's door, as the device handler drives it.
-        fn listener(&self, from: SocketAddr, datagram: &[u8], dst_len: usize) -> Reply {
-            use crate::device::{authenticate_anonymous, commit_anonymous};
-            use crate::noise::{inbound, TunnResult};
-            let Ingress::Wireguard(candidates) = self.hints.classify(
-                datagram,
-                &self.config,
-                Default::default(),
-                from,
-                None,
-                &mut OsRng,
-            ) else {
-                return Ok(None);
+        /// What the listener's receive step decides for `datagram`, with
+        /// nothing committed; `None` when classification never got there.
+        fn receive(
+            &self,
+            from: SocketAddr,
+            datagram: &[u8],
+        ) -> Option<crate::noise::inbound::Inbound<()>> {
+            use crate::device::authenticate_anonymous;
+            use crate::noise::inbound::{self, Inbound};
+            let Ingress::Wireguard(candidates) =
+                self.hints
+                    .classify(datagram, &self.config, self.obf, from, None, &mut OsRng)
+            else {
+                return None;
             };
             let mut scratch = [0u8; 2048];
-            let inbound::Inbound::Accepted((_, mut peer, packet)) = inbound::receive(
+            Some(
+                match inbound::receive(
+                    &self.config,
+                    self.obf,
+                    &self.limiter,
+                    Some(from.ip()),
+                    &candidates,
+                    datagram,
+                    |p| {
+                        authenticate_anonymous(
+                            &self.peers,
+                            &self.indices,
+                            &self.secret,
+                            &self.public,
+                            p,
+                            &mut scratch,
+                        )
+                    },
+                ) {
+                    Inbound::Accepted(_) => Inbound::Accepted(()),
+                    Inbound::NotOurs => Inbound::NotOurs,
+                    Inbound::Cookie(demand) => Inbound::Cookie(demand),
+                    Inbound::Refused(refusal) => Inbound::Refused(refusal),
+                },
+            )
+        }
+
+        /// The shared listener's door, as the device handler drives it.
+        fn listener(&self, from: SocketAddr, datagram: &[u8], dst_len: usize) -> Reply {
+            self.listener_with(None, from, datagram, dst_len)
+        }
+
+        /// [`Self::listener`] with probe replies on: `Ok(Some(reply))` for an
+        /// answered probe.
+        fn listener_with(
+            &self,
+            responder: Option<&ProbeResponder>,
+            from: SocketAddr,
+            datagram: &[u8],
+            dst_len: usize,
+        ) -> Reply {
+            use crate::device::{authenticate_anonymous, commit_anonymous};
+            use crate::noise::{inbound, Authenticated, TunnResult};
+            let candidates = match self.hints.classify(
+                datagram,
                 &self.config,
-                Default::default(),
+                self.obf,
+                from,
+                responder,
+                &mut OsRng,
+            ) {
+                Ingress::Wireguard(candidates) => candidates,
+                Ingress::Reply(reply) => return Ok(Some(reply)),
+                Ingress::Drop => return Ok(None),
+            };
+            // One buffer for authentication and commit, as the handler's
+            // `dst_buf`: a transport's plaintext is opened into it and
+            // delivered from it.
+            let mut dst = vec![0u8; dst_len];
+            let (mut peer, packet) = match inbound::receive(
+                &self.config,
+                self.obf,
                 &self.limiter,
                 Some(from.ip()),
                 &candidates,
@@ -479,25 +594,42 @@ mod tests {
                         &self.secret,
                         &self.public,
                         p,
-                        &mut scratch,
+                        &mut dst,
                     )
                 },
-            ) else {
-                return Err(());
-            };
-            let mut dst = vec![0u8; dst_len];
-            let reply = match commit_anonymous(
-                &mut peer,
-                packet,
-                from,
-                datagram,
-                self.hints.get(from),
-                &mut dst,
             ) {
+                inbound::Inbound::Accepted((_, peer, packet)) => (peer, packet),
+                // As the handler: evidence only, and only when every reading
+                // was refused for a reason that established nothing.
+                inbound::Inbound::Refused(refusal) => {
+                    if refusal.allows_imitation_hint {
+                        self.hints.observe_refused(datagram, &self.config, from);
+                    }
+                    return Err(());
+                }
+                inbound::Inbound::Cookie(_) | inbound::Inbound::NotOurs => return Err(()),
+            };
+            // As the handler: only an Auto initiation consults the cache, and
+            // a selected one discards the source's evidence.
+            let auto_initiation = self.config.imitation.protocol == P::Auto
+                && matches!(&packet, Authenticated::HandshakeInit(_));
+            let hint = if auto_initiation {
+                self.hints.get(from)
+            } else {
+                None
+            };
+            let reply = match commit_anonymous(&mut peer, packet, from, datagram, hint, &mut dst) {
                 TunnResult::Err(_) => return Err(()),
                 TunnResult::WriteToNetwork(reply) => Some(reply.to_vec()),
-                _ => None,
+                TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                    self.delivered.lock().push(packet.to_vec());
+                    None
+                }
+                TunnResult::Done => None,
             };
+            if auto_initiation && peer.tunnel.imitation_protocol() != P::None {
+                self.hints.discard(from);
+            }
             peer.adopt_endpoint(from);
             Ok(reply)
         }
@@ -514,8 +646,30 @@ mod tests {
             {
                 TunnResult::Err(_) => Err(()),
                 TunnResult::WriteToNetwork(reply) => Ok(Some(reply.to_vec())),
-                _ => Ok(None),
+                TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                    self.delivered.lock().push(packet.to_vec());
+                    Ok(None)
+                }
+                TunnResult::Done => Ok(None),
             }
+        }
+
+        fn take_delivered(&self) -> Vec<Vec<u8>> {
+            std::mem::take(&mut *self.delivered.lock())
+        }
+
+        /// The server's transport for `packet`, as it leaves the peer.
+        fn send(&self, packet: &[u8]) -> Vec<u8> {
+            use crate::noise::TunnResult;
+            let mut dst = [0u8; 2048];
+            match self.peer.lock().tunnel.encapsulate(packet, &mut dst) {
+                TunnResult::WriteToNetwork(data) => data.to_vec(),
+                other => panic!("server transport: {:?}", other),
+            }
+        }
+
+        fn has_tunnel_hint(&self) -> bool {
+            self.peer.lock().tunnel.has_imitation_hint()
         }
 
         fn endpoint(&self) -> Option<SocketAddr> {
@@ -663,6 +817,397 @@ mod tests {
             .connected(a, &initiation(&mut client))
             .unwrap()
             .expect("rekey on A");
+        assert!(is_stun(&learned));
+        assert_eq!(server.protocol(), P::Stun);
+    }
+
+    /// Send [`bare_ipv4`] both ways through `door` and the peer's tunnel,
+    /// checking the server's transport against `shape`.
+    fn exchange(
+        server: &Roaming,
+        client: &mut crate::noise::Tunn,
+        door: impl Fn(&[u8]) -> Reply,
+        shape: impl Fn(&[u8]) -> bool,
+    ) {
+        use crate::noise::inbound::fixtures::bare_ipv4;
+        use crate::noise::TunnResult;
+        let mut buf = [0u8; 2048];
+        let data = match client.encapsulate(&bare_ipv4(), &mut buf) {
+            TunnResult::WriteToNetwork(data) => data.to_vec(),
+            other => panic!("client transport: {:?}", other),
+        };
+        assert_eq!(door(&data), Ok(None));
+        assert_eq!(server.take_delivered(), vec![bare_ipv4()]);
+        let data = server.send(&bare_ipv4());
+        assert!(shape(&data), "server transport shape");
+        match client.decapsulate(None, &data, &mut buf) {
+            TunnResult::WriteToTunnelV4(p, _) => assert_eq!(p, bare_ipv4()),
+            other => panic!("server to client: {:?}", other),
+        }
+    }
+
+    /// The recorded STUN burst's first Binding Request under the recorded
+    /// layout and its colliding H4, on an unresolved Auto server.
+    fn recorded_colliding() -> (Roaming, crate::noise::Tunn, Vec<u8>) {
+        use crate::noise::auto_imitation_fixtures::*;
+        use crate::noise::imitation::detect::{detect, Probe};
+        let (server, client) =
+            Roaming::with_layout(recorded_layout(P::Auto), recorded_obf(COLLIDING_H4));
+        let request = recorded_stun_prelude()[0].clone();
+        assert_eq!(detect(&request), Some(Probe::Stun));
+        assert_eq!(
+            server
+                .config
+                .inbound_candidates(server.obf, &request)
+                .offsets(),
+            vec![36]
+        );
+        assert_eq!(server.protocol(), P::None);
+        assert!(!server.has_tunnel_hint());
+        (server, client, request)
+    }
+
+    /// A 72-byte DNS query whose QNAME puts `hIew` -- the recorded STUN
+    /// requests' bytes at S4 = 36 -- at offset 36 too.
+    fn colliding_dns_query() -> Vec<u8> {
+        use crate::noise::auto_imitation_fixtures::*;
+        use crate::noise::imitation::detect::{detect, Probe};
+        let domain = format!("{}hIew{}.com", "x".repeat(23), "x".repeat(23));
+        let query = AmneziaConfig::default()
+            .with_protocol_imitation(P::Dns, Some(domain))
+            .pre_handshake_imitation_datagrams(&mut OsRng)
+            .pop_front()
+            .unwrap()
+            .1;
+        assert_eq!(query.len(), 72);
+        assert_eq!(&query[36..40], b"hIew");
+        assert_eq!(detect(&query), Some(Probe::Dns));
+        assert_eq!(
+            recorded_layout(P::Auto)
+                .inbound_candidates(recorded_obf(COLLIDING_H4), &query)
+                .offsets(),
+            vec![36]
+        );
+        query
+    }
+
+    /// The shared listener records a refused prelude for its full source
+    /// address, and the next initiation from there selects it.
+    #[test]
+    fn auto_imitation_listener_learns_from_eligible_refusal() {
+        use crate::noise::auto_imitation_fixtures::*;
+        use crate::noise::errors::WireGuardError;
+        use crate::noise::imitation::detect::{detect, Probe};
+        use crate::noise::inbound::fixtures::{bare_ipv4, stun_header};
+        use crate::noise::inbound::{Inbound, Refusal};
+        let (server, mut client, request) = recorded_colliding();
+        let a = source(1000);
+
+        // Classification and receive alone record nothing: the listener's
+        // refusal arm does.
+        assert!(matches!(
+            server
+                .hints
+                .classify(&request, &server.config, server.obf, a, None, &mut OsRng),
+            Ingress::Wireguard(_)
+        ));
+        assert!(matches!(
+            server.receive(a, &request),
+            Some(Inbound::Refused(Refusal {
+                error: WireGuardError::WrongIndex,
+                allows_imitation_hint: true,
+            }))
+        ));
+        assert_eq!(server.hints.get(a), None);
+        assert_eq!(server.listener(a, &request, 2048), Err(()));
+        assert_eq!(server.hints.get(a), Some(P::Stun));
+        assert_eq!(server.hints.get(source(1001)), None, "same IP, other port");
+
+        let init = initiation(&mut client);
+        assert_eq!(detect(&init), None, "the initiation cannot detect itself");
+        let response = server.listener(a, &init, 2048).unwrap().expect("response");
+        assert!(is_stun(&response));
+        assert_eq!(server.protocol(), P::Stun);
+        assert_eq!(server.hints.get(a), None, "selection discards the evidence");
+        let ack = confirm(&mut client, &response);
+        assert_eq!(server.listener(a, &ack, 2048), Ok(None));
+        exchange(
+            &server,
+            &mut client,
+            |d| server.listener(a, d, 2048),
+            is_stun,
+        );
+
+        // A replayed transport on the real session is refused for its
+        // counter: vetoed, so nothing is recorded, though it is a request.
+        let mut buf = [0u8; 2048];
+        let mut data = match client.encapsulate(&bare_ipv4(), &mut buf) {
+            crate::noise::TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("{:?}", other),
+        };
+        stun_header(&mut data);
+        assert_eq!(detect(&data), Some(Probe::Stun));
+        assert_eq!(
+            server
+                .config
+                .inbound_candidates(server.obf, &data)
+                .offsets(),
+            vec![36]
+        );
+        assert_eq!(server.listener(a, &data, 2048), Ok(None));
+        assert_eq!(server.take_delivered(), vec![bare_ipv4()]);
+        let c = source(1002);
+        assert!(matches!(
+            server.receive(c, &data),
+            Some(Inbound::Refused(Refusal {
+                error: WireGuardError::DuplicateCounter,
+                allows_imitation_hint: false,
+            }))
+        ));
+        assert_eq!(server.listener(c, &data, 2048), Err(()));
+        assert_eq!(server.hints.get(c), None);
+
+        // A real peer's index with no session behind it: still evidence.
+        let (server, _, request) = recorded_colliding();
+        let mut planted = request.clone();
+        planted[40..44].copy_from_slice(&(1u32 << 8).to_le_bytes());
+        assert_eq!(detect(&planted), Some(Probe::Stun));
+        assert_eq!(
+            server
+                .config
+                .inbound_candidates(server.obf, &planted)
+                .offsets(),
+            vec![36]
+        );
+        assert!(matches!(
+            server.receive(a, &planted),
+            Some(Inbound::Refused(Refusal {
+                error: WireGuardError::NoCurrentSession,
+                allows_imitation_hint: true,
+            }))
+        ));
+        assert_eq!(server.listener(a, &planted, 2048), Err(()));
+        assert_eq!(server.hints.get(a), Some(P::Stun));
+
+        // A fixed mode records nothing.
+        let (fixed, _) = Roaming::with_layout(
+            recorded_layout(P::Dns).as_responder(),
+            recorded_obf(COLLIDING_H4),
+        );
+        assert!(matches!(
+            fixed.receive(a, &request),
+            Some(Inbound::Refused(Refusal {
+                allows_imitation_hint: true,
+                ..
+            }))
+        ));
+        assert_eq!(fixed.listener(a, &request, 2048), Err(()));
+        assert_eq!(fixed.hints.get(a), None);
+    }
+
+    /// Probe replies on: a colliding request is WireGuard traffic, so it is
+    /// never answered and charges nothing; a request with no reading is
+    /// answered as before. The budget is exactly one reply, on a frozen
+    /// clock, so a charge the colliding request made would show.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn auto_imitation_listener_wiring_with_probe_replies_enabled() {
+        use crate::noise::imitation::stun;
+        use rand_chacha::ChaCha8Rng;
+        use rand_core::SeedableRng;
+        let (server, _, colliding) = recorded_colliding();
+        let control = (0..)
+            .map(|seed| stun::generate(&mut ChaCha8Rng::seed_from_u64(seed)).remove(0))
+            .find(|r| {
+                server
+                    .config
+                    .inbound_candidates(server.obf, r)
+                    .offsets()
+                    .is_empty()
+            })
+            .unwrap();
+        let (a, b, c) = (source(1000), source(2000), source(3000));
+        let software = stun::host_software();
+        assert!(
+            stun::binding_success(&colliding, a, software).is_some(),
+            "a responder would answer the colliding request"
+        );
+        let reply = stun::binding_success(&control, b, software).expect("an answerable control");
+        assert_eq!(
+            stun::binding_success(&control, c, software).map(|r| r.len()),
+            Some(reply.len())
+        );
+        let responder = ProbeResponder::new(reply.len() as u32);
+
+        assert_eq!(
+            server.listener_with(Some(&responder), a, &colliding, 2048),
+            Err(())
+        );
+        assert_eq!(server.hints.get(a), Some(P::Stun));
+        assert_eq!(
+            server.listener_with(Some(&responder), b, &control, 2048),
+            Ok(Some(reply))
+        );
+        assert_eq!(
+            server.listener_with(Some(&responder), c, &control, 2048),
+            Ok(None),
+            "the budget held exactly one reply"
+        );
+
+        // Under load, a datagram whose initiation reading has a valid mac1
+        // gets the cookie disposition: one load decision, no evidence.
+        use crate::noise::inbound::fixtures::{
+            assert_initiation_gate_passes, colliding as colliding_layout, stun_gated_initiation,
+        };
+        use crate::noise::inbound::Inbound;
+        use crate::noise::rate_limiter::RateLimiter;
+        let (mut server, _) = Roaming::with_layout(
+            colliding_layout(None).with_protocol_imitation(P::Auto, None),
+            ObfuscationRanges::default(),
+        );
+        let wire = stun_gated_initiation(&server.public);
+        assert_initiation_gate_passes(&RateLimiter::new(&server.public, 100), &wire);
+        server.limiter = RateLimiter::new(&server.public, 0);
+        assert!(matches!(server.receive(a, &wire), Some(Inbound::Cookie(_))));
+        assert_eq!(server.limiter.load_events(), 1);
+        server.limiter = RateLimiter::new(&server.public, 0);
+        assert_eq!(server.listener(a, &wire, 2048), Err(()));
+        assert_eq!(server.limiter.load_events(), 1);
+        assert_eq!(server.hints.get(a), None);
+    }
+
+    /// Refused evidence lives under the cache's existing rules.
+    #[test]
+    fn auto_imitation_cache_retention_expiry_and_isolation() {
+        let (server, mut client, request) = recorded_colliding();
+        let dns = colliding_dns_query();
+        let a = source(1000);
+
+        // The same source keeps its first live hint; another port is its own.
+        assert_eq!(server.listener(a, &request, 2048), Err(()));
+        assert_eq!(server.listener(a, &dns, 2048), Err(()));
+        assert_eq!(server.hints.get(a), Some(P::Stun));
+        assert_eq!(server.listener(source(1001), &dns, 2048), Err(()));
+        assert_eq!(server.hints.get(source(1001)), Some(P::Dns));
+        assert_eq!(server.hints.get(source(1002)), None);
+        // Peer removal clears the cache.
+        server.hints.clear();
+        assert_eq!(server.hints.get(a), None);
+        assert_eq!(server.hints.get(source(1001)), None);
+
+        // Evidence at a learned peer's endpoint is stored, ignored by
+        // selection, and discarded after it.
+        assert_eq!(server.listener(a, &request, 2048), Err(()));
+        let response = server
+            .listener(a, &initiation(&mut client), 2048)
+            .unwrap()
+            .expect("response");
+        assert!(is_stun(&response));
+        confirm(&mut client, &response);
+        assert_eq!(server.listener(a, &dns, 2048), Err(()));
+        assert_eq!(server.hints.get(a), Some(P::Dns));
+        let rekey = server
+            .listener(a, &initiation(&mut client), 2048)
+            .unwrap()
+            .expect("rekey");
+        assert!(is_stun(&rekey), "a learned mode is not repinned");
+        assert_eq!(server.protocol(), P::Stun);
+        assert_eq!(server.hints.get(a), None);
+
+        #[cfg(feature = "mock-instant")]
+        {
+            use mock_instant::thread_local::MockClock;
+            use std::time::Duration;
+            let (server, _, request) = recorded_colliding();
+            assert_eq!(server.listener(a, &request, 2048), Err(()));
+            MockClock::advance(Duration::from_secs(29));
+            assert_eq!(server.listener(a, &dns, 2048), Err(()));
+            assert_eq!(server.hints.get(a), Some(P::Stun));
+            MockClock::advance(Duration::from_secs(1));
+            assert_eq!(server.hints.get(a), None, "expired at 30 s");
+            assert_eq!(server.listener(a, &dns, 2048), Err(()));
+            assert_eq!(server.hints.get(a), Some(P::Dns));
+        }
+    }
+
+    /// A colliding prelude on the peer's connected socket is the tunnel's
+    /// evidence, and a rekey there learns from it.
+    #[test]
+    fn auto_imitation_connected_learns_from_colliding_prelude() {
+        let (server, mut client, request) = recorded_colliding();
+        let a = source(1000);
+        let first = server
+            .listener(a, &initiation(&mut client), 2048)
+            .unwrap()
+            .expect("first response");
+        assert!(!is_stun(&first));
+        let ack = confirm(&mut client, &first);
+        server.listener(a, &ack, 2048).unwrap();
+        assert_eq!(server.endpoint(), Some(a));
+        assert_eq!(server.protocol(), P::None);
+        assert!(!server.has_tunnel_hint());
+
+        assert_eq!(server.connected(a, &request), Err(()));
+        assert!(server.has_tunnel_hint());
+        assert_eq!(
+            server.hints.get(a),
+            None,
+            "the listener's cache is not involved"
+        );
+        let learned = server
+            .connected(a, &initiation(&mut client))
+            .unwrap()
+            .expect("rekey on A");
+        assert!(is_stun(&learned));
+        assert_eq!(server.protocol(), P::Stun);
+        assert!(!server.has_tunnel_hint());
+        let ack = confirm(&mut client, &learned);
+        assert_eq!(server.connected(a, &ack), Ok(None));
+        exchange(&server, &mut client, |d| server.connected(a, d), is_stun);
+    }
+
+    /// A colliding prelude's tunnel evidence is dropped by a roam like any
+    /// other: it does not shape a rekey on the new endpoint, and that
+    /// endpoint's own prelude still does.
+    #[test]
+    fn auto_imitation_colliding_pending_hint_does_not_follow_a_roam() {
+        use crate::noise::auto_imitation_fixtures::recorded_stun_prelude;
+        let (server, mut client, request) = recorded_colliding();
+        let (a, b) = (source(1000), source(2000));
+        let first = server
+            .listener(a, &initiation(&mut client), 2048)
+            .unwrap()
+            .expect("first response");
+        let ack = confirm(&mut client, &first);
+        server.listener(a, &ack, 2048).unwrap();
+        assert_eq!(server.protocol(), P::None);
+        assert!(!server.has_tunnel_hint());
+
+        assert_eq!(server.connected(a, &request), Err(()));
+        assert!(server.has_tunnel_hint());
+        server.listener(b, &keepalive(&mut client), 2048).unwrap();
+        assert_eq!(server.endpoint(), Some(b));
+        assert!(!server.has_tunnel_hint(), "the roam discarded A's evidence");
+
+        let second = server
+            .connected(b, &initiation(&mut client))
+            .unwrap()
+            .expect("rekey on B");
+        assert!(!is_stun(&second));
+        assert_eq!(server.protocol(), P::None);
+        confirm(&mut client, &second);
+
+        let own = recorded_stun_prelude()[1].clone();
+        assert_eq!(
+            server.config.inbound_candidates(server.obf, &own).offsets(),
+            vec![36]
+        );
+        assert_eq!(server.connected(b, &own), Err(()));
+        assert!(server.has_tunnel_hint());
+        let learned = server
+            .connected(b, &initiation(&mut client))
+            .unwrap()
+            .expect("rekey with B's own prelude");
         assert!(is_stun(&learned));
         assert_eq!(server.protocol(), P::Stun);
     }
