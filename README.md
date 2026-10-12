@@ -140,9 +140,10 @@ the bytes a STUN request carries at S4 fall in H4 — and is then tried as that 
 If every such reading is refused for a reason that establishes nothing (a failed mac1; an
 unknown peer, index or session; no matching handshake in flight; a failed AEAD), the datagram
 still becomes evidence for its source under the rules above. The receive call reports the
-same error as before, and such a datagram is never answered as a probe. Refusals after
-decryption (stale timestamps, replayed or out-of-window counters), a destination buffer too
-small to verify, any other error, and cookie or load dispositions record nothing. Remaining
+same error as before, and such a datagram is never answered as a probe. Timestamp validation
+follows decryption. Counter refusals, which can occur before or after AEAD, are conservatively
+excluded. Local buffer failures and every other non-allowlisted error also veto fallback.
+Cookie or load dispositions record nothing. Remaining
 limitations: the evidence is no more authenticated than any other hint, and a refused replay
 can still supply one (with header protection off, its prefix can be rewritten); colliding
 probes stay unanswered; and a datagram that a peer actually accepts is never reinterpreted.

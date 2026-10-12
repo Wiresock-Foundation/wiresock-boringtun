@@ -54,7 +54,9 @@ Each mutant applied to a fresh copy and rebuilt; unit suites (`device,mock-insta
 | M5 accepted packets observed | accepted packets, accumulation, stale initiation, the Auto runs of the three later-reading regressions |
 | M6 socket-lifetime check removed | all four retired-callback races (plain and colliding) and the tunnel-state race |
 
-## Validation (head 373fbc6; later commits touch docs only)
+## Validation
+
+Local validation and release binary at 373fbc6; subsequent changes are documentation and the test-only precondition correction at 7bd49ef. Production build inputs are unchanged.
 
 - Windows (stable 1.98.1, at 83c4c60, code-identical apart from a one-line test fix): `cargo test -p boringtun --lib auto_imitation` 16/0; `--features ffi-bindings,mock-instant` 413/0; `cargo check --features ffi-bindings,jni-bindings,mock-instant` ok; `cargo test -p boringtun` 310/0; `cargo fmt --check` and `git diff --check` clean; MSRV lint `cargo +stable clippy --all-targets --features=ffi-bindings -- -D clippy::incompatible_msrv` ok (stable lint, not a 1.75 build).
 - Rust 1.75 builds (CI win7-msrv procedure, throwaway `git archive` copy, tracked Cargo.lock untouched): x86_64 and i686 `--features=ffi-bindings --locked` pass. The first attempt failed in ring's `cl.exe` step on an over-long object path under the scratch directory; a short `CARGO_TARGET_DIR` fixed it.
@@ -70,3 +72,9 @@ Each mutant applied to a fresh copy and rebuilt; unit suites (`device,mock-insta
 | `test-boringtun-sip-wire-live.sh` | 159/0 | 159/0 |
 
 The four failures are the expectation flips the plan defers to the installer, done atomically with a pinned build; the installer was not changed.
+
+## Final-head CI and independent review (7bd49ef)
+
+CI on 7bd49ef: PR Status Checks 15/15 jobs succeeded ([run 38240014024](https://github.com/Wiresock-Foundation/wiresock-boringtun/actions/runs/38240014024)), Semgrep OSS scan succeeded (run 38240013940). The merge-ref logs name base b949439 and head 7bd49ef, report the 66 ignored integration tests passing and build Rust 1.75 x86_64/i686.
+
+An independent review of `b949439..7bd49ef` closed with no production correctness or security blocker and two P3 documentation findings, both addressed in the commit after 7bd49ef (wording only: the counter-refusal explanation in `auto.rs`/README, and this section's heading). The reviewer's own reruns on exact-head disposable copies under Linux/WSL reported core/noise 365 passed, device Auto unit tests 12 passed, root/TUN Auto live tests 12 passed, the expected red failure on the base, and reproductions of mutants M1, M3 and M6; the reviewer independently hashed the recorded binary as the 373fbc6 build (`40660f61…`). Those runs are the reviewer's, not part of the validation above; the reviewer's script and logs are kept at `C:/Users/vadim/.codex/visualizations/2026/10/12/01a12f3f-c629-76e1-b0ee-a4ed3722e1c9/pr82-review/` (`probes.py`, `logs/`, exact base/head archives). The reviewer inspected rather than reran the installer campaigns and the Windows/MSRV builds.

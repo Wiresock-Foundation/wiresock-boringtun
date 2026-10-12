@@ -24,9 +24,10 @@ pub(crate) const HINT_LIFETIME: Duration = Duration::from_secs(30);
 /// established nothing: its mac1 did not hold (`InvalidMac`), no peer, index,
 /// session or in-flight handshake matched (`WrongKey`, `WrongIndex`,
 /// `NoCurrentSession`, `UnexpectedPacket`), or its AEAD did not open
-/// (`InvalidAeadTag`). Every other error vetoes: timestamp and replay-window
-/// refusals come after decryption, a short destination buffer is a local
-/// failure that verified nothing, and anything else is excluded by default.
+/// (`InvalidAeadTag`). Timestamp validation follows decryption. Counter
+/// refusals, which can occur before or after AEAD, are conservatively
+/// excluded. Local buffer failures and every other non-allowlisted error
+/// also veto fallback.
 ///
 /// This is policy, not an authentication statement: an allowed refusal
 /// proves nothing about who sent the datagram, and a hint it yields stays
