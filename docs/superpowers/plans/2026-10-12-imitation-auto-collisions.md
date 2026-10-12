@@ -39,3 +39,33 @@ Checked before writing test 18: the existing `site_coverage_probe_and_cookie_rep
 - Device harness: `Roaming` records tunnel plaintext from either door (`take_delivered`) and gains `listener_with` (probe responder), `receive` (the decision without a commit), `send` and `has_tunnel_hint`.
 - Live harness: the device's writes to its TUN are not otherwise observable, so "plaintext both ways" uses a new AF_PACKET capture (`TunCapture`) for client to device and the existing `TunInjector` for device to client; `exchange` brings the link up first. `AutoClient` now always configures an allowed IP for itself, so the device has a route for it.
 - Test 19 is `auto_imitation_live_fixed_mode_colliding_request_stays_silent`; tests 16 and 18 also run their no-prelude and control cases inside the one test.
+
+## Mutation checks
+
+Each mutant applied to a fresh copy and rebuilt; unit suites (`device,mock-instant`) and the live Auto tests run against it. All six were killed:
+
+| Mutant | Killed by |
+|---|---|
+| M1 production listener records nothing | live: colliding prelude learned, probe replies silent (the unit harness has its own copy, so only live tests can see this) |
+| M2 core hook off | 8 unit tests (core and connected-socket) and both colliding retired-callback races |
+| M3 eligibility flag ignored at both doors | accumulation, stale initiation, accepted packets, cookie/load; live replayed-transport veto |
+| M4 `DestinationBufferTooSmall` allowed | accumulation and the per-variant policy test |
+| M5 accepted packets observed | accepted packets, accumulation, stale initiation, the Auto runs of the three later-reading regressions |
+| M6 socket-lifetime check removed | all four retired-callback races (plain and colliding) and the tunnel-state race |
+
+## Validation (head 373fbc6; later commits touch docs only)
+
+- Windows (stable 1.98.1, at 83c4c60, code-identical apart from a one-line test fix): `cargo test -p boringtun --lib auto_imitation` 16/0; `--features ffi-bindings,mock-instant` 413/0; `cargo check --features ffi-bindings,jni-bindings,mock-instant` ok; `cargo test -p boringtun` 310/0; `cargo fmt --check` and `git diff --check` clean; MSRV lint `cargo +stable clippy --all-targets --features=ffi-bindings -- -D clippy::incompatible_msrv` ok (stable lint, not a 1.75 build).
+- Rust 1.75 builds (CI win7-msrv procedure, throwaway `git archive` copy, tracked Cargo.lock untouched): x86_64 and i686 `--features=ffi-bindings --locked` pass. The first attempt failed in ring's `cl.exe` step on an over-long object path under the scratch directory; a short `CARGO_TARGET_DIR` fixed it.
+- Linux (WSL, rustup 1.97.1): workspace `--features device,ffi-bindings,mock-instant` 668/0; live Auto 12/0; whole ignored suite 66/0; clippy per feature with no warnings in changed files after 373fbc6.
+- Release `boringtun-cli` from `git archive 373fbc6`, fresh target: sha256 `40660f6199a9a901d4bf88db62ccadac85bca8f2104b5a8859f7c3d10ad93ecc`.
+
+## Recorded reproductions (installer tree 0aaaa63 via git archive, unchanged)
+
+| Run | Published b949439 (`1210a3c6…`) | New (`40660f61…`) |
+|---|---|---|
+| `test-boringtun-auto-hint-live.sh` | 158/0 | 154/4: exactly `collision` (247-byte SIP probe, now SIP) and `stun-replay-colliding` (recorded STUN burst, now STUN), and their two cross-controls. `hint`, `hp-hint` (random, refusal warning), `hp-none` (random, no warning), `stun-replay-clear`, genuine dns/quic/sip/stun and reviewed-stun 1-3 pass. |
+| `repro-stun.sh`, 16 genuine STUN clients, S 110,57,133,25 | 5 of 16 unresolved | 0 of 16 |
+| `test-boringtun-sip-wire-live.sh` | 159/0 | 159/0 |
+
+The four failures are the expectation flips the plan defers to the installer, done atomically with a pinned build; the installer was not changed.
