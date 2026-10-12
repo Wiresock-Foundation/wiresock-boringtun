@@ -4873,7 +4873,6 @@ allowed_ip=10.66.66.2/32",
                 amnezia,
                 obf,
                 probe_reply_bytes_per_sec,
-                ..Default::default()
             },
         );
         let secret = StaticSecret::random_from_rng(OsRng);
