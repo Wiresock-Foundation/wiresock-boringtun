@@ -1066,6 +1066,51 @@ fn a_refused_tick_demand_is_reported() {
     assert_eq!((r.op, i.events), (DONE, 0));
 }
 
+/// The tick that ends a handshake cycle -- here the untuned 90-second bound,
+/// with a packet queued behind the initiation -- reports the expiry, and the
+/// queue it cleared. The next tick finds it already expired: the same error,
+/// no event.
+#[cfg(feature = "mock-instant")]
+#[test]
+fn an_expiry_is_reported_by_the_tick_that_expires() {
+    let (a, b) = (party(), party());
+    let client = plain(&a, &b, 1, 0);
+    let mut dst = vec![0u8; 2048];
+    let (r, i) = ex(&client, Op::Write(&ipv4(1, 40)), &mut dst);
+    assert_eq!(r.op, WTN);
+    assert_eq!(i.state, st::INITIATION_PENDING | st::QUEUE_NONEMPTY);
+    advance(Duration::from_secs(91));
+    let (r, i) = ex(&client, Op::Tick, &mut dst);
+    assert_eq!((r.op, r.size), (ERR, 15));
+    assert_eq!(
+        facts(&i),
+        (0, 0, ev::HANDSHAKE_EXPIRED, st::HANDSHAKE_EXPIRED)
+    );
+    let (r, i) = ex(&client, Op::Tick, &mut dst);
+    assert_eq!((r.op, r.size), (ERR, 15));
+    assert_eq!(facts(&i), (0, 0, 0, st::HANDSHAKE_EXPIRED));
+}
+
+/// A session older than reject-after-time is dropped by the tick that ages
+/// it, and that tick reports both the ageing and that the selected session is
+/// gone.
+#[cfg(feature = "mock-instant")]
+#[test]
+fn ageing_out_the_current_session_is_reported() {
+    let (a, b) = (party(), party());
+    let client = plain(&a, &b, 1, 0);
+    let server = plain(&b, &a, 2, 0);
+    establish(&client, &server);
+    advance(Duration::from_secs(181));
+    let mut dst = vec![0u8; 2048];
+    let (r, i) = ex(&client, Op::Tick, &mut dst);
+    assert_eq!(r.op, DONE);
+    assert_eq!(
+        facts(&i),
+        (0, 0, ev::SESSIONS_AGED_OUT | ev::CURRENT_SESSION_CHANGED, 0)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Memory protocol
 // ---------------------------------------------------------------------------
