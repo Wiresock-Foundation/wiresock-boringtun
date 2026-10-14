@@ -205,6 +205,50 @@ WG_STATIC_ASSERT(sizeof(((struct stats *)0)->reserved) == 56,
 WG_STATIC_ASSERT(sizeof(struct stats) == 16 + 2 * sizeof(size_t) + 56,
                  "stats total size must not change; decrement reserved when adding a field");
 
+// wireguard_packet_info: the same literals `ffi::metadata_tests` pins on the
+// Rust side. Twelve uint32_t, every offset and width, size 48 and alignment 4
+// at both word sizes -- no pointer, no size_t, no 64-bit member, which is why
+// the sequence is two words.
+#define WG_PI_OFF(field) offsetof(struct wireguard_packet_info, field)
+#define WG_PI_SIZE(field) sizeof(((struct wireguard_packet_info *)0)->field)
+WG_STATIC_ASSERT(sizeof(struct wireguard_packet_info) == 48, "wireguard_packet_info must be 48 bytes");
+WG_STATIC_ASSERT(_Alignof(struct wireguard_packet_info) == 4,
+                 "wireguard_packet_info must stay 4-byte aligned");
+WG_STATIC_ASSERT(WG_PI_OFF(size) == 0 && WG_PI_SIZE(size) == 4, "size moved");
+WG_STATIC_ASSERT(WG_PI_OFF(in_flags) == 4 && WG_PI_SIZE(in_flags) == 4, "in_flags moved");
+WG_STATIC_ASSERT(WG_PI_OFF(max_transport_output) == 8 && WG_PI_SIZE(max_transport_output) == 4,
+                 "max_transport_output moved");
+WG_STATIC_ASSERT(WG_PI_OFF(max_control_output) == 12 && WG_PI_SIZE(max_control_output) == 4,
+                 "max_control_output moved");
+WG_STATIC_ASSERT(WG_PI_OFF(written_size) == 16 && WG_PI_SIZE(written_size) == 4,
+                 "written_size moved");
+WG_STATIC_ASSERT(WG_PI_OFF(input_kind) == 20 && WG_PI_SIZE(input_kind) == 4, "input_kind moved");
+WG_STATIC_ASSERT(WG_PI_OFF(output_kind) == 24 && WG_PI_SIZE(output_kind) == 4,
+                 "output_kind moved");
+WG_STATIC_ASSERT(WG_PI_OFF(events) == 28 && WG_PI_SIZE(events) == 4, "events moved");
+WG_STATIC_ASSERT(WG_PI_OFF(state) == 32 && WG_PI_SIZE(state) == 4, "state moved");
+WG_STATIC_ASSERT(WG_PI_OFF(op_seq_lo) == 36 && WG_PI_SIZE(op_seq_lo) == 4, "op_seq_lo moved");
+WG_STATIC_ASSERT(WG_PI_OFF(op_seq_hi) == 40 && WG_PI_SIZE(op_seq_hi) == 4, "op_seq_hi moved");
+WG_STATIC_ASSERT(WG_PI_OFF(burst_due_ms) == 44 && WG_PI_SIZE(burst_due_ms) == 4,
+                 "burst_due_ms moved");
+WG_STATIC_ASSERT(WIREGUARD_PACKET_INFO_SIZE_V1 == 48 && WIREGUARD_PACKET_INFO_SIZE_MAX == 1024 &&
+                     WIREGUARD_PACKET_INFO_OUTPUT_START == 16,
+                 "packet_info extent constants changed");
+
+// The four metadata entry points, signatures written out.
+static struct wireguard_result (*const check_read_ex)(
+    const struct wireguard_tunnel *, const uint8_t *, uint32_t, uint8_t *, uint32_t,
+    struct wireguard_packet_info *) = wireguard_read_ex;
+static struct wireguard_result (*const check_write_ex)(
+    const struct wireguard_tunnel *, const uint8_t *, uint32_t, uint8_t *, uint32_t,
+    struct wireguard_packet_info *) = wireguard_write_ex;
+static struct wireguard_result (*const check_tick_ex)(
+    const struct wireguard_tunnel *, uint8_t *, uint32_t,
+    struct wireguard_packet_info *) = wireguard_tick_ex;
+static struct wireguard_result (*const check_force_ex)(
+    const struct wireguard_tunnel *, uint8_t *, uint32_t,
+    struct wireguard_packet_info *) = wireguard_force_handshake_ex;
+
 // The declaration the client links against. Taking its address is enough to
 // require that it exists with exactly this signature.
 static struct wireguard_tunnel *(*const check_ctor)(
@@ -230,4 +274,20 @@ const void *wg_ffi_layout_check_anchor(void)
     // Both pointers referenced, so neither can be optimised out or warned
     // unused. The condition is never false; it exists only to name check_mtu.
     return check_mtu ? (const void *)&check_ctor : (const void *)&check_mtu;
+}
+
+// The metadata entry points, referenced the same way.
+const void *wg_ffi_layout_check_ex_anchor(int which);
+const void *wg_ffi_layout_check_ex_anchor(int which)
+{
+    switch (which) {
+    case 0:
+        return (const void *)&check_read_ex;
+    case 1:
+        return (const void *)&check_write_ex;
+    case 2:
+        return (const void *)&check_tick_ex;
+    default:
+        return (const void *)&check_force_ex;
+    }
 }

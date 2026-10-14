@@ -40,9 +40,12 @@ mod session;
 // no consumer outside `noise` on this branch yet. Present tense would be a claim
 // this tree does not support -- this PR is mergeable to master on its own.
 pub(crate) mod timers;
+// What one operation did, for the C `wireguard_*_ex` entry points.
+pub(crate) mod op_report;
 
 use amnezia::AmneziaConfig;
 use handshake::ObfuscationRanges;
+use op_report::{event, PacketKind};
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -134,6 +137,9 @@ pub struct Tunn {
     /// nothing. Every other access has `&mut Tunn`; the device holds the
     /// peer's lock around all of them anyway, so the ordering is `Relaxed`.
     udp_window: AtomicU32,
+    /// Operation sequence, session serials and the facts of the operation in
+    /// progress, for the C `_ex` entry points (`op_report`).
+    meta: op_report::OpState,
 }
 
 struct PendingAmneziaJunk {
@@ -515,6 +521,7 @@ impl Tunn {
             rate_limiter: rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
+            meta: Default::default(),
         })
     }
 
@@ -539,6 +546,7 @@ impl Tunn {
         for s in &mut self.sessions {
             *s = None;
         }
+        self.meta.all_sessions_removed();
     }
 
     /// Replace this tunnel's AmneziaWG obfuscation settings.
@@ -798,6 +806,7 @@ impl Tunn {
         for s in &mut self.sessions {
             *s = None;
         }
+        self.meta.all_sessions_removed();
     }
 
     /// Encapsulate a single packet from the tunnel interface.
@@ -907,7 +916,14 @@ impl Tunn {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes += src.len();
-            return self.write_to_network(dst, packet_size);
+            let result = self.write_to_network(dst, packet_size);
+            let kind = if src.is_empty() {
+                PacketKind::TransportKeepalive
+            } else {
+                PacketKind::TransportData
+            };
+            self.meta.note_output(kind, &result);
+            return result;
         }
         TunnResult::Err(WireGuardError::NoCurrentSession)
     }
@@ -1088,7 +1104,7 @@ impl Tunn {
                 // turn an attenuating reply into an amplifying one. The check
                 // on what actually came out stays anyway: it is the guard, and
                 // the bound above is only how the draw avoids tripping it.
-                match self.write_to_network_with(
+                let result = match self.write_to_network_with(
                     dst,
                     packet_size,
                     amnezia::TrailerRoom::cookie_reply(wire_len),
@@ -1099,7 +1115,9 @@ impl Tunn {
                         TunnResult::Done
                     }
                     other => other,
-                }
+                };
+                self.meta.note_output(PacketKind::CookieReply, &result);
+                result
             }
         }
     }
@@ -1211,6 +1229,22 @@ impl Tunn {
         packet: Authenticated,
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
+        // Accepted, irreversibly, as what it authenticated as -- whatever the
+        // commit below then reports. A cookie reply authenticates no peer.
+        // Transport is told apart by the receiver's own keepalive rule
+        // (`validate_decapsulated_packet`), malformed inner packets included
+        // as data.
+        let (kind, authenticated) = match &packet {
+            Authenticated::HandshakeInit(_) => (PacketKind::HandshakeInitiation, true),
+            Authenticated::HandshakeResponse(_) => (PacketKind::HandshakeResponse, true),
+            Authenticated::CookieReply(_) => (PacketKind::CookieReply, false),
+            Authenticated::Data { len, .. } => match dst.get(..*len).and_then(<[u8]>::first) {
+                None | Some(&0) => (PacketKind::TransportKeepalive, true),
+                Some(_) => (PacketKind::TransportData, true),
+            },
+        };
+        self.meta.note_input(kind, authenticated);
+
         match packet {
             Authenticated::HandshakeInit(init) => self.commit_handshake_init(init, dst),
             Authenticated::HandshakeResponse(response) => {
@@ -1233,6 +1267,7 @@ impl Tunn {
         // Store new session in ring buffer
         let index = session.local_index();
         self.sessions[index % N_SESSIONS] = Some(session);
+        self.meta.session_stored(index % N_SESSIONS);
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeLastPacketSent);
@@ -1240,7 +1275,10 @@ impl Tunn {
 
         tracing::debug!(message = "Sending handshake_response", local_idx = index);
 
-        Ok(self.write_to_network(dst, packet_size))
+        let result = self.write_to_network(dst, packet_size);
+        self.meta
+            .note_output(PacketKind::HandshakeResponse, &result);
+        Ok(result)
     }
 
     fn commit_handshake_response<'a>(
@@ -1277,6 +1315,7 @@ impl Tunn {
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
         self.sessions[index] = Some(session);
+        self.meta.session_stored(index);
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick_session_established(true, index); // New session established, we are the initiator
@@ -1284,7 +1323,11 @@ impl Tunn {
 
         tracing::debug!("Sending keepalive");
 
-        Ok(self.write_to_network(dst, keepalive_packet_size)) // Send a keepalive as a response
+        // Send a keepalive as a response
+        let result = self.write_to_network(dst, keepalive_packet_size);
+        self.meta
+            .note_output(PacketKind::TransportKeepalive, &result);
+        Ok(result)
     }
 
     fn commit_cookie_reply<'a>(
@@ -1362,6 +1405,7 @@ impl Tunn {
         if self.amnezia.emits_pre_handshake() {
             self.pending_amnezia_junk =
                 Some(self.new_pre_handshake_burst(None, reset_expired_timers));
+            self.meta.note(event::BURST_PREPARED);
             return self.advance_amnezia_junk(dst);
         }
 
@@ -1470,7 +1514,14 @@ impl Tunn {
                         self.timers.handshake_attempts.saturating_add(1);
                 }
                 self.timer_tick(TimerName::TimeLastPacketSent);
-                self.write_to_network(dst, packet_size)
+                let result = self.write_to_network(dst, packet_size);
+                // Produced and returned -- not sent: the caller has yet to.
+                if matches!(result, TunnResult::WriteToNetwork(_)) {
+                    self.meta.note(event::INITIATION_PRODUCED);
+                }
+                self.meta
+                    .note_output(PacketKind::HandshakeInitiation, &result);
+                result
             }
             Err(e) => TunnResult::Err(e),
         }
@@ -1558,7 +1609,9 @@ impl Tunn {
             };
             self.reset_expired_timers_on_first_emit();
             dst[..size].copy_from_slice(&datagram);
-            return TunnResult::WriteToNetwork(&mut dst[..size]);
+            let result = TunnResult::WriteToNetwork(&mut dst[..size]);
+            self.meta.note_output(PacketKind::Imitation, &result);
+            return result;
         }
 
         if remaining == 0 {
@@ -1605,7 +1658,9 @@ impl Tunn {
             pending.last_packet_at = Some(Instant::now());
         }
 
-        TunnResult::WriteToNetwork(packet)
+        let result = TunnResult::WriteToNetwork(packet);
+        self.meta.note_output(PacketKind::Junk, &result);
+        result
     }
 
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
@@ -1743,6 +1798,7 @@ impl Tunn {
             return Err(WireGuardError::PacketQueueFull);
         }
         self.packet_queue.push_back(packet.to_vec());
+        self.meta.note(event::QUEUE_ADMITTED);
         Ok(())
     }
 

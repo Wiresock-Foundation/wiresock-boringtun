@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::errors::WireGuardError;
+use super::op_report::event;
 use crate::noise::{Tunn, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
@@ -254,6 +255,7 @@ impl Tunn {
         for session in &mut self.sessions {
             *session = None;
         }
+        self.meta.all_sessions_removed();
 
         self.packet_queue.clear();
         self.pending_amnezia_junk = None;
@@ -283,6 +285,8 @@ impl Tunn {
                         session = session.receiving_index,
                         after_secs = reject_after_time.as_secs()
                     );
+                    self.meta.session_removed(i);
+                    self.meta.note(event::SESSIONS_AGED_OUT);
                 }
                 *t = time_now;
             }
@@ -310,6 +314,7 @@ impl Tunn {
             );
             self.handshake.set_expired();
             self.clear_all();
+            self.meta.note(event::HANDSHAKE_EXPIRED);
             return true;
         }
 
@@ -341,6 +346,7 @@ impl Tunn {
             tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
             self.handshake.set_expired();
             self.clear_all();
+            self.meta.note(event::HANDSHAKE_EXPIRED);
             return true;
         }
         false
@@ -445,6 +451,7 @@ impl Tunn {
                         );
                         self.handshake.set_expired();
                         self.clear_all();
+                        self.meta.note(event::HANDSHAKE_EXPIRED);
                         return TunnResult::Err(WireGuardError::ConnectionExpired);
                     }
 
@@ -535,11 +542,18 @@ impl Tunn {
             {
                 self.timers.want_handshake = true;
             }
+            if matches!(result, TunnResult::Err(_)) {
+                self.meta.note(event::TICK_DEMAND_REFUSED);
+            }
             return result;
         }
 
         if keepalive_required {
-            return self.encapsulate(&[], dst);
+            let result = self.encapsulate(&[], dst);
+            if matches!(result, TunnResult::Err(_)) {
+                self.meta.note(event::TICK_DEMAND_REFUSED);
+            }
+            return result;
         }
 
         TunnResult::Done

@@ -729,6 +729,169 @@ struct wireguard_result wireguard_force_handshake(const struct wireguard_tunnel 
                                                   uint8_t *dst,
                                                   uint32_t dst_size);
 
+// ---------------------------------------------------------------------------
+// Operation metadata: wireguard_*_ex
+//
+// Each _ex call is the legacy call of the same name, plus -- when info is not
+// NULL -- what that operation did, computed under the same tunnel lock and
+// returned with the result it describes. With info NULL it IS the legacy call;
+// the legacy entry points are that same body. There is no global and no "last
+// result" query.
+//
+// Observability only: the metadata changes nothing the operation does. The
+// two budget inputs are reserved for a later contract and must be 0.
+//
+// Protocol, in order. info NULL: no metadata. Otherwise only the 4-byte size
+// is read first; it must be in [48, 1024]. Then the 16-byte input head:
+// in_flags and both budgets must be 0. Then every byte of [48, size) must be 0
+// (a newer caller's field this library cannot honour). Any failure returns
+// WIREGUARD_ERROR with size 19 BEFORE the tunnel is locked: nothing ran, no
+// sequence number was taken, src was not read, and no byte of info was
+// written -- its output fields may still hold an older call's values and must
+// not be read. Otherwise the call writes [16, 48) exactly once, after it has
+// run; [0, 16) and [48, size) are never written. info needs no alignment.
+//
+// Reading a result, in order:
+//   1. op WIREGUARD_ERROR with size 19: see above; nothing is available.
+//   2. written_size < 48: treat as unavailable (a conforming library writes 48).
+//   3. op WIREGUARD_ERROR: size is an error code. An error is NOT "nothing
+//      happened": events/input_kind still report what happened before it (an
+//      authenticated datagram whose inner packet was malformed is ERROR 12 with
+//      INPUT_ACCEPTED | PEER_AUTHENTICATED).
+//   4. output_kind is meaningful only with WRITE_TO_NETWORK. Route by it; never
+//      by the bytes. An unknown value means bytes this caller cannot route.
+//   5. Unknown event/state bits are ignored; no fact is inferred from them.
+//   6. op_seq = ((uint64_t)op_seq_hi << 32) | op_seq_lo -- widen first.
+//
+// Plaintext ownership is the legacy rule, unchanged: wireguard_write(_ex)
+// accepted src -- exactly once -- iff op is WRITE_TO_NETWORK or WIREGUARD_DONE.
+// It was either encrypted into dst (output_kind TRANSPORT_*) or queued
+// (WIREGUARD_EV_QUEUE_ADMITTED) while the output is a burst item, the
+// initiation, or nothing at all. Never submit it again. Any WIREGUARD_ERROR
+// means src was not accepted. Queued packets are emitted by draining: call
+// wireguard_read(_ex) with src_size 0 (src still non-NULL) until DONE.
+// WIREGUARD_DONE from a drain or tick does NOT mean the queue is empty -- it
+// can be a pacing wait or a handshake wait; WIREGUARD_ST_QUEUE_NONEMPTY says.
+// ---------------------------------------------------------------------------
+
+#define WIREGUARD_PACKET_INFO_SIZE_V1 48u       // smallest accepted size
+#define WIREGUARD_PACKET_INFO_SIZE_MAX 1024u    // largest accepted size
+#define WIREGUARD_PACKET_INFO_OUTPUT_START 16u  // fixed start of the output region
+#define WIREGUARD_BURST_DUE_NONE 0xFFFFFFFFu    // burst_due_ms when no burst is pending
+#define WIREGUARD_ERROR_INVALID_PACKET_INFO 19u // wireguard_result.size; 18 is reserved
+
+// Kind of a datagram, stored in uint32_t fields. Values never change.
+enum wireguard_packet_kind
+{
+    WIREGUARD_PACKET_NONE = 0,
+    WIREGUARD_PACKET_HANDSHAKE_INITIATION = 1,
+    WIREGUARD_PACKET_HANDSHAKE_RESPONSE = 2,
+    WIREGUARD_PACKET_COOKIE_REPLY = 3, // as output: unreachable through this API
+    WIREGUARD_PACKET_TRANSPORT_DATA = 4,
+    WIREGUARD_PACKET_TRANSPORT_KEEPALIVE = 5,
+    WIREGUARD_PACKET_JUNK = 6,      // Jc pre-handshake junk
+    WIREGUARD_PACKET_IMITATION = 7, // DNS/QUIC/SIP/STUN imitation datagram
+};
+
+// events: facts of THIS operation; a set bit means "at least once".
+// INPUT_ACCEPTED: src was accepted -- authenticated and committed -- as
+//   input_kind; no other reading of it is tried. Header shape, a valid mac1 or
+//   a failed trial is never acceptance.
+// PEER_AUTHENTICATED: that input was authenticated under the peer's keys
+//   (initiation, response, transport). Never for a cookie reply.
+// SESSION_STORED: a session was written into the ring (either role); it is
+//   not necessarily the current one.
+// CURRENT_SESSION_CHANGED: the session selected for sending at exit is a
+//   different instance from the one at entry (absent <-> present included).
+// INITIATION_PRODUCED: a handshake initiation was formatted AND returned in
+//   dst by this call. Production only, not transmission.
+// QUEUE_ADMITTED: the plaintext (an empty one from a tick keepalive) was
+//   queued, once, to be sent when a session exists.
+// HANDSHAKE_EXPIRED: this call ended the handshake cycle; sessions, the queue
+//   and any burst were cleared. Not set for an already expired handshake.
+// SESSIONS_AGED_OUT: at least one stored session was dropped by age.
+// BURST_PREPARED: this call built a new pre-handshake burst.
+// TICK_DEMAND_REFUSED: a tick selected a handshake or keepalive demand and
+//   producing it failed (the result is the error).
+#define WIREGUARD_EV_INPUT_ACCEPTED 0x00000001u
+#define WIREGUARD_EV_PEER_AUTHENTICATED 0x00000002u
+#define WIREGUARD_EV_SESSION_STORED 0x00000004u
+#define WIREGUARD_EV_CURRENT_SESSION_CHANGED 0x00000008u
+#define WIREGUARD_EV_INITIATION_PRODUCED 0x00000010u
+#define WIREGUARD_EV_QUEUE_ADMITTED 0x00000020u
+#define WIREGUARD_EV_HANDSHAKE_EXPIRED 0x00000040u
+#define WIREGUARD_EV_SESSIONS_AGED_OUT 0x00000080u
+#define WIREGUARD_EV_BURST_PREPARED 0x00000100u
+#define WIREGUARD_EV_TICK_DEMAND_REFUSED 0x00000200u
+// Reserved for a budget contract; never set by this library.
+#define WIREGUARD_EV_QUEUE_HEAD_DROPPED 0x00010000u
+#define WIREGUARD_EV_BURST_ITEM_SKIPPED 0x00020000u
+
+// state: snapshot after this operation, under the same lock hold.
+#define WIREGUARD_ST_SESSION_CURRENT 0x00000001u    // a session is selected for sending
+#define WIREGUARD_ST_INITIATION_PENDING 0x00000002u // an initiation awaits its response
+#define WIREGUARD_ST_HANDSHAKE_EXPIRED 0x00000004u  // the handshake cycle has expired
+#define WIREGUARD_ST_QUEUE_NONEMPTY 0x00000008u     // queued plaintext awaits a drain
+#define WIREGUARD_ST_BURST_PENDING 0x00000010u      // burst items or its initiation remain
+#define WIREGUARD_ST_COOKIE_HELD 0x00000020u        // a cookie for our next mac2 is held
+
+// All uint32_t: size 48, alignment 4 on every target. Do not include this
+// header under a non-default packing pragma.
+struct wireguard_packet_info
+{
+    uint32_t size;                 //  0 in : declared readable extent; never written
+    uint32_t in_flags;             //  4 in : must be 0
+    uint32_t max_transport_output; //  8 in : reserved, must be 0
+    uint32_t max_control_output;   // 12 in : reserved, must be 0
+    uint32_t written_size;         // 16 out: exclusive end offset of what this call wrote (48)
+    uint32_t input_kind;           // 20 out: kind of the ACCEPTED input, else NONE
+    uint32_t output_kind;          // 24 out: kind of dst[0, size) iff op == WRITE_TO_NETWORK
+    uint32_t events;               // 28 out: WIREGUARD_EV_*
+    uint32_t state;                // 32 out: WIREGUARD_ST_*
+    uint32_t op_seq_lo;            // 36 out: operation sequence, low 32 bits
+    uint32_t op_seq_hi;            // 40 out: operation sequence, high 32 bits
+    uint32_t burst_due_ms;         // 44 out: see below
+};
+
+// op_seq: per tunnel object, 1 for its first operation, +1 for every
+// wireguard_read/write/tick/force_handshake call, legacy or _ex, taken when
+// the lock is acquired -- so a larger value ran later. Not for _ex calls
+// refused with 19, wireguard_stats, the MTU setter or constructors. A new
+// tunnel object starts again at 1.
+//
+// burst_due_ms: WIREGUARD_BURST_DUE_NONE iff no pre-handshake burst is
+// pending; 0 if its next item would pass the pacing gate now; otherwise the
+// milliseconds until it does, rounded up. A hint for when to call again (deadline =
+// your clock read just before the call + burst_due_ms), not a schedule: the
+// library still enforces the pacing itself, and an early call returns DONE
+// with a fresh value. 0 together with an ERROR means due but blocked (dst too
+// small): calling again with the same dst cannot progress. Retransmission,
+// keepalive, rekey and expiry still need the periodic wireguard_tick.
+
+struct wireguard_result wireguard_write_ex(const struct wireguard_tunnel *tunnel,
+                                           const uint8_t *src,
+                                           uint32_t src_size,
+                                           uint8_t *dst,
+                                           uint32_t dst_size,
+                                           struct wireguard_packet_info *info);
+
+struct wireguard_result wireguard_read_ex(const struct wireguard_tunnel *tunnel,
+                                          const uint8_t *src,
+                                          uint32_t src_size,
+                                          uint8_t *dst,
+                                          uint32_t dst_size,
+                                          struct wireguard_packet_info *info);
+
+struct wireguard_result wireguard_tick_ex(const struct wireguard_tunnel *tunnel,
+                                          uint8_t *dst,
+                                          uint32_t dst_size,
+                                          struct wireguard_packet_info *info);
+
+struct wireguard_result wireguard_force_handshake_ex(const struct wireguard_tunnel *tunnel,
+                                                     uint8_t *dst,
+                                                     uint32_t dst_size,
+                                                     struct wireguard_packet_info *info);
+
 struct stats wireguard_stats(const struct wireguard_tunnel *tunnel);
 
 /// Refresh the tunnel MTU that content_padding_addition pads against.

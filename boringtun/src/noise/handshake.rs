@@ -677,6 +677,15 @@ impl Handshake {
         }
     }
 
+    /// Whether either initiation slot awaits a response. Two slots, because a
+    /// response is accepted for `state` or `previous` (`authenticate_response`).
+    /// Read only by the C entry points' metadata (`op_report`).
+    #[cfg_attr(not(feature = "ffi-bindings"), allow(dead_code))]
+    pub(crate) fn has_initiation_pending(&self) -> bool {
+        matches!(self.state, HandshakeState::InitSent(_))
+            || matches!(self.previous, HandshakeState::InitSent(_))
+    }
+
     pub(crate) fn set_expired(&mut self) {
         self.previous = HandshakeState::Expired;
         self.state = HandshakeState::Expired;
