@@ -1875,8 +1875,11 @@ impl Device {
                     }
 
                     // `commit_anonymous` has recorded `from` as the endpoint,
-                    // unless this was a cookie reply, which moves nothing: no
-                    // connected socket for it either.
+                    // unless this was a cookie reply, which moves nothing and
+                    // so has no business opening a connected socket either.
+                    // The upgrade below connects to the recorded endpoint
+                    // whatever happens here, so this guard is not what keeps
+                    // a cookie reply from redirecting the peer.
                     if !moves_endpoint {
                         continue;
                     }
@@ -1943,6 +1946,14 @@ impl Device {
                             // Likewise its lifetime, which its handler checks
                             // before acting on anything it receives.
                             let lifetime = p.commit_connection_lifetime();
+                            // The address the socket was connected to, which
+                            // is the endpoint as recorded -- not `from`. The two
+                            // are the same for every packet that roams, but a
+                            // handler keyed to an address its socket is not
+                            // connected to fails `is_current_connection` on
+                            // every datagram, and that socket outranks the
+                            // listener for its 4-tuple: a blackhole.
+                            let connected = p.endpoint().addr.unwrap_or(from);
                             // Not `unwrap`: this is `epoll_ctl(EPOLL_CTL_ADD)`,
                             // which fails with ENOSPC once this UID is out of
                             // `max_user_watches` -- reachable on a server with
@@ -1953,9 +1964,13 @@ impl Device {
                             // lookup and the tunnel have all accepted the
                             // datagram. Note the sibling `Result` one line
                             // above is already handled this way.
-                            if let Err(e) =
-                                d.register_conn_handler(Arc::clone(peer), sock, from, gen, lifetime)
-                            {
+                            if let Err(e) = d.register_conn_handler(
+                                Arc::clone(peer),
+                                sock,
+                                connected,
+                                gen,
+                                lifetime,
+                            ) {
                                 // `swap`, not `store`: four worker threads can
                                 // race into this block on different peers.
                                 if !conn_upgrade_disabled.swap(true, Ordering::Relaxed) {
@@ -1997,7 +2012,7 @@ impl Device {
                                 tracing::info!(
                                     message = "Connected endpoint",
                                     port = d.listen_port,
-                                    endpoint = ?from
+                                    endpoint = ?connected
                                 );
                             }
                         }
