@@ -253,10 +253,6 @@ pub(crate) enum Authenticated {
     },
 }
 
-/// `window` grown to cover a frame of `size` bytes, as measured by the two
-/// `*_window_observation` accessors on [`AmneziaConfig`]. A free function over
-/// the field rather than a method, so the transport path can call it while it
-/// still holds a borrow of the session.
 impl Authenticated {
     /// Whether accepting this packet makes its source the peer's endpoint.
     ///
@@ -272,6 +268,10 @@ impl Authenticated {
     }
 }
 
+/// `window` grown to cover a frame of `size` bytes, as measured by the two
+/// `*_window_observation` accessors on [`AmneziaConfig`]. A free function over
+/// the field rather than a method, so the transport path can call it while it
+/// still holds a borrow of the session.
 fn grown_window(window: u32, size: usize) -> u32 {
     window.max(u32::try_from(size).unwrap_or(u32::MAX))
 }

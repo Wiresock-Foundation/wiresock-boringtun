@@ -362,7 +362,6 @@ mod tests {
                 panic!("response");
             };
             assert_eq!(peer.tunnel.imitation_protocol(), *protocol);
-            peer.adopt_endpoint(from);
             let TunnResult::WriteToNetwork(keepalive) =
                 client.decapsulate(None, response, &mut buffer)
             else {
@@ -411,7 +410,6 @@ mod tests {
                 ),
                 TunnResult::Done
             ));
-            peer.adopt_endpoint(roam);
             assert_eq!(peer.tunnel.imitation_protocol(), *protocol);
             drop(peer);
             assert_eq!(peers[pubkey].lock().tunnel.imitation_protocol(), *protocol);
@@ -618,7 +616,6 @@ mod tests {
             } else {
                 None
             };
-            let moves_endpoint = packet.moves_endpoint();
             let reply = match commit_anonymous(&mut peer, packet, from, datagram, hint, &mut dst) {
                 TunnResult::Err(_) => return Err(()),
                 TunnResult::WriteToNetwork(reply) => Some(reply.to_vec()),
@@ -630,9 +627,6 @@ mod tests {
             };
             if auto_initiation && peer.tunnel.imitation_protocol() != P::None {
                 self.hints.discard(from);
-            }
-            if moves_endpoint {
-                peer.adopt_endpoint(from);
             }
             Ok(reply)
         }

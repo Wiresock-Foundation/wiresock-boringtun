@@ -517,9 +517,9 @@ fn authenticate_anonymous<'m>(
 /// observed).
 ///
 /// The fresh window is only provisional. The endpoint moves to `from` only if
-/// the commit succeeds -- the handler then records it with
-/// `Peer::adopt_endpoint`, which keeps the window as it is -- and if the commit
-/// fails the endpoint stays where it was, so the window it replaced is put
+/// the commit succeeds -- this records it with `Peer::adopt_endpoint`, which
+/// keeps the window as it is -- and if the commit fails the endpoint stays
+/// where it was, so the window it replaced is put
 /// back and goes on describing that path. A failure can come after the
 /// window has been touched: an authenticated transport frame is observed and
 /// then refused for its inner packet, and an authenticated initiation or
@@ -539,8 +539,9 @@ fn authenticate_anonymous<'m>(
 ///
 /// A packet that does not move the endpoint
 /// ([`Authenticated::moves_endpoint`]: a cookie reply) is no new path: the
-/// window and the evidence are left alone, and the caller must not adopt
-/// `from` for it either.
+/// window, the evidence and the endpoint are all left alone. Deciding that
+/// here, rather than in each caller, is what lets the device tests exercise
+/// the rule production runs.
 fn commit_anonymous<'a>(
     peer: &mut Peer,
     packet: Authenticated,
@@ -549,17 +550,22 @@ fn commit_anonymous<'a>(
     hint: Option<crate::noise::amnezia::AmneziaImitationProtocol>,
     dst: &'a mut [u8],
 ) -> TunnResult<'a> {
-    let replaced = (packet.moves_endpoint() && peer.endpoint().addr != Some(from))
+    let moves_endpoint = packet.moves_endpoint();
+    let replaced = (moves_endpoint && peer.endpoint().addr != Some(from))
         .then(|| peer.tunnel.begin_new_path());
     let result = peer
         .tunnel
         .commit_with_imitation(packet, datagram, hint, dst);
+    let committed = !matches!(result, TunnResult::Err(_));
     if let Some(window) = replaced {
-        if matches!(result, TunnResult::Err(_)) {
-            peer.tunnel.restore_udp_window(window);
-        } else {
+        if committed {
             peer.tunnel.discard_imitation_hint();
+        } else {
+            peer.tunnel.restore_udp_window(window);
         }
+    }
+    if moves_endpoint && committed {
+        peer.adopt_endpoint(from);
     }
     result
 }
@@ -1868,14 +1874,14 @@ impl Device {
                         }
                     }
 
-                    // A cookie reply leaves the endpoint, and with it the
-                    // connected socket, where they are.
+                    // `commit_anonymous` has recorded `from` as the endpoint,
+                    // unless this was a cookie reply, which moves nothing: no
+                    // connected socket for it either.
                     if !moves_endpoint {
                         continue;
                     }
 
                     // This packet was OK, that means we want to create a connected socket for this peer
-                    p.adopt_endpoint(from);
                     if d.config.use_connected_socket
                         && !conn_upgrade_disabled.load(Ordering::Relaxed)
                         && !p.upgrade_suppressed()
@@ -2900,7 +2906,6 @@ mod ingress_tests {
             };
             // The same buffer the trial wrote the plaintext into, as the
             // handler uses `t.dst_buf` for both.
-            let moves_endpoint = packet.moves_endpoint();
             let delivered =
                 match commit_anonymous(&mut guard, packet, from, &[], None, &mut dst[..]) {
                     TunnResult::WriteToNetwork(d) => Delivered::Network(d.to_vec()),
@@ -2910,9 +2915,6 @@ mod ingress_tests {
                     TunnResult::Err(_) => return Delivered::Error,
                 };
             self.window_at_commit.set(guard.tunnel.udp_window());
-            if moves_endpoint {
-                guard.adopt_endpoint(from);
-            }
             delivered
         }
 
@@ -2997,11 +2999,36 @@ mod ingress_tests {
         OsRng.fill_bytes(&mut wire);
         wire.extend_from_slice(&reply);
 
-        let hint_before = r.peer.lock().tunnel.has_imitation_hint();
+        // Pending Auto evidence from the settled address, which a roam would
+        // discard. Auto changes only outbound framing, so the reply above
+        // still reads as before.
+        {
+            use crate::noise::amnezia::AmneziaImitationProtocol as P;
+            let mut p = r.peer.lock();
+            let auto = r.amnezia.clone().with_protocol_imitation(P::Auto, None);
+            p.tunnel
+                .try_set_obfuscation(ObfuscationRanges::default(), auto)
+                .unwrap();
+            let prelude = AmneziaConfig::default()
+                .with_protocol_imitation(P::Stun, None)
+                .pre_handshake_imitation_datagrams(&mut OsRng)
+                .pop_front()
+                .unwrap()
+                .1;
+            let _ = p.tunnel.decapsulate(Some(settled.ip()), &prelude, &mut buf);
+            assert!(
+                p.tunnel.has_imitation_hint(),
+                "precondition: evidence pending"
+            );
+        }
+
         assert!(matches!(r.ingress(&wire, attacker), Delivered::Done));
         assert_eq!(r.endpoint(), Some(settled), "the endpoint moved");
         assert_eq!(r.window(), OLD_WINDOW, "the window was reset");
-        assert_eq!(r.peer.lock().tunnel.has_imitation_hint(), hint_before);
+        assert!(
+            r.peer.lock().tunnel.has_imitation_hint(),
+            "the evidence was discarded"
+        );
 
         // The same reply again, from anywhere, is refused.
         assert!(matches!(r.ingress(&wire, settled), Delivered::Refused));
@@ -3297,7 +3324,6 @@ mod ingress_tests {
                     match commit_anonymous(&mut guard, packet, from, &[], None, &mut dst[..]) {
                         TunnResult::WriteToNetwork(d) => {
                             let d = d.to_vec();
-                            guard.adopt_endpoint(from);
                             Some(self.kind(&d))
                         }
                         other => panic!("an accepted initiation gave {:?}", other),
