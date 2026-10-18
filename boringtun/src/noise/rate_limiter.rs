@@ -148,14 +148,24 @@ impl Source {
 /// stricter for a source, never laxer. What stricter costs depends on the
 /// table: in the share table it asks a legitimate peer for a cookie, one
 /// round trip; in the proven table, which only applies once the aggregate is
-/// spent, a source sharing every slot with one past its proven share has its
+/// spent, a source whose every slot is already past its proven share -- one
+/// other source sharing them all, or a different one in each row -- has its
 /// cookie-proven messages dropped as `UnderLoad` until the window ends. That
 /// is the price of bounded memory; with two rows of 1024 slots a given pair
-/// of sources shares every slot with probability 2^-20. The key is drawn per
+/// of sources shares every slot with probability 2^-20, and the chance grows
+/// with the number of busy sources in the window. The key is drawn per
 /// limiter and never leaves it, so a sender cannot pick addresses that land
 /// on a victim's slots. Each slot packs `(window << 32) | count`; a count from
 /// an earlier window reads as zero, so the table expires by itself, with no
 /// sweep and no dependence on anyone calling `reset_count`.
+///
+/// Each slot is updated atomically, but a count is the minimum over rows
+/// bumped one after the other, not one atomic step: calls in flight at the
+/// same time can each read a count within the share. So the share is exact
+/// for calls that do not overlap and approximate for ones that do. Each row
+/// hands out every count once, so no more than `SOURCE_ROWS` times the share
+/// can be admitted in a window, and in practice the excess is bounded by the
+/// number of workers counting the same source at once.
 struct SourceCounts {
     hasher: RandomState,
     slots: Box<[AtomicU64]>,
