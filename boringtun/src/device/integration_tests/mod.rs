@@ -1862,9 +1862,32 @@ allowed_ip=10.66.66.2/32",
                 other => panic!("expected an initiation, got {:?}", other),
             };
             sock.send_to(&init, server).unwrap();
-            let (n, _) = sock
+            let (mut n, _) = sock
                 .recv_from(&mut rx)
                 .unwrap_or_else(|e| panic!("no response to initiation {}: {:?}", i, e));
+            // Dozens of initiations a second from one address put that
+            // source past its share of the handshake budget, so it is asked
+            // for a cookie. Answer as any initiator would: take the cookie and
+            // initiate again, now carrying mac2.
+            if matches!(
+                Tunn::parse_incoming_packet(Default::default(), &rx[..n]),
+                Ok(Packet::PacketCookieReply(_))
+            ) {
+                let reply = rx[..n].to_vec();
+                assert!(matches!(
+                    client.decapsulate(None, &reply, &mut buf),
+                    TunnResult::Done
+                ));
+                let init = match client.format_handshake_initiation(&mut buf, true) {
+                    TunnResult::WriteToNetwork(d) => d.to_vec(),
+                    other => panic!("expected an initiation, got {:?}", other),
+                };
+                sock.send_to(&init, server).unwrap();
+                n = sock
+                    .recv_from(&mut rx)
+                    .unwrap_or_else(|e| panic!("no response to initiation {}: {:?}", i, e))
+                    .0;
+            }
             assert!(
                 matches!(
                     Tunn::parse_incoming_packet(Default::default(), &rx[..n]),

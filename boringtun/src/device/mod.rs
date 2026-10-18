@@ -523,9 +523,9 @@ fn authenticate_anonymous<'m>(
 /// observed).
 ///
 /// The fresh window is only provisional. The endpoint moves to `from` only if
-/// the commit succeeds -- the handler then records it with
-/// `Peer::adopt_endpoint`, which keeps the window as it is -- and if the commit
-/// fails the endpoint stays where it was, so the window it replaced is put
+/// the commit succeeds -- this records it with `Peer::adopt_endpoint`, which
+/// keeps the window as it is -- and if the commit fails the endpoint stays
+/// where it was, so the window it replaced is put
 /// back and goes on describing that path. A failure can come after the
 /// window has been touched: an authenticated transport frame is observed and
 /// then refused for its inner packet, and an authenticated initiation or
@@ -542,6 +542,12 @@ fn authenticate_anonymous<'m>(
 ///
 /// The peer's lock is held from here to the endpoint update, so nothing else
 /// sees the window and the endpoint disagree.
+///
+/// A packet that does not move the endpoint
+/// ([`Authenticated::moves_endpoint`]: a cookie reply) is no new path: the
+/// window, the evidence and the endpoint are all left alone. Deciding that
+/// here, rather than in each caller, is what lets the device tests exercise
+/// the rule production runs.
 fn commit_anonymous<'a>(
     peer: &mut Peer,
     packet: Authenticated,
@@ -550,16 +556,22 @@ fn commit_anonymous<'a>(
     hint: Option<crate::noise::amnezia::AmneziaImitationProtocol>,
     dst: &'a mut [u8],
 ) -> TunnResult<'a> {
-    let replaced = (peer.endpoint().addr != Some(from)).then(|| peer.tunnel.begin_new_path());
+    let moves_endpoint = packet.moves_endpoint();
+    let replaced = (moves_endpoint && peer.endpoint().addr != Some(from))
+        .then(|| peer.tunnel.begin_new_path());
     let result = peer
         .tunnel
         .commit_with_imitation(packet, datagram, hint, dst);
+    let committed = !matches!(result, TunnResult::Err(_));
     if let Some(window) = replaced {
-        if matches!(result, TunnResult::Err(_)) {
-            peer.tunnel.restore_udp_window(window);
-        } else {
+        if committed {
             peer.tunnel.discard_imitation_hint();
+        } else {
+            peer.tunnel.restore_udp_window(window);
         }
+    }
+    if moves_endpoint && committed {
+        peer.adopt_endpoint(from);
     }
     result
 }
@@ -576,14 +588,14 @@ fn commit_anonymous<'a>(
 /// shape there and is dropped before any tunnel sees it.
 fn receive_on_connection<'a>(
     tunnel: &mut Tunn,
-    from: IpAddr,
+    from: SocketAddr,
     datagram: &[u8],
     dst: &'a mut [u8],
 ) -> TunnResult<'a> {
     if datagram.is_empty() {
         return TunnResult::Done;
     }
-    tunnel.decapsulate(Some(from), datagram, dst)
+    tunnel.decapsulate_from(Some(from), datagram, dst)
 }
 
 /// Whether creating an IPv6 socket failed because the host has no IPv6, as
@@ -934,7 +946,12 @@ impl Device {
             preshared_key,
             keepalive,
             next_index,
-            None,
+            // The device's limiter, as `set_key` gives every peer it already
+            // has. `None` gave a peer added later a private limiter -- its own
+            // budget and its own cookie secret -- so its connected socket
+            // rated and cookied it apart from the listener, and a cookie the
+            // listener issued failed mac2 there.
+            self.rate_limiter.clone(),
             self.config.obf,
             // Not `as_responder()`: the kernel module emits Jc junk from
             // `wg_packet_send_handshake_initiation` (src/send.c:58-75), i.e.
@@ -1778,7 +1795,7 @@ impl Device {
                         &d.config.amnezia,
                         obf,
                         rate_limiter,
-                        Some(from.ip()),
+                        Some(from.into()),
                         &candidates,
                         datagram,
                         |packet| {
@@ -1897,6 +1914,7 @@ impl Device {
                     } else {
                         None
                     };
+                    let moves_endpoint = packet.moves_endpoint();
                     match commit_anonymous(&mut p, packet, from, datagram, hint, &mut t.dst_buf[..])
                     {
                         TunnResult::Done => {}
@@ -1948,8 +1966,17 @@ impl Device {
                         }
                     }
 
+                    // `commit_anonymous` has recorded `from` as the endpoint,
+                    // unless this was a cookie reply, which moves nothing and
+                    // so has no business opening a connected socket either.
+                    // The upgrade below connects to the recorded endpoint
+                    // whatever happens here, so this guard is not what keeps
+                    // a cookie reply from redirecting the peer.
+                    if !moves_endpoint {
+                        continue;
+                    }
+
                     // This packet was OK, that means we want to create a connected socket for this peer
-                    p.adopt_endpoint(from);
                     if d.config.use_connected_socket
                         && !conn_upgrade_disabled.load(Ordering::Relaxed)
                         && !p.upgrade_suppressed()
@@ -2011,6 +2038,14 @@ impl Device {
                             // Likewise its lifetime, which its handler checks
                             // before acting on anything it receives.
                             let lifetime = p.commit_connection_lifetime();
+                            // The address the socket was connected to, which
+                            // is the endpoint as recorded -- not `from`. The two
+                            // are the same for every packet that roams, but a
+                            // handler keyed to an address its socket is not
+                            // connected to fails `is_current_connection` on
+                            // every datagram, and that socket outranks the
+                            // listener for its 4-tuple: a blackhole.
+                            let connected = p.endpoint().addr.unwrap_or(from);
                             // Not `unwrap`: this is `epoll_ctl(EPOLL_CTL_ADD)`,
                             // which fails with ENOSPC once this UID is out of
                             // `max_user_watches` -- reachable on a server with
@@ -2021,9 +2056,13 @@ impl Device {
                             // lookup and the tunnel have all accepted the
                             // datagram. Note the sibling `Result` one line
                             // above is already handled this way.
-                            if let Err(e) =
-                                d.register_conn_handler(Arc::clone(peer), sock, from, gen, lifetime)
-                            {
+                            if let Err(e) = d.register_conn_handler(
+                                Arc::clone(peer),
+                                sock,
+                                connected,
+                                gen,
+                                lifetime,
+                            ) {
                                 // `swap`, not `store`: four worker threads can
                                 // race into this block on different peers.
                                 if !conn_upgrade_disabled.swap(true, Ordering::Relaxed) {
@@ -2065,7 +2104,7 @@ impl Device {
                                 tracing::info!(
                                     message = "Connected endpoint",
                                     port = d.listen_port,
-                                    endpoint = ?from
+                                    endpoint = ?connected
                                 );
                             }
                         }
@@ -2087,7 +2126,6 @@ impl Device {
         gen: DiagGen,
         lifetime: peer::ConnLifetime,
     ) -> Result<(), Error> {
-        let peer_addr = endpoint.ip();
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
@@ -2134,7 +2172,7 @@ impl Device {
                     }
                     match receive_on_connection(
                         &mut p.tunnel,
-                        peer_addr,
+                        endpoint,
                         &t.src_buf[..read_bytes],
                         &mut t.dst_buf[..],
                     ) {
@@ -2664,7 +2702,7 @@ mod ingress_tests {
             amnezia,
             obf,
             &limiter,
-            Some(src_addr),
+            Some(src_addr.into()),
             &candidates,
             datagram,
             |packet| match packet {
@@ -2788,7 +2826,7 @@ mod ingress_tests {
                 &amnezia,
                 obf,
                 &limiter,
-                Some(src_addr),
+                Some(src_addr.into()),
                 &candidates,
                 &wire,
                 |packet| {
@@ -2957,7 +2995,7 @@ mod ingress_tests {
                 &self.amnezia,
                 ObfuscationRanges::default(),
                 &self.limiter,
-                Some(from.ip()),
+                Some(from.into()),
                 &candidates,
                 wire,
                 |packet| {
@@ -2985,7 +3023,6 @@ mod ingress_tests {
                     TunnResult::Err(_) => return Delivered::Error,
                 };
             self.window_at_commit.set(guard.tunnel.udp_window());
-            guard.adopt_endpoint(from);
             delivered
         }
 
@@ -3021,6 +3058,90 @@ mod ingress_tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// A valid cookie reply arriving from a new address is stored, and moves
+    /// nothing: not the endpoint (so not the connected socket either), not
+    /// the UDP window, not the pending imitation evidence. Its key is derived
+    /// from the client's *public* key and it is bound only to our last
+    /// handshake message's mac1, which travelled in clear -- this test makes
+    /// one exactly that way, as an on-path third party could. A replay of it
+    /// is then refused: that mac1 is spent.
+    #[test]
+    fn a_cookie_reply_from_a_new_address_does_not_move_the_endpoint() {
+        let settled = addr("198.51.100.1:40000");
+        let attacker = addr("203.0.113.66:4444");
+        let r = Roaming::new().settled_at(settled);
+        let client_public = *r.peers.keys().next().unwrap();
+
+        // The server peer sends a handshake message of its own; its mac1 and
+        // sender index are what a cookie reply must answer.
+        let mut buf = vec![0u8; MAX_UDP_SIZE];
+        let init = match r
+            .peer
+            .lock()
+            .tunnel
+            .format_handshake_initiation(&mut buf, true)
+        {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+        let at = ROAM_S[0] as usize;
+        let sender_idx =
+            u32::from_le_bytes([init[at + 4], init[at + 5], init[at + 6], init[at + 7]]);
+        let mac1 = &init[at + 116..at + 132];
+        assert_eq!(r.endpoint(), Some(settled));
+
+        let mut reply = vec![0u8; COOKIE_REPLY_SZ];
+        RateLimiter::new(&client_public, 0)
+            .format_cookie_reply(
+                ObfuscationRanges::default(),
+                &mut OsRng,
+                sender_idx,
+                [7u8; 16],
+                mac1,
+                &mut reply,
+            )
+            .unwrap();
+        let mut wire = vec![0u8; ROAM_S[2] as usize];
+        OsRng.fill_bytes(&mut wire);
+        wire.extend_from_slice(&reply);
+
+        // Pending Auto evidence from the settled address, which a roam would
+        // discard. Auto changes only outbound framing, so the reply above
+        // still reads as before.
+        {
+            use crate::noise::amnezia::AmneziaImitationProtocol as P;
+            let mut p = r.peer.lock();
+            let auto = r.amnezia.clone().with_protocol_imitation(P::Auto, None);
+            p.tunnel
+                .try_set_obfuscation(ObfuscationRanges::default(), auto)
+                .unwrap();
+            let prelude = AmneziaConfig::default()
+                .with_protocol_imitation(P::Stun, None)
+                .pre_handshake_imitation_datagrams(&mut OsRng)
+                .pop_front()
+                .unwrap()
+                .1;
+            let _ = p.tunnel.decapsulate(Some(settled.ip()), &prelude, &mut buf);
+            assert!(
+                p.tunnel.has_imitation_hint(),
+                "precondition: evidence pending"
+            );
+        }
+
+        assert!(matches!(r.ingress(&wire, attacker), Delivered::Done));
+        assert_eq!(r.endpoint(), Some(settled), "the endpoint moved");
+        assert_eq!(r.window(), OLD_WINDOW, "the window was reset");
+        assert!(
+            r.peer.lock().tunnel.has_imitation_hint(),
+            "the evidence was discarded"
+        );
+
+        // The same reply again, from anywhere, is refused.
+        assert!(matches!(r.ingress(&wire, settled), Delivered::Refused));
+        assert!(matches!(r.ingress(&wire, attacker), Delivered::Refused));
+        assert_eq!(r.endpoint(), Some(settled));
     }
 
     /// Only a refused address family means "no IPv6 here"; anything else
@@ -3061,7 +3182,7 @@ mod ingress_tests {
             TunnResult::WriteToNetwork(_)
         ));
         assert!(tunnel.has_pending_burst());
-        let from = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        let from: SocketAddr = "198.51.100.1:51820".parse().unwrap();
         for _ in 0..5 {
             assert!(matches!(
                 receive_on_connection(&mut tunnel, from, &[], &mut dst),
@@ -3346,7 +3467,7 @@ mod ingress_tests {
                 &self.amnezia,
                 obf,
                 &self.limiter,
-                Some(from.ip()),
+                Some(from.into()),
                 &candidates,
                 wire,
                 |packet| {
@@ -3364,7 +3485,6 @@ mod ingress_tests {
                     match commit_anonymous(&mut guard, packet, from, &[], None, &mut dst[..]) {
                         TunnResult::WriteToNetwork(d) => {
                             let d = d.to_vec();
-                            guard.adopt_endpoint(from);
                             Some(self.kind(&d))
                         }
                         other => panic!("an accepted initiation gave {:?}", other),
@@ -3623,23 +3743,16 @@ mod ingress_tests {
             other => panic!("expected an initiation, got {:?}", other),
         };
 
-        let limiter = RateLimiter::new(&server_public, HANDSHAKE_RATE_LIMIT);
+        let limiter = RateLimiter::new(&server_public, 0);
         let stripped = amnezia
             .strip_inbound(obf, &datagram)
             .expect("our own initiation must match our own shape");
         let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
         let mut scratch = vec![0u8; MAX_UDP_SIZE];
 
-        // `is_under_load` returns the counter value from *before* its own
-        // increment, so the limit-th call still reads as unloaded and the one
-        // after it is the first to demand a cookie. Asserting `Ok` here is not
-        // decoration: if the threshold ever moves, this loop stops leaving the
-        // limiter in the state the test is about, and it says so.
-        for _ in 0..HANDSHAKE_RATE_LIMIT {
-            limiter
-                .verify_packet(obf, &mut OsRng, Some(src), stripped, &mut scratch)
-                .expect("below the handshake rate limit, no cookie is demanded");
-        }
+        // A zero budget demands a cookie for the first message, whatever the
+        // clock: only the reply's size matters here, and the thresholds that
+        // decide when a real limiter gets there are `rate_limiter`'s tests.
         let cookie_len =
             match limiter.verify_packet(obf, &mut OsRng, Some(src), stripped, &mut scratch) {
                 Err(TunnResult::WriteToNetwork(cookie)) => cookie.len(),

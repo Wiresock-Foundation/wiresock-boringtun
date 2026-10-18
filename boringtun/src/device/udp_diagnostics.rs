@@ -2541,7 +2541,7 @@ mod tests {
     fn test_peer_with(index: u32, amnezia: AmneziaConfig, endpoint: Option<SocketAddr>) -> Peer {
         let secret = x25519::StaticSecret::from([0x11; 32]);
         let peer_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0x22; 32]));
-        let tunnel = Tunn::new_with_obfuscation(
+        let mut tunnel = Tunn::new_with_obfuscation(
             secret,
             peer_public,
             None,
@@ -2552,6 +2552,8 @@ mod tests {
             amnezia,
         )
         .unwrap();
+        // The preservation proofs compare two runs' retransmission times.
+        tunnel.seed_jitter(u64::from(index));
         Peer::new(tunnel, index, endpoint, None)
     }
 
