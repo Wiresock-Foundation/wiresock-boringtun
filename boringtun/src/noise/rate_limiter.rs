@@ -810,11 +810,13 @@ mod tests {
 
     /// One client behind a shared address can spend that address's share --
     /// mac1-only messages are enough, its own cookie on top -- but its NAT
-    /// neighbours are then cookied and let through, never dropped, while the
-    /// aggregate has room: their proven messages are charged to it.
+    /// neighbours are then cookied and let through while the aggregate has
+    /// room: their proven messages are charged to it. Once the aggregate is
+    /// spent, clients sharing an address share its proven share too, as on
+    /// Linux, so the excess is dropped for the neighbour as well.
     #[cfg(feature = "mock-instant")]
     #[test]
-    fn a_nat_neighbour_cannot_get_its_neighbours_dropped() {
+    fn a_nat_neighbour_is_cookied_not_dropped_while_the_aggregate_has_room() {
         let l = limiter(100);
         let attacker = endpoint("198.51.100.7:1");
         let neighbour = endpoint("198.51.100.7:2");
@@ -849,6 +851,14 @@ mod tests {
         assert!(l.count.load(Ordering::SeqCst) >= 100);
         assert!(matches!(
             gate(&l, Some(attacker), &message(&l, Some(own))),
+            HandshakeGate::UnderLoad
+        ));
+        assert!(matches!(
+            gate(
+                &l,
+                Some(neighbour),
+                &message(&l, Some(l.current_cookie(neighbour)))
+            ),
             HandshakeGate::UnderLoad
         ));
     }
