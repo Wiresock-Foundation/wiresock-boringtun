@@ -465,7 +465,18 @@ impl Tunn {
         }
 
         if self.handshake.is_expired() {
-            return TunnResult::Err(WireGuardError::ConnectionExpired);
+            // A persistent keepalive turned on since the cycle expired is
+            // still owed. Sending it restarts the cycle, the way a write
+            // does: with no session it is queued behind a fresh initiation
+            // (`format_handshake_initiation` on an Expired handshake). An
+            // interval that was already on owes nothing and stays expired.
+            if self.timers.persistent_keepalive == 0 || !self.timers.persistent_keepalive_due {
+                return TunnResult::Err(WireGuardError::ConnectionExpired);
+            }
+            tracing::debug!("KEEPALIVE(PERSISTENT_KEEPALIVE)");
+            self.timers.persistent_keepalive_due = false;
+            self.timer_tick(TimePersistentKeepalive);
+            return self.send_keepalive(dst, keepalive_rollback);
         }
 
         // Load timers only once:
@@ -619,20 +630,30 @@ impl Tunn {
         }
 
         if keepalive_required {
-            let result = self.encapsulate(&[], dst);
-            if matches!(
-                result,
-                TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
-            ) {
-                let (due, persistent, passive) = keepalive_rollback;
-                self.timers.persistent_keepalive_due = due;
-                self.timers[TimePersistentKeepalive] = persistent;
-                self.timers.want_keepalive = passive;
-            }
-            return result;
+            return self.send_keepalive(dst, keepalive_rollback);
         }
 
         TunnResult::Done
+    }
+
+    /// Send the keepalive a tick selected. If `dst` cannot hold it, put back
+    /// what selecting it spent, `rollback` as `update_timers` captured it.
+    fn send_keepalive<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+        rollback: (bool, Duration, Option<Duration>),
+    ) -> TunnResult<'a> {
+        let result = self.encapsulate(&[], dst);
+        if matches!(
+            result,
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ) {
+            let (due, persistent, passive) = rollback;
+            self.timers.persistent_keepalive_due = due;
+            self.timers[TimePersistentKeepalive] = persistent;
+            self.timers.want_keepalive = passive;
+        }
+        result
     }
 
     pub fn time_since_last_handshake(&self) -> Option<Duration> {
