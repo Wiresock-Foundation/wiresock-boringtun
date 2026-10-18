@@ -5066,6 +5066,103 @@ mod tests {
         assert_eq!(poll_kind(&mut my_tun), None, "a redundant keepalive");
     }
 
+    /// Tick once a second until the cycle expires, within `limit`.
+    #[cfg(feature = "mock-instant")]
+    fn tick_until_expired(tun: &mut Tunn, limit: Duration) {
+        let mut dst = vec![0u8; 2048];
+        let mut waited = Duration::ZERO;
+        loop {
+            match tun.update_timers(&mut dst) {
+                TunnResult::Err(WireGuardError::ConnectionExpired) => return,
+                TunnResult::Err(e) => panic!("unexpected timer error {:?}", e),
+                _ => {}
+            }
+            assert!(waited < limit, "the cycle never expired");
+            advance(Duration::from_secs(1));
+            waited += Duration::from_secs(1);
+        }
+    }
+
+    /// A persistent keepalive turned on after an idle tunnel's keys expired
+    /// is owed like any other: the next tick restarts the cycle with an
+    /// initiation, and the handshake it starts completes.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_keepalive_turned_on_after_idle_expiry_restarts_the_cycle() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        tick_until_expired(
+            &mut my_tun,
+            timers::REJECT_AFTER_TIME * 3 + Duration::from_secs(5),
+        );
+        let mut dst = vec![0u8; 2048];
+        assert!(matches!(
+            my_tun.update_timers(&mut dst),
+            TunnResult::Err(WireGuardError::ConnectionExpired)
+        ));
+
+        my_tun.set_persistent_keepalive(Some(25));
+        let init = unwrap_network_packet(my_tun.update_timers(&mut dst));
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+        assert!(my_tun.time_since_last_handshake().is_some());
+        assert_eq!(poll_kind(&mut my_tun), None, "a redundant keepalive");
+    }
+
+    /// The same after a handshake that ran out of attempts, and the restarted
+    /// cycle is a fresh one: it retransmits instead of expiring at once on the
+    /// old cycle's start time.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_keepalive_turned_on_after_exhausted_attempts_restarts_the_cycle() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let _ = create_handshake_init(&mut my_tun);
+        tick_until_expired(&mut my_tun, timers::untuned_attempt_window() * 2);
+
+        my_tun.set_persistent_keepalive(Some(25));
+        assert_eq!(poll_kind(&mut my_tun), Some("initiation"));
+        advance(
+            REKEY_TIMEOUT + Duration::from_millis(u64::from(timers::REKEY_TIMEOUT_JITTER_MAX_MS)),
+        );
+        assert_eq!(poll_kind(&mut my_tun), Some("initiation"));
+    }
+
+    /// A restart the caller's buffer cannot hold stays owed, and the next tick
+    /// with room sends it.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_keepalive_owed_after_expiry_survives_a_short_dst() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let _ = create_handshake_init(&mut my_tun);
+        tick_until_expired(&mut my_tun, timers::untuned_attempt_window() * 2);
+
+        my_tun.set_persistent_keepalive(Some(25));
+        assert!(matches!(
+            my_tun.update_timers(&mut [0u8; 64]),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+        advance(Duration::from_millis(250));
+        assert_eq!(poll_kind(&mut my_tun), Some("initiation"));
+    }
+
+    /// Only turning the interval on owes a keepalive: an interval that was
+    /// already on, or one that is changed, leaves an expired cycle expired.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn an_interval_already_on_does_not_restart_an_expired_cycle() {
+        let (mut my_tun, _their_tun) = create_two_tuns_with_keepalive(Some(25));
+        let _ = create_handshake_init(&mut my_tun);
+        tick_until_expired(&mut my_tun, timers::untuned_attempt_window() * 2);
+        my_tun.set_persistent_keepalive(Some(30));
+        for _ in 0..40 {
+            advance(Duration::from_secs(1));
+            assert!(matches!(
+                my_tun.update_timers(&mut [0u8; 2048]),
+                TunnResult::Err(WireGuardError::ConnectionExpired)
+            ));
+        }
+    }
+
     /// A keepalive the caller's buffer cannot hold keeps its demand: the one
     /// owed at activation goes out at the next tick that has room, not an
     /// interval later.
