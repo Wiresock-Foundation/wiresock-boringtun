@@ -349,7 +349,7 @@ mod tests {
                 &config,
                 Default::default(),
                 &limiter,
-                Some(from.ip()),
+                Some(from.into()),
                 &candidates,
                 init,
                 |p| authenticate_anonymous(&peers, &indices, &secret, &public, p, &mut output),
@@ -362,7 +362,6 @@ mod tests {
                 panic!("response");
             };
             assert_eq!(peer.tunnel.imitation_protocol(), *protocol);
-            peer.adopt_endpoint(from);
             let TunnResult::WriteToNetwork(keepalive) =
                 client.decapsulate(None, response, &mut buffer)
             else {
@@ -393,7 +392,7 @@ mod tests {
                 &config,
                 Default::default(),
                 &limiter,
-                Some(roam.ip()),
+                Some(roam.into()),
                 &candidates,
                 &keepalive,
                 |p| authenticate_anonymous(&peers, &indices, &secret, &public, p, &mut output),
@@ -411,7 +410,6 @@ mod tests {
                 ),
                 TunnResult::Done
             ));
-            peer.adopt_endpoint(roam);
             assert_eq!(peer.tunnel.imitation_protocol(), *protocol);
             drop(peer);
             assert_eq!(peers[pubkey].lock().tunnel.imitation_protocol(), *protocol);
@@ -526,7 +524,7 @@ mod tests {
                     &self.config,
                     self.obf,
                     &self.limiter,
-                    Some(from.ip()),
+                    Some(from.into()),
                     &candidates,
                     datagram,
                     |p| {
@@ -584,7 +582,7 @@ mod tests {
                 &self.config,
                 self.obf,
                 &self.limiter,
-                Some(from.ip()),
+                Some(from.into()),
                 &candidates,
                 datagram,
                 |p| {
@@ -630,7 +628,6 @@ mod tests {
             if auto_initiation && peer.tunnel.imitation_protocol() != P::None {
                 self.hints.discard(from);
             }
-            peer.adopt_endpoint(from);
             Ok(reply)
         }
 

@@ -26,13 +26,14 @@
 //!
 //! [`Tunn::decapsulate`]: super::Tunn::decapsulate
 
+#[cfg(test)]
 use std::net::IpAddr;
 
 use super::amnezia::{AmneziaConfig, InboundCandidates};
 use super::errors::WireGuardError;
 use super::handshake::ObfuscationRanges;
 use super::imitation::auto::allows_imitation_hint;
-use super::rate_limiter::{CookieDemand, HandshakeGate, LoadDecision, RateLimiter};
+use super::rate_limiter::{CookieDemand, HandshakeGate, LoadDecision, RateLimiter, Source};
 use super::{HandshakeInit, HandshakeResponse, Packet, Tunn};
 
 /// What became of one received datagram.
@@ -92,7 +93,7 @@ pub(crate) fn receive<T>(
     amnezia: &AmneziaConfig,
     obf: ObfuscationRanges,
     limiter: &RateLimiter,
-    src_addr: Option<IpAddr>,
+    src_addr: Option<Source>,
     candidates: &InboundCandidates,
     datagram: &[u8],
     mut trial: impl FnMut(Packet<'_>) -> Result<T, WireGuardError>,
@@ -362,7 +363,7 @@ pub(crate) mod fixtures {
         assert!(
             matches!(
                 limiter.gate_handshake(
-                    SRC,
+                    SRC.map(Into::into),
                     &wire[INIT_AT..],
                     0,
                     CookieDefense::Armed,
@@ -741,13 +742,21 @@ mod tests {
         let candidates = amnezia.inbound_candidates(obf, &wire);
 
         let mut tried = Vec::new();
-        let outcome = receive(&amnezia, obf, &limiter, SRC, &candidates, &wire, |p| {
-            tried.push(kind(&p));
-            match p {
-                Packet::PacketCookieReply(_) => Ok("cookie"),
-                _ => Err(WireGuardError::InvalidAeadTag),
-            }
-        });
+        let outcome = receive(
+            &amnezia,
+            obf,
+            &limiter,
+            SRC.map(Into::into),
+            &candidates,
+            &wire,
+            |p| {
+                tried.push(kind(&p));
+                match p {
+                    Packet::PacketCookieReply(_) => Ok("cookie"),
+                    _ => Err(WireGuardError::InvalidAeadTag),
+                }
+            },
+        );
         assert!(matches!(outcome, Inbound::Accepted("cookie")));
         // The response reading failed mac1 and never reached a trial; transport
         // came after the accepted cookie and was never tried.
@@ -779,7 +788,7 @@ mod tests {
                     &amnezia,
                     obf,
                     &starved,
-                    src,
+                    src.map(Into::into),
                     &candidates,
                     &wire,
                     transport_only
@@ -790,7 +799,15 @@ mod tests {
             let starved = RateLimiter::new(&public, 0);
             match (
                 src,
-                receive(&amnezia, obf, &starved, src, &candidates, &wire, nothing),
+                receive(
+                    &amnezia,
+                    obf,
+                    &starved,
+                    src.map(Into::into),
+                    &candidates,
+                    &wire,
+                    nothing,
+                ),
             ) {
                 (Some(_), Inbound::Cookie(_)) => {}
                 (
@@ -1087,10 +1104,18 @@ mod tests {
         let refused = |trial: &mut dyn FnMut(&Packet<'_>) -> WireGuardError| {
             let limiter = RateLimiter::new(&public, 100);
             let mut tried = Vec::new();
-            let outcome = receive(&amnezia, obf, &limiter, SRC, &candidates, &wire, |p| {
-                tried.push(kind(&p));
-                Err::<(), _>(trial(&p))
-            });
+            let outcome = receive(
+                &amnezia,
+                obf,
+                &limiter,
+                SRC.map(Into::into),
+                &candidates,
+                &wire,
+                |p| {
+                    tried.push(kind(&p));
+                    Err::<(), _>(trial(&p))
+                },
+            );
             assert_eq!(tried, vec!["init", "cookie", "data"]);
             match outcome {
                 Inbound::Refused(refusal) => refusal,
@@ -1149,7 +1174,7 @@ mod tests {
                 &amnezia,
                 obf,
                 &limiter,
-                SRC,
+                SRC.map(Into::into),
                 &candidates,
                 &wire,
                 |p| match p {
@@ -1161,9 +1186,15 @@ mod tests {
         ));
         let starved = RateLimiter::new(&public, 0);
         assert!(matches!(
-            receive(&amnezia, obf, &starved, SRC, &candidates, &wire, |_| {
-                Err::<(), _>(WireGuardError::InvalidAeadTag)
-            }),
+            receive(
+                &amnezia,
+                obf,
+                &starved,
+                SRC.map(Into::into),
+                &candidates,
+                &wire,
+                |_| { Err::<(), _>(WireGuardError::InvalidAeadTag) }
+            ),
             Inbound::Cookie(_)
         ));
         let starved = RateLimiter::new(&public, 0);
@@ -1181,7 +1212,7 @@ mod tests {
                 &amnezia,
                 obf,
                 &limiter,
-                SRC,
+                SRC.map(Into::into),
                 &InboundCandidates::default(),
                 &wire,
                 |_| Ok::<(), _>(())
@@ -1200,15 +1231,23 @@ mod tests {
         for accept in ["cookie", "data"] {
             let limiter = RateLimiter::new(&public, 100);
             let mut tried = Vec::new();
-            let outcome = receive(&amnezia, obf, &limiter, SRC, &candidates, &wire, |p| {
-                let k = kind(&p);
-                tried.push(k);
-                match k {
-                    "init" => Err(WireGuardError::DestinationBufferTooSmall),
-                    k if k == accept => Ok(k),
-                    _ => Err(WireGuardError::InvalidAeadTag),
-                }
-            });
+            let outcome = receive(
+                &amnezia,
+                obf,
+                &limiter,
+                SRC.map(Into::into),
+                &candidates,
+                &wire,
+                |p| {
+                    let k = kind(&p);
+                    tried.push(k);
+                    match k {
+                        "init" => Err(WireGuardError::DestinationBufferTooSmall),
+                        k if k == accept => Ok(k),
+                        _ => Err(WireGuardError::InvalidAeadTag),
+                    }
+                },
+            );
             assert!(matches!(outcome, Inbound::Accepted(k) if k == accept));
             let expected: &[&str] = if accept == "cookie" {
                 &["init", "cookie"]
