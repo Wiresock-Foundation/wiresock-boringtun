@@ -145,8 +145,13 @@ impl Source {
 /// Each source maps to one slot in each of [`SOURCE_ROWS`] rows through a
 /// randomly keyed SipHash, and its count is the smaller of its slots' counts.
 /// Sharing a slot can only *raise* a count, so a collision makes the limiter
-/// stricter for a source, never laxer -- the worst it does is ask a legitimate
-/// peer for a cookie, which costs one round trip. The key is drawn per
+/// stricter for a source, never laxer. What stricter costs depends on the
+/// table: in the share table it asks a legitimate peer for a cookie, one
+/// round trip; in the proven table, which only applies once the aggregate is
+/// spent, a source sharing every slot with one past its proven share has its
+/// cookie-proven messages dropped as `UnderLoad` until the window ends. That
+/// is the price of bounded memory; with two rows of 1024 slots a given pair
+/// of sources shares every slot with probability 2^-20. The key is drawn per
 /// limiter and never leaves it, so a sender cannot pick addresses that land
 /// on a victim's slots. Each slot packs `(window << 32) | count`; a count from
 /// an earlier window reads as zero, so the table expires by itself, with no
@@ -169,14 +174,17 @@ impl SourceCounts {
     /// Count one message from `source` in `window`, and return the source's
     /// count including it.
     fn count(&self, source: Source, window: u32) -> u32 {
-        let hash = self.hasher.hash_one(source.budget_key());
-        (0..SOURCE_ROWS)
-            .map(|row| {
-                let column = (hash >> (32 * row)) as usize % SOURCE_SLOTS;
-                Self::bump(&self.slots[row * SOURCE_SLOTS + column], window)
-            })
+        self.slots_of(source)
+            .map(|slot| Self::bump(&self.slots[slot], window))
             .min()
             .unwrap_or(0)
+    }
+
+    /// The slot `source` counts in, in each row.
+    fn slots_of(&self, source: Source) -> impl Iterator<Item = usize> {
+        let hash = self.hasher.hash_one(source.budget_key());
+        (0..SOURCE_ROWS)
+            .map(move |row| row * SOURCE_SLOTS + (hash >> (32 * row)) as usize % SOURCE_SLOTS)
     }
 
     fn bump(slot: &AtomicU64, window: u32) -> u32 {
@@ -433,7 +441,11 @@ impl RateLimiter {
     /// once -- an initiation at one offset, a response at another -- and a
     /// datagram is one event for the budget however many ways it is read. The
     /// first call that gets past mac1 decides and records it; later calls
-    /// reuse it without counting again.
+    /// reuse it without counting again. The same holds for the charge a
+    /// cookie-proven message makes: the first reading with a valid mac2 is
+    /// charged and its admission recorded, and every later one with a valid
+    /// mac2 shares it, so a reading that Noise then refuses neither spends
+    /// the budget twice nor keeps another reading of the same datagram out.
     ///
     /// `defense` is the receiver's AmneziaWG `DisableCookies` policy
     /// ([`AmneziaConfig::cookie_defense`]). [`CookieDefense::Bypassed`] skips
@@ -465,7 +477,9 @@ impl RateLimiter {
             return HandshakeGate::Pass;
         }
 
-        let under_load = *load.0.get_or_insert_with(|| self.is_under_load(src_addr));
+        let under_load = *load
+            .load
+            .get_or_insert_with(|| self.is_under_load(src_addr));
         if under_load == Load::Clear {
             return HandshakeGate::Pass;
         }
@@ -487,6 +501,19 @@ impl RateLimiter {
                 mac1: last_mac1,
             });
         }
+        if *load
+            .proven
+            .get_or_insert_with(|| self.admit_proven(under_load, addr))
+        {
+            HandshakeGate::Pass
+        } else {
+            HandshakeGate::UnderLoad
+        }
+    }
+
+    /// Charge one cookie-proven message from `addr`, found under load for
+    /// `under_load`, and say whether it is admitted.
+    fn admit_proven(&self, under_load: Load, addr: Source) -> bool {
         // A valid mac2 proves the address, and is what a source refused its
         // share returns with -- so without a bound of its own, a source that
         // fetched one cookie could buy unlimited Noise work under load.
@@ -498,7 +525,7 @@ impl RateLimiter {
         // proven handshakes dropped: they are cookied, then let through.
         if under_load == Load::SourceShare && self.count.fetch_add(1, Ordering::SeqCst) < self.limit
         {
-            return HandshakeGate::Pass;
+            return true;
         }
         // With the aggregate over, each proven source gets its share again,
         // counted only over proven messages -- as the Linux ratelimiter
@@ -507,10 +534,7 @@ impl RateLimiter {
         // address cannot spend that peer's allowance. At least
         // `SOURCE_FLOOR`: a limiter made to be under load from its first
         // message (`limit` 0) still has to let a cookie through.
-        if u64::from(self.proven.count(addr, self.window())) > self.source_limit.max(SOURCE_FLOOR) {
-            return HandshakeGate::UnderLoad;
-        }
-        HandshakeGate::Pass
+        u64::from(self.proven.count(addr, self.window())) <= self.source_limit.max(SOURCE_FLOOR)
     }
 
     /// Format the cookie reply a [`HandshakeGate::CookieDemanded`] called for.
@@ -546,9 +570,13 @@ pub(crate) enum CookieDefense {
 }
 
 /// Whether the limiter was under load when one received datagram reached it,
-/// decided at most once per datagram. See [`RateLimiter::gate_handshake`].
+/// and whether a cookie-proven message in it was admitted, each decided at
+/// most once per datagram. See [`RateLimiter::gate_handshake`].
 #[derive(Default)]
-pub(crate) struct LoadDecision(Option<Load>);
+pub(crate) struct LoadDecision {
+    load: Option<Load>,
+    proven: Option<bool>,
+}
 
 /// Why a handshake message found the limiter under load, if it did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -564,7 +592,7 @@ pub(crate) enum Load {
 impl LoadDecision {
     /// Whether a load decision has been taken for this datagram.
     pub(crate) fn is_decided(&self) -> bool {
-        self.0.is_some()
+        self.load.is_some()
     }
 }
 
@@ -922,6 +950,78 @@ mod tests {
         assert_eq!(counts.count(source, 7), 8001);
         // A later window starts from nothing.
         assert_eq!(counts.count(source, 8), 1);
+    }
+
+    /// A datagram read as two handshake messages, each with a valid mac2, is
+    /// charged once: the second reading shares the first's admission, even
+    /// when the first took the source's last proven slot -- so a reading that
+    /// Noise then refuses does not keep the other one out.
+    #[test]
+    fn a_datagram_read_twice_is_charged_once() {
+        let l = limiter(0);
+        let peer = endpoint("198.51.100.7:40000");
+        let cookie = l.current_cookie(peer);
+        // Spend all but one of the proven share (`SOURCE_FLOOR` at limit 0).
+        for _ in 0..SOURCE_FLOOR - 1 {
+            assert!(matches!(
+                gate(&l, Some(peer), &message(&l, Some(cookie))),
+                HandshakeGate::Pass
+            ));
+        }
+        let mut load = LoadDecision::default();
+        for _ in 0..2 {
+            assert!(matches!(
+                l.gate_handshake(
+                    Some(peer),
+                    &message(&l, Some(cookie)),
+                    1,
+                    CookieDefense::Armed,
+                    &mut load
+                ),
+                HandshakeGate::Pass
+            ));
+        }
+        // One slot was charged for the datagram, so the share is now spent.
+        assert!(matches!(
+            gate(&l, Some(peer), &message(&l, Some(cookie))),
+            HandshakeGate::UnderLoad
+        ));
+    }
+
+    /// The bounded table's trade-off, pinned: a source that shares every
+    /// proven slot with one past its proven share has its own cookie-proven
+    /// messages dropped -- not cookied -- until the window ends.
+    #[cfg(feature = "mock-instant")]
+    #[test]
+    fn a_full_collision_in_the_proven_table_drops_until_the_window_ends() {
+        let l = limiter(0);
+        let slots = |ip: u32| -> Vec<usize> {
+            l.proven
+                .slots_of(Source::Address(IpAddr::V4(Ipv4Addr::from(ip))))
+                .collect()
+        };
+        // Two sources sharing every slot: about 2^11 such pairs among 2^16.
+        let mut seen = std::collections::HashMap::new();
+        let (a, b) = (0..1u32 << 16)
+            .find_map(|ip| seen.insert(slots(ip), ip).map(|first| (first, ip)))
+            .expect("a full collision among 2^16 sources");
+        let source = |ip: u32| Source::Endpoint((Ipv4Addr::from(ip), 1).into());
+        let (a, b) = (source(a), source(b));
+        for _ in 0..SOURCE_FLOOR {
+            assert!(matches!(
+                gate(&l, Some(a), &message(&l, Some(l.current_cookie(a)))),
+                HandshakeGate::Pass
+            ));
+        }
+        assert!(matches!(
+            gate(&l, Some(b), &message(&l, Some(l.current_cookie(b)))),
+            HandshakeGate::UnderLoad
+        ));
+        mock_instant::thread_local::MockClock::advance(std::time::Duration::from_secs(1));
+        assert!(matches!(
+            gate(&l, Some(b), &message(&l, Some(l.current_cookie(b)))),
+            HandshakeGate::Pass
+        ));
     }
 
     /// A source's share comes back in the next second without anyone calling
