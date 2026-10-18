@@ -6549,6 +6549,77 @@ allowed_ip=10.66.66.2/32",
         assert_eq!(udp_count(&wg, Line::ErrorListener), 1);
     }
 
+    /// Without IPv6 -- refused through the test seam, so this runs on a
+    /// dual-stack host too -- a rebind commits the IPv4 listener alone, with
+    /// the transaction's usual guarantees: the old port is released, the
+    /// peer's connected socket goes with it, re-sending the held port is a
+    /// no-op, and `fwmark=` marks the listener there is. With the seam lifted,
+    /// the next rebind to another port brings the IPv6 listener back on a
+    /// host that has IPv6.
+    ///
+    /// Needs root and a TUN interface, hence `#[ignore]`.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn without_ipv6_a_rebind_commits_and_marks_the_one_listener() {
+        let wg = single_queue_device();
+        assert_eq!(wg.wg_set_key(StaticSecret::random_from_rng(OsRng)), UAPI_OK);
+        let old = free_port();
+        assert_eq!(wg.wg_set_port(old), UAPI_OK);
+        let peer = add_connected_peer(&wg);
+        assert!(conn_fd(&wg, &peer).is_some());
+
+        wg._device.device.read().refuse_ipv6(true);
+        let new = free_port();
+        assert_eq!(wg.wg_set_port(new), UAPI_OK);
+        assert_eq!(listen_port(&wg), new);
+        {
+            let device = wg._device.device.read();
+            assert!(device.udp4.is_some());
+            assert!(device.udp6.is_none(), "an IPv6 listener without IPv6");
+            assert_eq!(device.udp_listener_fds.len(), 1);
+        }
+        assert!(bindable(old).0, "old port {} still held", old);
+        assert!(
+            conn_fd(&wg, &peer).is_none(),
+            "the connected socket outlived its port"
+        );
+
+        // The held port again: nothing moves.
+        let fds = listener_fds(&wg);
+        let events = registered_events(&wg);
+        assert_eq!(wg.wg_set_port(new), UAPI_OK);
+        assert_eq!(listener_fds(&wg), fds);
+        assert_eq!(registered_events(&wg), events);
+
+        // fwmark= marks the one listener and is stored.
+        assert_eq!(wg.wg_set(&format!("fwmark={}", MARK)), UAPI_OK);
+        assert_eq!(stored_fwmark(&wg), Some(MARK));
+        assert_eq!(
+            wg._device
+                .device
+                .read()
+                .udp4
+                .as_ref()
+                .unwrap()
+                .mark()
+                .unwrap(),
+            MARK
+        );
+
+        wg._device.device.read().refuse_ipv6(false);
+        let host_has_ipv6 = UdpSocket::bind(("::", 0)).is_ok();
+        let again = free_port();
+        assert_eq!(wg.wg_set_port(again), UAPI_OK);
+        let device = wg._device.device.read();
+        assert_eq!(device.udp6.is_some(), host_has_ipv6);
+        assert_eq!(
+            device.udp_listener_fds.len(),
+            1 + usize::from(host_has_ipv6)
+        );
+        assert_eq!(device.udp4.as_ref().unwrap().mark().unwrap(), MARK);
+    }
+
     /// A rebind gives the listener pair fresh generations, and the listener
     /// lifecycle latch is per generation: one ERROR before, one after.
     #[test]

@@ -623,9 +623,10 @@ pub(super) fn single_send_to_attempt(
 
 /// [`single_send_to_attempt`] on a listener that may not exist. A device on a
 /// host without IPv6 has no IPv6 listener, and a send to an IPv6 endpoint
-/// then fails as the missing family fails anywhere, `EAFNOSUPPORT`, without a
-/// socket call -- observed like any other failed send, so the operator hears
-/// of a peer that cannot be reached.
+/// then fails without a socket call as `ENETUNREACH` -- what Linux reports
+/// for an IPv6 destination with no route -- so it is classed as the peer's
+/// route problem, a per-peer WARN, and not as a defect of a listener socket
+/// (`EAFNOSUPPORT` from a real socket is that, and says so at ERROR).
 #[cfg_attr(not(test), allow(unused_variables))]
 pub(super) fn listener_send_to_attempt(
     env: &DeviceUdpDiagnostics,
@@ -641,7 +642,7 @@ pub(super) fn listener_send_to_attempt(
     let token = AttemptToken;
     #[cfg(test)]
     let (token, _) = env.seam_begin(Op::Send, meta);
-    let result = Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
+    let result = Err(io::Error::from_raw_os_error(libc::ENETUNREACH));
     #[cfg(test)]
     env.seam_finish(token, false, &result);
     Attempt { result, token }
@@ -4361,9 +4362,10 @@ mod tests {
     }
 
     /// A device on a host without IPv6 has no IPv6 listener. Timer and TUN
-    /// output for an IPv6 endpoint is then a failed send, `EAFNOSUPPORT`,
-    /// journaled and observed like any other -- not a panic, and not a silent
-    /// skip -- while IPv4 endpoints are sent as usual.
+    /// output for an IPv6 endpoint is then a failed send, `ENETUNREACH`,
+    /// journaled and observed like any other -- a route problem of that peer,
+    /// not a panic, a silent skip, or a listener defect -- while IPv4
+    /// endpoints are sent as usual.
     #[test]
     fn without_an_ipv6_listener_ipv6_sends_fail_and_ipv4_sends_go_out() {
         let g = diag_lock();
@@ -4386,7 +4388,15 @@ mod tests {
         );
         assert_eq!(
             attempt_results(&env),
-            vec![Some(Err(Some(libc::EAFNOSUPPORT))); 2]
+            vec![Some(Err(Some(libc::ENETUNREACH))); 2]
+        );
+        assert_eq!(
+            classify(
+                Op::Send,
+                &io::Error::from_raw_os_error(libc::ENETUNREACH),
+                false
+            ),
+            Some(Class::Route)
         );
 
         let sink = v4();

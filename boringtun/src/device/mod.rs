@@ -345,6 +345,12 @@ pub struct Device {
     /// for up to a second. See `register_mtu_monitor`.
     #[cfg(test)]
     hold_mtu: AtomicBool,
+
+    /// Test-only: while set, the next listener bind finds the IPv6 family
+    /// refused (`EAFNOSUPPORT`), as on a host without IPv6, so the IPv4-only
+    /// paths run on dual-stack hosts too. See `bind_listen_pair`.
+    #[cfg(test)]
+    refuse_ipv6: AtomicBool,
 }
 
 /// A socket `set_fwmark` marks: one of the listeners, or a peer's connected
@@ -587,6 +593,13 @@ fn ipv6_is_unavailable(e: &io::Error) -> bool {
         e.raw_os_error(),
         Some(libc::EAFNOSUPPORT) | Some(libc::EPROTONOSUPPORT)
     )
+}
+
+#[cfg(test)]
+impl Device {
+    pub(crate) fn refuse_ipv6(&self, refuse: bool) {
+        self.refuse_ipv6.store(refuse, Ordering::SeqCst);
+    }
 }
 
 /// Read and discard up to `MAX_ITR` queued datagrams.
@@ -1017,6 +1030,8 @@ impl Device {
             mark_faults: Default::default(),
             #[cfg(test)]
             hold_mtu: AtomicBool::new(false),
+            #[cfg(test)]
+            refuse_ipv6: AtomicBool::new(false),
         };
 
         if uapi_fd >= 0 {
@@ -1071,7 +1086,7 @@ impl Device {
         // registering anything or touching the current one, so every failure
         // up to here leaves the device as it was: the candidate sockets just
         // close.
-        let (udp4, udp6, port) = Self::bind_listen_pair(port)?;
+        let (udp4, udp6, port) = self.bind_listen_pair(port)?;
         // The replacements inherit the device's fwmark: `set_fwmark` marks
         // the listeners it finds, and these are about to be them. Marked
         // here, not after the commit, because it can fail (EPERM without
@@ -1143,7 +1158,7 @@ impl Device {
 
     /// Create, configure and bind a nonblocking IPv4/IPv6 listener pair on
     /// `port`, or on the port the OS picks for the IPv4 socket when `port` is
-    /// 0. Returns the pair and the port bound. Registers nothing.
+    /// 0. Returns the listeners and the port bound. Registers nothing.
     ///
     /// A host without IPv6 -- a kernel booted with `ipv6.disable=1`, built
     /// without it, or a sandbox that refuses the family -- gets the IPv4
@@ -1151,8 +1166,13 @@ impl Device {
     /// as that, and is logged. Every other IPv6 failure, such as the port
     /// being taken, still fails the whole bind, so a working dual-stack host
     /// never silently loses half its listeners.
+    ///
+    /// Decided per bind, so a device that came up without IPv6 picks it up at
+    /// its next rebind -- `listen_port=` to another port, or to 0 -- if the
+    /// host has gained it; re-sending the port it holds is a no-op, as ever.
     #[allow(clippy::type_complexity)]
     fn bind_listen_pair(
+        &self,
         mut port: u16,
     ) -> Result<(socket2::Socket, Option<socket2::Socket>, u16), Error> {
         let udp4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -1169,7 +1189,17 @@ impl Device {
                 .port();
         }
 
-        let udp6 = match socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
+        #[cfg(test)]
+        let refused = self
+            .refuse_ipv6
+            .load(Ordering::SeqCst)
+            .then(|| io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
+        #[cfg(not(test))]
+        let refused = None;
+        let udp6 = match refused.map_or_else(
+            || socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)),
+            Err,
+        ) {
             Ok(udp6) => udp6,
             Err(e) if ipv6_is_unavailable(&e) => {
                 tracing::warn!(
