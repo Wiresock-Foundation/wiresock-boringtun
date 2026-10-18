@@ -983,8 +983,14 @@ impl Handshake {
     }
 
     /// Store a cookie [`Self::authenticate_cookie_reply`] accepted.
+    ///
+    /// The mac1 it answered is spent with it, as Linux (`have_sent_mac1`) and
+    /// wireguard-go (`hasLastMAC1`) do: each handshake message we send admits
+    /// one cookie reply, so a captured reply cannot be replayed to keep
+    /// overwriting the cookie until our next handshake message.
     pub(super) fn commit_cookie(&mut self, cookie: [u8; 16]) {
         self.cookies.write_cookie = Some(cookie);
+        self.cookies.last_mac1 = None;
     }
 
     // Compute and append mac1 and mac2 to a handshake message

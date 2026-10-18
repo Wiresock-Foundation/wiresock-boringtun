@@ -536,6 +536,11 @@ fn authenticate_anonymous<'m>(
 ///
 /// The peer's lock is held from here to the endpoint update, so nothing else
 /// sees the window and the endpoint disagree.
+///
+/// A packet that does not move the endpoint
+/// ([`Authenticated::moves_endpoint`]: a cookie reply) is no new path: the
+/// window and the evidence are left alone, and the caller must not adopt
+/// `from` for it either.
 fn commit_anonymous<'a>(
     peer: &mut Peer,
     packet: Authenticated,
@@ -544,7 +549,8 @@ fn commit_anonymous<'a>(
     hint: Option<crate::noise::amnezia::AmneziaImitationProtocol>,
     dst: &'a mut [u8],
 ) -> TunnResult<'a> {
-    let replaced = (peer.endpoint().addr != Some(from)).then(|| peer.tunnel.begin_new_path());
+    let replaced = (packet.moves_endpoint() && peer.endpoint().addr != Some(from))
+        .then(|| peer.tunnel.begin_new_path());
     let result = peer
         .tunnel
         .commit_with_imitation(packet, datagram, hint, dst);
@@ -1810,6 +1816,7 @@ impl Device {
                     } else {
                         None
                     };
+                    let moves_endpoint = packet.moves_endpoint();
                     match commit_anonymous(&mut p, packet, from, datagram, hint, &mut t.dst_buf[..])
                     {
                         TunnResult::Done => {}
@@ -1859,6 +1866,12 @@ impl Device {
                                 &addr,
                             );
                         }
+                    }
+
+                    // A cookie reply leaves the endpoint, and with it the
+                    // connected socket, where they are.
+                    if !moves_endpoint {
+                        continue;
                     }
 
                     // This packet was OK, that means we want to create a connected socket for this peer
@@ -2887,6 +2900,7 @@ mod ingress_tests {
             };
             // The same buffer the trial wrote the plaintext into, as the
             // handler uses `t.dst_buf` for both.
+            let moves_endpoint = packet.moves_endpoint();
             let delivered =
                 match commit_anonymous(&mut guard, packet, from, &[], None, &mut dst[..]) {
                     TunnResult::WriteToNetwork(d) => Delivered::Network(d.to_vec()),
@@ -2896,7 +2910,9 @@ mod ingress_tests {
                     TunnResult::Err(_) => return Delivered::Error,
                 };
             self.window_at_commit.set(guard.tunnel.udp_window());
-            guard.adopt_endpoint(from);
+            if moves_endpoint {
+                guard.adopt_endpoint(from);
+            }
             delivered
         }
 
@@ -2932,6 +2948,65 @@ mod ingress_tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// A valid cookie reply arriving from a new address is stored, and moves
+    /// nothing: not the endpoint (so not the connected socket either), not
+    /// the UDP window, not the pending imitation evidence. Its key is derived
+    /// from the client's *public* key and it is bound only to our last
+    /// handshake message's mac1, which travelled in clear -- this test makes
+    /// one exactly that way, as an on-path third party could. A replay of it
+    /// is then refused: that mac1 is spent.
+    #[test]
+    fn a_cookie_reply_from_a_new_address_does_not_move_the_endpoint() {
+        let settled = addr("198.51.100.1:40000");
+        let attacker = addr("203.0.113.66:4444");
+        let r = Roaming::new().settled_at(settled);
+        let client_public = *r.peers.keys().next().unwrap();
+
+        // The server peer sends a handshake message of its own; its mac1 and
+        // sender index are what a cookie reply must answer.
+        let mut buf = vec![0u8; MAX_UDP_SIZE];
+        let init = match r
+            .peer
+            .lock()
+            .tunnel
+            .format_handshake_initiation(&mut buf, true)
+        {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+        let at = ROAM_S[0] as usize;
+        let sender_idx =
+            u32::from_le_bytes([init[at + 4], init[at + 5], init[at + 6], init[at + 7]]);
+        let mac1 = &init[at + 116..at + 132];
+        assert_eq!(r.endpoint(), Some(settled));
+
+        let mut reply = vec![0u8; COOKIE_REPLY_SZ];
+        RateLimiter::new(&client_public, 0)
+            .format_cookie_reply(
+                ObfuscationRanges::default(),
+                &mut OsRng,
+                sender_idx,
+                [7u8; 16],
+                mac1,
+                &mut reply,
+            )
+            .unwrap();
+        let mut wire = vec![0u8; ROAM_S[2] as usize];
+        OsRng.fill_bytes(&mut wire);
+        wire.extend_from_slice(&reply);
+
+        let hint_before = r.peer.lock().tunnel.has_imitation_hint();
+        assert!(matches!(r.ingress(&wire, attacker), Delivered::Done));
+        assert_eq!(r.endpoint(), Some(settled), "the endpoint moved");
+        assert_eq!(r.window(), OLD_WINDOW, "the window was reset");
+        assert_eq!(r.peer.lock().tunnel.has_imitation_hint(), hint_before);
+
+        // The same reply again, from anywhere, is refused.
+        assert!(matches!(r.ingress(&wire, settled), Delivered::Refused));
+        assert!(matches!(r.ingress(&wire, attacker), Delivered::Refused));
+        assert_eq!(r.endpoint(), Some(settled));
     }
 
     /// An initiation from a new address is answered on the new path's fresh

@@ -5,10 +5,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- A cookie reply no longer moves the peer's endpoint. Its key is derived from the peer's public key and it is bound only to the mac1 of our last handshake message, which is sent in clear, so anyone who observed that message could send a valid reply from another address and redirect the peer's traffic and connected socket there. Authenticated handshake and transport packets still roam, as in Linux and wireguard-go.
+- A cookie reply is accepted once per handshake message we send, as in Linux and wireguard-go; a captured reply can no longer be replayed.
+- The Reject-After-Messages limit (2^64 - 2^13 - 1) is enforced on both directions. A session whose sending counter reaches it is not used again: the write is queued and a handshake is started, so the AEAD nonce cannot repeat even if the session timers never fire. A received counter at or above it is refused as `InvalidCounter` before decryption.
+
 ### Changed
 - Breaking (Rust): `noise::errors::WireGuardError` gains `PacketQueueFull`; exhaustive `match`es need an arm. All discriminants are now explicit and the existing values 0-16 are unchanged; C and JNI callers see the new error as code 17 through the existing `WIREGUARD_ERROR` result, with no ABI change.
 
 ### Fixed
+- A cookie reply no longer counts as a received packet for the timers, so it cannot defer the new-handshake attempt that follows unanswered traffic.
+- A decapsulated IPv4 packet whose IHL is below 5, or whose total length does not cover the header length IHL declares, is refused as `InvalidPacket` instead of being delivered shorter than its own header. Fragments and header checksums are still passed through unchanged to the receiving stack.
 - `Tunn::encapsulate` / `wireguard_write` without a session no longer queue the packet when they return an error, so retrying after `DestinationBufferTooSmall` cannot deliver it twice; the handshake-initiation capacity (148 bytes plus S1) and the junk-packet maximum are checked before any handshake state changes.
 - A full queue of packets waiting for a handshake is reported as `PacketQueueFull` instead of a silent drop reported as `Done`.
 - Draining queued packets (`decapsulate` with an empty datagram / `wireguard_read` with size 0) no longer re-admits them: without a session the queue is left as it is, and with a session a packet that does not fit stays at the head and the call reports `DestinationBufferTooSmall` instead of `Done`.
