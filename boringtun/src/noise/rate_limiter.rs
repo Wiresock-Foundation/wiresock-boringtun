@@ -180,19 +180,26 @@ impl SourceCounts {
     }
 
     fn bump(slot: &AtomicU64, window: u32) -> u32 {
-        let fresh = |packed: u64| {
-            if (packed >> 32) as u32 == window {
-                (packed as u32).saturating_add(1)
+        // A slot another thread has already moved to a later window is counted
+        // in that window, not reset back to this one: a caller that read the
+        // clock just before the second ticked over would otherwise wipe the
+        // newer window's count. "Later" is modulo 2^32 within half the range,
+        // which holds for the first 68 years of a limiter's life.
+        let next = |packed: u64| {
+            let (slot_window, count) = ((packed >> 32) as u32, packed as u32);
+            if slot_window == window || (slot_window.wrapping_sub(window) as i32) > 0 {
+                (slot_window, count.saturating_add(1))
             } else {
-                1
+                (window, 1)
             }
         };
         let previous = slot
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |packed| {
-                Some((u64::from(window) << 32) | u64::from(fresh(packed)))
+                let (window, count) = next(packed);
+                Some((u64::from(window) << 32) | u64::from(count))
             })
             .unwrap_or_else(|packed| packed);
-        fresh(previous)
+        next(previous).1
     }
 }
 
@@ -222,7 +229,12 @@ pub struct RateLimiter {
     last_reset: Mutex<Instant>,
     /// Each source's share of `limit`; see [`SOURCE_SHARE`].
     source_limit: u64,
+    /// Every mac1-valid message, by source: what decides a source's own load.
     sources: SourceCounts,
+    /// Messages with a valid mac2 while under load, by source. Kept apart from
+    /// `sources` because these alone prove their source address, so a flood
+    /// spoofing a peer's address cannot spend that peer's allowance here.
+    proven: SourceCounts,
     /// Load decisions taken since the last reset, for tests: `count` no longer
     /// sees a message its source's share already refused.
     #[cfg(test)]
@@ -247,6 +259,7 @@ impl RateLimiter {
             // first message, as it always was.
             source_limit: (limit / SOURCE_SHARE).max(limit.min(SOURCE_FLOOR)),
             sources: SourceCounts::new(),
+            proven: SourceCounts::new(),
             #[cfg(test)]
             decisions: AtomicU64::new(0),
         }
@@ -469,6 +482,18 @@ impl RateLimiter {
                 mac1: last_mac1,
             });
         }
+        // A valid mac2 proves the address, and is what a source refused its
+        // share returns with -- so without a bound of its own, a source that
+        // fetched one cookie could buy unlimited Noise work under load. Each
+        // proven source gets its share again here, counted only over proven
+        // messages, as the Linux ratelimiter applies its per-IP bucket only
+        // past the cookie check.
+        //
+        // At least `SOURCE_FLOOR`: a limiter made to be under load from its
+        // first message (`limit` 0) still has to let a cookie through.
+        if u64::from(self.proven.count(addr, self.window())) > self.source_limit.max(SOURCE_FLOOR) {
+            return HandshakeGate::UnderLoad;
+        }
         HandshakeGate::Pass
     }
 
@@ -524,7 +549,9 @@ pub(crate) enum HandshakeGate {
     Pass,
     /// mac1 does not hold. Not a handshake message to this key.
     BadMac,
-    /// Under load, with no source address to check mac2 against.
+    /// Under load, and either no source address to check mac2 against, or a
+    /// valid mac2 from a source past its share of proven messages: dropped,
+    /// with nothing sent.
     UnderLoad,
     /// Under load, and mac2 does not hold: the answer is a cookie reply, not
     /// Noise work. Nothing about the sender has been authenticated -- mac1 is
@@ -709,6 +736,76 @@ mod tests {
             ));
         }
         assert!(!passes(&l, endpoint("198.51.100.9:6000")));
+    }
+
+    /// Under load, a source returning with a valid mac2 is let through for
+    /// its share of proven messages, then dropped -- one cookie does not buy
+    /// unlimited Noise work. Mac1-only messages spoofing its address do not
+    /// spend that allowance, and another proven source has its own.
+    // Mock clock only, for the reason given on the tests above.
+    #[cfg(feature = "mock-instant")]
+    #[test]
+    fn a_proven_source_is_held_to_its_share_and_spoofing_cannot_spend_it() {
+        let l = limiter(100);
+        let flood = |source| {
+            for _ in 0..1000 {
+                assert!(!passes(&l, source));
+            }
+        };
+        let peer = endpoint("198.51.100.7:40000");
+        // Put the peer's address over its share, as a spoofer would.
+        for _ in 0..20 {
+            assert!(passes(&l, peer));
+        }
+        flood(peer);
+        let cookie = l.current_cookie(peer);
+        for _ in 0..20 {
+            assert!(matches!(
+                gate(&l, Some(peer), &message(&l, Some(cookie))),
+                HandshakeGate::Pass
+            ));
+            flood(peer);
+        }
+        assert!(matches!(
+            gate(&l, Some(peer), &message(&l, Some(cookie))),
+            HandshakeGate::UnderLoad
+        ));
+
+        let other = endpoint("203.0.113.9:1");
+        for _ in 0..21 {
+            gate(&l, Some(other), &message(&l, None));
+        }
+        assert!(matches!(
+            gate(&l, Some(other), &message(&l, Some(l.current_cookie(other)))),
+            HandshakeGate::Pass
+        ));
+    }
+
+    /// A zero-budget limiter, under load from the first message, still lets a
+    /// few cookie-carrying messages per source through.
+    #[test]
+    fn a_zero_budget_limiter_still_honours_cookies() {
+        let l = limiter(0);
+        let peer = endpoint("198.51.100.7:40000");
+        let cookie = l.current_cookie(peer);
+        assert!(matches!(
+            gate(&l, Some(peer), &message(&l, Some(cookie))),
+            HandshakeGate::Pass
+        ));
+    }
+
+    /// A slot already moved on to a later window by another thread is counted
+    /// there, not reset to the caller's older window.
+    #[test]
+    fn a_late_count_does_not_reset_a_newer_window() {
+        let counts = SourceCounts::new();
+        let source = endpoint("192.0.2.33:1");
+        for _ in 0..3 {
+            counts.count(source, 8);
+        }
+        assert_eq!(counts.count(source, 7), 4);
+        assert_eq!(counts.count(source, 8), 5);
+        assert_eq!(counts.count(source, 9), 1);
     }
 
     /// The table never grows, however many sources it has seen.

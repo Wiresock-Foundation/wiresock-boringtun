@@ -3485,24 +3485,16 @@ mod ingress_tests {
             other => panic!("expected an initiation, got {:?}", other),
         };
 
-        let limiter = RateLimiter::new(&server_public, HANDSHAKE_RATE_LIMIT);
+        let limiter = RateLimiter::new(&server_public, 0);
         let stripped = amnezia
             .strip_inbound(obf, &datagram)
             .expect("our own initiation must match our own shape");
         let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
         let mut scratch = vec![0u8; MAX_UDP_SIZE];
 
-        // Every message here comes from one source, which is under load on
-        // its own once past its share of the limit: the share-th call still
-        // reads as unloaded and the one after it is the first to demand a
-        // cookie. Asserting `Ok` here is not decoration: if the threshold ever
-        // moves, this loop stops leaving the limiter in the state the test is
-        // about, and it says so.
-        for _ in 0..HANDSHAKE_RATE_LIMIT / crate::noise::rate_limiter::SOURCE_SHARE {
-            limiter
-                .verify_packet(obf, &mut OsRng, Some(src), stripped, &mut scratch)
-                .expect("below the handshake rate limit, no cookie is demanded");
-        }
+        // A zero budget demands a cookie for the first message, whatever the
+        // clock: only the reply's size matters here, and the thresholds that
+        // decide when a real limiter gets there are `rate_limiter`'s tests.
         let cookie_len =
             match limiter.verify_packet(obf, &mut OsRng, Some(src), stripped, &mut scratch) {
                 Err(TunnResult::WriteToNetwork(cookie)) => cookie.len(),
