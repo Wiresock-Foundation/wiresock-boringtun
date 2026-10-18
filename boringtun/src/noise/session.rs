@@ -37,6 +37,14 @@ const WORD_SIZE: u64 = 64;
 const N_WORDS: u64 = 16; // Suffice to reorder 64*16 = 1024 packets; can be increased at will
 const N_BITS: u64 = WORD_SIZE * N_WORDS;
 
+/// Reject-After-Messages, whitepaper section 6.2: `2^64 - 2^13 - 1`. A counter
+/// at or above it is never sent and never accepted, so the 64-bit AEAD nonce
+/// cannot wrap under one key -- whether or not the session timers ever fire.
+/// Every counter that is used therefore lies in `0..REJECT_AFTER_MESSAGES`,
+/// which also keeps the replay window's `counter + N_BITS` and `counter + 1`
+/// clear of overflow.
+pub(super) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);
+
 #[derive(Debug, Clone, Default)]
 struct ReceivingKeyCounterValidator {
     /// In order to avoid replays while allowing for some reordering of the packets, we keep a
@@ -84,6 +92,9 @@ impl ReceivingKeyCounterValidator {
     /// Returns true if the counter was not yet received, and is not too far back
     #[inline(always)]
     fn will_accept(&self, counter: u64) -> Result<(), WireGuardError> {
+        if counter >= REJECT_AFTER_MESSAGES {
+            return Err(WireGuardError::InvalidCounter);
+        }
         if counter >= self.next {
             // As long as the counter is growing no replay took place for sure
             return Ok(());
@@ -103,6 +114,9 @@ impl ReceivingKeyCounterValidator {
     /// decryption something changed)
     #[inline(always)]
     fn mark_did_receive(&mut self, counter: u64) -> Result<(), WireGuardError> {
+        if counter >= REJECT_AFTER_MESSAGES {
+            return Err(WireGuardError::InvalidCounter);
+        }
         if counter + N_BITS < self.next {
             // Drop if too far back
             return Err(WireGuardError::InvalidCounter);
@@ -175,6 +189,37 @@ impl Session {
         self.receiving_index as usize
     }
 
+    /// True once every nonce below [`REJECT_AFTER_MESSAGES`] has been used:
+    /// the session can still receive, but must not send again.
+    pub(super) fn sending_exhausted(&self) -> bool {
+        self.sending_key_counter.load(Ordering::Relaxed) >= REJECT_AFTER_MESSAGES
+    }
+
+    /// Claim the next sending nonce, or `None` once the session is exhausted.
+    ///
+    /// A compare-and-swap rather than `fetch_add`: a refused claim must leave
+    /// the counter where it is. Incrementing first and checking after would
+    /// move an exhausted counter on with every refused send, and 2^13 of them
+    /// would wrap it back to nonces already used under this key.
+    fn claim_sending_nonce(&self) -> Option<u64> {
+        self.sending_key_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |counter| {
+                if counter < REJECT_AFTER_MESSAGES {
+                    Some(counter + 1)
+                } else {
+                    None
+                }
+            })
+            .ok()
+    }
+
+    /// Fast-forward the sending counter, so the limit can be tested without
+    /// sending 2^64 packets.
+    #[cfg(test)]
+    pub(super) fn set_sending_counter(&self, counter: u64) {
+        self.sending_key_counter.store(counter, Ordering::Relaxed);
+    }
+
     /// Returns true if receiving counter is good to use
     fn receiving_counter_quick_check(&self, counter: u64) -> Result<(), WireGuardError> {
         let counter_validator = self.receiving_key_counter.lock();
@@ -226,7 +271,13 @@ impl Session {
         // nonce. Note this bound covers the base frame only -- the Amnezia S4
         // prefix is added later, by `write_to_network` -- so `Tunn::encapsulate`
         // preflights the full wire size before calling this.
-        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed);
+        //
+        // An exhausted session is `ConnectionExpired`. `Tunn` does not route a
+        // send here once `sending_exhausted` holds -- it starts a handshake
+        // instead -- so this is the backstop, not the normal path.
+        let sending_key_counter = self
+            .claim_sending_nonce()
+            .ok_or(WireGuardError::ConnectionExpired)?;
 
         let (message_type, rest) = dst.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);
@@ -283,7 +334,10 @@ impl Session {
         if packet.receiver_idx != self.receiving_index {
             return Err(WireGuardError::WrongIndex);
         }
-        // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
+        // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption.
+        // This also refuses a counter at or above REJECT_AFTER_MESSAGES before
+        // any cryptography, as `InvalidCounter` -- the same pre-AEAD refusal a
+        // counter behind the window already gets.
         self.receiving_counter_quick_check(packet.counter)?;
 
         let ret = {
@@ -314,6 +368,130 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand_core::OsRng;
+    use std::convert::TryInto;
+
+    /// Two halves of one session: what `a` seals, `b` opens.
+    fn session_pair() -> (Session, Session) {
+        let a_to_b = [1u8; 32];
+        let b_to_a = [2u8; 32];
+        (
+            Session::new(1, 2, b_to_a, a_to_b),
+            Session::new(2, 1, a_to_b, b_to_a),
+        )
+    }
+
+    fn seal(session: &Session, src: &[u8]) -> Result<Vec<u8>, WireGuardError> {
+        let mut dst = vec![0u8; src.len() + super::super::DATA_OVERHEAD_SZ];
+        session
+            .format_packet_data(ObfuscationRanges::default(), &mut OsRng, src, 0, &mut dst)
+            .map(|p| p.to_vec())
+    }
+
+    fn open(session: &Session, frame: &[u8]) -> Result<Vec<u8>, WireGuardError> {
+        let packet = PacketData {
+            receiver_idx: u32::from_le_bytes(frame[4..8].try_into().unwrap()),
+            counter: u64::from_le_bytes(frame[8..16].try_into().unwrap()),
+            encrypted_encapsulated_packet: &frame[DATA_OFFSET..],
+        };
+        let mut dst = vec![0u8; frame.len()];
+        session
+            .receive_packet_data(packet, &mut dst)
+            .map(|p| p.to_vec())
+    }
+
+    fn counter_of(frame: &[u8]) -> u64 {
+        u64::from_le_bytes(frame[8..16].try_into().unwrap())
+    }
+
+    #[test]
+    fn reject_after_messages_is_the_whitepaper_value() {
+        // 2^64 - 2^13 - 1, written out independently of the definition.
+        assert_eq!(REJECT_AFTER_MESSAGES, 0xFFFF_FFFF_FFFF_DFFF);
+    }
+
+    #[test]
+    fn the_last_counter_below_the_limit_is_sent_and_received() {
+        let (a, b) = session_pair();
+        a.set_sending_counter(REJECT_AFTER_MESSAGES - 1);
+        assert!(!a.sending_exhausted());
+
+        let frame = seal(&a, b"last").unwrap();
+        assert_eq!(counter_of(&frame), REJECT_AFTER_MESSAGES - 1);
+        assert_eq!(open(&b, &frame).unwrap(), b"last");
+        assert!(a.sending_exhausted());
+    }
+
+    #[test]
+    fn an_exhausted_session_refuses_to_send_and_never_moves_its_counter() {
+        let (a, _b) = session_pair();
+        a.set_sending_counter(REJECT_AFTER_MESSAGES);
+        assert!(a.sending_exhausted());
+
+        // Far more refusals than the 2^13 headroom: if a refusal advanced the
+        // counter, these would carry it past u64::MAX and back to 0.
+        for _ in 0..(1u32 << 14) {
+            assert!(matches!(
+                seal(&a, b"x"),
+                Err(WireGuardError::ConnectionExpired)
+            ));
+        }
+        assert_eq!(
+            a.sending_key_counter.load(Ordering::Relaxed),
+            REJECT_AFTER_MESSAGES
+        );
+    }
+
+    #[test]
+    fn a_too_small_dst_is_refused_before_the_limit_is_consulted() {
+        // The capacity error stays the first one reported, so a caller that
+        // retries with a larger buffer does not see a different error first.
+        let (a, _b) = session_pair();
+        a.set_sending_counter(REJECT_AFTER_MESSAGES);
+        let mut dst = [0u8; 8];
+        assert!(matches!(
+            a.format_packet_data(ObfuscationRanges::default(), &mut OsRng, b"x", 0, &mut dst),
+            Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+    }
+
+    #[test]
+    fn a_counter_at_or_above_the_limit_is_refused_before_decryption() {
+        // A sealed frame relabelled with a counter at the limit: a counter
+        // check that ran after the AEAD would report InvalidAeadTag instead.
+        let (a, b) = session_pair();
+        let mut frame = seal(&a, b"data").unwrap();
+        for counter in [REJECT_AFTER_MESSAGES, REJECT_AFTER_MESSAGES + 1, u64::MAX] {
+            frame[8..16].copy_from_slice(&counter.to_le_bytes());
+            assert!(matches!(
+                open(&b, &frame),
+                Err(WireGuardError::InvalidCounter)
+            ));
+        }
+    }
+
+    #[test]
+    fn the_replay_window_refuses_the_limit_without_overflowing() {
+        let mut c: ReceivingKeyCounterValidator = Default::default();
+        for counter in [REJECT_AFTER_MESSAGES, u64::MAX - N_BITS, u64::MAX] {
+            assert!(matches!(
+                c.will_accept(counter),
+                Err(WireGuardError::InvalidCounter)
+            ));
+            assert!(matches!(
+                c.mark_did_receive(counter),
+                Err(WireGuardError::InvalidCounter)
+            ));
+        }
+        // The highest usable counter moves `next` to the limit without
+        // wrapping, after which every replay and the limit itself stay refused.
+        assert!(c.mark_did_receive(REJECT_AFTER_MESSAGES - 1).is_ok());
+        assert_eq!(c.next, REJECT_AFTER_MESSAGES);
+        assert!(c.mark_did_receive(REJECT_AFTER_MESSAGES - 1).is_err());
+        assert!(c.mark_did_receive(REJECT_AFTER_MESSAGES).is_err());
+        assert!(c.will_accept(0).is_err());
+    }
+
     #[test]
     fn test_replay_counter() {
         let mut c: ReceivingKeyCounterValidator = Default::default();

@@ -199,7 +199,7 @@ impl Peer {
     /// critical section: `commit_anonymous` starts the window for a new source
     /// *before* committing its packet, so a reply drawn during the commit is
     /// sized for the path it will go out on, and puts the old window back if
-    /// the commit fails; on success the handler records the source with
+    /// the commit fails; on success it records the source with
     /// [`Self::adopt_endpoint`], which does not reset again. The peer's lock is
     /// held throughout, so no other code sees the window and the endpoint
     /// disagree.

@@ -253,6 +253,21 @@ pub(crate) enum Authenticated {
     },
 }
 
+impl Authenticated {
+    /// Whether accepting this packet makes its source the peer's endpoint.
+    ///
+    /// Every authenticated handshake message and transport frame does; a
+    /// cookie reply does not, as in Linux and wireguard-go. Its key is derived
+    /// from our peer's *public* key and it is bound only to the mac1 of our
+    /// last handshake message, which travelled in clear -- so anyone who saw
+    /// that message can relay a valid reply, or make one, from any address.
+    /// Roaming on it would hand them the endpoint and the connected socket.
+    #[cfg(feature = "device")]
+    pub(crate) fn moves_endpoint(&self) -> bool {
+        !matches!(self, Authenticated::CookieReply(_))
+    }
+}
+
 /// `window` grown to cover a frame of `size` bytes, as measured by the two
 /// `*_window_observation` accessors on [`AmneziaConfig`]. A free function over
 /// the field rather than a method, so the transport path can call it while it
@@ -887,8 +902,15 @@ impl Tunn {
         self.admit_without_session(src, dst)
     }
 
+    /// A current session that can still send. One whose nonces are spent
+    /// (`Session::sending_exhausted`, Reject-After-Messages) counts as none:
+    /// a write then takes the no-session path -- queued, and a handshake
+    /// started -- rather than failing on a session that may not send again.
+    /// The session stays in its slot and keeps receiving until it expires.
     fn has_current_session(&self) -> bool {
-        self.sessions[self.current % N_SESSIONS].is_some()
+        self.sessions[self.current % N_SESSIONS]
+            .as_ref()
+            .is_some_and(|session| !session.sending_exhausted())
     }
 
     /// Format `src` on the current session -- a new submission from
@@ -1428,7 +1450,11 @@ impl Tunn {
         cookie: [u8; 16],
     ) -> Result<TunnResult<'a>, WireGuardError> {
         self.handshake.commit_cookie(cookie);
-        self.timer_tick(TimerName::TimeLastPacketReceived);
+        // Not `TimeLastPacketReceived`: that tick is evidence the peer is
+        // alive, and a cookie reply is not -- see
+        // `Authenticated::moves_endpoint`. Ticking it here let relayed replies
+        // keep the KEEPALIVE + REKEY_TIMEOUT new-handshake trigger from ever
+        // firing on a dead path. Linux and wireguard-go do not tick it.
         self.timer_tick(TimerName::TimeCookieReceived);
 
         tracing::debug!("Did set cookie");
@@ -1805,7 +1831,18 @@ impl Tunn {
                 // rather than the bytes received. wireguard-go rejects the same case
                 // (`int(length) < ipv4.HeaderLen`). The v6 branch needs no equivalent:
                 // it adds IPV6_MIN_HEADER_SIZE to the payload length.
-                if computed_len < IPV4_MIN_HEADER_SIZE {
+                //
+                // The bound is the header the packet itself declares, not the
+                // 20-byte minimum: IHL counts 32-bit words, and a total length
+                // between 20 and `IHL * 4` hands the caller a buffer shorter
+                // than the header it describes. A TUN's stack drops that (and
+                // an IHL below 5) as a header error, but an FFI caller that
+                // takes `ihl * 4` as the payload offset -- to clamp an MSS, or
+                // rewrite an address -- would read past what it was given. The
+                // source address at 12..16 lies inside the 20 bytes checked
+                // above whatever IHL says, so it is read before this.
+                let header_len = usize::from(packet[0] & 0x0f) * 4;
+                if header_len < IPV4_MIN_HEADER_SIZE || computed_len < header_len {
                     return TunnResult::Err(WireGuardError::InvalidPacket);
                 }
                 (computed_len, IpAddr::from(addr_bytes))
@@ -2503,6 +2540,64 @@ mod tests {
         );
     }
 
+    /// Reject-After-Messages at the `Tunn` level: the last usable nonce is
+    /// sent and delivered, the next write is accepted onto the queue and
+    /// starts a handshake instead of reusing or wrapping a nonce, the spent
+    /// session still receives meanwhile, and the queued packet is delivered on
+    /// the new session.
+    #[test]
+    fn an_exhausted_session_rekeys_instead_of_reusing_a_nonce() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let packet = create_ipv4_udp_packet();
+        let mut dst = vec![0u8; 2048];
+        let mut their_dst = vec![0u8; 2048];
+
+        my_tun.sessions[my_tun.current % N_SESSIONS]
+            .as_ref()
+            .unwrap()
+            .set_sending_counter(session::REJECT_AFTER_MESSAGES - 1);
+
+        let last = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        assert_eq!(counter_of(&last), session::REJECT_AFTER_MESSAGES - 1);
+        assert!(matches!(
+            their_tun.decapsulate(None, &last, &mut their_dst),
+            TunnResult::WriteToTunnelV4(p, _) if p == packet.as_slice()
+        ));
+
+        // Accepted (queued), and the output is an initiation, not data. Under
+        // a frozen mock clock it would carry the first handshake's TAI64N
+        // timestamp, and the responder would rightly refuse it as a replay.
+        advance_past_pacing_gate(Duration::from_millis(5));
+        let init = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        assert!(matches!(
+            Tunn::parse_incoming_packet(my_tun.handshake.obf, &init),
+            Ok(Packet::HandshakeInit(_))
+        ));
+        assert_eq!(my_tun.packet_queue.len(), 1);
+
+        // The spent session can no longer send but still receives.
+        let reply = unwrap_network_packet(their_tun.encapsulate(&packet, &mut their_dst));
+        assert!(matches!(
+            my_tun.decapsulate(None, &reply, &mut dst),
+            TunnResult::WriteToTunnelV4(p, _) if p == packet.as_slice()
+        ));
+
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+
+        let queued = unwrap_network_packet(my_tun.decapsulate(None, &[], &mut dst));
+        assert!(
+            counter_of(&queued) < 2,
+            "the queued packet went out on the new session"
+        );
+        assert!(my_tun.packet_queue.is_empty());
+        assert!(matches!(
+            their_tun.decapsulate(None, &queued, &mut their_dst),
+            TunnResult::WriteToTunnelV4(p, _) if p == packet.as_slice()
+        ));
+    }
+
     #[test]
     fn decapsulate_errors_when_dst_cannot_hold_the_plaintext() {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
@@ -2639,6 +2734,93 @@ mod tests {
                 "a total length of exactly the header size must be accepted, got {:?}",
                 other
             ),
+        }
+    }
+
+    /// Set IHL (the low nibble of byte 0) and the total length of `packet`.
+    fn with_ihl_and_total_len(mut packet: Vec<u8>, ihl: u8, total_len: u16) -> Vec<u8> {
+        packet[0] = 0x40 | ihl;
+        packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ].copy_from_slice(&total_len.to_be_bytes());
+        packet
+    }
+
+    /// The total length must cover the header IHL declares, and IHL must
+    /// declare at least the 20-byte fixed header. A packet carrying options
+    /// is still delivered, trimmed to its total length.
+    #[test]
+    fn an_ipv4_header_length_the_packet_does_not_cover_is_rejected() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut dst = vec![0u8; 2048];
+        let mut their_dst = vec![0u8; 2048];
+        // 20-byte header, 8-byte UDP header and payload, padded with room for
+        // up to 40 bytes of options.
+        let mut base = create_ipv4_udp_packet();
+        base.resize(base.len() + 40, 0);
+
+        let mut refused = Vec::new();
+        // IHL below the fixed header, with an otherwise valid total length.
+        for ihl in 0..5u8 {
+            refused.push((ihl, 32u16));
+        }
+        // IHL 6 (24 bytes) and 15 (60 bytes) with a total length short of it.
+        for total in 20..24u16 {
+            refused.push((6, total));
+        }
+        refused.push((15, 59));
+        for (ihl, total) in refused {
+            let bogus = with_ihl_and_total_len(base.clone(), ihl, total);
+            let sent = unwrap_network_packet(my_tun.encapsulate(&bogus, &mut dst));
+            match their_tun.decapsulate(None, &sent, &mut their_dst) {
+                TunnResult::Err(WireGuardError::InvalidPacket) => {}
+                other => panic!(
+                    "IHL {} with total length {} must be InvalidPacket, got {:?}",
+                    ihl, total, other
+                ),
+            }
+        }
+
+        // Exactly the declared header, and a header with options followed by
+        // a payload and trailing bytes: both delivered, trimmed, byte-exact.
+        for (ihl, total) in [(6u8, 24u16), (6, 30), (15, 60), (5, 20)] {
+            let packet = with_ihl_and_total_len(base.clone(), ihl, total);
+            let sent = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+            match their_tun.decapsulate(None, &sent, &mut their_dst) {
+                TunnResult::WriteToTunnelV4(recv, src) => {
+                    assert_eq!(recv, &packet[..usize::from(total)]);
+                    assert_eq!(src, std::net::Ipv4Addr::new(192, 168, 1, 2));
+                }
+                other => panic!(
+                    "IHL {} with total length {} must be delivered, got {:?}",
+                    ihl, total, other
+                ),
+            }
+        }
+    }
+
+    /// Fragments and the header checksum are deliberately not interpreted:
+    /// reassembly and checksum verification belong to the stack the packet is
+    /// delivered to, as in Linux WireGuard and wireguard-go, and the AEAD
+    /// already proved the bytes are the peer's. Pinned so that neither starts
+    /// happening by accident.
+    #[test]
+    fn ipv4_fragments_and_checksums_are_delivered_as_sent() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut dst = vec![0u8; 2048];
+        let mut their_dst = vec![0u8; 2048];
+        // More-fragments with offset 0; a later fragment (offset 64 bytes);
+        // a header checksum that cannot be right.
+        let mut first_fragment = create_ipv4_udp_packet();
+        first_fragment[6] = 0x20;
+        let mut later_fragment = create_ipv4_udp_packet();
+        later_fragment[6..8].copy_from_slice(&8u16.to_be_bytes());
+        let mut bad_checksum = create_ipv4_udp_packet();
+        bad_checksum[10] ^= 0xff;
+        for packet in [first_fragment, later_fragment, bad_checksum] {
+            let sent = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+            match their_tun.decapsulate(None, &sent, &mut their_dst) {
+                TunnResult::WriteToTunnelV4(recv, _) => assert_eq!(recv, &packet[..]),
+                other => panic!("expected delivery, got {:?}", other),
+            }
         }
     }
 
@@ -3005,6 +3187,47 @@ mod tests {
         )
         .unwrap();
         (my_tun, their_tun)
+    }
+
+    /// An accepted cookie reply stores the cookie and is not evidence that the
+    /// peer is alive: `TimeLastPacketReceived` stays where it was, so the
+    /// new-handshake trigger it gates is not deferred. A second delivery of the
+    /// same reply is refused, since the mac1 it answers is spent.
+    #[test]
+    fn a_cookie_reply_is_stored_once_and_does_not_tick_last_packet_received() {
+        let (mut my_tun, mut their_tun) = cookie_provoking_pair(AmneziaConfig::default());
+        let mut dst = vec![0u8; 2048];
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        let src = Some(std::net::IpAddr::from([10, 0, 0, 1]));
+        let cookie = unwrap_network_packet(their_tun.decapsulate(src, &init, &mut dst));
+        assert_eq!(cookie.len(), COOKIE_REPLY_SZ);
+
+        // A tick would record the current poll time; move it off zero first,
+        // or the assertion below could not tell a tick from none.
+        advance_past_pacing_gate(Duration::from_millis(50));
+        my_tun.update_timers(&mut dst);
+        let received_before = my_tun.timers[TimerName::TimeLastPacketReceived];
+        assert!(my_tun.timers[TimerName::TimeCurrent] > received_before);
+
+        assert!(matches!(
+            my_tun.decapsulate(src, &cookie, &mut dst),
+            TunnResult::Done
+        ));
+        assert!(my_tun.handshake.has_cookie());
+        assert_eq!(
+            my_tun.timers[TimerName::TimeLastPacketReceived],
+            received_before,
+            "a cookie reply ticked TimeLastPacketReceived"
+        );
+        assert_eq!(
+            my_tun.timers[TimerName::TimeCookieReceived],
+            my_tun.timers[TimerName::TimeCurrent]
+        );
+
+        assert!(matches!(
+            my_tun.decapsulate(src, &cookie, &mut dst),
+            TunnResult::Err(WireGuardError::UnexpectedPacket)
+        ));
     }
 
     /// A cookie reply the caller's buffer cannot hold is an error, not a panic.
