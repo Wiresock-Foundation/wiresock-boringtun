@@ -3,7 +3,8 @@
 
 use super::errors::WireGuardError;
 use crate::noise::{Tunn, TunnResult};
-use std::mem;
+use rand_chacha::ChaCha8Rng;
+use rand_core::{OsRng, RngCore, SeedableRng};
 use std::ops::{Index, IndexMut};
 
 use std::time::Duration;
@@ -22,6 +23,13 @@ pub(crate) const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
 pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
+/// The handshake retransmission and new-handshake deadlines each get a
+/// uniform `0..REKEY_TIMEOUT_JITTER_MAX_MS` milliseconds added, as in Linux
+/// (`REKEY_TIMEOUT_JITTER_MAX_JIFFIES`, HZ / 3), wireguard-go and
+/// amneziawg-go (`RekeyTimeoutJitterMaxMs`) -- on top of a configured
+/// AmneziaWG range too, as amneziawg-go adds it -- so peers that lost a
+/// handshake together do not retry in lockstep.
+pub(crate) const REKEY_TIMEOUT_JITTER_MAX_MS: u32 = 334;
 
 #[derive(Debug)]
 pub enum TimerName {
@@ -48,6 +56,13 @@ pub enum TimerName {
 
 use self::TimerName::*;
 
+/// The untuned absolute handshake bound: `REKEY_ATTEMPT_TIME`, plus the most
+/// jitter its `REKEY_ATTEMPT_TIME / REKEY_TIMEOUT` intervals can add.
+pub(crate) fn untuned_attempt_window() -> Duration {
+    let intervals = (REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs()) as u32;
+    REKEY_ATTEMPT_TIME + Duration::from_millis(u64::from(REKEY_TIMEOUT_JITTER_MAX_MS)) * intervals
+}
+
 #[derive(Debug)]
 pub struct Timers {
     /// Is the owner of the timer the initiator or the responder for the last handshake?
@@ -56,11 +71,31 @@ pub struct Timers {
     time_started: Instant,
     timers: [Duration; TimerName::Top as usize],
     pub(super) session_timers: [Duration; super::N_SESSIONS],
-    /// Did we receive data without sending anything back?
-    want_keepalive: bool,
-    /// Did we send data without hearing back?
-    pub(super) want_handshake: bool,
+    /// When data was first received with nothing sent back since: the
+    /// passive keepalive is due `keepalive_current` after it (upstream
+    /// `timersDataReceived` arms `sendKeepalive`; any authenticated send
+    /// cancels it). Data alone arms it: a received keepalive must not be
+    /// answered with another, or two idle peers ping each other forever.
+    /// Upstream's `needAnotherKeepalive` re-arm is not kept: the one keepalive
+    /// answers all data received before it.
+    want_keepalive: Option<Duration>,
+    /// When data was first sent with nothing heard back since: a new
+    /// handshake is due `new_handshake_current` after it (upstream
+    /// `timersDataSent` arms `newHandshake`; any authenticated receive cancels
+    /// it). Measured from the send, not from the last receive, or the first
+    /// packet after a long quiet spell would start a handshake at once.
+    pub(super) want_handshake: Option<Duration>,
     persistent_keepalive: usize,
+    /// A persistent keepalive is owed at the next poll: set when the interval
+    /// is configured at construction or enabled later, so the peer is reached
+    /// at once rather than one interval later -- as Linux and wireguard-go do
+    /// when a peer is brought up with, or given, a keepalive interval.
+    persistent_keepalive_due: bool,
+    /// The source of handshake jitter. Its own generator, not the
+    /// handshake's: an untuned configuration never draws from that one for
+    /// timers, and the Jc and padding draws that do use it stay where they
+    /// were.
+    pub(super) jitter_rng: ChaCha8Rng,
     /// Should this timer call reset rr function (if not a shared rr instance)
     pub(super) should_reset_rr: bool,
     /// Per-arming draws from the AmneziaWG tunable timer ranges; the classic
@@ -103,9 +138,11 @@ impl Timers {
             time_started: Instant::now(),
             timers: Default::default(),
             session_timers: Default::default(),
-            want_keepalive: Default::default(),
-            want_handshake: Default::default(),
+            want_keepalive: None,
+            want_handshake: None,
             persistent_keepalive: usize::from(persistent_keepalive.unwrap_or(0)),
+            persistent_keepalive_due: persistent_keepalive.unwrap_or(0) > 0,
+            jitter_rng: ChaCha8Rng::seed_from_u64(OsRng.next_u64()),
             should_reset_rr: reset_rr,
             retransmit_current: REKEY_TIMEOUT,
             handshake_attempts: 0,
@@ -132,12 +169,21 @@ impl Timers {
     // We don't really clear the timers, but we set them to the current time to
     // so the reference time frame is the same
     pub(super) fn clear(&mut self) {
-        let now = Instant::now().duration_since(self.time_started);
+        // Never earlier than the last poll, as in `Tunn::monotonic_now`.
+        let now = Instant::now()
+            .duration_since(self.time_started)
+            .max(self[TimeCurrent]);
         for t in &mut self.timers[..] {
             *t = now;
         }
-        self.want_handshake = false;
-        self.want_keepalive = false;
+        self.want_handshake = None;
+        self.want_keepalive = None;
+    }
+
+    /// One draw of handshake jitter; see [`REKEY_TIMEOUT_JITTER_MAX_MS`].
+    pub(super) fn jitter(&mut self) -> Duration {
+        let ms = self.jitter_rng.next_u32() % REKEY_TIMEOUT_JITTER_MAX_MS;
+        Duration::from_millis(u64::from(ms))
     }
 }
 
@@ -156,36 +202,46 @@ impl IndexMut<TimerName> for Timers {
 
 impl Tunn {
     pub(super) fn timer_tick(&mut self, timer_name: TimerName) {
+        let time = self.timers[TimeCurrent];
         match timer_name {
+            // Any authenticated packet, either way: hearing back cancels the
+            // new-handshake deadline, sending anything cancels the passive
+            // keepalive, and both are traffic the persistent keepalive need
+            // not repeat (upstream `timersAnyAuthenticatedPacketReceived`,
+            // `...Sent` and `...Traversal`).
             TimeLastPacketReceived => {
-                // Draw only when the latch arms, not per packet: upstream mods
-                // its sendKeepalive timer only when it is not already pending,
-                // so each armed deadline is a single uniform draw from the
-                // configured range. Unset ranges return the constant without
-                // touching the RNG.
-                if !self.timers.want_keepalive {
-                    self.timers.keepalive_current =
-                        self.amnezia.timers.keepalive(&mut self.handshake.rng);
-                }
-                self.timers.want_keepalive = true;
-                self.timers.want_handshake = false;
+                self.timers.want_handshake = None;
+                self.timers[TimePersistentKeepalive] = time;
             }
             TimeLastPacketSent => {
-                // Same arming rule as above, for the unanswered-data deadline
-                // (upstream `timersDataSent` / `newHandshakeTimeout`).
-                if !self.timers.want_handshake {
-                    self.timers.new_handshake_current = self
-                        .amnezia
-                        .timers
-                        .new_handshake_timeout(&mut self.handshake.rng);
-                }
-                self.timers.want_handshake = true;
-                self.timers.want_keepalive = false;
+                self.timers.want_keepalive = None;
+                self.timers[TimePersistentKeepalive] = time;
+                // Any authenticated send reaches the peer as the owed
+                // keepalive would -- an initiation started by hand or by a Jc
+                // burst included -- so it is no longer owed.
+                self.timers.persistent_keepalive_due = false;
+            }
+            // Data only. Draw only when the deadline arms, not per packet:
+            // upstream mods these timers only when they are not already
+            // pending, so each armed deadline is a single uniform draw from
+            // the configured range. Unset ranges return the constant without
+            // touching the handshake RNG.
+            TimeLastDataPacketReceived if self.timers.want_keepalive.is_none() => {
+                self.timers.keepalive_current =
+                    self.amnezia.timers.keepalive(&mut self.handshake.rng);
+                self.timers.want_keepalive = Some(time);
+            }
+            TimeLastDataPacketSent if self.timers.want_handshake.is_none() => {
+                self.timers.new_handshake_current = self
+                    .amnezia
+                    .timers
+                    .new_handshake_timeout(&mut self.handshake.rng)
+                    + self.timers.jitter();
+                self.timers.want_handshake = Some(time);
             }
             _ => {}
         }
 
-        let time = self.timers[TimeCurrent];
         self.timers[timer_name] = time;
     }
 
@@ -231,7 +287,7 @@ impl Tunn {
         let t = self.amnezia.timers;
         let retransmit = t.retransmit_timeout(&mut self.handshake.rng);
         let keepalive = t.keepalive(&mut self.handshake.rng);
-        let new_handshake = t.new_handshake_timeout(&mut self.handshake.rng);
+        let new_handshake = t.new_handshake_timeout(&mut self.handshake.rng) + self.timers.jitter();
         let rekey_after = t.key_refresh_sending(&mut self.handshake.rng);
         let refresh_receive = t.key_refresh_receiving(&mut self.handshake.rng);
 
@@ -240,7 +296,7 @@ impl Tunn {
         // forever by a periodic `awg syncconf`.
         let max_retransmissions = t.max_retransmissions(&mut self.handshake.rng);
 
-        self.timers.retransmit_current = retransmit;
+        self.timers.retransmit_current = retransmit + self.timers.jitter();
         self.timers.max_retransmissions_current = max_retransmissions;
         self.timers.keepalive_current = keepalive;
         self.timers.new_handshake_current = new_handshake;
@@ -271,7 +327,7 @@ impl Tunn {
         let timers = &mut self.timers;
 
         for (i, t) in timers.session_timers.iter_mut().enumerate() {
-            if time_now - *t > reject_after_time {
+            if time_now.saturating_sub(*t) > reject_after_time {
                 if let Some(session) = self.sessions[i].take() {
                     // The message names the rule, the field names the number
                     // that actually fired: with `reject_after_time` tuned, the
@@ -334,9 +390,14 @@ impl Tunn {
         // that can exceed the window, and with both unset the two are
         // the fixed 5 and 90 seconds. A tuned tunnel is bounded by the
         // count, and beyond that by `keychain_expire() * 3` above.
+        //
+        // Widened by the most jitter the cycle's retransmissions can add
+        // (`untuned_attempt_window`), so the 90 seconds of fixed 5-second
+        // intervals the count was derived from still fit, jittered: no
+        // retransmission the count allows is cut off by the bound.
         if self.amnezia.timers.max_handshake_attempts == (0, 0)
             && self.amnezia.timers.rekey_timeout == (0, 0)
-            && now - self.timers[TimeLastHandshakeStarted] >= REKEY_ATTEMPT_TIME
+            && now.saturating_sub(self.timers[TimeLastHandshakeStarted]) >= untuned_attempt_window()
         {
             tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
             self.handshake.set_expired();
@@ -346,10 +407,28 @@ impl Tunn {
         false
     }
 
+    /// Time since the tunnel started, never earlier than the last poll's: a
+    /// clock that steps back must not make the `now - earlier_tick`
+    /// subtractions below underflow, which panics -- and aborts the process
+    /// under the C and JNI entry points.
+    fn monotonic_now(&self, time: Instant) -> Duration {
+        time.duration_since(self.timers.time_started)
+            .max(self.timers[TimeCurrent])
+    }
+
     pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
         let mut handshake_initiation_required = false;
-        let mut consumed_handshake_latch = false;
+        let mut consumed_handshake_latch = None;
         let mut keepalive_required = false;
+        // What selecting a keepalive spends, put back if it then does not fit
+        // `dst`: as with the handshake latch below, a capacity refusal must
+        // not cost the demand -- a persistent keepalive owed at activation
+        // would otherwise wait a whole interval.
+        let keepalive_rollback = (
+            self.timers.persistent_keepalive_due,
+            self.timers[TimePersistentKeepalive],
+            self.timers.want_keepalive,
+        );
 
         let time = Instant::now();
 
@@ -359,7 +438,7 @@ impl Tunn {
 
         // All the times are counted from tunnel initiation, for efficiency our timers are rounded
         // to a second, as there is no real benefit to having highly accurate timers.
-        let now = time.duration_since(self.timers.time_started);
+        let now = self.monotonic_now(time);
         self.timers[TimeCurrent] = now;
 
         self.update_session_timers(now);
@@ -391,8 +470,6 @@ impl Tunn {
 
         // Load timers only once:
         let session_established = self.timers[TimeSessionEstablished];
-        let aut_packet_received = self.timers[TimeLastPacketReceived];
-        let aut_packet_sent = self.timers[TimeLastPacketSent];
         let data_packet_received = self.timers[TimeLastDataPacketReceived];
         let data_packet_sent = self.timers[TimeLastDataPacketSent];
         let persistent_keepalive = self.timers.persistent_keepalive;
@@ -482,37 +559,39 @@ impl Tunn {
                     }
                 }
 
-                // If we have sent a packet to a given peer but have not received a
-                // packet after from that peer for (KEEPALIVE + REKEY_TIMEOUT) ms
-                // (keepalive high end plus a rekey_timeout draw, made when the
-                // latch armed), we initiate a new handshake.
-                if data_packet_sent > aut_packet_received
-                    && now - aut_packet_received >= self.timers.new_handshake_current
-                    && mem::replace(&mut self.timers.want_handshake, false)
-                {
-                    tracing::warn!("HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)");
-                    handshake_initiation_required = true;
-                    consumed_handshake_latch = true;
+                // If we have sent data to a given peer but have not received a
+                // packet from that peer for (KEEPALIVE + REKEY_TIMEOUT) ms since
+                // (keepalive high end plus a rekey_timeout draw and jitter,
+                // made when the deadline armed), we initiate a new handshake.
+                if let Some(armed) = self.timers.want_handshake {
+                    if now.saturating_sub(armed) >= self.timers.new_handshake_current {
+                        tracing::warn!("HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)");
+                        handshake_initiation_required = true;
+                        consumed_handshake_latch = self.timers.want_handshake.take();
+                    }
                 }
 
                 if !handshake_initiation_required {
-                    // If a packet has been received from a given peer, but we have not sent one back
-                    // to the given peer in KEEPALIVE ms (drawn when the latch armed,
+                    // If data has been received from a given peer, but we have not sent anything back
+                    // to the given peer in KEEPALIVE ms since (drawn when the deadline armed,
                     // when configured), we send an empty packet.
-                    if data_packet_received > aut_packet_sent
-                        && now - aut_packet_sent >= self.timers.keepalive_current
-                        && mem::replace(&mut self.timers.want_keepalive, false)
-                    {
-                        tracing::debug!("KEEPALIVE(KEEPALIVE_TIMEOUT)");
-                        keepalive_required = true;
+                    if let Some(armed) = self.timers.want_keepalive {
+                        if now.saturating_sub(armed) >= self.timers.keepalive_current {
+                            tracing::debug!("KEEPALIVE(KEEPALIVE_TIMEOUT)");
+                            self.timers.want_keepalive = None;
+                            keepalive_required = true;
+                        }
                     }
 
-                    // Persistent KEEPALIVE
+                    // Persistent KEEPALIVE: one interval after the last
+                    // authenticated packet either way, or at once when owed.
                     if persistent_keepalive > 0
-                        && (now - self.timers[TimePersistentKeepalive]
-                            >= Duration::from_secs(persistent_keepalive as _))
+                        && (self.timers.persistent_keepalive_due
+                            || now.saturating_sub(self.timers[TimePersistentKeepalive])
+                                >= Duration::from_secs(persistent_keepalive as _))
                     {
                         tracing::debug!("KEEPALIVE(PERSISTENT_KEEPALIVE)");
+                        self.timers.persistent_keepalive_due = false;
                         self.timer_tick(TimePersistentKeepalive);
                         keepalive_required = true;
                     }
@@ -526,20 +605,31 @@ impl Tunn {
             // capacity refusal now happens before any handshake state exists
             // to retransmit, so re-arm it -- unless a burst was prepared, which
             // carries the demand itself.
-            if consumed_handshake_latch
-                && self.pending_amnezia_junk.is_none()
-                && matches!(
-                    result,
-                    TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
-                )
-            {
-                self.timers.want_handshake = true;
+            if let Some(armed) = consumed_handshake_latch {
+                if self.pending_amnezia_junk.is_none()
+                    && matches!(
+                        result,
+                        TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+                    )
+                {
+                    self.timers.want_handshake = Some(armed);
+                }
             }
             return result;
         }
 
         if keepalive_required {
-            return self.encapsulate(&[], dst);
+            let result = self.encapsulate(&[], dst);
+            if matches!(
+                result,
+                TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+            ) {
+                let (due, persistent, passive) = keepalive_rollback;
+                self.timers.persistent_keepalive_due = due;
+                self.timers[TimePersistentKeepalive] = persistent;
+                self.timers.want_keepalive = passive;
+            }
+            return result;
         }
 
         TunnResult::Done
@@ -551,7 +641,7 @@ impl Tunn {
             let duration_since_tun_start = Instant::now().duration_since(self.timers.time_started);
             let duration_since_session_established = self.timers[TimeSessionEstablished];
 
-            Some(duration_since_tun_start - duration_since_session_established)
+            Some(duration_since_tun_start.saturating_sub(duration_since_session_established))
         } else {
             None
         }
@@ -571,7 +661,18 @@ impl Tunn {
 impl Timers {
     /// Replace the persistent-keepalive interval. `None` (or zero) disables it,
     /// matching how [`Timers::new`] interprets the same argument.
+    ///
+    /// Turning it on owes a keepalive at once, as Linux and wireguard-go send
+    /// one when an interval is set where there was none; changing an interval
+    /// that was already on does not.
     pub(super) fn set_persistent_keepalive(&mut self, keepalive: Option<u16>) {
-        self.persistent_keepalive = usize::from(keepalive.unwrap_or(0));
+        let interval = usize::from(keepalive.unwrap_or(0));
+        if self.persistent_keepalive == 0 && interval > 0 {
+            self.persistent_keepalive_due = true;
+        }
+        if interval == 0 {
+            self.persistent_keepalive_due = false;
+        }
+        self.persistent_keepalive = interval;
     }
 }

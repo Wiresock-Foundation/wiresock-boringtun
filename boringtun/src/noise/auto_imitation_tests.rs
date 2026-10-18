@@ -685,8 +685,9 @@ fn auto_imitation_eligibility_accumulates_across_candidates() {
     ));
     assert!(!server.has_imitation_hint());
 
-    // ...and one too old for the window, on the real receiving index.
-    for _ in 0..1100 {
+    // ...and one too old for the 8192-counter window, on the real receiving
+    // index.
+    for _ in 0..8300 {
         let data = network(client.encapsulate(&bare_ipv4(), &mut buf));
         assert!(matches!(
             server.decapsulate(SRC, &data, &mut [0u8; 2048]),
