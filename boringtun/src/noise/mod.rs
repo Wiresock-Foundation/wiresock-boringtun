@@ -723,6 +723,13 @@ impl Tunn {
         self.auto_imitation.clear_pending();
     }
 
+    /// Reseed the handshake jitter, so two runs of the same tunnel retransmit
+    /// at the same times. For the device tests, which cannot see the field.
+    #[cfg(all(test, feature = "device"))]
+    pub(crate) fn seed_jitter(&mut self, seed: u64) {
+        self.timers.jitter_rng = rand_core::SeedableRng::seed_from_u64(seed);
+    }
+
     /// Whether a pre-handshake burst is queued, the initiation behind it not
     /// yet sent. For the device tests, which cannot see the field.
     #[cfg(all(test, feature = "device"))]
