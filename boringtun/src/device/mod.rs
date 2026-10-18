@@ -558,6 +558,37 @@ fn commit_anonymous<'a>(
     result
 }
 
+/// What a peer's connected socket makes of one received datagram.
+///
+/// An empty one is nothing. `Tunn::decapsulate` reads an empty datagram as
+/// its caller asking to drain what the tunnel already holds -- send a queued
+/// packet, move a pending Jc or imitation burst on, start the handshake the
+/// queue waits for -- and a datagram off the network, which anyone who knows
+/// the 4-tuple can forge, must not make that request. The device drains with
+/// its own `decapsulate(None, &[])` calls, after output that calls for it.
+/// The shared listener needs no such check: an empty datagram fits no packet
+/// shape there and is dropped before any tunnel sees it.
+fn receive_on_connection<'a>(
+    tunnel: &mut Tunn,
+    from: IpAddr,
+    datagram: &[u8],
+    dst: &'a mut [u8],
+) -> TunnResult<'a> {
+    if datagram.is_empty() {
+        return TunnResult::Done;
+    }
+    tunnel.decapsulate(Some(from), datagram, dst)
+}
+
+/// Whether creating an IPv6 socket failed because the host has no IPv6, as
+/// opposed to anything that should stop the device.
+fn ipv6_is_unavailable(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EAFNOSUPPORT) | Some(libc::EPROTONOSUPPORT)
+    )
+}
+
 /// Read and discard up to `MAX_ITR` queued datagrams.
 ///
 /// Required for correctness, not tidiness. `EventPoll::new_event` documents
@@ -1031,8 +1062,7 @@ impl Device {
         if port != 0
             && port == self.listen_port
             && self.udp4.is_some()
-            && self.udp6.is_some()
-            && self.udp_listener_fds.len() == 2
+            && self.udp_listener_fds.len() == 1 + usize::from(self.udp6.is_some())
         {
             return Ok(());
         }
@@ -1049,10 +1079,11 @@ impl Device {
         // the clone only for clarity: SO_MARK belongs to the socket, which a
         // clone shares, so the registered descriptor carries it either way.
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        for listener in [&udp4, &udp6] {
+        for listener in std::iter::once(&udp4).chain(udp6.as_ref()) {
             self.mark_listener(listener)?;
         }
-        let (clone4, clone6) = (udp4.try_clone()?, udp6.try_clone()?);
+        let clone4 = udp4.try_clone()?;
+        let clone6 = udp6.as_ref().map(socket2::Socket::try_clone).transpose()?;
         // The candidates' diagnostic identities, so their handlers can name
         // them. A failed rebind discards them; none is ever handed out again.
         let id4 = ListenerId {
@@ -1077,9 +1108,10 @@ impl Device {
         // `set=1` inside the device's write closure, and a worker dispatches
         // only while holding the device read lock, which the write excludes.
         let fd4 = self.register_udp_handler(clone4, id4)?;
-        let fd6 = match self.register_udp_handler(clone6, id6) {
-            Ok(fd) => fd,
-            Err(e) => {
+        let fd6 = match clone6.map(|clone6| self.register_udp_handler(clone6, id6)) {
+            None => None,
+            Some(Ok(fd)) => Some(fd),
+            Some(Err(e)) => {
                 unsafe { self.queue.clear_event_by_fd(fd4) };
                 return Err(e);
             }
@@ -1089,11 +1121,12 @@ impl Device {
         // the descriptors they were registered under (their clones', not
         // `udp4`/`udp6`'s own, which were never registered), then close the
         // previous sockets by replacing them.
-        for fd in std::mem::replace(&mut self.udp_listener_fds, vec![fd4, fd6]) {
+        let fds = std::iter::once(fd4).chain(fd6).collect();
+        for fd in std::mem::replace(&mut self.udp_listener_fds, fds) {
             unsafe { self.queue.clear_event_by_fd(fd) };
         }
         self.udp4 = Some(udp4);
-        self.udp6 = Some(udp6);
+        self.udp6 = udp6;
         self.udp4_gen = id4.gen;
         self.udp6_gen = id6.gen;
         self.listen_port = port;
@@ -1111,7 +1144,17 @@ impl Device {
     /// Create, configure and bind a nonblocking IPv4/IPv6 listener pair on
     /// `port`, or on the port the OS picks for the IPv4 socket when `port` is
     /// 0. Returns the pair and the port bound. Registers nothing.
-    fn bind_listen_pair(mut port: u16) -> Result<(socket2::Socket, socket2::Socket, u16), Error> {
+    ///
+    /// A host without IPv6 -- a kernel booted with `ipv6.disable=1`, built
+    /// without it, or a sandbox that refuses the family -- gets the IPv4
+    /// listener alone: only an IPv6 `socket()` refused for its family counts
+    /// as that, and is logged. Every other IPv6 failure, such as the port
+    /// being taken, still fails the whole bind, so a working dual-stack host
+    /// never silently loses half its listeners.
+    #[allow(clippy::type_complexity)]
+    fn bind_listen_pair(
+        mut port: u16,
+    ) -> Result<(socket2::Socket, Option<socket2::Socket>, u16), Error> {
         let udp4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         udp4.set_reuse_address(true)?;
         udp4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
@@ -1126,12 +1169,23 @@ impl Device {
                 .port();
         }
 
-        let udp6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        let udp6 = match socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
+            Ok(udp6) => udp6,
+            Err(e) if ipv6_is_unavailable(&e) => {
+                tracing::warn!(
+                    message = "IPv6 is unavailable on this host; listening on IPv4 only",
+                    port = port,
+                    error = %e
+                );
+                return Ok((udp4, None, port));
+            }
+            Err(e) => return Err(e.into()),
+        };
         udp6.set_reuse_address(true)?;
         udp6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
         udp6.set_nonblocking(true)?;
 
-        Ok((udp4, udp6, port))
+        Ok((udp4, Some(udp6), port))
     }
 
     /// The committed listener of `family`, by diagnostic identity.
@@ -1404,9 +1458,12 @@ impl Device {
             Box::new(|d, t| {
                 let peer_map = &d.peers;
 
-                let (udp4, udp6) = match (d.udp4.as_ref(), d.udp6.as_ref()) {
-                    (Some(udp4), Some(udp6)) => (udp4, udp6),
-                    _ => return Action::Continue,
+                // No IPv6 listener on a host without IPv6: timers still run,
+                // and a send to an IPv6 endpoint fails as it would anywhere
+                // the family is missing.
+                let (udp4, udp6) = match d.udp4.as_ref() {
+                    Some(udp4) => (udp4, d.udp6.as_ref()),
+                    None => return Action::Continue,
                 };
 
                 // Go over each peer and invoke the timer function
@@ -2045,8 +2102,9 @@ impl Device {
                         d.conn_recv_point(ConnRecvPoint::Handled, endpoint);
                         break;
                     }
-                    match p.tunnel.decapsulate(
-                        Some(peer_addr),
+                    match receive_on_connection(
+                        &mut p.tunnel,
+                        peer_addr,
                         &t.src_buf[..read_bytes],
                         &mut t.dst_buf[..],
                     ) {
@@ -2127,7 +2185,8 @@ impl Device {
                 // * Encapsulate the packet for the given peer
                 // * Send encapsulated packet to the peer's endpoint
                 let udp4 = d.udp4.as_ref().expect("Not connected");
-                let udp6 = d.udp6.as_ref().expect("Not connected");
+                // `None` on a host without IPv6; see `bind_listen_pair`.
+                let udp6 = d.udp6.as_ref();
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
@@ -2932,6 +2991,59 @@ mod ingress_tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// Only a refused address family means "no IPv6 here"; anything else
+    /// about the IPv6 socket still fails the bind as a whole.
+    #[test]
+    fn only_a_missing_address_family_means_ipv6_is_unavailable() {
+        let errno = io::Error::from_raw_os_error;
+        assert!(ipv6_is_unavailable(&errno(libc::EAFNOSUPPORT)));
+        assert!(ipv6_is_unavailable(&errno(libc::EPROTONOSUPPORT)));
+        for other in [libc::EADDRINUSE, libc::EACCES, libc::EMFILE, libc::ENOBUFS] {
+            assert!(!ipv6_is_unavailable(&errno(other)), "errno {}", other);
+        }
+        assert!(!ipv6_is_unavailable(&io::Error::other("no errno")));
+    }
+
+    /// An empty datagram on a connected socket is not a drain request. With a
+    /// Jc burst pending, the tunnel's own drain call moves the burst on; the
+    /// same zero bytes from the network move nothing.
+    #[test]
+    fn an_empty_datagram_on_a_connected_socket_drains_nothing() {
+        let amnezia = AmneziaConfig::new(5, 0, 0, 0).with_pre_handshake_junk(3, 10, 20, 0);
+        let secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let peer = x25519::PublicKey::from(&x25519::StaticSecret::random_from_rng(OsRng));
+        let mut tunnel = Tunn::new_with_obfuscation(
+            secret,
+            peer,
+            None,
+            None,
+            1,
+            None,
+            ObfuscationRanges::default(),
+            amnezia,
+        )
+        .unwrap();
+        let mut dst = vec![0u8; MAX_UDP_SIZE];
+        assert!(matches!(
+            tunnel.encapsulate(&[0x45; 40], &mut dst),
+            TunnResult::WriteToNetwork(_)
+        ));
+        assert!(tunnel.has_pending_burst());
+        let from = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        for _ in 0..5 {
+            assert!(matches!(
+                receive_on_connection(&mut tunnel, from, &[], &mut dst),
+                TunnResult::Done
+            ));
+        }
+        assert!(tunnel.has_pending_burst());
+        // Control: the tunnel's own drain does emit the next junk datagram.
+        assert!(matches!(
+            tunnel.decapsulate(None, &[], &mut dst),
+            TunnResult::WriteToNetwork(_)
+        ));
     }
 
     /// An initiation from a new address is answered on the new path's fresh

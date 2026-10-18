@@ -2720,12 +2720,16 @@ allowed_ip=10.66.66.2/32",
         (v4, v6)
     }
 
-    /// A test port nothing holds.
+    /// A test port nothing holds. On a host without IPv6, where the device
+    /// listens on IPv4 alone, only the IPv4 half can be held, and asking for
+    /// both would never return.
     #[cfg(target_os = "linux")]
     fn free_port() -> u16 {
+        let ipv6 = UdpSocket::bind(("::", 0)).is_ok();
         loop {
             let port = next_port();
-            if bindable(port) == FREE {
+            let (v4, v6) = bindable(port);
+            if v4 && (v6 || !ipv6) {
                 return port;
             }
         }

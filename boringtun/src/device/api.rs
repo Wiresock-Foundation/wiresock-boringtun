@@ -32,6 +32,15 @@ const SOCK_DIR: &str = "/var/run/wireguard/";
 /// fork, publish in both places rather than choosing.
 const AWG_SOCK_DIR: &str = "/var/run/amneziawg/";
 
+/// `<dir>/<name>.sock`, with exactly one separator. Both directories end in
+/// `/`, and joining them with another bound `/var/run/wireguard//wg0.sock`:
+/// the kernel resolves that, but reports the doubled name as the socket's
+/// bound path, so exact-path lookups (`lsof`, `ss -x`, `/proc/net/unix`) and
+/// the `awg` symlink's target all carried it.
+fn sock_path(dir: &str, name: &str) -> String {
+    format!("{}/{}.sock", dir.trim_end_matches('/'), name)
+}
+
 /// Parse an AmneziaWG range value: either a bare number (`"1"`) or the
 /// inclusive `min-max` form (`"342871004-442871003"`). A bare value is a
 /// degenerate range, which is exactly how the kernel module's `mh_genspec`
@@ -382,7 +391,7 @@ impl Device {
     /// is logged, leaving the device reachable by `wg` but not `awg`.
     pub fn register_api_handler(&mut self) -> Result<(), Error> {
         let name = self.iface.name()?;
-        let path = format!("{}/{}.sock", SOCK_DIR, name);
+        let path = sock_path(SOCK_DIR, &name);
 
         create_sock_dir(SOCK_DIR);
 
@@ -396,7 +405,7 @@ impl Device {
         // listener, so there is exactly one socket and one accept loop; both
         // toolchains then reach the same device. Failure is not fatal -- the
         // daemon still works, just only under `wg`.
-        let awg_path = format!("{}/{}.sock", AWG_SOCK_DIR, name);
+        let awg_path = sock_path(AWG_SOCK_DIR, &name);
         create_sock_dir(AWG_SOCK_DIR);
         let _ = remove_file(&awg_path);
         match std::os::unix::fs::symlink(&path, &awg_path) {
@@ -1202,6 +1211,20 @@ fn api_set_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uapi_socket_paths_have_a_single_separator() {
+        assert_eq!(sock_path(SOCK_DIR, "wg0"), "/var/run/wireguard/wg0.sock");
+        assert_eq!(
+            sock_path(AWG_SOCK_DIR, "wg0"),
+            "/var/run/amneziawg/wg0.sock"
+        );
+        // Whether or not the directory carries its trailing separator.
+        assert_eq!(
+            sock_path("/var/run/wireguard", "utun7"),
+            "/var/run/wireguard/utun7.sock"
+        );
+    }
 
     fn os(errno: i32) -> std::io::Error {
         std::io::Error::from_raw_os_error(errno)

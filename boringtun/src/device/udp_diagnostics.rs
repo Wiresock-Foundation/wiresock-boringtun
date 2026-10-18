@@ -621,6 +621,32 @@ pub(super) fn single_send_to_attempt(
     Attempt { result, token }
 }
 
+/// [`single_send_to_attempt`] on a listener that may not exist. A device on a
+/// host without IPv6 has no IPv6 listener, and a send to an IPv6 endpoint
+/// then fails as the missing family fails anywhere, `EAFNOSUPPORT`, without a
+/// socket call -- observed like any other failed send, so the operator hears
+/// of a peer that cannot be reached.
+#[cfg_attr(not(test), allow(unused_variables))]
+pub(super) fn listener_send_to_attempt(
+    env: &DeviceUdpDiagnostics,
+    sock: Option<&Socket>,
+    meta: AttemptMeta,
+    buf: &[u8],
+    to: &SockAddr,
+) -> Attempt {
+    if let Some(sock) = sock {
+        return single_send_to_attempt(env, sock, meta, buf, to);
+    }
+    #[cfg(not(test))]
+    let token = AttemptToken;
+    #[cfg(test)]
+    let (token, _) = env.seam_begin(Op::Send, meta);
+    let result = Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
+    #[cfg(test)]
+    env.seam_finish(token, false, &result);
+    Attempt { result, token }
+}
+
 #[cfg_attr(not(test), allow(unused_variables))]
 #[inline]
 pub(super) fn single_recv_attempt(
@@ -665,13 +691,13 @@ pub(super) fn timer_send_step(
     p: &mut Peer,
     udp4: &Socket,
     id4: ListenerId,
-    udp6: &Socket,
+    udp6: Option<&Socket>,
     id6: ListenerId,
     endpoint: SocketAddr,
     packet: &[u8],
 ) {
     let (sock, id, site) = match endpoint {
-        SocketAddr::V4(_) => (udp4, id4, Site::TimerV4),
+        SocketAddr::V4(_) => (Some(udp4), id4, Site::TimerV4),
         SocketAddr::V6(_) => (udp6, id6, Site::TimerV6),
     };
     let meta = AttemptMeta {
@@ -679,7 +705,7 @@ pub(super) fn timer_send_step(
         socket: SocketRef::Listener(id),
         dest: Some(endpoint),
     };
-    let attempt = single_send_to_attempt(env, sock, meta, packet, &endpoint.into());
+    let attempt = listener_send_to_attempt(env, sock, meta, packet, &endpoint.into());
     let peer = p.index();
     let target = Target::Listener { id, to: endpoint };
     observe_peer_send(
@@ -845,7 +871,7 @@ pub(super) fn tun_send_step(
     peer: &mut Peer,
     udp4: &Socket,
     id4: ListenerId,
-    udp6: &Socket,
+    udp6: Option<&Socket>,
     id6: ListenerId,
     packet: &[u8],
 ) -> bool {
@@ -883,7 +909,7 @@ pub(super) fn tun_send_step(
                 dest: Some(addr),
             };
             (
-                single_send_to_attempt(env, udp6, meta, packet, &addr.into()),
+                listener_send_to_attempt(env, udp6, meta, packet, &addr.into()),
                 Target::Listener { id: id6, to: addr },
                 Site::TunV6,
             )
@@ -2564,11 +2590,20 @@ mod tests {
 
     impl Listeners {
         fn tun(&self, env: &DeviceUdpDiagnostics, p: &mut Peer, packet: &[u8]) -> bool {
-            tun_send_step(env, p, &self.u4, self.id4, &self.u6, self.id6, packet)
+            tun_send_step(env, p, &self.u4, self.id4, Some(&self.u6), self.id6, packet)
         }
 
         fn timer(&self, env: &DeviceUdpDiagnostics, p: &mut Peer, to: SocketAddr, packet: &[u8]) {
-            timer_send_step(env, p, &self.u4, self.id4, &self.u6, self.id6, to, packet)
+            timer_send_step(
+                env,
+                p,
+                &self.u4,
+                self.id4,
+                Some(&self.u6),
+                self.id6,
+                to,
+                packet,
+            )
         }
     }
 
@@ -4312,6 +4347,54 @@ mod tests {
             )],
             "[FAM-T4] journal site, socket and destination"
         );
+    }
+
+    /// Every attempt's result as the journal recorded it.
+    fn attempt_results(env: &DeviceUdpDiagnostics) -> Vec<Option<Result<usize, Option<i32>>>> {
+        env.journal()
+            .iter()
+            .filter_map(|e| match e {
+                JournalEvent::Attempt { result, .. } => Some(*result),
+                JournalEvent::Decision { .. } => None,
+            })
+            .collect()
+    }
+
+    /// A device on a host without IPv6 has no IPv6 listener. Timer and TUN
+    /// output for an IPv6 endpoint is then a failed send, `EAFNOSUPPORT`,
+    /// journaled and observed like any other -- not a panic, and not a silent
+    /// skip -- while IPv4 endpoints are sent as usual.
+    #[test]
+    fn without_an_ipv6_listener_ipv6_sends_fail_and_ipv4_sends_go_out() {
+        let g = diag_lock();
+        let env = DeviceUdpDiagnostics::for_tests(&g);
+        let u4 = v4();
+        let id4 = lid(Family::V4, 4);
+        let id6 = lid(Family::V6, 6);
+        let v6_endpoint: SocketAddr = "[2001:db8::1]:51820".parse().unwrap();
+
+        let mut p = test_peer(1);
+        timer_send_step(&env, &mut p, &u4, id4, None, id6, v6_endpoint, b"t6");
+        p.set_endpoint(v6_endpoint);
+        assert!(tun_send_step(&env, &mut p, &u4, id4, None, id6, b"u6"));
+        assert_eq!(
+            attempted(&env),
+            vec![
+                (Site::TimerV6, SocketRef::Listener(id6), Some(v6_endpoint)),
+                (Site::TunV6, SocketRef::Listener(id6), Some(v6_endpoint)),
+            ]
+        );
+        assert_eq!(
+            attempt_results(&env),
+            vec![Some(Err(Some(libc::EAFNOSUPPORT))); 2]
+        );
+
+        let sink = v4();
+        let mut q = test_peer(2);
+        timer_send_step(&env, &mut q, &u4, id4, None, id6, local(&sink), b"t4");
+        let (bytes, from) = wait_recv_from(&sink).expect("delivered over IPv4");
+        assert_eq!(bytes, b"t4");
+        assert_eq!(from, local(&u4));
     }
 
     #[test]
