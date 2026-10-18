@@ -304,21 +304,26 @@ impl RateLimiter {
     }
 
     /// Whether one more handshake message from `source` finds the limiter
-    /// under load: its source past its share, or the aggregate past `limit`.
+    /// under load, and why: its source past its share, or the aggregate past
+    /// `limit`.
     ///
     /// A message its source's share refuses is not counted against the
     /// aggregate, or one flooding address would still exhaust it and put every
     /// peer into cookie mode -- the very thing the per-source count is for.
     /// Without a source only the aggregate applies.
-    fn is_under_load(&self, source: Option<Source>) -> bool {
+    fn is_under_load(&self, source: Option<Source>) -> Load {
         #[cfg(test)]
         self.decisions.fetch_add(1, Ordering::SeqCst);
         if let Some(source) = source {
             if u64::from(self.sources.count(source, self.window())) > self.source_limit {
-                return true;
+                return Load::SourceShare;
             }
         }
-        self.count.fetch_add(1, Ordering::SeqCst) >= self.limit
+        if self.count.fetch_add(1, Ordering::SeqCst) >= self.limit {
+            Load::Aggregate
+        } else {
+            Load::Clear
+        }
     }
 
     /// The current one-second window of the per-source counts. `u32` seconds
@@ -461,7 +466,7 @@ impl RateLimiter {
         }
 
         let under_load = *load.0.get_or_insert_with(|| self.is_under_load(src_addr));
-        if !under_load {
+        if under_load == Load::Clear {
             return HandshakeGate::Pass;
         }
         let addr = match src_addr {
@@ -484,13 +489,24 @@ impl RateLimiter {
         }
         // A valid mac2 proves the address, and is what a source refused its
         // share returns with -- so without a bound of its own, a source that
-        // fetched one cookie could buy unlimited Noise work under load. Each
-        // proven source gets its share again here, counted only over proven
-        // messages, as the Linux ratelimiter applies its per-IP bucket only
-        // past the cookie check.
+        // fetched one cookie could buy unlimited Noise work under load.
         //
-        // At least `SOURCE_FLOOR`: a limiter made to be under load from its
-        // first message (`limit` 0) still has to let a cookie through.
+        // Refused only its own share, it is admitted against the aggregate
+        // instead, which bounds the Noise work at `limit` a second. Its share
+        // is per address, and a client behind the same NAT that spent it --
+        // mac1-only messages are enough -- must not get its neighbours'
+        // proven handshakes dropped: they are cookied, then let through.
+        if under_load == Load::SourceShare && self.count.fetch_add(1, Ordering::SeqCst) < self.limit
+        {
+            return HandshakeGate::Pass;
+        }
+        // With the aggregate over, each proven source gets its share again,
+        // counted only over proven messages -- as the Linux ratelimiter
+        // applies its per-IP bucket only past the cookie check, and only when
+        // the whole device is under load -- so a flood spoofing a peer's
+        // address cannot spend that peer's allowance. At least
+        // `SOURCE_FLOOR`: a limiter made to be under load from its first
+        // message (`limit` 0) still has to let a cookie through.
         if u64::from(self.proven.count(addr, self.window())) > self.source_limit.max(SOURCE_FLOOR) {
             return HandshakeGate::UnderLoad;
         }
@@ -532,7 +548,17 @@ pub(crate) enum CookieDefense {
 /// Whether the limiter was under load when one received datagram reached it,
 /// decided at most once per datagram. See [`RateLimiter::gate_handshake`].
 #[derive(Default)]
-pub(crate) struct LoadDecision(Option<bool>);
+pub(crate) struct LoadDecision(Option<Load>);
+
+/// Why a handshake message found the limiter under load, if it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Load {
+    Clear,
+    /// Its source is past its share; the aggregate was not consulted.
+    SourceShare,
+    /// The aggregate is past `limit`.
+    Aggregate,
+}
 
 #[cfg(test)]
 impl LoadDecision {
@@ -738,33 +764,37 @@ mod tests {
         assert!(!passes(&l, endpoint("198.51.100.9:6000")));
     }
 
-    /// Under load, a source returning with a valid mac2 is let through for
-    /// its share of proven messages, then dropped -- one cookie does not buy
-    /// unlimited Noise work. Mac1-only messages spoofing its address do not
-    /// spend that allowance, and another proven source has its own.
+    /// With the aggregate over, a source returning with a valid mac2 is let
+    /// through for its share of proven messages, then dropped -- one cookie
+    /// does not buy unlimited Noise work. Mac1-only messages spoofing its
+    /// address do not spend that allowance, and another proven source has its
+    /// own.
     // Mock clock only, for the reason given on the tests above.
     #[cfg(feature = "mock-instant")]
     #[test]
     fn a_proven_source_is_held_to_its_share_and_spoofing_cannot_spend_it() {
         let l = limiter(100);
-        let flood = |source| {
+        // A spoofed flood: sources that each stay inside their share.
+        for i in 0..100u32 {
+            assert!(passes(
+                &l,
+                Source::Endpoint((Ipv4Addr::from(0x0a00_0000 + i), 1).into())
+            ));
+        }
+        let peer = endpoint("198.51.100.7:40000");
+        let spoof = |source| {
             for _ in 0..1000 {
                 assert!(!passes(&l, source));
             }
         };
-        let peer = endpoint("198.51.100.7:40000");
-        // Put the peer's address over its share, as a spoofer would.
-        for _ in 0..20 {
-            assert!(passes(&l, peer));
-        }
-        flood(peer);
+        spoof(peer);
         let cookie = l.current_cookie(peer);
         for _ in 0..20 {
             assert!(matches!(
                 gate(&l, Some(peer), &message(&l, Some(cookie))),
                 HandshakeGate::Pass
             ));
-            flood(peer);
+            spoof(peer);
         }
         assert!(matches!(
             gate(&l, Some(peer), &message(&l, Some(cookie))),
@@ -772,12 +802,54 @@ mod tests {
         ));
 
         let other = endpoint("203.0.113.9:1");
-        for _ in 0..21 {
-            gate(&l, Some(other), &message(&l, None));
-        }
         assert!(matches!(
             gate(&l, Some(other), &message(&l, Some(l.current_cookie(other)))),
             HandshakeGate::Pass
+        ));
+    }
+
+    /// One client behind a shared address can spend that address's share --
+    /// mac1-only messages are enough, its own cookie on top -- but its NAT
+    /// neighbours are then cookied and let through, never dropped, while the
+    /// aggregate has room: their proven messages are charged to it.
+    #[cfg(feature = "mock-instant")]
+    #[test]
+    fn a_nat_neighbour_cannot_get_its_neighbours_dropped() {
+        let l = limiter(100);
+        let attacker = endpoint("198.51.100.7:1");
+        let neighbour = endpoint("198.51.100.7:2");
+        for _ in 0..21 {
+            gate(&l, Some(attacker), &message(&l, None));
+        }
+        let own = l.current_cookie(attacker);
+        for _ in 0..21 {
+            assert!(matches!(
+                gate(&l, Some(attacker), &message(&l, Some(own))),
+                HandshakeGate::Pass
+            ));
+        }
+        assert!(matches!(
+            gate(&l, Some(neighbour), &message(&l, None)),
+            HandshakeGate::CookieDemanded(_)
+        ));
+        assert!(matches!(
+            gate(
+                &l,
+                Some(neighbour),
+                &message(&l, Some(l.current_cookie(neighbour)))
+            ),
+            HandshakeGate::Pass
+        ));
+        // Proven messages from an address over its share draw on the
+        // aggregate, so Noise work stays bounded at `limit`: once it is spent
+        // the per-source proven share applies to them too.
+        for _ in 0..200 {
+            gate(&l, Some(attacker), &message(&l, Some(own)));
+        }
+        assert!(l.count.load(Ordering::SeqCst) >= 100);
+        assert!(matches!(
+            gate(&l, Some(attacker), &message(&l, Some(own))),
+            HandshakeGate::UnderLoad
         ));
     }
 
