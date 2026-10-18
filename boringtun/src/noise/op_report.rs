@@ -17,9 +17,10 @@
 //! There is no "last result" to query later: the report is returned with the
 //! result it describes, or not at all.
 //!
-//! The vocabulary is the accepted P1-prime metadata contract (WRS-225 V1-V6),
-//! observability-only: no budget is applied, so nothing here changes what
-//! the operation does.
+//! The vocabulary is the accepted P1-prime metadata contract (WRS-225 V1-V6).
+//! Nothing here changes what the operation does; the output budgets the same
+//! entry points carry are applied by the producers (`budget`), and their
+//! effects are recorded here like any other fact.
 //!
 //! Only the C entry points read a report. A build without them still records
 //! the facts -- a few bit operations at the sites -- and never reads them back,
@@ -61,6 +62,9 @@ pub(crate) mod event {
     pub(crate) const SESSIONS_AGED_OUT: u32 = 0x0000_0080;
     pub(crate) const BURST_PREPARED: u32 = 0x0000_0100;
     pub(crate) const TICK_DEMAND_REFUSED: u32 = 0x0000_0200;
+    /// A drain deleted one or more queued plaintext packets whose mandatory
+    /// frame exceeded the call's finite transport budget.
+    pub(crate) const QUEUE_HEAD_DROPPED: u32 = 0x0001_0000;
 }
 
 /// Snapshot after the operation, under the same lock hold. ABI values.
@@ -296,5 +300,30 @@ impl Tunn {
     #[cfg(all(test, feature = "ffi-bindings"))]
     pub(crate) fn op_state_mut(&mut self) -> &mut OpState {
         &mut self.meta
+    }
+
+    /// Plaintext packets the tunnel owns, waiting for a session or a drain.
+    #[cfg(all(test, feature = "ffi-bindings"))]
+    pub(crate) fn queued_len(&self) -> usize {
+        self.packet_queue.len()
+    }
+
+    /// The bytes of the pending burst's next imitation datagram, so a test
+    /// can check that a refused item is the one emitted later, unchanged.
+    #[cfg(all(test, feature = "ffi-bindings"))]
+    pub(crate) fn pending_front_imitation(&self) -> Option<Vec<u8>> {
+        self.pending_amnezia_junk
+            .as_ref()?
+            .imitation_datagrams
+            .front()
+            .map(|(_, d)| d.clone())
+    }
+
+    /// How far the handshake generator -- tags, S prefixes, junk sizes and
+    /// fills, imitation -- has advanced, so a test can tell a refusal that
+    /// drew nothing from one that did.
+    #[cfg(all(test, feature = "ffi-bindings"))]
+    pub(crate) fn rng_word_pos(&self) -> u128 {
+        self.handshake.rng.get_word_pos()
     }
 }

@@ -5,23 +5,26 @@
 //! with the result it describes.
 //!
 //! The layout and meaning are the accepted WRS-225 P1-prime metadata contract
-//! (V1 declarations with the V2 `written_size` reading), implemented
-//! observability-only: the two output budgets must be 0, and a non-zero one
-//! is refused with error 19 rather than ignored. Error 18, the budget refusal,
-//! is reserved and never returned. With metadata or without, the operation is
-//! the legacy one; the legacy entry points are this same body with `info`
-//! NULL.
+//! (V1 declarations with the V2 `written_size` reading). The two input budgets,
+//! `max_transport_output` and `max_control_output`, bound the network datagram
+//! this one operation may produce; 0 is unbounded, each on its own. A mandatory
+//! datagram over a finite budget is error 18 (`OutputBudgetExceeded`): the
+//! operation ran, and its report says what it did. With metadata or without --
+//! or with both budgets 0 -- the operation is the legacy one; the legacy entry
+//! points are this same body with `info` NULL.
 //!
 //! The memory protocol, in the order the code below follows it:
 //!
-//! 1. `info` NULL: no metadata; the call is the legacy call.
+//! 1. `info` NULL: no metadata, no budget; the call is the legacy call.
 //! 2. Read the 4-byte `size` -- the only read before it is checked. Outside
 //!    48..=1024: error 19.
-//! 3. Read the 16-byte input head. `in_flags` != 0, or a budget != 0: error 19.
+//! 3. Read the 16-byte input head. `in_flags` != 0: error 19. The budgets are
+//!    taken as they are; any value is valid.
 //! 4. Every byte of `[48, size)` must be zero (a field from a newer header
 //!    that this library cannot honour): otherwise error 19.
-//! 5. Only now lock the tunnel, take the operation's sequence number, run it,
-//!    and compute the report under the same lock hold.
+//! 5. Only now lock the tunnel, take the operation's sequence number, run it
+//!    under the budgets just read -- a copy, held for this call only -- and
+//!    compute the report under the same lock hold.
 //! 6. After unlocking, write `[16, 48)` once. Nothing else is ever written:
 //!    `[0, 16)` and `[48, size)` are the caller's.
 //!
@@ -31,6 +34,7 @@
 //! reference is ever formed over caller memory.
 
 use super::wireguard_result;
+use crate::noise::budget::OutputBudget;
 use crate::noise::errors::WireGuardError;
 use crate::noise::op_report::OpReport;
 use crate::noise::{Tunn, TunnResult};
@@ -56,9 +60,11 @@ pub struct wireguard_packet_info {
     pub size: u32,
     /// In: reserved, must be 0.
     pub in_flags: u32,
-    /// In: reserved for an output-budget contract; must be 0.
+    /// In: largest transport data or keepalive datagram this call may
+    /// produce, in bytes of UDP payload; 0 is unbounded.
     pub max_transport_output: u32,
-    /// In: reserved for an output-budget contract; must be 0.
+    /// In: largest initiation, response, junk or imitation datagram this call
+    /// may produce, in bytes of UDP payload; 0 is unbounded.
     pub max_control_output: u32,
     /// Out: exclusive end offset of the output region this call wrote (48).
     pub written_size: u32,
@@ -101,20 +107,25 @@ const _: () = assert!(
         == WIREGUARD_PACKET_INFO_SIZE_V1 as usize
 );
 
-/// Steps 2-4 of the protocol. Reads 4 bytes, then -- only for a `size` this
-/// library accepts, which the caller has declared readable -- the input head
-/// and the tail.
-unsafe fn accepts(info: *const u8) -> bool {
+/// Steps 2-4 of the protocol: the call's budgets, or `None` for error 19.
+/// Reads 4 bytes, then -- only for a `size` this library accepts, which the
+/// caller has declared readable -- the input head and the tail.
+unsafe fn accepts(info: *const u8) -> Option<OutputBudget> {
     let size = ptr::read_unaligned(info as *const u32);
     if !(WIREGUARD_PACKET_INFO_SIZE_V1..=WIREGUARD_PACKET_INFO_SIZE_MAX).contains(&size) {
-        return false;
+        return None;
     }
     let [_, in_flags, max_transport_output, max_control_output] =
         ptr::read_unaligned(info as *const [u32; 4]);
-    if in_flags != 0 || max_transport_output != 0 || max_control_output != 0 {
-        return false;
+    if in_flags != 0 {
+        return None;
     }
-    (WIREGUARD_PACKET_INFO_SIZE_V1 as usize..size as usize).all(|i| ptr::read(info.add(i)) == 0)
+    (WIREGUARD_PACKET_INFO_SIZE_V1 as usize..size as usize)
+        .all(|i| ptr::read(info.add(i)) == 0)
+        .then_some(OutputBudget {
+            transport: max_transport_output,
+            control: max_control_output,
+        })
 }
 
 /// Step 6: the one write.
@@ -134,20 +145,27 @@ unsafe fn publish(info: *mut wireguard_packet_info, report: &OpReport) {
 }
 
 /// One FFI operation, with or without metadata: the shared body of the
-/// legacy and `_ex` entry points. `op` runs under the tunnel lock; it is
-/// where `src` and `dst` are turned into slices, so a refused `info` never
-/// reaches them.
+/// legacy and `_ex` entry points. `op` runs under the tunnel lock, with the
+/// budgets `info` carries (none without it); it is where `src` and `dst` are
+/// turned into slices, so a refused `info` never reaches them.
 pub(super) unsafe fn run<'a>(
     tunnel: *const Mutex<Tunn>,
     info: *mut wireguard_packet_info,
-    op: impl FnOnce(&mut Tunn) -> TunnResult<'a>,
+    op: impl FnOnce(&mut Tunn, OutputBudget) -> TunnResult<'a>,
 ) -> wireguard_result {
-    if !info.is_null() && !accepts(info as *const u8) {
-        return wireguard_result::from(TunnResult::Err(WireGuardError::InvalidPacketInfo));
-    }
+    let budget = if info.is_null() {
+        OutputBudget::UNBOUNDED
+    } else {
+        match accepts(info as *const u8) {
+            Some(budget) => budget,
+            None => {
+                return wireguard_result::from(TunnResult::Err(WireGuardError::InvalidPacketInfo))
+            }
+        }
+    };
     let mut tunnel = tunnel.as_ref().unwrap().lock();
     let entry = tunnel.begin_op();
-    let result = op(&mut tunnel);
+    let result = op(&mut tunnel, budget);
     let report = (!info.is_null()).then(|| tunnel.finish_op(entry, &result));
     drop(tunnel);
     let result = wireguard_result::from(result);

@@ -40,6 +40,8 @@ pub use packet_info::{
 };
 
 #[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
 mod metadata_tests;
 
 #[cfg(not(test))]
@@ -2003,11 +2005,11 @@ pub unsafe extern "C" fn wireguard_write_ex(
     dst_size: u32,
     info: *mut wireguard_packet_info,
 ) -> wireguard_result {
-    packet_info::run(tunnel, info, |tunnel| {
+    packet_info::run(tunnel, info, |tunnel, budget| {
         // Slices are not owned, and therefore will not be freed by Rust
         let src = slice::from_raw_parts(src, src_size as usize);
         let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-        tunnel.encapsulate(src, dst)
+        tunnel.encapsulate_with_budget(src, dst, budget)
     })
 }
 
@@ -2035,7 +2037,7 @@ pub unsafe extern "C" fn wireguard_read_ex(
     dst_size: u32,
     info: *mut wireguard_packet_info,
 ) -> wireguard_result {
-    packet_info::run(tunnel, info, |tunnel| {
+    packet_info::run(tunnel, info, |tunnel, budget| {
         // Slices are not owned, and therefore will not be freed by Rust
         let src = slice::from_raw_parts(src, src_size as usize);
         let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
@@ -2049,7 +2051,11 @@ pub unsafe extern "C" fn wireguard_read_ex(
         // built and however it is driven. So a future `wireguard_read_from` that
         // plumbs a real address through here needs no new guard; it inherits that
         // one. This `None` is now a second line, not the only one.
-        tunnel.decapsulate(None, src, dst)
+        //
+        // `decapsulate_with_budget` is `decapsulate(None, ..)` under the call's
+        // budgets. A `wireguard_read_from` would also have to budget the cookie
+        // reply, which that function leaves unbudgeted because it is unreachable.
+        tunnel.decapsulate_with_budget(src, dst, budget)
     })
 }
 
@@ -2073,10 +2079,10 @@ pub unsafe extern "C" fn wireguard_tick_ex(
     dst_size: u32,
     info: *mut wireguard_packet_info,
 ) -> wireguard_result {
-    packet_info::run(tunnel, info, |tunnel| {
+    packet_info::run(tunnel, info, |tunnel, budget| {
         // Slices are not owned, and therefore will not be freed by Rust
         let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-        tunnel.update_timers(dst)
+        tunnel.update_timers_with_budget(dst, budget)
     })
 }
 
@@ -2099,10 +2105,10 @@ pub unsafe extern "C" fn wireguard_force_handshake_ex(
     dst_size: u32,
     info: *mut wireguard_packet_info,
 ) -> wireguard_result {
-    packet_info::run(tunnel, info, |tunnel| {
+    packet_info::run(tunnel, info, |tunnel, budget| {
         // Slices are not owned, and therefore will not be freed by Rust
         let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-        tunnel.format_handshake_initiation(dst, true)
+        tunnel.format_handshake_initiation_with_budget(dst, true, budget)
     })
 }
 

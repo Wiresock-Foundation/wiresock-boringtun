@@ -823,7 +823,11 @@ mod tests {
                 "the transport packet was accepted, so its counter is spent"
             );
 
-            // An initiation accepted into a buffer too small for its answer.
+            // An initiation whose answer cannot fit the buffer is no longer
+            // accepted first (AWG-R1-003): the room for the response is
+            // checked before authentication, so nothing is consumed and the
+            // same initiation is answered once there is room -- after which
+            // it is a replay.
             let (mut mine, mut theirs) = pair(&amnezia, None);
             let init = network(mine.format_handshake_initiation(&mut buf, false));
             assert!(matches!(
@@ -833,9 +837,16 @@ mod tests {
             assert!(
                 matches!(
                     theirs.decapsulate(SRC, &init, &mut buf),
+                    TunnResult::WriteToNetwork(_)
+                ),
+                "refused before it was accepted: the retry is answered"
+            );
+            assert!(
+                matches!(
+                    theirs.decapsulate(SRC, &init, &mut buf),
                     TunnResult::Err(WireGuardError::WrongTai64nTimestamp)
                 ),
-                "the initiation was accepted before its answer failed"
+                "accepted now: a replay"
             );
         }
     }

@@ -972,11 +972,17 @@ fn a_cookie_reply_is_accepted_but_not_peer_authentication() {
 /// An input accepted and committed, then an error: the error is reported, and
 /// so is exactly what happened before it -- never more, never less.
 ///
-/// * An initiation into a `dst` below the 92-byte response: the timestamp is
-///   committed (re-offering it is a replay), but no session was stored.
-/// * An initiation into a `dst` that fits the response but not its S2
-///   prefix: the session WAS stored before framing failed.
 /// * An authenticated transport packet whose plaintext is not IP.
+///
+/// And the case that used to be one (AWG-R1-003): an initiation whose response
+/// cannot fit `dst` is now refused BEFORE it is authenticated, so nothing is
+/// accepted and the same initiation is answered once there is room.
+///
+/// * A `dst` below the 92-byte response: was ACCEPTED | PEER_AUTHENTICATED,
+///   the timestamp committed, and the re-offer a replay (7). Now 0 with no
+///   facts, and the re-offer is answered.
+/// * A `dst` that fits 92 but not the S2-prefixed response: was also
+///   SESSION_STORED. Now the same as above.
 #[test]
 fn an_error_after_acceptance_keeps_what_really_happened() {
     let (a, b) = (party(), party());
@@ -992,17 +998,24 @@ fn an_error_after_acceptance_keeps_what_really_happened() {
     let init = cb[..r.size].to_vec();
     let (r, i) = ex(&server, Op::Read(&init), &mut sb[..91]);
     assert_eq!((r.op, r.size), (ERR, 0));
+    assert_eq!(facts(&i), (0, 0, 0, 0), "refused before authentication");
+    let (r, i) = ex(&server, Op::Read(&init), &mut sb);
+    assert_eq!(
+        (r.op, r.size),
+        (WTN, 120),
+        "not accepted before: answered now"
+    );
     assert_eq!(
         facts(&i),
         (
             k(PacketKind::HandshakeInitiation),
-            0,
-            ev::INPUT_ACCEPTED | ev::PEER_AUTHENTICATED,
+            k(PacketKind::HandshakeResponse),
+            ev::INPUT_ACCEPTED | ev::PEER_AUTHENTICATED | ev::SESSION_STORED,
             0
         )
     );
     let (r, i) = ex(&server, Op::Read(&init), &mut sb);
-    assert_eq!((r.op, r.size), (ERR, 7), "it was accepted: now a replay");
+    assert_eq!((r.op, r.size), (ERR, 7), "accepted now: a replay");
     assert_eq!(facts(&i), (0, 0, 0, 0));
 
     advance(Duration::from_millis(2));
@@ -1010,11 +1023,14 @@ fn an_error_after_acceptance_keeps_what_really_happened() {
     let init = cb[..r.size].to_vec();
     let (r, i) = ex(&server, Op::Read(&init), &mut sb[..100]);
     assert_eq!((r.op, r.size), (ERR, 0));
+    assert_eq!(facts(&i), (0, 0, 0, 0), "refused before authentication");
+    let (r, i) = ex(&server, Op::Read(&init), &mut sb);
+    assert_eq!((r.op, r.size), (WTN, 120));
     assert_eq!(
         facts(&i),
         (
             k(PacketKind::HandshakeInitiation),
-            0,
+            k(PacketKind::HandshakeResponse),
             ev::INPUT_ACCEPTED | ev::PEER_AUTHENTICATED | ev::SESSION_STORED,
             0
         )
@@ -1154,13 +1170,14 @@ fn head(m: &mut [u8], size: u32, in_flags: u32, transport: u32, control: u32) {
 /// caller's memory changes and no sequence number is taken. Accepted shapes
 /// write exactly `[16, 48)`, at any alignment, and leave `[0, 16)`, the
 /// declared tail and everything past it alone. A refusal on storage that
-/// holds a previous success leaves that success's values in place.
+/// holds a previous success leaves that success's values in place. A nonzero
+/// budget is not a refused shape (`budget_tests`).
 #[test]
 fn invalid_packet_info_is_refused_before_anything_runs() {
     let (a, b) = (party(), party());
     let t = plain(&a, &b, 1, 0);
     type Shape = fn(&mut [u8]);
-    let refused: [(&str, Shape); 17] = [
+    let refused: [(&str, Shape); 15] = [
         ("size 0", |m| put(m, 0, 0)),
         ("size 3", |m| put(m, 0, 3)),
         ("size 4", |m| put(m, 0, 4)),
@@ -1174,8 +1191,6 @@ fn invalid_packet_info_is_refused_before_anything_runs() {
         ("size max", |m| put(m, 0, u32::MAX)),
         ("in_flags 1", |m| head(m, 48, 1, 0, 0)),
         ("in_flags top", |m| head(m, 48, 0x8000_0000, 0, 0)),
-        ("transport budget", |m| head(m, 48, 0, 1400, 0)),
-        ("control budget", |m| head(m, 48, 0, 0, 200)),
         ("first tail byte", |m| {
             head(m, 64, 0, 0, 0);
             m[48..64].fill(0);

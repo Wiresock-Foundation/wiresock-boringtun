@@ -738,18 +738,19 @@ struct wireguard_result wireguard_force_handshake(const struct wireguard_tunnel 
 // the legacy entry points are that same body. There is no global and no "last
 // result" query.
 //
-// Observability only: the metadata changes nothing the operation does. The
-// two budget inputs are reserved for a later contract and must be 0.
+// The metadata changes nothing the operation does. The two budget inputs bound
+// what it may produce -- see "Output budgets" below; both 0 is the legacy call.
 //
 // Protocol, in order. info NULL: no metadata. Otherwise only the 4-byte size
 // is read first; it must be in [48, 1024]. Then the 16-byte input head:
-// in_flags and both budgets must be 0. Then every byte of [48, size) must be 0
-// (a newer caller's field this library cannot honour). Any failure returns
-// WIREGUARD_ERROR with size 19 BEFORE the tunnel is locked: nothing ran, no
-// sequence number was taken, src was not read, and no byte of info was
-// written -- its output fields may still hold an older call's values and must
-// not be read. Otherwise the call writes [16, 48) exactly once, after it has
-// run; [0, 16) and [48, size) are never written. info needs no alignment.
+// in_flags must be 0; any budget value is valid. Then every byte of
+// [48, size) must be 0 (a newer caller's field this library cannot honour).
+// Any failure returns WIREGUARD_ERROR with size 19 BEFORE the tunnel is
+// locked: nothing ran, no sequence number was taken, src was not read, and no
+// byte of info was written -- its output fields may still hold an older call's
+// values and must not be read. Otherwise the call writes [16, 48) exactly
+// once, after it has run; [0, 16) and [48, size) are never written. info needs
+// no alignment.
 //
 // Reading a result, in order:
 //   1. op WIREGUARD_ERROR with size 19: see above; nothing is available.
@@ -757,7 +758,8 @@ struct wireguard_result wireguard_force_handshake(const struct wireguard_tunnel 
 //   3. op WIREGUARD_ERROR: size is an error code. An error is NOT "nothing
 //      happened": events/input_kind still report what happened before it (an
 //      authenticated datagram whose inner packet was malformed is ERROR 12 with
-//      INPUT_ACCEPTED | PEER_AUTHENTICATED).
+//      INPUT_ACCEPTED | PEER_AUTHENTICATED; a tick whose keepalive is over the
+//      budget is ERROR 18 with TICK_DEMAND_REFUSED).
 //   4. output_kind is meaningful only with WRITE_TO_NETWORK. Route by it; never
 //      by the bytes. An unknown value means bytes this caller cannot route.
 //   5. Unknown event/state bits are ignored; no fact is inferred from them.
@@ -772,13 +774,40 @@ struct wireguard_result wireguard_force_handshake(const struct wireguard_tunnel 
 // wireguard_read(_ex) with src_size 0 (src still non-NULL) until DONE.
 // WIREGUARD_DONE from a drain or tick does NOT mean the queue is empty -- it
 // can be a pacing wait or a handshake wait; WIREGUARD_ST_QUEUE_NONEMPTY says.
+//
+// Output budgets. max_transport_output bounds a TRANSPORT_DATA or
+// TRANSPORT_KEEPALIVE datagram; max_control_output a HANDSHAKE_INITIATION,
+// HANDSHAKE_RESPONSE, JUNK or IMITATION one. The unit is the whole UDP payload
+// this call returns in dst -- S prefix, trailer and padding included; outer IP,
+// UDP and SOCKS headers not. 0 is unbounded, for each field on its own, and a
+// budget holds for this one call only: nothing is remembered. Decrypted
+// plaintext (WRITE_TO_TUNNEL_*) is never bounded.
+//
+// A datagram's mandatory part -- the message, its S1-S4 prefix, and an
+// imitation datagram whole -- is never cut. Over a finite budget the call
+// returns WIREGUARD_ERROR with size WIREGUARD_ERROR_OUTPUT_BUDGET_EXCEEDED
+// (18), before it has consumed anything for that datagram; over both the
+// budget and dst_size, it is 18, and over dst_size alone, 0. Equal fits.
+// Optional bytes (RandomTrailers, content padding) shrink to what both leave.
+// What is refused stays where it was: a write's src is not accepted; a
+// response or initiation offered by read is not accepted, so offer it again
+// with room; a burst item, the initiation behind a burst, or a queued packet
+// stays pending; a tick's refused demand is given back. Pre-handshake junk
+// (Jc) is drawn from [min(Jmin, max_control_output), min(Jmax, max_control_output)];
+// with an imitation protocol its protocol minimum stays, and a control budget
+// below it is 18. A drain (src_size 0) with a session and a transport budget
+// DELETES each queued packet whose mandatory frame exceeds that budget -- it
+// could never be sent under it -- and reports WIREGUARD_EV_QUEUE_HEAD_DROPPED;
+// a packet short of dst_size only is kept, with error 0. Without metadata, or
+// with both budgets 0, every call is the legacy call.
 // ---------------------------------------------------------------------------
 
 #define WIREGUARD_PACKET_INFO_SIZE_V1 48u       // smallest accepted size
 #define WIREGUARD_PACKET_INFO_SIZE_MAX 1024u    // largest accepted size
 #define WIREGUARD_PACKET_INFO_OUTPUT_START 16u  // fixed start of the output region
 #define WIREGUARD_BURST_DUE_NONE 0xFFFFFFFFu    // burst_due_ms when no burst is pending
-#define WIREGUARD_ERROR_INVALID_PACKET_INFO 19u // wireguard_result.size; 18 is reserved
+#define WIREGUARD_ERROR_OUTPUT_BUDGET_EXCEEDED 18u // wireguard_result.size: over a finite budget
+#define WIREGUARD_ERROR_INVALID_PACKET_INFO 19u // wireguard_result.size: info refused, nothing ran
 
 // Kind of a datagram, stored in uint32_t fields. Values never change.
 enum wireguard_packet_kind
@@ -813,6 +842,8 @@ enum wireguard_packet_kind
 // BURST_PREPARED: this call built a new pre-handshake burst.
 // TICK_DEMAND_REFUSED: a tick selected a handshake or keepalive demand and
 //   producing it failed (the result is the error).
+// QUEUE_HEAD_DROPPED: a drain deleted one or more queued packets whose
+//   mandatory frame exceeded max_transport_output. No count, no order.
 #define WIREGUARD_EV_INPUT_ACCEPTED 0x00000001u
 #define WIREGUARD_EV_PEER_AUTHENTICATED 0x00000002u
 #define WIREGUARD_EV_SESSION_STORED 0x00000004u
@@ -823,8 +854,8 @@ enum wireguard_packet_kind
 #define WIREGUARD_EV_SESSIONS_AGED_OUT 0x00000080u
 #define WIREGUARD_EV_BURST_PREPARED 0x00000100u
 #define WIREGUARD_EV_TICK_DEMAND_REFUSED 0x00000200u
-// Reserved for a budget contract; never set by this library.
 #define WIREGUARD_EV_QUEUE_HEAD_DROPPED 0x00010000u
+// Reserved; never set by this library (burst items are never skipped).
 #define WIREGUARD_EV_BURST_ITEM_SKIPPED 0x00020000u
 
 // state: snapshot after this operation, under the same lock hold.
@@ -841,8 +872,8 @@ struct wireguard_packet_info
 {
     uint32_t size;                 //  0 in : declared readable extent; never written
     uint32_t in_flags;             //  4 in : must be 0
-    uint32_t max_transport_output; //  8 in : reserved, must be 0
-    uint32_t max_control_output;   // 12 in : reserved, must be 0
+    uint32_t max_transport_output; //  8 in : transport datagram budget, bytes; 0 = unbounded
+    uint32_t max_control_output;   // 12 in : control datagram budget, bytes; 0 = unbounded
     uint32_t written_size;         // 16 out: exclusive end offset of what this call wrote (48)
     uint32_t input_kind;           // 20 out: kind of the ACCEPTED input, else NONE
     uint32_t output_kind;          // 24 out: kind of dst[0, size) iff op == WRITE_TO_NETWORK
@@ -865,8 +896,9 @@ struct wireguard_packet_info
 // your clock read just before the call + burst_due_ms), not a schedule: the
 // library still enforces the pacing itself, and an early call returns DONE
 // with a fresh value. 0 together with an ERROR means due but blocked (dst too
-// small): calling again with the same dst cannot progress. Retransmission,
-// keepalive, rekey and expiry still need the periodic wireguard_tick.
+// small, or over the budget): calling again with the same dst and budgets
+// cannot progress. Retransmission, keepalive, rekey and expiry still need the
+// periodic wireguard_tick.
 
 struct wireguard_result wireguard_write_ex(const struct wireguard_tunnel *tunnel,
                                            const uint8_t *src,
