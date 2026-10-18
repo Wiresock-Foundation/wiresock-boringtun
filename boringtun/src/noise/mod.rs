@@ -51,13 +51,13 @@ use handshake::ObfuscationRanges;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::inbound::Inbound;
-use crate::noise::rate_limiter::RateLimiter;
+use crate::noise::rate_limiter::{RateLimiter, Source};
 use crate::noise::timers::{TimerName, Timers};
 use crate::x25519;
 
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -987,12 +987,43 @@ impl Tunn {
     /// the drain with a larger `dst`, never resubmit the packet. Without a
     /// session the drain only drives the handshake, so `Done` there does not
     /// mean the queue is empty.
+    ///
+    /// `src_addr` is the datagram's source address, which the under-load
+    /// cookie is bound to. A caller that knows the source UDP port as well
+    /// should use [`Self::decapsulate_from`], so the cookie covers the whole
+    /// endpoint. With `None` no cookie can be demanded: under load, a
+    /// handshake message is refused as `UnderLoad`.
     pub fn decapsulate<'a>(
         &mut self,
         src_addr: Option<IpAddr>,
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
+        self.decapsulate_source(src_addr.map(Source::from), datagram, dst)
+    }
+
+    /// [`Self::decapsulate`] given the datagram's whole UDP source endpoint.
+    /// The under-load cookie is then bound to the address and port together,
+    /// as the whitepaper specifies (section 5.4.7), so a cookie issued to one
+    /// endpoint -- say, another client behind the same NAT -- does not
+    /// validate a handshake from another.
+    pub fn decapsulate_from<'a>(
+        &mut self,
+        src: Option<SocketAddr>,
+        datagram: &[u8],
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        self.decapsulate_source(src.map(Source::from), datagram, dst)
+    }
+
+    fn decapsulate_source<'a>(
+        &mut self,
+        source: Option<Source>,
+        datagram: &[u8],
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        // Auto imitation evidence stays keyed on the address, as it was.
+        let src_addr = source.map(Source::address);
         if datagram.is_empty() {
             // Indicates a repeated call
             return self.send_queued_packet(dst);
@@ -1034,7 +1065,7 @@ impl Tunn {
                 &this.amnezia,
                 obf,
                 &this.rate_limiter,
-                src_addr,
+                source,
                 &candidates,
                 datagram,
                 |packet| this.authenticate(packet, dst),
@@ -3005,6 +3036,45 @@ mod tests {
         )
         .unwrap();
         (my_tun, their_tun)
+    }
+
+    /// The whole cookie exchange through `decapsulate_from`: the cookie is
+    /// issued to one endpoint, and the initiation that carries it is accepted
+    /// from that endpoint only. From another port of the same address --
+    /// another client behind the same NAT -- a fresh cookie is demanded.
+    #[test]
+    fn a_cookie_is_honoured_only_from_the_endpoint_it_was_issued_to() {
+        let (mut my_tun, mut their_tun) = cookie_provoking_pair(AmneziaConfig::default());
+        let mut dst = vec![0u8; 2048];
+        let issued: SocketAddr = "198.51.100.7:40000".parse().unwrap();
+        let neighbour: SocketAddr = "198.51.100.7:40001".parse().unwrap();
+
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        let cookie =
+            unwrap_network_packet(their_tun.decapsulate_from(Some(issued), &init, &mut dst));
+        assert_eq!(cookie.len(), COOKIE_REPLY_SZ);
+        assert!(matches!(
+            my_tun.decapsulate(None, &cookie, &mut dst),
+            TunnResult::Done
+        ));
+
+        // A fresh initiation, now carrying mac2 under that cookie (and, under
+        // a frozen mock clock, a timestamp the responder has not seen).
+        advance_past_pacing_gate(Duration::from_millis(5));
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, true));
+        let refused =
+            unwrap_network_packet(their_tun.decapsulate_from(Some(neighbour), &init, &mut dst));
+        assert_eq!(
+            refused.len(),
+            COOKIE_REPLY_SZ,
+            "a neighbour's mac2 was honoured"
+        );
+        let response =
+            unwrap_network_packet(their_tun.decapsulate_from(Some(issued), &init, &mut dst));
+        assert!(matches!(
+            Tunn::parse_incoming_packet(their_tun.handshake.obf, &response),
+            Ok(Packet::HandshakeResponse(_))
+        ));
     }
 
     /// A cookie reply the caller's buffer cannot hold is an error, not a panic.

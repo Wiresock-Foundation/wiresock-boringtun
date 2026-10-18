@@ -7,7 +7,9 @@ use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, W
 #[cfg(feature = "mock-instant")]
 use mock_instant::thread_local::Instant;
 use portable_atomic::{AtomicU64, Ordering};
-use std::net::IpAddr;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
+use std::net::{IpAddr, SocketAddr};
 
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
@@ -26,7 +28,173 @@ const COOKIE_NONCE_SIZE: usize = 24;
 /// How often should reset count in seconds
 const RESET_PERIOD: u64 = 1;
 
+/// The share of the aggregate handshake budget one source may use: a source
+/// is under load on its own once it sends more than `limit / SOURCE_SHARE`
+/// handshake messages in a second. So one flooding address gets cookie
+/// replies while everyone else keeps the full Noise path, and it takes about
+/// this many abusive sources -- or a spoofed flood, which no per-source count
+/// can see -- to put the whole limiter under load.
+pub(crate) const SOURCE_SHARE: u64 = 5;
+
+/// The least share a source gets, however small `limit` is (and never more
+/// than `limit`). A tunnel's own limiter allows 10 a second, a fifth of which
+/// would cookie a peer that merely re-handshakes three times in a second.
+const SOURCE_FLOOR: u64 = 5;
+
+/// The per-source counts: [`SOURCE_ROWS`] rows of [`SOURCE_SLOTS`] slots,
+/// fixed at construction (16 KiB), so no number of distinct sources can grow
+/// them.
+const SOURCE_ROWS: usize = 2;
+const SOURCE_SLOTS: usize = 1024;
+
 type Cookie = [u8; COOKIE_SIZE];
+
+/// Where a handshake message came from, as far as the receiver knows it.
+///
+/// The cookie is a MAC over the source, so a cookie handed to one endpoint is
+/// no good from another -- whitepaper section 5.4.7 makes it the IP address
+/// *and* UDP port. A receiver that knows only the address (the public
+/// [`Tunn::decapsulate`], which takes an `IpAddr`) gets a cookie over the
+/// address alone: no port is assumed, and the two forms can never produce the
+/// same cookie. A receiver that knows nothing (the C `wireguard_read`) cannot
+/// demand a cookie at all; see [`HandshakeGate::UnderLoad`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    Endpoint(SocketAddr),
+    Address(IpAddr),
+}
+
+impl From<SocketAddr> for Source {
+    fn from(endpoint: SocketAddr) -> Self {
+        Source::Endpoint(endpoint)
+    }
+}
+
+impl From<IpAddr> for Source {
+    fn from(address: IpAddr) -> Self {
+        Source::Address(address)
+    }
+}
+
+impl Source {
+    /// The source address exactly as it was given.
+    pub(crate) fn address(self) -> IpAddr {
+        match self {
+            Source::Endpoint(endpoint) => endpoint.ip(),
+            Source::Address(address) => address,
+        }
+    }
+
+    /// The source address, with an IPv4-mapped IPv6 address taken as the IPv4
+    /// address it maps: the same host whichever socket family it reached.
+    fn ip(self) -> IpAddr {
+        let ip = self.address();
+        match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        }
+    }
+
+    /// The cookie's input. A tag byte keeps the four shapes apart -- an
+    /// endpoint from its bare address, and IPv4 from IPv6, which zero-padding
+    /// the IPv4 octets to 16 bytes used to conflate (`a.b.c.d` and
+    /// `ab:cd::`). The cookie is only ever checked by the responder that made
+    /// it, so its encoding is local: the initiator echoes it opaquely.
+    fn cookie_input(self, out: &mut [u8; 19]) -> &[u8] {
+        let port = match self {
+            Source::Endpoint(endpoint) => Some(endpoint.port()),
+            Source::Address(_) => None,
+        };
+        let len = match self.ip() {
+            IpAddr::V4(v4) => {
+                out[0] = if port.is_some() { 0x04 } else { 0x14 };
+                out[1..5].copy_from_slice(&v4.octets());
+                5
+            }
+            IpAddr::V6(v6) => {
+                out[0] = if port.is_some() { 0x06 } else { 0x16 };
+                out[1..17].copy_from_slice(&v6.octets());
+                17
+            }
+        };
+        match port {
+            Some(port) => {
+                out[len..len + 2].copy_from_slice(&port.to_be_bytes());
+                &out[..len + 2]
+            }
+            None => &out[..len],
+        }
+    }
+
+    /// What one source's handshake budget is keyed on: an IPv4 address, or an
+    /// IPv6 /64 -- one host can hold a whole /64, so a finer key would hand it
+    /// as many budgets as it has addresses. The Linux ratelimiter keys IPv6 on
+    /// the /64 as well. Never the port: a source cannot multiply its budget by
+    /// rotating ports.
+    fn budget_key(self) -> (u8, u64) {
+        match self.ip() {
+            IpAddr::V4(v4) => (4, u64::from(u32::from(v4))),
+            IpAddr::V6(v6) => (6, (u128::from(v6) >> 64) as u64),
+        }
+    }
+}
+
+/// Handshake messages per source in the current one-second window, in a fixed
+/// table that holds no addresses at all.
+///
+/// Each source maps to one slot in each of [`SOURCE_ROWS`] rows through a
+/// randomly keyed SipHash, and its count is the smaller of its slots' counts.
+/// Sharing a slot can only *raise* a count, so a collision makes the limiter
+/// stricter for a source, never laxer -- the worst it does is ask a legitimate
+/// peer for a cookie, which costs one round trip. The key is drawn per
+/// limiter and never leaves it, so a sender cannot pick addresses that land
+/// on a victim's slots. Each slot packs `(window << 32) | count`; a count from
+/// an earlier window reads as zero, so the table expires by itself, with no
+/// sweep and no dependence on anyone calling `reset_count`.
+struct SourceCounts {
+    hasher: RandomState,
+    slots: Box<[AtomicU64]>,
+}
+
+impl SourceCounts {
+    fn new() -> Self {
+        SourceCounts {
+            hasher: RandomState::new(),
+            slots: (0..SOURCE_ROWS * SOURCE_SLOTS)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        }
+    }
+
+    /// Count one message from `source` in `window`, and return the source's
+    /// count including it.
+    fn count(&self, source: Source, window: u32) -> u32 {
+        let hash = self.hasher.hash_one(source.budget_key());
+        (0..SOURCE_ROWS)
+            .map(|row| {
+                let column = (hash >> (32 * row)) as usize % SOURCE_SLOTS;
+                Self::bump(&self.slots[row * SOURCE_SLOTS + column], window)
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
+    fn bump(slot: &AtomicU64, window: u32) -> u32 {
+        let fresh = |packed: u64| {
+            if (packed >> 32) as u32 == window {
+                (packed as u32).saturating_add(1)
+            } else {
+                1
+            }
+        };
+        let previous = slot
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |packed| {
+                Some((u64::from(window) << 32) | u64::from(fresh(packed)))
+            })
+            .unwrap_or_else(|packed| packed);
+        fresh(previous)
+    }
+}
 
 /// There are two places where WireGuard requires "randomness" for cookies
 /// * The 24 byte nonce in the cookie massage - here the only goal is to avoid nonce reuse
@@ -47,10 +215,18 @@ pub struct RateLimiter {
     mac1_key: [u8; 32],
     cookie_key: Key,
     limit: u64,
-    /// The counter since last reset
+    /// The counter since last reset: messages admitted past their source's
+    /// share, against the aggregate `limit`.
     count: AtomicU64,
     /// The time last reset was performed on this rate limiter
     last_reset: Mutex<Instant>,
+    /// Each source's share of `limit`; see [`SOURCE_SHARE`].
+    source_limit: u64,
+    sources: SourceCounts,
+    /// Load decisions taken since the last reset, for tests: `count` no longer
+    /// sees a message its source's share already refused.
+    #[cfg(test)]
+    decisions: AtomicU64,
 }
 
 impl RateLimiter {
@@ -67,6 +243,12 @@ impl RateLimiter {
             limit,
             count: AtomicU64::new(0),
             last_reset: Mutex::new(Instant::now()),
+            // Zero stays zero, so a zero-budget limiter is under load from the
+            // first message, as it always was.
+            source_limit: (limit / SOURCE_SHARE).max(limit.min(SOURCE_FLOOR)),
+            sources: SourceCounts::new(),
+            #[cfg(test)]
+            decisions: AtomicU64::new(0),
         }
     }
 
@@ -83,25 +265,23 @@ impl RateLimiter {
         let mut last_reset_time = self.last_reset.lock();
         if current_time.duration_since(*last_reset_time).as_secs() >= RESET_PERIOD {
             self.count.store(0, Ordering::SeqCst);
+            #[cfg(test)]
+            self.decisions.store(0, Ordering::SeqCst);
             *last_reset_time = current_time;
         }
     }
 
-    /// Compute the correct cookie value based on the current secret value and the source IP
-    fn current_cookie(&self, addr: IpAddr) -> Cookie {
-        let mut addr_bytes = [0u8; 16];
+    /// Compute the correct cookie value based on the current secret value and the source
+    fn current_cookie(&self, source: Source) -> Cookie {
+        let mut input = [0u8; 19];
+        let input = source.cookie_input(&mut input);
 
-        match addr {
-            IpAddr::V4(a) => addr_bytes[..4].copy_from_slice(&a.octets()[..]),
-            IpAddr::V6(a) => addr_bytes[..].copy_from_slice(&a.octets()[..]),
-        }
-
-        // The current cookie for a given IP is the MAC(responder.changing_secret_every_two_minutes, initiator.ip_address)
+        // The current cookie for a given source is the MAC(responder.changing_secret_every_two_minutes, initiator.ip_address || initiator.udp_port)
         // First we derive the secret from the current time, the value of cur_counter would change with time.
         let cur_counter = Instant::now().duration_since(self.start_time).as_secs() / COOKIE_REFRESH;
 
         // Next we derive the cookie
-        b2s_keyed_mac_16_2(&self.secret_key, &cur_counter.to_le_bytes(), &addr_bytes)
+        b2s_keyed_mac_16_2(&self.secret_key, &cur_counter.to_le_bytes(), input)
     }
 
     fn nonce(&self) -> [u8; COOKIE_NONCE_SIZE] {
@@ -110,8 +290,28 @@ impl RateLimiter {
         b2s_mac_24(&self.nonce_key, &ctr.to_le_bytes())
     }
 
-    fn is_under_load(&self) -> bool {
+    /// Whether one more handshake message from `source` finds the limiter
+    /// under load: its source past its share, or the aggregate past `limit`.
+    ///
+    /// A message its source's share refuses is not counted against the
+    /// aggregate, or one flooding address would still exhaust it and put every
+    /// peer into cookie mode -- the very thing the per-source count is for.
+    /// Without a source only the aggregate applies.
+    fn is_under_load(&self, source: Option<Source>) -> bool {
+        #[cfg(test)]
+        self.decisions.fetch_add(1, Ordering::SeqCst);
+        if let Some(source) = source {
+            if u64::from(self.sources.count(source, self.window())) > self.source_limit {
+                return true;
+            }
+        }
         self.count.fetch_add(1, Ordering::SeqCst) >= self.limit
+    }
+
+    /// The current one-second window of the per-source counts. `u32` seconds
+    /// wrap after 136 years; a wrap could at worst merge two windows.
+    fn window(&self) -> u32 {
+        Instant::now().duration_since(self.start_time).as_secs() as u32
     }
 
     /// How many load decisions have been taken since the last reset: what
@@ -119,7 +319,7 @@ impl RateLimiter {
     /// counted, which no outcome can show while the budget is not yet spent.
     #[cfg(test)]
     pub(crate) fn load_events(&self) -> u64 {
-        self.count.load(Ordering::SeqCst)
+        self.decisions.load(Ordering::SeqCst)
     }
 
     pub(crate) fn format_cookie_reply<'a>(
@@ -182,7 +382,7 @@ impl RateLimiter {
         | Packet::HandshakeResponse(HandshakeResponse { sender_idx, .. }) = packet
         {
             match self.gate_handshake(
-                src_addr,
+                src_addr.map(Source::from),
                 src,
                 sender_idx,
                 CookieDefense::Armed,
@@ -229,7 +429,7 @@ impl RateLimiter {
     /// [`AmneziaConfig::cookie_defense`]: super::amnezia::AmneziaConfig::cookie_defense
     pub(crate) fn gate_handshake(
         &self,
-        src_addr: Option<IpAddr>,
+        src_addr: Option<Source>,
         message: &[u8],
         sender_idx: u32,
         defense: CookieDefense,
@@ -247,7 +447,7 @@ impl RateLimiter {
             return HandshakeGate::Pass;
         }
 
-        let under_load = *load.0.get_or_insert_with(|| self.is_under_load());
+        let under_load = *load.0.get_or_insert_with(|| self.is_under_load(src_addr));
         if !under_load {
             return HandshakeGate::Pass;
         }
@@ -340,4 +540,223 @@ pub(crate) struct CookieDemand {
     sender_idx: u32,
     cookie: Cookie,
     mac1: [u8; 16],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn limiter(limit: u64) -> RateLimiter {
+        let secret = crate::x25519::StaticSecret::random_from_rng(OsRng);
+        RateLimiter::new(&crate::x25519::PublicKey::from(&secret), limit)
+    }
+
+    fn endpoint(s: &str) -> Source {
+        Source::Endpoint(s.parse().unwrap())
+    }
+
+    /// A canonical-length handshake message with a valid mac1 and, given a
+    /// cookie, the mac2 it makes.
+    fn message(limiter: &RateLimiter, cookie: Option<Cookie>) -> Vec<u8> {
+        let mut message = vec![0u8; super::super::HANDSHAKE_INIT_SZ];
+        OsRng.fill_bytes(&mut message[..116]);
+        let mac1 = b2s_keyed_mac_16(&limiter.mac1_key, &message[..116]);
+        message[116..132].copy_from_slice(&mac1);
+        if let Some(cookie) = cookie {
+            let mac2 = b2s_keyed_mac_16_2(&cookie, &message[..116], &mac1);
+            message[132..].copy_from_slice(&mac2);
+        }
+        message
+    }
+
+    fn gate(limiter: &RateLimiter, source: Option<Source>, message: &[u8]) -> HandshakeGate {
+        limiter.gate_handshake(
+            source,
+            message,
+            1,
+            CookieDefense::Armed,
+            &mut LoadDecision::default(),
+        )
+    }
+
+    fn passes(limiter: &RateLimiter, source: Source) -> bool {
+        matches!(
+            gate(limiter, Some(source), &message(limiter, None)),
+            HandshakeGate::Pass
+        )
+    }
+
+    #[test]
+    fn the_cookie_covers_the_port_and_keeps_every_source_shape_apart() {
+        let l = limiter(0);
+        let cookies = [
+            l.current_cookie(endpoint("192.0.2.1:1000")),
+            l.current_cookie(endpoint("192.0.2.1:1001")),
+            l.current_cookie(endpoint("192.0.2.2:1000")),
+            l.current_cookie(Source::Address("192.0.2.1".parse().unwrap())),
+            // The old zero-padded encoding made these two the same input.
+            l.current_cookie(Source::Address("42.1.2.3".parse().unwrap())),
+            l.current_cookie(Source::Address("2a01:203::".parse().unwrap())),
+            l.current_cookie(endpoint("[2a01:203::]:1000")),
+        ];
+        for (i, a) in cookies.iter().enumerate() {
+            for b in &cookies[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // Stable for one endpoint, and an IPv4-mapped address is its IPv4.
+        assert_eq!(cookies[0], l.current_cookie(endpoint("192.0.2.1:1000")));
+        assert_eq!(
+            cookies[0],
+            l.current_cookie(endpoint("[::ffff:192.0.2.1]:1000"))
+        );
+    }
+
+    /// A cookie answers the endpoint it was issued to: from another port of
+    /// the same address -- another client behind the same NAT -- its mac2
+    /// does not hold and a fresh cookie is demanded.
+    #[test]
+    fn a_cookie_validates_only_from_the_endpoint_it_was_issued_to() {
+        let l = limiter(0);
+        let issued = endpoint("198.51.100.7:40000");
+        let message = message(&l, Some(l.current_cookie(issued)));
+        assert!(matches!(
+            gate(&l, Some(issued), &message),
+            HandshakeGate::Pass
+        ));
+        for other in [
+            endpoint("198.51.100.7:40001"),
+            endpoint("198.51.100.8:40000"),
+            Source::Address("198.51.100.7".parse().unwrap()),
+        ] {
+            assert!(matches!(
+                gate(&l, Some(other), &message),
+                HandshakeGate::CookieDemanded(_)
+            ));
+        }
+        // No source at all: nothing to bind a cookie to.
+        assert!(matches!(gate(&l, None, &message), HandshakeGate::UnderLoad));
+    }
+
+    #[test]
+    fn the_share_follows_the_limit() {
+        for (limit, share) in [(0, 0), (1, 1), (3, 3), (10, 5), (100, 20), (1000, 200)] {
+            assert_eq!(limiter(limit).source_limit, share, "limit {}", limit);
+        }
+    }
+
+    /// One flooding source is held to its share and gets cookies; another
+    /// source, and the aggregate, are untouched by it.
+    // Mock clock only: a real one could cross a window boundary mid-test
+    // and reset the count being asserted on.
+    #[cfg(feature = "mock-instant")]
+    #[test]
+    fn one_flooding_source_does_not_put_everyone_under_load() {
+        let l = limiter(100);
+        let flooder = endpoint("203.0.113.1:5000");
+        for _ in 0..20 {
+            assert!(passes(&l, flooder));
+        }
+        for _ in 0..1000 {
+            assert!(matches!(
+                gate(&l, Some(flooder), &message(&l, None)),
+                HandshakeGate::CookieDemanded(_)
+            ));
+        }
+        assert_eq!(
+            l.count.load(Ordering::SeqCst),
+            20,
+            "refused messages counted"
+        );
+        assert!(passes(&l, endpoint("198.51.100.9:6000")));
+    }
+
+    /// Ports do not multiply a budget, and neither do the addresses of one
+    /// IPv6 /64; a different /64 is a different source.
+    // Mock clock only: a real one could cross a window boundary mid-test
+    // and reset the count being asserted on.
+    #[cfg(feature = "mock-instant")]
+    #[test]
+    fn a_budget_is_per_address_and_per_ipv6_slash_64() {
+        let l = limiter(100);
+        for port in 0..20u16 {
+            assert!(passes(
+                &l,
+                Source::Endpoint((Ipv4Addr::new(192, 0, 2, 1), port).into())
+            ));
+        }
+        assert!(!passes(&l, endpoint("192.0.2.1:9999")));
+
+        let l = limiter(100);
+        for host in 0..20u16 {
+            let ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, host);
+            assert!(passes(&l, Source::Endpoint((ip, 443).into())));
+        }
+        assert!(!passes(&l, endpoint("[2001:db8:0:1::ffff]:443")));
+        assert!(passes(&l, endpoint("[2001:db8:0:2::1]:443")));
+    }
+
+    /// Sources that each stay inside their share -- as a spoofed flood does --
+    /// are caught by the aggregate, and then everyone is asked for a cookie.
+    #[test]
+    fn many_sources_still_reach_the_aggregate_limit() {
+        let l = limiter(100);
+        for i in 0..100u32 {
+            assert!(passes(
+                &l,
+                Source::Endpoint((Ipv4Addr::from(0x0a00_0000 + i), 1).into())
+            ));
+        }
+        assert!(!passes(&l, endpoint("198.51.100.9:6000")));
+    }
+
+    /// The table never grows, however many sources it has seen.
+    #[test]
+    fn the_per_source_table_is_bounded() {
+        let l = limiter(u64::MAX);
+        for i in 0..100_000u32 {
+            l.sources
+                .count(Source::Address(IpAddr::V4(Ipv4Addr::from(i))), 0);
+        }
+        assert_eq!(l.sources.slots.len(), SOURCE_ROWS * SOURCE_SLOTS);
+    }
+
+    /// Concurrent counts from many threads lose no update.
+    #[test]
+    fn concurrent_counts_are_exact() {
+        let counts = std::sync::Arc::new(SourceCounts::new());
+        let source = endpoint("192.0.2.33:1");
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let counts = std::sync::Arc::clone(&counts);
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        counts.count(source, 7);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(counts.count(source, 7), 8001);
+        // A later window starts from nothing.
+        assert_eq!(counts.count(source, 8), 1);
+    }
+
+    /// A source's share comes back in the next second without anyone calling
+    /// `reset_count`; the aggregate keeps its existing reset.
+    #[cfg(feature = "mock-instant")]
+    #[test]
+    fn a_source_share_expires_with_its_window() {
+        let l = limiter(100);
+        let source = endpoint("203.0.113.1:5000");
+        for _ in 0..20 {
+            assert!(passes(&l, source));
+        }
+        assert!(!passes(&l, source));
+        mock_instant::thread_local::MockClock::advance(std::time::Duration::from_secs(1));
+        assert!(passes(&l, source));
+    }
 }
