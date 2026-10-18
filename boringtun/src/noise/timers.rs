@@ -216,6 +216,10 @@ impl Tunn {
             TimeLastPacketSent => {
                 self.timers.want_keepalive = None;
                 self.timers[TimePersistentKeepalive] = time;
+                // Any authenticated send reaches the peer as the owed
+                // keepalive would -- an initiation started by hand or by a Jc
+                // burst included -- so it is no longer owed.
+                self.timers.persistent_keepalive_due = false;
             }
             // Data only. Draw only when the deadline arms, not per packet:
             // upstream mods these timers only when they are not already

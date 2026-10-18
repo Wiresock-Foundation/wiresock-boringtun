@@ -2687,12 +2687,6 @@ mod tests {
         let (mut my_tun, _their_tun) = create_two_tuns_and_handshake_with_keepalive(Some(1));
         let mut small = vec![0u8; DATA_OVERHEAD_SZ - 1];
 
-        // The keepalive owed since the interval was configured goes first.
-        let mut dst = vec![0u8; 2048];
-        assert_eq!(
-            unwrap_network_packet(my_tun.update_timers(&mut dst)).len(),
-            DATA_OVERHEAD_SZ
-        );
         assert!(matches!(my_tun.update_timers(&mut small), TunnResult::Done));
 
         advance_past_pacing_gate(Duration::from_millis(1100));
@@ -4921,10 +4915,9 @@ mod tests {
     #[cfg(feature = "mock-instant")]
     fn persistent_keepalives_are_not_sent_while_traffic_flows() {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake_with_keepalive(Some(25));
-        // The keepalive owed since the interval was configured (on our side
-        // only): the handshake helper never polled, so it is still due.
-        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
-        // Idle: the next one is a full interval after that one.
+        // The handshake settled the keepalive owed at activation.
+        assert_eq!(poll_kind(&mut my_tun), None);
+        // Idle: the next one is a full interval after the handshake.
         for _ in 0..24 {
             advance(Duration::from_secs(1));
             assert_eq!(poll_kind(&mut my_tun), None);
@@ -4958,7 +4951,6 @@ mod tests {
         for sending in [true, false] {
             let (mut my_tun, mut their_tun) =
                 create_two_tuns_and_handshake_with_keepalive(Some(25));
-            assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
             for _ in 0..12 {
                 advance(Duration::from_secs(5));
                 if sending {
@@ -5051,6 +5043,20 @@ mod tests {
         my_tun.clear_all();
         let _ = my_tun.update_timers(&mut dst);
         let _ = my_tun.time_since_last_handshake();
+    }
+
+    /// The keepalive owed at activation is settled by any authenticated send:
+    /// a handshake started by hand first is not followed by a redundant one.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn an_owed_persistent_keepalive_is_settled_by_any_send() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_with_keepalive(Some(25));
+        let mut dst = vec![0u8; 2048];
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, true));
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+        assert_eq!(poll_kind(&mut my_tun), None, "a redundant keepalive");
     }
 
     /// A keepalive the caller's buffer cannot hold keeps its demand: the one
