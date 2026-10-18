@@ -902,7 +902,12 @@ impl Device {
             preshared_key,
             keepalive,
             next_index,
-            None,
+            // The device's limiter, as `set_key` gives every peer it already
+            // has. `None` gave a peer added later a private limiter -- its own
+            // budget and its own cookie secret -- so its connected socket
+            // rated and cookied it apart from the listener, and a cookie the
+            // listener issued failed mac2 there.
+            self.rate_limiter.clone(),
             self.config.obf,
             // Not `as_responder()`: the kernel module emits Jc junk from
             // `wg_packet_send_handshake_initiation` (src/send.c:58-75), i.e.
@@ -1703,7 +1708,7 @@ impl Device {
                         &d.config.amnezia,
                         obf,
                         rate_limiter,
-                        Some(from.ip()),
+                        Some(from.into()),
                         &candidates,
                         datagram,
                         |packet| {
@@ -2034,7 +2039,6 @@ impl Device {
         gen: DiagGen,
         lifetime: peer::ConnLifetime,
     ) -> Result<(), Error> {
-        let peer_addr = endpoint.ip();
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
@@ -2079,8 +2083,8 @@ impl Device {
                         d.conn_recv_point(ConnRecvPoint::Handled, endpoint);
                         break;
                     }
-                    match p.tunnel.decapsulate(
-                        Some(peer_addr),
+                    match p.tunnel.decapsulate_from(
+                        Some(endpoint),
                         &t.src_buf[..read_bytes],
                         &mut t.dst_buf[..],
                     ) {
@@ -2609,7 +2613,7 @@ mod ingress_tests {
             amnezia,
             obf,
             &limiter,
-            Some(src_addr),
+            Some(src_addr.into()),
             &candidates,
             datagram,
             |packet| match packet {
@@ -2733,7 +2737,7 @@ mod ingress_tests {
                 &amnezia,
                 obf,
                 &limiter,
-                Some(src_addr),
+                Some(src_addr.into()),
                 &candidates,
                 &wire,
                 |packet| {
@@ -2902,7 +2906,7 @@ mod ingress_tests {
                 &self.amnezia,
                 ObfuscationRanges::default(),
                 &self.limiter,
-                Some(from.ip()),
+                Some(from.into()),
                 &candidates,
                 wire,
                 |packet| {
@@ -3321,7 +3325,7 @@ mod ingress_tests {
                 &self.amnezia,
                 obf,
                 &self.limiter,
-                Some(from.ip()),
+                Some(from.into()),
                 &candidates,
                 wire,
                 |packet| {
@@ -3597,23 +3601,16 @@ mod ingress_tests {
             other => panic!("expected an initiation, got {:?}", other),
         };
 
-        let limiter = RateLimiter::new(&server_public, HANDSHAKE_RATE_LIMIT);
+        let limiter = RateLimiter::new(&server_public, 0);
         let stripped = amnezia
             .strip_inbound(obf, &datagram)
             .expect("our own initiation must match our own shape");
         let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
         let mut scratch = vec![0u8; MAX_UDP_SIZE];
 
-        // `is_under_load` returns the counter value from *before* its own
-        // increment, so the limit-th call still reads as unloaded and the one
-        // after it is the first to demand a cookie. Asserting `Ok` here is not
-        // decoration: if the threshold ever moves, this loop stops leaving the
-        // limiter in the state the test is about, and it says so.
-        for _ in 0..HANDSHAKE_RATE_LIMIT {
-            limiter
-                .verify_packet(obf, &mut OsRng, Some(src), stripped, &mut scratch)
-                .expect("below the handshake rate limit, no cookie is demanded");
-        }
+        // A zero budget demands a cookie for the first message, whatever the
+        // clock: only the reply's size matters here, and the thresholds that
+        // decide when a real limiter gets there are `rate_limiter`'s tests.
         let cookie_len =
             match limiter.verify_packet(obf, &mut OsRng, Some(src), stripped, &mut scratch) {
                 Err(TunnResult::WriteToNetwork(cookie)) => cookie.len(),
