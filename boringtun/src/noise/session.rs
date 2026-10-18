@@ -34,10 +34,13 @@ const AEAD_SIZE: usize = 16;
 
 // Receiving buffer constants
 const WORD_SIZE: u64 = 64;
-const N_WORDS: u64 = 16; // Suffice to reorder 64*16 = 1024 packets; can be increased at will
+// 64 * 128 = 8192 counters of reordering, the window Linux and wireguard-go
+// keep (theirs is 8192 bits less one word): 1 KiB per session, 8 KiB for a
+// tunnel's eight session slots.
+const N_WORDS: u64 = 128;
 const N_BITS: u64 = WORD_SIZE * N_WORDS;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct ReceivingKeyCounterValidator {
     /// In order to avoid replays while allowing for some reordering of the packets, we keep a
     /// bitmap of received packets, and the value of the highest counter
@@ -45,6 +48,17 @@ struct ReceivingKeyCounterValidator {
     /// Used to estimate packet loss
     receive_cnt: u64,
     bitmap: [u64; N_WORDS as usize],
+}
+
+// By hand: `Default` is derived for arrays of at most 32 elements.
+impl Default for ReceivingKeyCounterValidator {
+    fn default() -> Self {
+        ReceivingKeyCounterValidator {
+            next: 0,
+            receive_cnt: 0,
+            bitmap: [0; N_WORDS as usize],
+        }
+    }
 }
 
 impl ReceivingKeyCounterValidator {
@@ -314,6 +328,58 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window is 8192 counters: the oldest still inside it is accepted
+    /// once, one older is too far back.
+    #[test]
+    fn the_replay_window_holds_8192_counters() {
+        assert_eq!(N_BITS, 8192);
+        let mut c: ReceivingKeyCounterValidator = Default::default();
+        let top = 3 * N_BITS + 17;
+        assert!(c.mark_did_receive(top).is_ok());
+        let oldest = top + 1 - N_BITS;
+        assert!(c.will_accept(oldest).is_ok());
+        assert!(c.mark_did_receive(oldest).is_ok());
+        assert!(matches!(
+            c.mark_did_receive(oldest),
+            Err(WireGuardError::InvalidCounter)
+        ));
+        assert!(matches!(
+            c.will_accept(oldest - 1),
+            Err(WireGuardError::InvalidCounter)
+        ));
+        // Every counter between them arrives, in reverse, exactly once.
+        for counter in (oldest + 1..top).rev() {
+            assert!(c.mark_did_receive(counter).is_ok(), "{}", counter);
+        }
+        for counter in oldest..=top {
+            assert!(c.mark_did_receive(counter).is_err(), "{}", counter);
+        }
+    }
+
+    /// A jump of at least the window clears every bit, so nothing seen before
+    /// it aliases a counter after it; a smaller jump clears exactly the
+    /// skipped counters.
+    #[test]
+    fn a_large_jump_forgets_the_old_window() {
+        let mut c: ReceivingKeyCounterValidator = Default::default();
+        for counter in 0..N_BITS {
+            assert!(c.mark_did_receive(counter).is_ok());
+        }
+        let after = N_BITS + N_BITS + 5;
+        assert!(c.mark_did_receive(after).is_ok());
+        for counter in after + 1 - N_BITS..after {
+            assert!(c.will_accept(counter).is_ok(), "{}", counter);
+        }
+        let mut c: ReceivingKeyCounterValidator = Default::default();
+        assert!(c.mark_did_receive(0).is_ok());
+        assert!(c.mark_did_receive(1000).is_ok());
+        for counter in 1..1000 {
+            assert!(c.will_accept(counter).is_ok(), "{}", counter);
+        }
+        assert!(c.will_accept(0).is_err());
+    }
+
     #[test]
     fn test_replay_counter() {
         let mut c: ReceivingKeyCounterValidator = Default::default();

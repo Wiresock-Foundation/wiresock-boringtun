@@ -1590,7 +1590,8 @@ impl Tunn {
                 self.timers.retransmit_current = self
                     .amnezia
                     .timers
-                    .retransmit_timeout(&mut self.handshake.rng);
+                    .retransmit_timeout(&mut self.handshake.rng)
+                    + self.timers.jitter();
                 if starting_new_handshake {
                     // The cycle's first initiation is not a retransmission, so
                     // the counter starts empty; the budget is drawn once here
@@ -1980,7 +1981,7 @@ impl Tunn {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "mock-instant")]
-    use crate::noise::timers::{REKEY_AFTER_TIME, REKEY_TIMEOUT};
+    use crate::noise::timers::{KEEPALIVE_TIMEOUT, REKEY_AFTER_TIME, REKEY_TIMEOUT};
 
     use super::*;
     use rand_core::{OsRng, RngCore};
@@ -2285,7 +2286,10 @@ mod tests {
         let packet = Tunn::parse_incoming_packet(my_tun.handshake.obf, &init).unwrap();
         assert!(matches!(packet, Packet::HandshakeInit(_)));
 
-        mock_instant::thread_local::MockClock::advance(REKEY_TIMEOUT);
+        // Past the retransmission deadline whatever its jitter drew.
+        mock_instant::thread_local::MockClock::advance(
+            REKEY_TIMEOUT + Duration::from_millis(u64::from(timers::REKEY_TIMEOUT_JITTER_MAX_MS)),
+        );
         update_timer_results_in_handshake(&mut my_tun)
     }
 
@@ -2678,6 +2682,12 @@ mod tests {
         let (mut my_tun, _their_tun) = create_two_tuns_and_handshake_with_keepalive(Some(1));
         let mut small = vec![0u8; DATA_OVERHEAD_SZ - 1];
 
+        // The keepalive owed since the interval was configured goes first.
+        let mut dst = vec![0u8; 2048];
+        assert_eq!(
+            unwrap_network_packet(my_tun.update_timers(&mut dst)).len(),
+            DATA_OVERHEAD_SZ
+        );
         assert!(matches!(my_tun.update_timers(&mut small), TunnResult::Done));
 
         advance_past_pacing_gate(Duration::from_millis(1100));
@@ -4358,8 +4368,14 @@ mod tests {
             TunnResult::WriteToTunnelV4(..)
         ));
 
+        // The reply is data nothing has answered: the passive keepalive
+        // follows KEEPALIVE_TIMEOUT later, as in wireguard-go.
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(10));
+        let keepalive = unwrap_network_packet(my_tun.update_timers(&mut my_dst));
+        assert_eq!(keepalive.len(), DATA_OVERHEAD_SZ);
+
         // 29 seconds into the session: not yet.
-        mock_instant::thread_local::MockClock::advance(Duration::from_secs(28));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(18));
         assert!(matches!(
             my_tun.update_timers(&mut my_dst),
             TunnResult::Done
@@ -4778,6 +4794,279 @@ mod tests {
             their_tun.update_timers(&mut their_dst),
             TunnResult::WriteToNetwork(_)
         ));
+    }
+
+    /// What `update_timers` emitted, by kind: `None` for `Done`.
+    #[cfg(feature = "mock-instant")]
+    fn poll_kind(tun: &mut Tunn) -> Option<&'static str> {
+        let mut dst = vec![0u8; 2048];
+        let obf = tun.handshake.obf;
+        match tun.update_timers(&mut dst) {
+            TunnResult::Done => None,
+            TunnResult::WriteToNetwork(p) => match Tunn::parse_incoming_packet(obf, p) {
+                Ok(Packet::HandshakeInit(_)) => Some("initiation"),
+                Ok(Packet::PacketData(d)) if p.len() == DATA_OVERHEAD_SZ => {
+                    let _ = d;
+                    Some("keepalive")
+                }
+                Ok(Packet::PacketData(_)) => Some("data"),
+                other => panic!("unexpected timer output {:?}", other.map(|_| ())),
+            },
+            other => panic!("unexpected timer result {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "mock-instant")]
+    fn advance(d: Duration) {
+        mock_instant::thread_local::MockClock::advance(d);
+    }
+
+    /// `from` sends `packet` (data, or a keepalive when empty) and `to`
+    /// receives it, each having polled first so their ticks carry the current
+    /// time.
+    #[cfg(feature = "mock-instant")]
+    fn deliver(from: &mut Tunn, to: &mut Tunn, packet: &[u8]) {
+        let mut dst = vec![0u8; 2048];
+        let mut out = vec![0u8; 2048];
+        assert_eq!(poll_kind(from), None);
+        assert_eq!(poll_kind(to), None);
+        let wire = unwrap_network_packet(from.encapsulate(packet, &mut dst));
+        let r = to.decapsulate(None, &wire, &mut out);
+        assert!(!matches!(r, TunnResult::Err(_)), "{:?}", r);
+    }
+
+    /// A received keepalive is not answered with one: only data owes a
+    /// passive keepalive, or two idle peers ping each other forever.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_keepalive_is_not_answered_with_a_keepalive() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        advance(Duration::from_secs(1));
+        deliver(&mut my_tun, &mut their_tun, &[]);
+        for _ in 0..30 {
+            advance(Duration::from_secs(1));
+            assert_eq!(poll_kind(&mut their_tun), None);
+        }
+    }
+
+    /// The passive keepalive is due KEEPALIVE_TIMEOUT after the data that
+    /// owes it, not after whatever this side last sent: a tunnel idle for
+    /// minutes does not answer the first packet at once.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn the_passive_keepalive_waits_a_full_timeout_after_long_idle() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        for _ in 0..100 {
+            advance(Duration::from_secs(1));
+            assert_eq!(poll_kind(&mut their_tun), None);
+        }
+        deliver(&mut my_tun, &mut their_tun, &create_ipv4_udp_packet());
+        advance(Duration::from_millis(250));
+        assert_eq!(poll_kind(&mut their_tun), None, "answered at once");
+        advance(KEEPALIVE_TIMEOUT - Duration::from_millis(350));
+        assert_eq!(poll_kind(&mut their_tun), None);
+        advance(Duration::from_millis(100));
+        assert_eq!(poll_kind(&mut their_tun), Some("keepalive"));
+        // Once: the keepalive answered it.
+        advance(KEEPALIVE_TIMEOUT);
+        assert_eq!(poll_kind(&mut their_tun), None);
+    }
+
+    /// The new-handshake deadline runs from the data that went unanswered,
+    /// plus at most the jitter, not from the last packet heard: after a long
+    /// quiet spell the first packet sent does not start a handshake at once.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn an_unanswered_packet_after_idle_rekeys_only_after_the_timeout() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        for _ in 0..60 {
+            advance(Duration::from_secs(1));
+            assert_eq!(poll_kind(&mut my_tun), None);
+        }
+        let mut dst = vec![0u8; 2048];
+        unwrap_network_packet(my_tun.encapsulate(&create_ipv4_udp_packet(), &mut dst));
+        advance(Duration::from_millis(250));
+        assert_eq!(poll_kind(&mut my_tun), None, "rekeyed at once");
+        let deadline = KEEPALIVE_TIMEOUT + REKEY_TIMEOUT;
+        advance(deadline - Duration::from_millis(500));
+        assert_eq!(poll_kind(&mut my_tun), None);
+        advance(Duration::from_millis(
+            250 + u64::from(timers::REKEY_TIMEOUT_JITTER_MAX_MS),
+        ));
+        assert_eq!(poll_kind(&mut my_tun), Some("initiation"));
+
+        // And an answer in time cancels it.
+        let (mut my_tun, mut their_tun2) = create_two_tuns_and_handshake();
+        let _ = &mut their_tun;
+        advance(Duration::from_secs(1));
+        deliver(&mut my_tun, &mut their_tun2, &create_ipv4_udp_packet());
+        advance(Duration::from_secs(5));
+        deliver(&mut their_tun2, &mut my_tun, &create_ipv4_udp_packet());
+        for _ in 0..30 {
+            advance(Duration::from_secs(1));
+            assert_ne!(poll_kind(&mut my_tun), Some("initiation"));
+        }
+    }
+
+    /// The persistent keepalive is due one interval after the last
+    /// authenticated packet either way, so with traffic flowing it is never
+    /// sent (`deliver` polls both sides and asserts nothing is due; before,
+    /// one went out every 25 seconds regardless).
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn persistent_keepalives_are_not_sent_while_traffic_flows() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake_with_keepalive(Some(25));
+        // The keepalive owed since the interval was configured (on our side
+        // only): the handshake helper never polled, so it is still due.
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+        // Idle: the next one is a full interval after that one.
+        for _ in 0..24 {
+            advance(Duration::from_secs(1));
+            assert_eq!(poll_kind(&mut my_tun), None);
+        }
+        advance(Duration::from_secs(1));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+
+        let packet = create_ipv4_udp_packet();
+        for _ in 0..12 {
+            advance(Duration::from_secs(5));
+            deliver(&mut my_tun, &mut their_tun, &packet);
+            deliver(&mut their_tun, &mut my_tun, &packet);
+        }
+        // A received packet restarts the interval too: we last received.
+        advance(Duration::from_secs(5));
+        deliver(&mut my_tun, &mut their_tun, &[]);
+        deliver(&mut their_tun, &mut my_tun, &[]);
+        for _ in 0..24 {
+            advance(Duration::from_secs(1));
+            assert_eq!(poll_kind(&mut my_tun), None);
+        }
+        advance(Duration::from_secs(1));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+    }
+
+    /// Either direction alone restarts the persistent-keepalive interval:
+    /// keepalives only sent, or only received, every five seconds.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn either_direction_alone_restarts_the_persistent_keepalive() {
+        for sending in [true, false] {
+            let (mut my_tun, mut their_tun) =
+                create_two_tuns_and_handshake_with_keepalive(Some(25));
+            assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+            for _ in 0..12 {
+                advance(Duration::from_secs(5));
+                if sending {
+                    deliver(&mut my_tun, &mut their_tun, &[]);
+                } else {
+                    deliver(&mut their_tun, &mut my_tun, &[]);
+                }
+            }
+        }
+    }
+
+    /// A persistent keepalive is sent at once when the interval is first
+    /// configured -- to bring the tunnel up, without a session -- or turned
+    /// on later; changing an interval that was already on owes nothing.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_persistent_keepalive_is_sent_at_once_on_activation() {
+        let (mut fresh, _) = create_two_tuns_with_keepalive(Some(25));
+        assert_eq!(poll_kind(&mut fresh), Some("initiation"));
+
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        advance(Duration::from_secs(1));
+        assert_eq!(poll_kind(&mut my_tun), None);
+        my_tun.set_persistent_keepalive(Some(25));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+        my_tun.set_persistent_keepalive(Some(30));
+        advance(Duration::from_secs(1));
+        assert_eq!(poll_kind(&mut my_tun), None);
+        my_tun.set_persistent_keepalive(None);
+        my_tun.set_persistent_keepalive(Some(30));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+    }
+
+    /// Retransmission and new-handshake deadlines carry 0-333 ms of jitter,
+    /// untuned and on top of a configured range alike.
+    #[test]
+    fn handshake_deadlines_are_jittered() {
+        let ms = |d: Duration| d.as_millis() as u64;
+        for amnezia in [
+            AmneziaConfig::default(),
+            AmneziaConfig::default().with_tunable_timers(amnezia::AwgTimers {
+                rekey_timeout: (7, 7),
+                ..amnezia::AwgTimers::default()
+            }),
+        ] {
+            let base = amnezia.timers.retransmit_timeout(&mut OsRng);
+            let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+            let mut seen = std::collections::BTreeSet::new();
+            let mut dst = vec![0u8; 2048];
+            for _ in 0..64 {
+                unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, true));
+                let drawn = my_tun.timers.retransmit_current;
+                assert!(drawn >= base && ms(drawn) < ms(base) + 334, "{:?}", drawn);
+                seen.insert(drawn);
+            }
+            assert!(seen.len() > 1, "no jitter: {:?}", seen);
+        }
+    }
+
+    /// A clock that steps back behind the tunnel's own ticks does not make the
+    /// timers panic: elapsed times are measured from a `now` that never goes
+    /// back.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_clock_stepping_back_does_not_panic_the_timers() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        advance(Duration::from_secs(20));
+        let mut dst = vec![0u8; 2048];
+        let _ = my_tun.update_timers(&mut dst);
+        let _ = their_tun.update_timers(&mut dst);
+        // Established, and every tick taken, at 20 s.
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+        assert_eq!(
+            my_tun.timers[TimerName::TimeSessionEstablished],
+            my_tun.timers[TimerName::TimeCurrent]
+        );
+        let now = mock_instant::thread_local::MockClock::time();
+        mock_instant::thread_local::MockClock::set_time(now - Duration::from_secs(15));
+        for _ in 0..3 {
+            let _ = my_tun.update_timers(&mut dst);
+            let _ = their_tun.update_timers(&mut dst);
+            advance(Duration::from_secs(1));
+        }
+    }
+
+    /// An untuned cycle sends every one of its retransmissions even when
+    /// each one's jitter is at its largest: the absolute bound leaves room
+    /// for the jitter, so the attempt count is what ends the cycle.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn an_untuned_cycle_keeps_its_last_retransmission_under_maximal_jitter() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let mut dst = vec![0u8; 2048];
+        unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        let step = REKEY_TIMEOUT
+            + Duration::from_millis(u64::from(timers::REKEY_TIMEOUT_JITTER_MAX_MS) - 1);
+        let mut retransmissions = 0;
+        loop {
+            advance(step);
+            match my_tun.update_timers(&mut dst) {
+                TunnResult::WriteToNetwork(_) => retransmissions += 1,
+                TunnResult::Err(WireGuardError::ConnectionExpired) => break,
+                other => panic!("{:?}", other),
+            }
+            assert!(retransmissions < 100);
+        }
+        assert_eq!(
+            retransmissions,
+            (timers::REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs() - 1) as u32
+        );
     }
 
     /// A live `set_obfuscation` reaches the cached timer draws.

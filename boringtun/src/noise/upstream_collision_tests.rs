@@ -1117,6 +1117,9 @@ fn seeded_tunnels(seed: u64) -> (Tunn, Tunn) {
     let mut expected = timers_before.clone();
     expected.named[T_RECEIVED] = now;
     expected.named[T_ESTABLISHED] = now;
+    // Any authenticated packet received restarts the persistent-keepalive
+    // interval (wireguard-go `timersAnyAuthenticatedPacketTraversal`).
+    expected.named[TimerName::TimePersistentKeepalive as usize] = now;
     expected.sessions[slot] = now;
     assert_eq!(
         timer_state(&a),
@@ -1329,6 +1332,22 @@ fn assert_one_sends_timers(t: &Tunn, before: &TimerState, now: Duration, data: b
     let mut expected = before.clone();
     expected.named[T_SENT] = now;
     expected.named[T_DATA_SENT] = data_sent;
+    // Any authenticated send restarts the persistent-keepalive interval
+    // (wireguard-go `timersAnyAuthenticatedPacketTraversal`).
+    expected.named[TimerName::TimePersistentKeepalive as usize] = now;
+    // Data that finds the new-handshake deadline unarmed arms it, with a
+    // fresh draw plus up to 333 ms of jitter.
+    if data && after.deadlines[2] != before.deadlines[2] {
+        let base = Duration::from_secs(15);
+        let jitter = Duration::from_millis(u64::from(super::timers::REKEY_TIMEOUT_JITTER_MAX_MS));
+        assert!(
+            after.deadlines[2] >= base && after.deadlines[2] < base + jitter,
+            "{}: new-handshake deadline {:?}",
+            what,
+            after.deadlines[2]
+        );
+        expected.deadlines[2] = after.deadlines[2];
+    }
     assert_eq!(after, expected, "{}: no other timer moves", what);
 }
 

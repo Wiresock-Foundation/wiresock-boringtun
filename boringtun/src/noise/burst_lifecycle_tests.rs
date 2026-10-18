@@ -8,7 +8,9 @@
 
 use super::amnezia::{AmneziaConfig, AmneziaImitationProtocol, AwgTimers};
 use super::timers::TimerName::*;
-use super::timers::REKEY_ATTEMPT_TIME;
+// The untuned absolute bound: the attempt time plus the most handshake jitter
+// its retransmissions can add (the "90s" in the test names).
+use super::timers::untuned_attempt_window;
 use super::*;
 use mock_instant::thread_local::{Instant, MockClock};
 use rand_core::{OsRng, RngCore};
@@ -138,7 +140,7 @@ fn snap(t: &Tunn) -> Snap {
         started: t.timers[TimeLastHandshakeStarted],
         last_sent: t.timers[TimeLastPacketSent],
         attempts: t.timers.handshake_attempts,
-        want_handshake: t.timers.want_handshake,
+        want_handshake: t.timers.want_handshake.is_some(),
         pending: t.pending_amnezia_junk.as_ref().map(|p| {
             (
                 p.imitation_datagrams.len(),
@@ -328,9 +330,15 @@ fn t_b1_jc_burst_final_initiation_refused_past_the_90s_bound_expires() {
         matches!(before.pending, Some((0, 0, Some(_), false))),
         "[R3:TB1:MATCHES-BEFORE-PENDING-SOME-SOME]"
     );
-    let at = refuse_until_expired(&mut c, FLOOR - 1, &before, started, REKEY_ATTEMPT_TIME);
+    let at = refuse_until_expired(
+        &mut c,
+        FLOOR - 1,
+        &before,
+        started,
+        untuned_attempt_window(),
+    );
     assert!(
-        at - started >= REKEY_ATTEMPT_TIME,
+        at - started >= untuned_attempt_window(),
         "[R3:TB1:AT-STARTED-REKEY-ATTEMPT-TIME]"
     );
 }
@@ -387,7 +395,13 @@ fn t_b2_imitation_burst_final_initiation_refused_past_the_90s_bound_expires() {
         matches!(before.pending, Some((0, 0, _, false))),
         "[R3:TB2:MATCHES-BEFORE-PENDING-SOME-FALSE]"
     );
-    refuse_until_expired(&mut c, FLOOR - 1, &before, started, REKEY_ATTEMPT_TIME);
+    refuse_until_expired(
+        &mut c,
+        FLOOR - 1,
+        &before,
+        started,
+        untuned_attempt_window(),
+    );
 }
 
 // T-B2 -- pending imitation datagram itself refused past the bound.
@@ -411,7 +425,7 @@ fn t_b2_pending_imitation_datagram_refused_past_the_90s_bound_expires() {
         matches!(before.pending, Some((n, 0, _, false)) if n > 0),
         "[R3:TB2B:MATCHES-BEFORE-PENDING-SOME-N]"
     );
-    refuse_until_expired(&mut c, 10, &before, started, REKEY_ATTEMPT_TIME);
+    refuse_until_expired(&mut c, 10, &before, started, untuned_attempt_window());
 }
 
 // T-B3 -- a newly restarted Expired cycle is not destroyed by its own stale
@@ -568,8 +582,9 @@ fn t_b4_a_restarted_empty_burst_resets_once_at_its_initiation() {
     );
     assert_eq!(s.attempts, 0, "[R3:TB4:ATTEMPTS]");
     assert!(s.queue.is_empty(), "[R3:TB4:QUEUE-IS-EMPTY]");
-    // Armed by the send itself (every sent packet arms it), not by the refusal.
-    assert!(s.want_handshake, "[R3:TB4:WANT-HANDSHAKE]");
+    // Not armed: only data arms the new-handshake deadline (an initiation
+    // has its own retransmission timer), and the refusal does not either.
+    assert!(!s.want_handshake, "[R3:TB4:WANT-HANDSHAKE]");
     // One demand, one initiation: nothing else is due before the retransmit.
     adv(secs(1));
     assert!(
@@ -903,7 +918,7 @@ fn t_b12_a_burst_bearing_latch_refusal_keeps_exactly_one_demand() {
     let _ = c.update_timers(&mut big);
     let _data = net(c.encapsulate(&ipv4(2), &mut big));
     assert!(
-        c.timers.want_handshake,
+        c.timers.want_handshake.is_some(),
         "[R3:TB12:LATCH-ARMED-BY-THE-SEND] latch armed by the send"
     );
     adv(secs(16));

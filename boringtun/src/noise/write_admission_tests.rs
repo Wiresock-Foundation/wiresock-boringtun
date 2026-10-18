@@ -174,7 +174,7 @@ fn snap(t: &Tunn) -> Snap {
         started: t.timers[TimerName::TimeLastHandshakeStarted],
         last_sent: t.timers[TimerName::TimeLastPacketSent],
         attempts: t.timers.handshake_attempts,
-        want_handshake: t.timers.want_handshake,
+        want_handshake: t.timers.want_handshake.is_some(),
         pending: t.pending_amnezia_junk.as_ref().map(|p| {
             (
                 p.imitation_datagrams.len(),
@@ -1248,11 +1248,15 @@ fn absolute_expiry_still_ends_a_cycle_whose_dst_stays_short() {
     let started = c.timers[TimerName::TimeLastHandshakeStarted];
     let mut expired = false;
     for _ in 0..40 {
-        mock_instant::thread_local::MockClock::advance(Duration::from_secs(5));
+        // Past the retransmission deadline whatever its jitter drew.
+        mock_instant::thread_local::MockClock::advance(
+            Duration::from_secs(5)
+                + Duration::from_millis(u64::from(super::timers::REKEY_TIMEOUT_JITTER_MAX_MS)),
+        );
         let mut buf = [0u8; 100];
         let r = c.update_timers(&mut buf);
         let now = c.timers[TimerName::TimeCurrent];
-        if now - started < super::timers::REKEY_ATTEMPT_TIME {
+        if now - started < super::timers::untuned_attempt_window() {
             assert!(is_dbts(&r), "[R3:T20:RETRANSMISSION-REFUSED] {:?}", r);
             assert_eq!(
                 c.timers.handshake_attempts, 0,
