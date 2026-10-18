@@ -1417,6 +1417,11 @@ impl Tunn {
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick_session_established(true, index); // New session established, we are the initiator
         self.set_current_session(l_idx);
+        // The keepalive below is an authenticated send like any other
+        // (wireguard-go sends it through `SendKeepalive`): it answers data the
+        // old session received meanwhile, and restarts the persistent
+        // keepalive interval.
+        self.timer_tick(TimerName::TimeLastPacketSent);
 
         tracing::debug!("Sending keepalive");
 
@@ -5038,8 +5043,41 @@ mod tests {
         for _ in 0..3 {
             let _ = my_tun.update_timers(&mut dst);
             let _ = their_tun.update_timers(&mut dst);
+            let _ = my_tun.time_since_last_handshake();
             advance(Duration::from_secs(1));
         }
+        // The timer reset reads the clock too, and the next poll compares the
+        // session timers it leaves against it.
+        my_tun.clear_all();
+        let _ = my_tun.update_timers(&mut dst);
+        let _ = my_tun.time_since_last_handshake();
+    }
+
+    /// A keepalive the caller's buffer cannot hold keeps its demand: the one
+    /// owed at activation goes out at the next tick that has room, not an
+    /// interval later.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_keepalive_refused_for_capacity_stays_owed() {
+        let (mut fresh, _) = create_two_tuns_with_keepalive(Some(25));
+        assert!(matches!(
+            fresh.update_timers(&mut [0u8; 64]),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+        advance(Duration::from_millis(250));
+        assert_eq!(poll_kind(&mut fresh), Some("initiation"));
+
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        advance(Duration::from_secs(1));
+        deliver(&mut their_tun, &mut my_tun, &create_ipv4_udp_packet());
+        advance(KEEPALIVE_TIMEOUT);
+        let mut small = vec![0u8; DATA_OVERHEAD_SZ - 1];
+        assert!(matches!(
+            my_tun.update_timers(&mut small),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+        advance(Duration::from_millis(250));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
     }
 
     /// An untuned cycle sends every one of its retransmissions even when

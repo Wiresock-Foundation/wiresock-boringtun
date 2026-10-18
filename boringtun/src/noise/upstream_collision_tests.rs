@@ -1100,8 +1100,8 @@ fn seeded_tunnels(seed: u64) -> (Tunn, Tunn) {
         "confirmation: one window observation"
     );
     // `commit_handshake_response`: the response counts as a packet received
-    // and establishes the session (its slot's session timer too); it does
-    // not tick the packet-sent or data-sent timers.
+    // and establishes the session (its slot's session timer too); the
+    // keepalive it sends ticks packet-sent, not data-sent.
     let slot = a.current % N_SESSIONS;
     for (timer, what) in [
         (T_RECEIVED, "packet-received tick"),
@@ -1117,14 +1117,16 @@ fn seeded_tunnels(seed: u64) -> (Tunn, Tunn) {
     let mut expected = timers_before.clone();
     expected.named[T_RECEIVED] = now;
     expected.named[T_ESTABLISHED] = now;
-    // Any authenticated packet received restarts the persistent-keepalive
-    // interval (wireguard-go `timersAnyAuthenticatedPacketTraversal`).
+    // The confirming keepalive is an authenticated send (wireguard-go's
+    // `SendKeepalive`), and both directions restart the persistent-keepalive
+    // interval (`timersAnyAuthenticatedPacketTraversal`). Not data-sent.
+    expected.named[T_SENT] = now;
     expected.named[TimerName::TimePersistentKeepalive as usize] = now;
     expected.sessions[slot] = now;
     assert_eq!(
         timer_state(&a),
         expected,
-        "confirmation: no packet-sent or data-sent tick, nothing else moves"
+        "confirmation: a packet-sent tick, no data-sent tick, nothing else moves"
     );
 
     // The responder takes candidate 16 through its ordinary receive path:

@@ -76,6 +76,8 @@ pub struct Timers {
     /// `timersDataReceived` arms `sendKeepalive`; any authenticated send
     /// cancels it). Data alone arms it: a received keepalive must not be
     /// answered with another, or two idle peers ping each other forever.
+    /// Upstream's `needAnotherKeepalive` re-arm is not kept: the one keepalive
+    /// answers all data received before it.
     want_keepalive: Option<Duration>,
     /// When data was first sent with nothing heard back since: a new
     /// handshake is due `new_handshake_current` after it (upstream
@@ -167,7 +169,10 @@ impl Timers {
     // We don't really clear the timers, but we set them to the current time to
     // so the reference time frame is the same
     pub(super) fn clear(&mut self) {
-        let now = Instant::now().duration_since(self.time_started);
+        // Never earlier than the last poll, as in `Tunn::monotonic_now`.
+        let now = Instant::now()
+            .duration_since(self.time_started)
+            .max(self[TimeCurrent]);
         for t in &mut self.timers[..] {
             *t = now;
         }
@@ -318,7 +323,7 @@ impl Tunn {
         let timers = &mut self.timers;
 
         for (i, t) in timers.session_timers.iter_mut().enumerate() {
-            if time_now - *t > reject_after_time {
+            if time_now.saturating_sub(*t) > reject_after_time {
                 if let Some(session) = self.sessions[i].take() {
                     // The message names the rule, the field names the number
                     // that actually fired: with `reject_after_time` tuned, the
@@ -384,8 +389,8 @@ impl Tunn {
         //
         // Widened by the most jitter the cycle's retransmissions can add
         // (`untuned_attempt_window`), so the 90 seconds of fixed 5-second
-        // intervals the count was derived from still fit: the count stays
-        // what ends the cycle, as it does in Linux and wireguard-go.
+        // intervals the count was derived from still fit, jittered: no
+        // retransmission the count allows is cut off by the bound.
         if self.amnezia.timers.max_handshake_attempts == (0, 0)
             && self.amnezia.timers.rekey_timeout == (0, 0)
             && now.saturating_sub(self.timers[TimeLastHandshakeStarted]) >= untuned_attempt_window()
@@ -411,6 +416,15 @@ impl Tunn {
         let mut handshake_initiation_required = false;
         let mut consumed_handshake_latch = None;
         let mut keepalive_required = false;
+        // What selecting a keepalive spends, put back if it then does not fit
+        // `dst`: as with the handshake latch below, a capacity refusal must
+        // not cost the demand -- a persistent keepalive owed at activation
+        // would otherwise wait a whole interval.
+        let keepalive_rollback = (
+            self.timers.persistent_keepalive_due,
+            self.timers[TimePersistentKeepalive],
+            self.timers.want_keepalive,
+        );
 
         let time = Instant::now();
 
@@ -601,7 +615,17 @@ impl Tunn {
         }
 
         if keepalive_required {
-            return self.encapsulate(&[], dst);
+            let result = self.encapsulate(&[], dst);
+            if matches!(
+                result,
+                TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+            ) {
+                let (due, persistent, passive) = keepalive_rollback;
+                self.timers.persistent_keepalive_due = due;
+                self.timers[TimePersistentKeepalive] = persistent;
+                self.timers.want_keepalive = passive;
+            }
+            return result;
         }
 
         TunnResult::Done
@@ -613,7 +637,7 @@ impl Tunn {
             let duration_since_tun_start = Instant::now().duration_since(self.timers.time_started);
             let duration_since_session_established = self.timers[TimeSessionEstablished];
 
-            Some(duration_since_tun_start - duration_since_session_established)
+            Some(duration_since_tun_start.saturating_sub(duration_since_session_established))
         } else {
             None
         }

@@ -10,12 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Timers follow the Linux and wireguard-go (and amneziawg-go) state machine:
-  - The passive keepalive is owed only to received *data* -- a received keepalive no longer arms it -- and is due `KEEPALIVE_TIMEOUT` after that data, not after whatever was last sent, so a tunnel idle for minutes no longer answers the first packet at once.
+  - The passive keepalive is due `KEEPALIVE_TIMEOUT` after the received data that owes it, not after whatever was last sent, so a tunnel idle for minutes no longer answers the first packet at once; and data received in the same timer tick as a send is now answered too. Only data arms it, as before.
   - The new-handshake deadline (`KEEPALIVE_TIMEOUT + REKEY_TIMEOUT`) is armed only by sent data, and runs from that send rather than from the last packet received, so the first packet after a quiet spell no longer starts a handshake at once.
   - The persistent keepalive is due one interval after the last authenticated packet in either direction, so it is no longer sent while traffic flows.
   - A persistent keepalive is sent at the first timer tick when the interval is configured at construction or turned on later (not when an existing interval changes), instead of one full interval later. Without a session this starts the handshake, as in Linux and wireguard-go.
-  - Handshake retransmissions and the new-handshake deadline carry 0-333 ms of jitter, on top of a configured AmneziaWG range as amneziawg-go adds it; the untuned 90-second absolute bound is widened by the most that jitter can add over its retransmissions (to about 96 s), so the attempt count still ends the cycle.
-  - A clock that steps backwards no longer underflows the timer arithmetic, which panicked (and aborted the process under the C and JNI bindings).
+  - Handshake retransmissions and the new-handshake deadline carry 0-333 ms of jitter, on top of a configured AmneziaWG range as amneziawg-go adds it; the untuned 90-second absolute bound is widened by the most that jitter can add over its retransmissions (to about 96 s), so it cuts off none of the retransmissions the attempt count allows.
+  - A clock that steps backwards no longer underflows the timer arithmetic (the timer poll, the timer reset and `time_since_last_handshake`), which panicked and aborted the process under the C and JNI bindings.
+  - A keepalive that does not fit the caller's buffer keeps its demand, so a persistent keepalive owed at activation is retried at the next tick rather than an interval later; and the keepalive confirming a handshake response counts as a sent packet.
 - The anti-replay window holds 8192 counters instead of 1024, as in Linux and wireguard-go, so more reordering is tolerated before legitimate packets are dropped. This costs 7 KiB more per tunnel (eight session slots).
 - `Tunn::encapsulate` / `wireguard_write` without a session no longer queue the packet when they return an error, so retrying after `DestinationBufferTooSmall` cannot deliver it twice; the handshake-initiation capacity (148 bytes plus S1) and the junk-packet maximum are checked before any handshake state changes.
 - A full queue of packets waiting for a handshake is reported as `PacketQueueFull` instead of a silent drop reported as `Done`.
