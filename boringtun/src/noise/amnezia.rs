@@ -14,7 +14,7 @@ use super::{
     handshake::ObfuscationRanges, COOKIE_REPLY_SZ, DATA_OVERHEAD_SZ, HANDSHAKE_INIT_SZ,
     HANDSHAKE_RESP_SZ,
 };
-use crate::noise::budget;
+use crate::noise::budget::{self, ControlOutput, OutputBudget};
 use crate::noise::errors::WireGuardError;
 use crate::noise::header_protection::{HeaderProtectionKey, NONCE_SIZE, TYPE_MASK_SIZE};
 use crate::noise::rate_limiter::CookieDefense;
@@ -2437,19 +2437,27 @@ impl AmneziaConfig {
         random_usize_inclusive(lo, hi, rng)
     }
 
-    /// The range the next Jc junk datagram is drawn from under a `control`
-    /// output budget (0: the configured range). Ordinary junk is clamped at
-    /// both ends; a protocol's junk keeps its protocol minimum and is
-    /// `OutputBudgetExceeded` below it (`budget::junk_range`). The stored
-    /// configuration, Jc included, is not touched.
+    /// The range the next Jc junk datagram is drawn from under `budget`'s
+    /// control budget for it (0: the configured range). Ordinary junk is
+    /// clamped at both ends; a protocol's junk keeps its protocol minimum and
+    /// is `OutputBudgetExceeded` below it (`budget::junk_range`) -- unless the
+    /// budget bounds ordinary junk only, when it has no control budget at all
+    /// ([`OutputBudget::control_for`]). The stored configuration, Jc
+    /// included, is not touched.
     pub(crate) fn pre_handshake_junk_range_within(
         &self,
-        control: u32,
+        budget: OutputBudget,
     ) -> Result<(usize, usize), WireGuardError> {
+        let protocol_shaped = self.imitation.protocol != AmneziaImitationProtocol::None;
+        let kind = if protocol_shaped {
+            ControlOutput::Other
+        } else {
+            ControlOutput::OrdinaryJunk
+        };
         budget::junk_range(
             self.pre_handshake_junk_size_range(),
-            self.imitation.protocol != AmneziaImitationProtocol::None,
-            control,
+            protocol_shaped,
+            budget.control_for(kind),
         )
     }
 

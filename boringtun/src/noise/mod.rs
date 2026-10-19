@@ -46,7 +46,7 @@ pub(crate) mod op_report;
 pub(crate) mod budget;
 
 use amnezia::AmneziaConfig;
-use budget::OutputBudget;
+use budget::{ControlOutput, OutputBudget};
 use handshake::ObfuscationRanges;
 use op_report::{event, PacketKind};
 
@@ -1254,7 +1254,7 @@ impl Tunn {
                 budget::admit(
                     Some(HANDSHAKE_RESP_SZ + self.amnezia.handshake_response_junk_size()),
                     dst.len(),
-                    budget.control,
+                    budget.control_for(ControlOutput::Other),
                 )?;
                 self.handshake
                     .authenticate_initiation(&p)
@@ -1375,7 +1375,7 @@ impl Tunn {
         dst: &'a mut [u8],
         budget: OutputBudget,
     ) -> Result<TunnResult<'a>, WireGuardError> {
-        let ceiling = budget::ceiling(dst.len(), budget.control);
+        let ceiling = budget::ceiling(dst.len(), budget.control_for(ControlOutput::Other));
         let (packet, session) = self.handshake.commit_initiation(init, dst)?;
         let packet_size = packet.len();
 
@@ -1509,7 +1509,8 @@ impl Tunn {
     }
 
     /// [`Self::format_handshake_initiation`] with every datagram it may
-    /// produce -- burst item, junk, initiation -- bounded by `budget.control`
+    /// produce -- burst item, junk, initiation -- bounded by the control
+    /// budget [`OutputBudget::control_for`] gives its kind
     /// (`wireguard_force_handshake_ex`, and the no-session write, drain and
     /// tick paths).
     pub(crate) fn format_handshake_initiation_with_budget<'a>(
@@ -1631,7 +1632,7 @@ impl Tunn {
         let ceiling = match budget::admit(
             Some(self.initiation_wire_floor()),
             dst.len(),
-            budget.control,
+            budget.control_for(ControlOutput::Other),
         ) {
             Ok(ceiling) => ceiling,
             Err(e) => return TunnResult::Err(e),
@@ -1759,7 +1760,11 @@ impl Tunn {
                 .expect("queue checked non-empty above")
                 .1
                 .len();
-            if let Err(e) = budget::admit(Some(size), dst.len(), budget.control) {
+            if let Err(e) = budget::admit(
+                Some(size),
+                dst.len(),
+                budget.control_for(ControlOutput::Other),
+            ) {
                 return TunnResult::Err(e);
             }
             let (_, datagram) = pending.imitation_datagrams.pop_front().unwrap();
@@ -1806,11 +1811,12 @@ impl Tunn {
 
         // The size range this datagram is drawn from under the control
         // budget -- ordinary junk clamped at both ends, protocol junk refused
-        // when the budget is below its protocol's minimum -- then the
-        // preflight against the largest size that range can produce, before
-        // the draw: deterministic admission, no RNG spent on a refusal, and
-        // no retry-dependent size. `dst` never narrows the range.
-        let range = match self.amnezia.pre_handshake_junk_range_within(budget.control) {
+        // when the budget is below its protocol's minimum, unless the call
+        // bounds ordinary junk only -- then the preflight against the largest
+        // size that range can produce, before the draw: deterministic
+        // admission, no RNG spent on a refusal, and no retry-dependent size.
+        // `dst` never narrows the range.
+        let range = match self.amnezia.pre_handshake_junk_range_within(budget) {
             Ok(range) => range,
             Err(e) => return TunnResult::Err(e),
         };

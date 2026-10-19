@@ -198,8 +198,21 @@ fn legacy(t: &Owned, op: Op, dst: &mut [u8]) -> Res {
 /// The call must have run -- metadata published, the inputs untouched -- and
 /// this slice never reports a skipped burst item.
 fn exb(t: &Owned, op: Op, dst: &mut [u8], bt: u32, bc: u32) -> (Res, wireguard_packet_info) {
+    exf(t, op, dst, 0, bt, bc)
+}
+
+/// `exb` with `in_flags = flags`.
+fn exf(
+    t: &Owned,
+    op: Op,
+    dst: &mut [u8],
+    flags: u32,
+    bt: u32,
+    bc: u32,
+) -> (Res, wireguard_packet_info) {
     let mut info = wireguard_packet_info {
         size: WIREGUARD_PACKET_INFO_SIZE_V1,
+        in_flags: flags,
         max_transport_output: bt,
         max_control_output: bc,
         ..Default::default()
@@ -207,8 +220,8 @@ fn exb(t: &Owned, op: Op, dst: &mut [u8], bt: u32, bc: u32) -> (Res, wireguard_p
     let r = unsafe { raw_call(t.0, op, dst, &mut info) };
     assert_eq!(
         info.written_size, 48,
-        "the call ran and published (bt {}, bc {}): got {:?}",
-        bt, bc, r
+        "the call ran and published (flags {:#x}, bt {}, bc {}): got {:?}",
+        flags, bt, bc, r
     );
     assert_eq!(
         (
@@ -217,7 +230,7 @@ fn exb(t: &Owned, op: Op, dst: &mut [u8], bt: u32, bc: u32) -> (Res, wireguard_p
             info.max_transport_output,
             info.max_control_output
         ),
-        (48, 0, bt, bc),
+        (48, flags, bt, bc),
         "inputs are never written"
     );
     assert_eq!(
@@ -440,7 +453,7 @@ fn budgets_keep_the_memory_protocol() {
             }),
             ("in_flags", |m| {
                 put(m, 0, 48);
-                put(m, 4, 1);
+                put(m, 4, 2);
                 put(m, 8, 1400);
                 put(m, 12, 200);
             }),
@@ -2189,6 +2202,820 @@ fn w_ka_tick_clips_the_keepalive_padding() {
         let mut cb = vec![0u8; 2048];
         let armed = Armed::new(50);
         let (r, i) = exb(&client, Op::Tick, &mut cb, bt, 0);
+        assert_eq!(
+            (r.op, r.size, i.output_kind),
+            (WTN, out, k(PacketKind::TransportKeepalive)),
+            "bt {}",
+            bt
+        );
+        assert!(armed.consumed());
+        drop(armed);
+        read_done(&peer, &cb[..r.size]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY: C bounds ordinary Jc junk only
+// ---------------------------------------------------------------------------
+
+/// The header's value of `WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY`.
+const ORDINARY_JUNK_ONLY: u32 = 0x0000_0001;
+
+/// The header defines the flag -- the one `WIREGUARD_INFO_F_*` bit -- and the
+/// library's constant has the same value.
+#[test]
+fn the_header_defines_the_ordinary_junk_only_flag() {
+    let header = include_str!("../wireguard_ffi.h");
+    let defines: Vec<&str> = header
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("#define WIREGUARD_INFO_F_"))
+        .collect();
+    assert_eq!(defines.len(), 1, "{:?}", defines);
+    let mut words = defines[0].split_whitespace().skip(1);
+    assert_eq!(
+        words.next(),
+        Some("WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY")
+    );
+    assert_eq!(words.next(), Some("0x00000001u"));
+    assert_eq!(
+        WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY,
+        ORDINARY_JUNK_ONLY
+    );
+}
+
+/// Admission: the flag alone is accepted by all four `_ex` entry points,
+/// with zero and finite budgets, at every alignment, with a zero tail up to
+/// the largest size -- the call runs, writes `[16, 48)` and takes one
+/// sequence number. Every other bit, alone or with the flag, and the flag
+/// with a nonzero tail byte, are still 19 before anything runs: no byte
+/// written, no sequence number, nothing admitted.
+#[test]
+fn the_flag_is_the_one_accepted_in_flags_bit() {
+    let (a, b) = (party(), party());
+    let client = plain(&a, &b, 1, 0);
+    let server = plain(&b, &a, 2, 0);
+    establish(&client, &server);
+    let mut dst = vec![0u8; 2048];
+    let seq_of = |t: &Owned| unsafe { (*t.0).lock().op_state_mut().op_seq() };
+    let p = ipv4(1, 100);
+    let ops = [
+        ("write", Op::Write(&p)),
+        ("read", Op::Read(EMPTY)),
+        ("tick", Op::Tick),
+        ("force", Op::Force),
+    ];
+    let unknown = [
+        0x0000_0002,
+        0x0000_0004,
+        0x8000_0000,
+        ORDINARY_JUNK_ONLY | 0x0000_0002,
+        ORDINARY_JUNK_ONLY | 0x8000_0000,
+        u32::MAX,
+    ];
+    for at in 0..4 {
+        let mut buf = vec![CANARY; 1024 + 64];
+        for (name, op) in ops {
+            let mut refused = Vec::new();
+            for flags in unknown {
+                for (bt, bc) in [(0, 0), (1400, 200)] {
+                    refused.push((flags, 48u32, bt, bc, false));
+                }
+            }
+            refused.push((ORDINARY_JUNK_ONLY, 64, 0, 0, true));
+            refused.push((ORDINARY_JUNK_ONLY, 64, 1400, 200, true));
+            for (flags, size, bt, bc, dirty_tail) in refused {
+                buf.fill(CANARY);
+                let m = &mut buf[at..];
+                put(m, 0, size);
+                put(m, 4, flags);
+                put(m, 8, bt);
+                put(m, 12, bc);
+                if size > 48 {
+                    m[48..size as usize].fill(0);
+                }
+                if dirty_tail {
+                    m[size as usize - 1] = 1;
+                }
+                let before = buf.clone();
+                let (seq, queued) = (seq_of(&client), client.with(|t| t.queued_len()));
+                let r = unsafe {
+                    raw_call(
+                        client.0,
+                        op,
+                        &mut dst,
+                        buf[at..].as_mut_ptr() as *mut wireguard_packet_info,
+                    )
+                };
+                let case = format!("offset {} {} flags {:#x} size {}", at, name, flags, size);
+                assert_eq!((r.op, r.size), (ERR, 19), "{}", case);
+                assert_eq!(buf, before, "{}: nothing written", case);
+                assert_eq!(seq_of(&client), seq, "{}: no sequence", case);
+                assert_eq!(
+                    client.with(|t| t.queued_len()),
+                    queued,
+                    "{}: not admitted",
+                    case
+                );
+            }
+
+            for (size, bt, bc) in [
+                (48u32, 0u32, 0u32),
+                (48, 1400, 0),
+                (64, 0, 200),
+                (1024, 1, 1),
+                (1024, u32::MAX, u32::MAX),
+            ] {
+                buf.fill(CANARY);
+                let m = &mut buf[at..];
+                put(m, 0, size);
+                put(m, 4, ORDINARY_JUNK_ONLY);
+                put(m, 8, bt);
+                put(m, 12, bc);
+                m[48..size as usize].fill(0);
+                let before = buf.clone();
+                let seq = seq_of(&client);
+                let r = unsafe {
+                    raw_call(
+                        client.0,
+                        op,
+                        &mut dst,
+                        buf[at..].as_mut_ptr() as *mut wireguard_packet_info,
+                    )
+                };
+                let case = format!("offset {} {} size {} bt {} bc {}", at, name, size, bt, bc);
+                assert_ne!((r.op, r.size), (ERR, 19), "{}: accepted", case);
+                assert_eq!(&buf[..at + 16], &before[..at + 16], "{}: inputs", case);
+                assert_eq!(&buf[at + 48..], &before[at + 48..], "{}: tail", case);
+                let m = &buf[at..];
+                assert_eq!(get(m, 16), 48, "{}: written_size", case);
+                assert_eq!(
+                    (u64::from(get(m, 40)) << 32) | u64::from(get(m, 36)),
+                    seq + 1,
+                    "{}: one sequence number",
+                    case
+                );
+            }
+        }
+    }
+}
+
+/// Ordinary Jc junk under the flag: each item is drawn from [min(Jmin, C),
+/// min(Jmax, C)], as without it (decision 1A), with Jc and the configured
+/// bounds untouched. A `dst` one byte short of the working maximum is 0
+/// before the draw -- nothing drawn, the item still owed -- and the working
+/// maximum fits whatever is drawn. The owner's 1000..=1280 at C 572 is 572,
+/// item after item. The initiation behind the burst is not junk: under the
+/// same C, 1 included, it is the whole 148 bytes and the peer answers it.
+#[test]
+fn flag_mode_ordinary_junk_is_clamped_at_both_ends() {
+    // (case, configured Jmin..=Jmax, C, working lo..=hi)
+    type Case = (&'static str, (u32, u32), u32, (usize, usize));
+    let cases: [Case; 7] = [
+        ("1000..1280 at 572", (1000, 1280), 572, (572, 572)),
+        ("100..1280 at 572", (100, 1280), 572, (100, 572)),
+        ("C equal to Jmax", (100, 572), 572, (100, 572)),
+        ("C equal to Jmin", (572, 1280), 572, (572, 572)),
+        ("C above the range", (100, 1000), 1200, (100, 1000)),
+        ("C 1", (1000, 1280), 1, (1, 1)),
+        ("C 0", (1000, 1280), 0, (1000, 1280)),
+    ];
+    for (name, (lo, hi), bc, (wlo, whi)) in cases {
+        let (a, b) = (party(), party());
+        let client = awg(&a, &b, 1, &junk_profile(3, lo, hi));
+        let server = plain(&b, &a, 2, 0);
+        let mut dst = vec![0u8; 2048];
+        let mut sizes = Vec::new();
+        for left in (0..3u16).rev() {
+            // The force prepares the burst; ticks serve it.
+            let op = if left == 2 { Op::Force } else { Op::Tick };
+            let pos = client.with(|t| t.rng_word_pos());
+            let (r, i) = exf(&client, op, &mut dst[..whi - 1], ORDINARY_JUNK_ONLY, 0, bc);
+            assert_eq!((r.op, r.size), (ERR, STORAGE), "{}", name);
+            assert_eq!(
+                (i.events & !ev::BURST_PREPARED, i.state, i.burst_due_ms),
+                (0, st::BURST_PENDING, 0),
+                "{}: due but blocked",
+                name
+            );
+            assert_eq!(client.with(|t| t.rng_word_pos()), pos, "{}: no draw", name);
+            assert_eq!(
+                client.with(|t| t.pending_burst_shape()),
+                Some((0, left + 1)),
+                "{}: nothing consumed",
+                name
+            );
+
+            let (r, i) = exf(
+                &client,
+                Op::Tick,
+                &mut dst[..whi],
+                ORDINARY_JUNK_ONLY,
+                0,
+                bc,
+            );
+            assert_eq!(
+                (r.op, i.output_kind),
+                (WTN, k(PacketKind::Junk)),
+                "{}",
+                name
+            );
+            assert_eq!(client.with(|t| t.pending_burst_shape()), Some((0, left)));
+            sizes.push(r.size);
+        }
+        assert!(
+            sizes.iter().all(|s| (wlo..=whi).contains(s)),
+            "{}: {:?} outside {}..={}",
+            name,
+            sizes,
+            wlo,
+            whi
+        );
+        let (r, i) = exf(&client, Op::Tick, &mut dst, ORDINARY_JUNK_ONLY, 0, bc);
+        assert_eq!(
+            (r.op, r.size, i.output_kind),
+            (WTN, 148, k(PacketKind::HandshakeInitiation)),
+            "{}",
+            name
+        );
+        assert_eq!(answered(&server, &dst[..148], 2048).len(), 92);
+        let cfg = client.with(|t| t.amnezia_config().pre_handshake_junk);
+        assert_eq!(
+            (cfg.packet_count, cfg.packet_size_min, cfg.packet_size_max),
+            (3, lo as u16, hi as u16),
+            "{}: the configuration is not rewritten",
+            name
+        );
+    }
+}
+
+/// One operation stream under the flag: two ordinary junk items capped to
+/// C 572, then the initiation -- 648 bytes with S1 500, over C -- produced
+/// whole once `dst` holds it (one byte short is 0, the burst still owing
+/// it). The responder answers it under the flag with C 1: one byte short of
+/// the 192-byte S2 response is 0 with nothing accepted, then the whole
+/// response; the initiator confirms it with C 1 and data then flows. The
+/// flag-clear twin of the same stream refuses that initiation and that
+/// response with 18 at C 572 and C 191, and sends them at C 648 and C 192.
+#[test]
+fn flag_mode_handshake_after_capped_junk_is_whole() {
+    let client_cfg = wireguard_awg_params {
+        s1_init_junk: 500,
+        s2_response_junk: 100,
+        ..junk_profile(2, 1000, 1280)
+    };
+    let server_cfg = wireguard_awg_params {
+        s1_init_junk: 500,
+        s2_response_junk: 100,
+        ..params()
+    };
+    for flagged in [true, false] {
+        let f = if flagged { ORDINARY_JUNK_ONLY } else { 0 };
+        let (a, b) = (party(), party());
+        let client = awg(&a, &b, 1, &client_cfg);
+        let server = awg(&b, &a, 2, &server_cfg);
+        let (mut cb, mut sb) = (vec![0u8; 2048], vec![0u8; 2048]);
+
+        for op in [Op::Force, Op::Tick] {
+            let (r, i) = exf(&client, op, &mut cb, f, 0, 572);
+            assert_eq!(
+                (r.op, r.size, i.output_kind),
+                (WTN, 572, k(PacketKind::Junk)),
+                "flag {}",
+                flagged
+            );
+        }
+        let init = if flagged {
+            let (r, i) = exf(&client, Op::Tick, &mut cb[..647], f, 0, 572);
+            assert_eq!((r.op, r.size), (ERR, STORAGE));
+            assert_eq!(
+                (facts(&i), i.burst_due_ms),
+                ((0, 0, 0, st::BURST_PENDING), 0)
+            );
+            let (r, i) = exf(&client, Op::Tick, &mut cb, f, 0, 572);
+            assert_eq!((r.op, r.size), (WTN, 648));
+            assert_eq!(
+                (facts(&i), i.burst_due_ms),
+                (
+                    (
+                        0,
+                        k(PacketKind::HandshakeInitiation),
+                        ev::INITIATION_PRODUCED,
+                        st::INITIATION_PENDING
+                    ),
+                    BURST_DUE_NONE
+                )
+            );
+            cb[..648].to_vec()
+        } else {
+            let (r, i) = exb(&client, Op::Tick, &mut cb, 0, 572);
+            assert_eq!((r.op, r.size), (ERR, BUDGET));
+            assert_eq!(facts(&i), (0, 0, 0, st::BURST_PENDING));
+            let (r, _) = exb(&client, Op::Tick, &mut cb, 0, 648);
+            assert_eq!((r.op, r.size), (WTN, 648));
+            cb[..648].to_vec()
+        };
+
+        let (short, bc) = if flagged { (191, 1) } else { (2048, 191) };
+        let (r, i) = exf(&server, Op::Read(&init), &mut sb[..short], f, 0, bc);
+        let want = if flagged { STORAGE } else { BUDGET };
+        assert_eq!((r.op, r.size), (ERR, want), "flag {}", flagged);
+        assert_eq!(facts(&i), (0, 0, 0, 0), "nothing accepted");
+        let (r, i) = exf(
+            &server,
+            Op::Read(&init),
+            &mut sb,
+            f,
+            0,
+            if flagged { 1 } else { 192 },
+        );
+        assert_eq!((r.op, r.size), (WTN, 192), "flag {}", flagged);
+        assert_eq!(
+            facts(&i),
+            (
+                k(PacketKind::HandshakeInitiation),
+                k(PacketKind::HandshakeResponse),
+                ev::INPUT_ACCEPTED | ev::PEER_AUTHENTICATED | ev::SESSION_STORED,
+                0
+            )
+        );
+        let resp = sb[..192].to_vec();
+
+        let (r, i) = exf(&client, Op::Read(&resp), &mut cb, f, 0, 1);
+        assert_eq!(
+            (r.op, r.size, i.output_kind, i.state),
+            (
+                WTN,
+                32,
+                k(PacketKind::TransportKeepalive),
+                st::SESSION_CURRENT
+            )
+        );
+        let keepalive = cb[..32].to_vec();
+        let (r, i) = exf(&server, Op::Read(&keepalive), &mut sb, f, 0, 1);
+        assert_eq!((r.op, i.state), (DONE, st::SESSION_CURRENT));
+        let (r, _) = exf(&client, Op::Write(&ipv4(7, 100)), &mut cb, f, 0, 1);
+        assert_eq!(r.op, WTN);
+        assert_eq!(delivered(&server, &cb[..r.size]), (7, 100));
+    }
+}
+
+/// The optional bytes of excluded control are not clipped by C under the
+/// flag: with the same armed RandomTrailers word, an initiation and a
+/// response under the flag with C 1 have exactly the length of their C 0
+/// twins -- 264 and 208, the word consumed -- and the peer completes each
+/// handshake. Flag-clear C 1 refuses both with 18 before the draw.
+#[test]
+fn flag_mode_keeps_handshake_trailers_whole() {
+    let modes = [
+        (ORDINARY_JUNK_ONLY, 1u32, Ok(())),
+        (ORDINARY_JUNK_ONLY, 0, Ok(())),
+        (0, 0, Ok(())),
+        (0, 1, Err(BUDGET)),
+    ];
+    for (f, bc, want) in modes {
+        // W-INIT: headroom 352, word 116.
+        let (a, b) = (party(), party());
+        let client = awg(&a, &b, 1, &rt());
+        let peer = awg(&b, &a, 2, &rt());
+        let mut cb = vec![0u8; 2048];
+        let armed = Armed::new(116);
+        let (r, i) = exf(&client, Op::Force, &mut cb, f, 0, bc);
+        match want {
+            Ok(()) => {
+                assert_eq!(
+                    (r.op, r.size, i.output_kind),
+                    (WTN, 264, k(PacketKind::HandshakeInitiation)),
+                    "init flags {} bc {}",
+                    f,
+                    bc
+                );
+                assert!(armed.consumed());
+                drop(armed);
+                assert_eq!(answered(&peer, &cb[..r.size], 92).len(), 92);
+            }
+            Err(code) => {
+                assert_eq!((r.op, r.size), (ERR, code));
+                assert!(!armed.consumed(), "refused before the draw");
+            }
+        }
+
+        // W-RESP: headroom 408, word 116.
+        let (a, b) = (party(), party());
+        let client = awg(&a, &b, 1, &rt());
+        let peer = awg(&b, &a, 2, &rt());
+        let mut pb = vec![0u8; 2048];
+        assert_eq!(legacy(&peer, Op::Force, &mut pb[..148]).size, 148);
+        let mut cb = vec![0u8; 2048];
+        let armed = Armed::new(116);
+        let (r, i) = exf(&client, Op::Read(&pb[..148]), &mut cb, f, 0, bc);
+        match want {
+            Ok(()) => {
+                assert_eq!(
+                    (r.op, r.size, i.output_kind),
+                    (WTN, 208, k(PacketKind::HandshakeResponse)),
+                    "resp flags {} bc {}",
+                    f,
+                    bc
+                );
+                assert!(armed.consumed());
+                drop(armed);
+                let keepalive = answered(&peer, &cb[..r.size], 32);
+                read_done(&client, &keepalive);
+            }
+            Err(code) => {
+                assert_eq!((r.op, r.size), (ERR, code));
+                assert_eq!(facts(&i), (0, 0, 0, 0), "nothing accepted");
+                assert!(!armed.consumed());
+            }
+        }
+    }
+}
+
+/// Protocol-shaped Jc junk and whole imitation datagrams are not ordinary
+/// junk. For DNS, QUIC, SIP and STUN, on one burst: a flag-clear call still
+/// honours a finite C -- the imitation datagram at one byte under its length
+/// and the Jc item at one byte under its protocol minimum are 18 -- while
+/// under the flag the same imitation datagram goes out whole with C 1, the
+/// bytes that were pending, and each Jc item is drawn from the whole
+/// protocol range with C below its minimum: a `dst` one short of the
+/// protocol maximum is 0 with nothing drawn, and the item lies in
+/// [min, max]. The initiation then goes out at 148 under C 1.
+#[test]
+fn flag_mode_leaves_protocol_junk_and_imitation_whole() {
+    for (protocol, browser, (pmin, pmax)) in [
+        (AmneziaImitationProtocol::Dns, 0u32, (50usize, 200usize)),
+        (AmneziaImitationProtocol::Quic, 1, (1200, 1252)),
+        (AmneziaImitationProtocol::Sip, 0, (200, 1200)),
+        (AmneziaImitationProtocol::Stun, 0, (28, 100)),
+    ] {
+        let (a, b) = (party(), party());
+        let client = awg(
+            &a,
+            &b,
+            1,
+            &wireguard_awg_params {
+                imitation_protocol: protocol as u32,
+                imitation_browser: browser,
+                junk_packet_count: 2,
+                ..params()
+            },
+        );
+        let server = plain(&b, &a, 2, 0);
+        let mut dst = vec![0u8; 2048];
+
+        // A flag-clear C 1 prepares the burst and refuses its first datagram.
+        let (r, i) = exb(&client, Op::Force, &mut dst, 0, 1);
+        assert_eq!((r.op, r.size), (ERR, BUDGET), "{:?}", protocol);
+        assert_eq!(
+            facts(&i),
+            (0, 0, ev::BURST_PREPARED, st::BURST_PENDING),
+            "{:?}",
+            protocol
+        );
+        let total = client.with(|t| t.pending_burst_shape()).unwrap().0;
+        assert!(total >= 1, "{:?}", protocol);
+        for n in 0..total {
+            if n > 0 {
+                advance(Duration::from_millis(20));
+            }
+            let item = client.with(|t| t.pending_front_imitation()).unwrap();
+            let len = item.len();
+            let (r, i) = exb(&client, Op::Tick, &mut dst, 0, len as u32 - 1);
+            assert_eq!(
+                (r.op, r.size, facts(&i)),
+                (ERR, BUDGET, (0, 0, 0, st::BURST_PENDING)),
+                "{:?} item {}: flag clear",
+                protocol,
+                n
+            );
+            let (r, _) = exf(
+                &client,
+                Op::Tick,
+                &mut dst[..len - 1],
+                ORDINARY_JUNK_ONLY,
+                0,
+                1,
+            );
+            assert_eq!(
+                (r.op, r.size),
+                (ERR, STORAGE),
+                "{:?} item {}: storage still decides",
+                protocol,
+                n
+            );
+            assert_eq!(client.with(|t| t.pending_front_imitation()).unwrap(), item);
+            let (r, i) = exf(&client, Op::Tick, &mut dst[..len], ORDINARY_JUNK_ONLY, 0, 1);
+            assert_eq!(
+                (r.op, r.size, i.output_kind),
+                (WTN, len, k(PacketKind::Imitation)),
+                "{:?} item {}",
+                protocol,
+                n
+            );
+            assert_eq!(&dst[..len], &item[..], "the pending bytes, whole");
+        }
+        assert_eq!(client.with(|t| t.pending_burst_shape()), Some((0, 2)));
+
+        let below = pmin as u32 - 1;
+        let pos = client.with(|t| t.rng_word_pos());
+        let (r, i) = exb(&client, Op::Tick, &mut dst, 0, below);
+        assert_eq!(
+            (r.op, r.size, facts(&i)),
+            (ERR, BUDGET, (0, 0, 0, st::BURST_PENDING)),
+            "{:?}: flag clear C {}",
+            protocol,
+            below
+        );
+        let (r, _) = exf(
+            &client,
+            Op::Tick,
+            &mut dst[..pmax - 1],
+            ORDINARY_JUNK_ONLY,
+            0,
+            below,
+        );
+        assert_eq!(
+            (r.op, r.size),
+            (ERR, STORAGE),
+            "{:?}: the protocol maximum",
+            protocol
+        );
+        assert_eq!(client.with(|t| t.rng_word_pos()), pos, "nothing drawn");
+        for (bc, left) in [(below, 1u16), (1, 0)] {
+            let (r, i) = exf(
+                &client,
+                Op::Tick,
+                &mut dst[..pmax],
+                ORDINARY_JUNK_ONLY,
+                0,
+                bc,
+            );
+            assert_eq!(
+                (r.op, i.output_kind),
+                (WTN, k(PacketKind::Junk)),
+                "{:?} C {}",
+                protocol,
+                bc
+            );
+            assert!(
+                (pmin..=pmax).contains(&r.size),
+                "{:?} C {}: {} not in {}..={}",
+                protocol,
+                bc,
+                r.size,
+                pmin,
+                pmax
+            );
+            assert_eq!(client.with(|t| t.pending_burst_shape()), Some((0, left)));
+        }
+        let (r, i) = exf(&client, Op::Tick, &mut dst, ORDINARY_JUNK_ONLY, 0, 1);
+        assert_eq!(
+            (r.op, r.size, i.output_kind),
+            (WTN, 148, k(PacketKind::HandshakeInitiation)),
+            "{:?}",
+            protocol
+        );
+        answered(&server, &dst[..148], 2048);
+    }
+}
+
+/// Storage, pending order and pacing under the flag (mock clock, Jd 10 ms,
+/// C 572 for 1000..=1280). A `dst` below the working maximum is 0 with
+/// nothing drawn and nothing consumed, and the next call with room sends
+/// that item. A pre-due call is DONE with or without the flag -- no extra
+/// item, no draw -- until Jd has passed; a due item short of storage is 0
+/// with due 0. The initiation behind the burst keeps its pacing and its
+/// storage refusal, under C 1.
+#[cfg(feature = "mock-instant")]
+#[test]
+fn flag_mode_keeps_storage_order_and_pacing() {
+    at(Duration::ZERO);
+    let (a, b) = (party(), party());
+    let client = awg(
+        &a,
+        &b,
+        1,
+        &wireguard_awg_params {
+            junk_packet_delay_ms: 10,
+            ..junk_profile(3, 1000, 1280)
+        },
+    );
+    let server = plain(&b, &a, 2, 0);
+    let mut dst = vec![0u8; 2048];
+    let f = ORDINARY_JUNK_ONLY;
+    let pos = client.with(|t| t.rng_word_pos());
+
+    let (r, i) = exf(&client, Op::Force, &mut dst[..571], f, 0, 572);
+    assert_eq!((r.op, r.size), (ERR, STORAGE));
+    assert_eq!(
+        (facts(&i), i.burst_due_ms),
+        ((0, 0, ev::BURST_PREPARED, st::BURST_PENDING), 0)
+    );
+    assert_eq!(client.with(|t| t.rng_word_pos()), pos, "nothing drawn");
+    assert_eq!(client.with(|t| t.pending_burst_shape()), Some((0, 3)));
+
+    let (r, i) = exf(&client, Op::Tick, &mut dst[..572], f, 0, 572);
+    assert_eq!(
+        (r.op, r.size, i.output_kind),
+        (WTN, 572, k(PacketKind::Junk))
+    );
+    assert_eq!(i.burst_due_ms, 10);
+    assert_eq!(client.with(|t| t.pending_burst_shape()), Some((0, 2)));
+
+    let pos = client.with(|t| t.rng_word_pos());
+    for (flags, bc) in [(f, 572), (0, 572), (f, 1), (0, 0)] {
+        let (r, i) = exf(&client, Op::Tick, &mut dst, flags, 0, bc);
+        assert_eq!(
+            (r.op, r.size, i.burst_due_ms),
+            (DONE, 0, 10),
+            "pre-due, flags {} bc {}",
+            flags,
+            bc
+        );
+    }
+    at(Duration::from_millis(9));
+    let (r, i) = exf(&client, Op::Tick, &mut dst, f, 0, 572);
+    assert_eq!((r.op, i.burst_due_ms), (DONE, 1));
+    assert_eq!(
+        client.with(|t| t.rng_word_pos()),
+        pos,
+        "pre-due draws nothing"
+    );
+    assert_eq!(client.with(|t| t.pending_burst_shape()), Some((0, 2)));
+
+    at(Duration::from_millis(10));
+    let (r, i) = exf(&client, Op::Tick, &mut dst[..571], f, 0, 572);
+    assert_eq!((r.op, r.size, i.burst_due_ms), (ERR, STORAGE, 0));
+    assert_eq!(client.with(|t| t.rng_word_pos()), pos);
+    assert_eq!(client.with(|t| t.pending_burst_shape()), Some((0, 2)));
+    let (r, _) = exf(&client, Op::Tick, &mut dst[..572], f, 0, 572);
+    assert_eq!((r.op, r.size), (WTN, 572));
+    assert_eq!(client.with(|t| t.pending_burst_shape()), Some((0, 1)));
+
+    at(Duration::from_millis(20));
+    let (r, i) = exf(&client, Op::Tick, &mut dst, f, 0, 572);
+    assert_eq!((r.op, r.size, i.burst_due_ms), (WTN, 572, 10));
+    assert_eq!(client.with(|t| t.pending_burst_shape()), Some((0, 0)));
+
+    at(Duration::from_millis(25));
+    let (r, i) = exf(&client, Op::Tick, &mut dst, f, 0, 1);
+    assert_eq!((r.op, i.burst_due_ms), (DONE, 5));
+    at(Duration::from_millis(30));
+    let (r, i) = exf(&client, Op::Tick, &mut dst[..147], f, 0, 1);
+    assert_eq!(
+        (r.op, r.size, facts(&i), i.burst_due_ms),
+        (ERR, STORAGE, (0, 0, 0, st::BURST_PENDING), 0)
+    );
+    let (r, i) = exf(&client, Op::Tick, &mut dst[..148], f, 0, 1);
+    assert_eq!(
+        (r.op, r.size, i.output_kind, i.burst_due_ms),
+        (WTN, 148, k(PacketKind::HandshakeInitiation), BURST_DUE_NONE)
+    );
+    answered(&server, &dst[..148], 2048);
+}
+
+/// No mode or limit outlives its call, on one tunnel or across two. One
+/// burst (S1 500, Jc 4, 1000..=1280) served by alternating calls: flag C 572
+/// is 572, flag-clear C 0 is in 1000..=1280, flag C 1 is 1, flag-clear C 700
+/// is 700. A flag call on another tunnel changes nothing here: the
+/// 648-byte initiation is then 18 for a flag-clear C 572 call -- the burst
+/// keeping it -- and produced by the next call with the flag. Every call
+/// takes one sequence number, the refused one included.
+#[test]
+fn the_flag_and_c_belong_to_one_call() {
+    let cfg = wireguard_awg_params {
+        s1_init_junk: 500,
+        ..junk_profile(4, 1000, 1280)
+    };
+    let server_cfg = wireguard_awg_params {
+        s1_init_junk: 500,
+        ..params()
+    };
+    let (a, b, c) = (party(), party(), party());
+    let client = awg(&a, &b, 1, &cfg);
+    let other = awg(&c, &b, 3, &cfg);
+    let server = awg(&b, &a, 2, &server_cfg);
+    let mut dst = vec![0u8; 2048];
+    let f = ORDINARY_JUNK_ONLY;
+
+    let (r, i) = exf(&client, Op::Force, &mut dst, f, 0, 572);
+    assert_eq!(
+        (r.op, r.size, i.output_kind),
+        (WTN, 572, k(PacketKind::Junk))
+    );
+    let seq = op_seq(&i);
+    let (r, i) = exb(&client, Op::Tick, &mut dst, 0, 0);
+    assert_eq!((r.op, i.output_kind), (WTN, k(PacketKind::Junk)));
+    assert!((1000..=1280).contains(&r.size), "{}", r.size);
+    let (r, _) = exf(&client, Op::Tick, &mut dst, f, 0, 1);
+    assert_eq!((r.op, r.size), (WTN, 1));
+    let (r, _) = exb(&client, Op::Tick, &mut dst, 0, 700);
+    assert_eq!((r.op, r.size), (WTN, 700));
+    assert_eq!(client.with(|t| t.pending_burst_shape()), Some((0, 0)));
+
+    let (r, _) = exf(&other, Op::Force, &mut dst, f, 0, 1);
+    assert_eq!((r.op, r.size), (WTN, 1));
+
+    let (r, i) = exb(&client, Op::Tick, &mut dst, 0, 572);
+    assert_eq!((r.op, r.size), (ERR, BUDGET));
+    assert_eq!(
+        (facts(&i), i.burst_due_ms, op_seq(&i)),
+        ((0, 0, 0, st::BURST_PENDING), 0, seq + 4)
+    );
+    let (r, i) = exf(&client, Op::Tick, &mut dst, f, 0, 572);
+    assert_eq!(
+        (r.op, r.size, i.output_kind, op_seq(&i)),
+        (WTN, 648, k(PacketKind::HandshakeInitiation), seq + 5)
+    );
+    assert_eq!(answered(&server, &dst[..648], 2048).len(), 92);
+}
+
+/// The flag never touches transport: with it set and C 1, a finite T still
+/// refuses an over-budget write with 18 -- no nonce spent: the next frame
+/// is counter 1 -- and clips data padding to T; the response keepalive's
+/// padding is clipped by T (W-RKA's 40 against 82); and a drain deletes a
+/// head whose mandatory frame exceeds T and emits the next one, while a
+/// fitting head short of storage stays queued with 0.
+#[test]
+fn flag_mode_leaves_the_transport_budget_in_charge() {
+    let f = ORDINARY_JUNK_ONLY;
+    let (a, b) = (party(), party());
+    let client = plain(&a, &b, 1, 0);
+    let server = plain(&b, &a, 2, 0);
+    establish(&client, &server);
+    let mut dst = vec![0u8; 2048];
+    let p = ipv4(1, 1169);
+    let (r, i) = exf(&client, Op::Write(&p), &mut dst, f, 1200, 1);
+    assert_eq!((r.op, r.size, facts(&i)), (ERR, BUDGET, (0, 0, 0, CUR)));
+    let (r, _) = exf(&client, Op::Write(&p), &mut dst, f, 0, 1);
+    assert_eq!((r.op, r.size), (WTN, 1216));
+    assert_eq!(counter_of(&dst[..r.size]), 1, "the refusal spent no nonce");
+    assert_eq!(delivered(&server, &dst[..r.size]), (1, 1169));
+    for (bt, out) in [(1216, 1216), (1201, 1201)] {
+        let (r, i) = exf(&client, Op::Write(&p), &mut dst, f, bt, 1);
+        assert_eq!(
+            (r.op, r.size, i.output_kind),
+            (WTN, out, k(PacketKind::TransportData))
+        );
+        assert_eq!(delivered(&server, &dst[..r.size]), (1, 1169));
+    }
+
+    // W-RKA under the flag.
+    for (bt, out) in [(40, 40), (0, 82)] {
+        let (a, b) = (party(), party());
+        let client = awg(&a, &b, 1, &rt());
+        let peer = awg(&b, &a, 2, &rt());
+        let mut cb = vec![0u8; 2048];
+        let (r, _) = ex(&client, Op::Force, &mut cb[..148]);
+        let resp = answered(&peer, &cb[..r.size], 92);
+        let armed = Armed::new(50);
+        let (r, i) = exf(&client, Op::Read(&resp), &mut cb, f, bt, 1);
+        assert_eq!(
+            (r.op, r.size, i.output_kind),
+            (WTN, out, k(PacketKind::TransportKeepalive)),
+            "bt {}",
+            bt
+        );
+        assert!(armed.consumed());
+        drop(armed);
+        read_done(&peer, &cb[..r.size]);
+    }
+
+    // The drain: an oversized head deleted, the next emitted.
+    let (client, server) = queued_pair(&[1400, 100]);
+    let mut d = vec![0u8; 1232];
+    let (r, i) = exf(&client, Op::Read(EMPTY), &mut d, f, 1200, 1);
+    assert_eq!(
+        (r, facts(&i)),
+        (
+            Res { op: WTN, size: 144 },
+            (0, DATA, QUEUE_HEAD_DROPPED, CUR)
+        )
+    );
+    assert_eq!(delivered(&server, &d[..144]).0, 2);
+    // A fitting head short of storage: kept, 0, then sent.
+    let (client, server) = queued_pair(&[1100]);
+    let mut d = vec![0u8; 1100];
+    let (r, i) = exf(&client, Op::Read(EMPTY), &mut d, f, 1200, 1);
+    assert_eq!((r.op, r.size, facts(&i)), (ERR, STORAGE, (0, 0, 0, CUR_Q)));
+    let (r, i) = exf(&client, Op::Read(EMPTY), &mut dst, f, 1200, 1);
+    assert_eq!((r.op, r.size, facts(&i)), (WTN, 1136, (0, DATA, 0, CUR)));
+    assert_eq!(delivered(&server, &dst[..1136]).0, 1);
+}
+
+/// W-KA-TICK under the flag: the periodic keepalive's padding is clipped by
+/// T, whatever C: 40 against 82.
+#[cfg(feature = "mock-instant")]
+#[test]
+fn flag_mode_tick_keepalive_obeys_the_transport_budget() {
+    for (bt, out) in [(40, 40), (0, 82)] {
+        at(Duration::ZERO);
+        let (client, peer) = h_rt(1);
+        at(secs(1));
+        let mut cb = vec![0u8; 2048];
+        let armed = Armed::new(50);
+        let (r, i) = exf(&client, Op::Tick, &mut cb, ORDINARY_JUNK_ONLY, bt, 1);
         assert_eq!(
             (r.op, r.size, i.output_kind),
             (WTN, out, k(PacketKind::TransportKeepalive)),

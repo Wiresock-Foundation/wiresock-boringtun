@@ -35,7 +35,8 @@ use std::sync::Once;
 
 mod packet_info;
 pub use packet_info::{
-    wireguard_packet_info, WIREGUARD_PACKET_INFO_OUTPUT_START, WIREGUARD_PACKET_INFO_SIZE_MAX,
+    wireguard_packet_info, WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY,
+    WIREGUARD_PACKET_INFO_OUTPUT_START, WIREGUARD_PACKET_INFO_SIZE_MAX,
     WIREGUARD_PACKET_INFO_SIZE_V1,
 };
 

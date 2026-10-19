@@ -743,7 +743,8 @@ struct wireguard_result wireguard_force_handshake(const struct wireguard_tunnel 
 //
 // Protocol, in order. info NULL: no metadata. Otherwise only the 4-byte size
 // is read first; it must be in [48, 1024]. Then the 16-byte input head:
-// in_flags must be 0; any budget value is valid. Then every byte of
+// in_flags may hold only WIREGUARD_INFO_F_* bits defined below, and any budget
+// value is valid. Then every byte of
 // [48, size) must be 0 (a newer caller's field this library cannot honour).
 // Any failure returns WIREGUARD_ERROR with size 19 BEFORE the tunnel is
 // locked: nothing ran, no sequence number was taken, src was not read, and no
@@ -800,6 +801,18 @@ struct wireguard_result wireguard_force_handshake(const struct wireguard_tunnel 
 // could never be sent under it -- and reports WIREGUARD_EV_QUEUE_HEAD_DROPPED;
 // a packet short of dst_size only is kept, with error 0. Without metadata, or
 // with both budgets 0, every call is the legacy call.
+//
+// WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY in in_flags: for this call only,
+// max_control_output bounds ordinary Jc junk -- junk with no imitation
+// protocol -- and nothing else. That junk is drawn from the clamped range
+// above, unchanged. The initiation, the response, every imitation datagram and
+// Jc junk shaped by an imitation protocol are produced exactly as with
+// max_control_output 0: neither their mandatory part nor their optional bytes
+// are bounded by it, while dst_size still bounds them. With
+// max_control_output 0 the flag changes nothing. max_transport_output is not
+// affected. A library that predates this bit refuses it with 19: use the
+// matching library, never retry the call with the flag cleared, and never take
+// 19 as leave to send unbounded junk.
 // ---------------------------------------------------------------------------
 
 #define WIREGUARD_PACKET_INFO_SIZE_V1 48u       // smallest accepted size
@@ -808,6 +821,7 @@ struct wireguard_result wireguard_force_handshake(const struct wireguard_tunnel 
 #define WIREGUARD_BURST_DUE_NONE 0xFFFFFFFFu    // burst_due_ms when no burst is pending
 #define WIREGUARD_ERROR_OUTPUT_BUDGET_EXCEEDED 18u // wireguard_result.size: over a finite budget
 #define WIREGUARD_ERROR_INVALID_PACKET_INFO 19u // wireguard_result.size: info refused, nothing ran
+#define WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY 0x00000001u // in_flags: control budget bounds ordinary junk only
 
 // Kind of a datagram, stored in uint32_t fields. Values never change.
 enum wireguard_packet_kind
@@ -871,7 +885,7 @@ enum wireguard_packet_kind
 struct wireguard_packet_info
 {
     uint32_t size;                 //  0 in : declared readable extent; never written
-    uint32_t in_flags;             //  4 in : must be 0
+    uint32_t in_flags;             //  4 in : WIREGUARD_INFO_F_*; any other bit is 19
     uint32_t max_transport_output; //  8 in : transport datagram budget, bytes; 0 = unbounded
     uint32_t max_control_output;   // 12 in : control datagram budget, bytes; 0 = unbounded
     uint32_t written_size;         // 16 out: exclusive end offset of what this call wrote (48)

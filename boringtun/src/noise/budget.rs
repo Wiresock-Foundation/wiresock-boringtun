@@ -9,10 +9,13 @@
 //! and SOCKS headers not. `transport` bounds data and keepalive frames;
 //! `control` bounds initiations, responses, Jc junk and imitation datagrams.
 //! 0 is unbounded, independently for each. Decrypted plaintext is never
-//! budgeted.
+//! budgeted. With `ordinary_junk_only` (`WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY`)
+//! `control` bounds ordinary Jc junk alone; every other control datagram is
+//! then produced as under a `control` of 0 ([`OutputBudget::control_for`]).
 //!
 //! An [`OutputBudget`] is an argument of the one operation that carries it,
-//! never state of the tunnel, so no call's limit can reach a later call.
+//! never state of the tunnel, so no call's limit -- or mode -- can reach a
+//! later call.
 //!
 //! Every producer applies [`admit`] to its mandatory datagram before it
 //! consumes anything -- a nonce, a draw, handshake state, a queued packet --
@@ -30,8 +33,23 @@ const _: () = assert!(usize::BITS >= 32);
 pub(crate) struct OutputBudget {
     /// Transport data and keepalive frames.
     pub(crate) transport: u32,
-    /// Initiation, response, junk and imitation datagrams.
+    /// Initiation, response, junk and imitation datagrams -- read through
+    /// [`Self::control_for`].
     pub(crate) control: u32,
+    /// `control` bounds ordinary Jc junk only.
+    pub(crate) ordinary_junk_only: bool,
+}
+
+/// A control datagram, as the control budget tells them apart. The producer
+/// knows which it is making; nothing is inferred from bytes or lengths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ControlOutput {
+    /// Jc junk with no imitation protocol: random bytes from the configured
+    /// size range.
+    OrdinaryJunk,
+    /// An initiation, a response, a whole imitation datagram, or Jc junk
+    /// shaped by an imitation protocol.
+    Other,
 }
 
 impl OutputBudget {
@@ -39,7 +57,19 @@ impl OutputBudget {
     pub(crate) const UNBOUNDED: Self = Self {
         transport: 0,
         control: 0,
+        ordinary_junk_only: false,
     };
+
+    /// The control budget a datagram of `kind` is produced under: `control`,
+    /// except that with `ordinary_junk_only` only ordinary junk has one --
+    /// anything else gets 0, exactly what a call whose `control` is 0 gives
+    /// it, mandatory admission and optional ceiling alike.
+    pub(crate) fn control_for(self, kind: ControlOutput) -> u32 {
+        match kind {
+            ControlOutput::Other if self.ordinary_junk_only => 0,
+            _ => self.control,
+        }
+    }
 }
 
 /// Whether a mandatory datagram of `mandatory` bytes -- `None` when its size
@@ -147,6 +177,28 @@ mod tests {
             assert_eq!(code(admit(m, d, b)), want, "m {:?} d {} b {}", m, d, b);
             assert_eq!(exceeds(m, b), want == Err(18), "m {:?} b {}", m, b);
         }
+    }
+
+    /// The flag gives ordinary junk the call's `control` and everything
+    /// else 0; without it, or with `control` 0, every kind gets `control`.
+    /// `transport` is never read.
+    #[test]
+    fn control_for_bounds_only_ordinary_junk_under_the_flag() {
+        for transport in [0, 1200] {
+            for control in [0u32, 1, 572, u32::MAX] {
+                for ordinary_junk_only in [false, true] {
+                    let b = OutputBudget {
+                        transport,
+                        control,
+                        ordinary_junk_only,
+                    };
+                    let other = if ordinary_junk_only { 0 } else { control };
+                    assert_eq!(b.control_for(ControlOutput::OrdinaryJunk), control);
+                    assert_eq!(b.control_for(ControlOutput::Other), other, "{:?}", b);
+                }
+            }
+        }
+        assert_eq!(OutputBudget::default(), OutputBudget::UNBOUNDED);
     }
 
     /// The transport frame's size is checked arithmetic: the largest

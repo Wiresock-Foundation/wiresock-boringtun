@@ -18,8 +18,9 @@
 //! 1. `info` NULL: no metadata, no budget; the call is the legacy call.
 //! 2. Read the 4-byte `size` -- the only read before it is checked. Outside
 //!    48..=1024: error 19.
-//! 3. Read the 16-byte input head. `in_flags` != 0: error 19. The budgets are
-//!    taken as they are; any value is valid.
+//! 3. Read the 16-byte input head. An `in_flags` bit other than
+//!    [`WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY`]: error 19. The budgets
+//!    are taken as they are; any value is valid.
 //! 4. Every byte of `[48, size)` must be zero (a field from a newer header
 //!    that this library cannot honour): otherwise error 19.
 //! 5. Only now lock the tunnel, take the operation's sequence number, run it
@@ -50,6 +51,14 @@ pub const WIREGUARD_PACKET_INFO_SIZE_MAX: u32 = 1024;
 /// Fixed start of the output region.
 pub const WIREGUARD_PACKET_INFO_OUTPUT_START: u32 = 16;
 
+/// `in_flags`: `max_control_output` bounds ordinary Jc junk only. The
+/// initiation, the response, imitation datagrams and protocol-shaped junk of
+/// that call are produced as with `max_control_output` 0. A library without
+/// this bit refuses it with 19.
+pub const WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY: u32 = 0x0000_0001;
+/// Every `in_flags` bit this library honours; any other is error 19.
+const KNOWN_IN_FLAGS: u32 = WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY;
+
 /// Metadata of one `wireguard_*_ex` operation. All `uint32_t`: size 48 and
 /// alignment 4 on every target, 32- and 64-bit alike.
 #[allow(non_camel_case_types)]
@@ -58,7 +67,7 @@ pub const WIREGUARD_PACKET_INFO_OUTPUT_START: u32 = 16;
 pub struct wireguard_packet_info {
     /// In: the bytes the caller declares readable at `info`. Never written.
     pub size: u32,
-    /// In: reserved, must be 0.
+    /// In: `WIREGUARD_INFO_F_*` bits; any other bit is error 19.
     pub in_flags: u32,
     /// In: largest transport data or keepalive datagram this call may
     /// produce, in bytes of UDP payload; 0 is unbounded.
@@ -117,7 +126,7 @@ unsafe fn accepts(info: *const u8) -> Option<OutputBudget> {
     }
     let [_, in_flags, max_transport_output, max_control_output] =
         ptr::read_unaligned(info as *const [u32; 4]);
-    if in_flags != 0 {
+    if in_flags & !KNOWN_IN_FLAGS != 0 {
         return None;
     }
     (WIREGUARD_PACKET_INFO_SIZE_V1 as usize..size as usize)
@@ -125,6 +134,7 @@ unsafe fn accepts(info: *const u8) -> Option<OutputBudget> {
         .then_some(OutputBudget {
             transport: max_transport_output,
             control: max_control_output,
+            ordinary_junk_only: in_flags & WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY != 0,
         })
 }
 

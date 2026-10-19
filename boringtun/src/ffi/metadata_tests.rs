@@ -1189,7 +1189,7 @@ fn invalid_packet_info_is_refused_before_anything_runs() {
         ("size 47", |m| put(m, 0, 47)),
         ("size 1025", |m| put(m, 0, 1025)),
         ("size max", |m| put(m, 0, u32::MAX)),
-        ("in_flags 1", |m| head(m, 48, 1, 0, 0)),
+        ("in_flags 2", |m| head(m, 48, 2, 0, 0)),
         ("in_flags top", |m| head(m, 48, 0x8000_0000, 0, 0)),
         ("first tail byte", |m| {
             head(m, 64, 0, 0, 0);
@@ -1245,7 +1245,7 @@ fn invalid_packet_info_is_refused_before_anything_runs() {
             assert_eq!(get(m, 44), BURST_DUE_NONE);
 
             let written = buf.clone();
-            put(&mut buf[at..], 4, 1);
+            put(&mut buf[at..], 4, 2);
             let r = tick_raw(&t, buf[at..].as_mut_ptr());
             assert_eq!((r.op, r.size), (ERR, 19));
             assert_eq!(&buf[at + 16..at + 48], &written[at + 16..at + 48]);
