@@ -33,6 +33,10 @@ mod burst_lifecycle_tests;
 mod jc_golden_tests;
 #[cfg(test)]
 mod write_admission_tests;
+// A peer's initiation neither selects its responder session nor overwrites
+// the selected one (LC-REV-01).
+#[cfg(test)]
+mod session_preservation_tests;
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
 pub(crate) mod quic;
 mod session;
@@ -870,6 +874,10 @@ impl Tunn {
         self.admit_without_session(src, dst, budget)
     }
 
+    /// Whether a session is selected for sending: the occupant of `current`'s
+    /// slot. Only selection puts one there -- an accepted response's session
+    /// is selected as it is stored, and a responder session is never stored
+    /// there (`commit_handshake_init`) but selected by transport on it.
     fn has_current_session(&self) -> bool {
         self.sessions[self.current % N_SESSIONS].is_some()
     }
@@ -1376,11 +1384,18 @@ impl Tunn {
         budget: OutputBudget,
     ) -> Result<TunnResult<'a>, WireGuardError> {
         let ceiling = budget::ceiling(dst.len(), budget.control_for(ControlOutput::Other));
-        let (packet, session) = self.handshake.commit_initiation(init, dst)?;
+        // Never in the selected session's slot. Stored there, this session --
+        // unconfirmed until transport arrives on it (`commit_data`) -- would
+        // overwrite the session in use and, as the occupant of `current`'s
+        // slot, be sent on before the peer has it, with no session selected
+        // as much as with one.
+        let selected_slot = self.current % N_SESSIONS;
+        let (packet, session) = self.handshake.commit_initiation(init, dst, selected_slot)?;
         let packet_size = packet.len();
 
         // Store new session in ring buffer
         let index = session.local_index();
+        debug_assert_ne!(index % N_SESSIONS, selected_slot);
         self.sessions[index % N_SESSIONS] = Some(session);
         self.meta.session_stored(index % N_SESSIONS);
 

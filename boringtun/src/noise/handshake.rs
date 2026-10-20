@@ -711,6 +711,20 @@ impl Handshake {
         self.next_index
     }
 
+    /// [`Self::inc_index`] for a responder session, skipping the one value
+    /// whose ring slot is `reserved_slot` -- the slot of the session selected
+    /// for sending, which an unconfirmed responder must not take (see
+    /// `Tunn::commit_handshake_init`). Consecutive values never share a slot,
+    /// the wrap of the low byte included (256 is a multiple of
+    /// `N_SESSIONS`), so at most one value is skipped.
+    fn inc_index_avoiding(&mut self, reserved_slot: usize) -> u32 {
+        let index = self.inc_index();
+        if index as usize % super::N_SESSIONS == reserved_slot {
+            return self.inc_index();
+        }
+        index
+    }
+
     pub(crate) fn set_static_private(
         &mut self,
         private_key: x25519::StaticSecret,
@@ -824,7 +838,8 @@ impl Handshake {
         })
     }
 
-    /// Accept an authenticated initiation and answer it.
+    /// Accept an authenticated initiation and answer it, with a responder
+    /// session whose local index is never in ring slot `reserved_slot`.
     ///
     /// The timestamp is recorded first, so a destination buffer too small for
     /// the response fails *after* the initiation has been accepted -- as it
@@ -834,6 +849,7 @@ impl Handshake {
         &mut self,
         init: AuthenticatedInit,
         dst: &'a mut [u8],
+        reserved_slot: usize,
     ) -> Result<(&'a mut [u8], Session), WireGuardError> {
         self.last_handshake_timestamp = init.timestamp;
 
@@ -847,7 +863,7 @@ impl Handshake {
             },
         );
 
-        self.format_handshake_response(dst)
+        self.format_handshake_response(dst, reserved_slot)
     }
 
     /// Authenticate a handshake response without consuming the handshake it
@@ -1107,6 +1123,7 @@ impl Handshake {
     fn format_handshake_response<'a>(
         &mut self,
         dst: &'a mut [u8],
+        reserved_slot: usize,
     ) -> Result<(&'a mut [u8], Session), WireGuardError> {
         if dst.len() < super::HANDSHAKE_RESP_SZ {
             return Err(WireGuardError::DestinationBufferTooSmall);
@@ -1133,7 +1150,7 @@ impl Handshake {
 
         // responder.ephemeral_private = DH_GENERATE()
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
-        let local_index = self.inc_index();
+        let local_index = self.inc_index_avoiding(reserved_slot);
         // msg.message_type = 2
         // msg.reserved_zero = { 0, 0, 0 }
         message_type.copy_from_slice(&self.obf.random_h2(&mut self.rng).to_le_bytes());

@@ -302,6 +302,18 @@ impl Tunn {
         &mut self.meta
     }
 
+    /// The selected session's serial (0 for none), and the serial of the
+    /// session in `slot`: which stored session a selection follows.
+    #[cfg(all(test, feature = "ffi-bindings"))]
+    pub(crate) fn selected_serial(&self) -> u64 {
+        self.selected_session_serial()
+    }
+
+    #[cfg(all(test, feature = "ffi-bindings"))]
+    pub(crate) fn serial_of_slot(&self, slot: usize) -> u64 {
+        self.meta.slot_serial[slot]
+    }
+
     /// Plaintext packets the tunnel owns, waiting for a session or a drain.
     #[cfg(all(test, feature = "ffi-bindings"))]
     pub(crate) fn queued_len(&self) -> usize {

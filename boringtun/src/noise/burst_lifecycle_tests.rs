@@ -979,7 +979,9 @@ fn t_b13_the_exemption_ends_when_the_handshake_leaves_expired() {
         panic!("[R3:TB13:THE-INITIATION-AUTHENTICATES]");
     };
     assert!(
-        c.handshake.commit_initiation(auth, &mut [0u8; 50]).is_err(),
+        c.handshake
+            .commit_initiation(auth, &mut [0u8; 50], c.current % N_SESSIONS)
+            .is_err(),
         "[R3:TB13:THE-COMMIT-CANNOT-ANSWER]"
     );
     assert!(
