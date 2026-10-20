@@ -29,6 +29,8 @@ mod live_reframe_tests;
 #[cfg(test)]
 mod random_trailers_tests;
 #[cfg(test)]
+mod receive_metadata_tests;
+#[cfg(test)]
 mod upstream_collision_tests;
 // R3 write admission, owned drain, burst lifecycle and burst-output goldens.
 #[cfg(test)]
@@ -95,6 +97,22 @@ pub enum TunnResult<'a> {
     WriteToNetwork(&'a mut [u8]),
     WriteToTunnelV4(&'a mut [u8], Ipv4Addr),
     WriteToTunnelV6(&'a mut [u8], Ipv6Addr),
+}
+
+/// Cryptographic proof classification, independent of subsequent packet/action validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticatedPacketKind {
+    HandshakeInitiation,
+    HandshakeResponse,
+    Transport,
+    CookieReply,
+}
+
+impl AuthenticatedPacketKind {
+    /// Cookie keys derive from public material, so accepted cookies never authorize roaming.
+    pub fn moves_endpoint(self) -> bool {
+        !matches!(self, Self::CookieReply)
+    }
 }
 
 impl<'a> From<WireGuardError> for TunnResult<'a> {
@@ -254,6 +272,15 @@ pub(crate) enum Authenticated {
 }
 
 impl Authenticated {
+    fn kind(&self) -> AuthenticatedPacketKind {
+        match self {
+            Self::HandshakeInit(_) => AuthenticatedPacketKind::HandshakeInitiation,
+            Self::HandshakeResponse(_) => AuthenticatedPacketKind::HandshakeResponse,
+            Self::CookieReply(_) => AuthenticatedPacketKind::CookieReply,
+            Self::Data { .. } => AuthenticatedPacketKind::Transport,
+        }
+    }
+
     /// Whether accepting this packet makes its source the peer's endpoint.
     ///
     /// Every authenticated handshake message and transport frame does; a
@@ -264,7 +291,7 @@ impl Authenticated {
     /// Roaming on it would hand them the endpoint and the connected socket.
     #[cfg(feature = "device")]
     pub(crate) fn moves_endpoint(&self) -> bool {
-        !matches!(self, Authenticated::CookieReply(_))
+        self.kind().moves_endpoint()
     }
 }
 
@@ -1028,7 +1055,13 @@ impl Tunn {
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
-        self.decapsulate_source(src_addr.map(Source::from), datagram, dst)
+        let mut authenticated = None;
+        self.decapsulate_source(
+            src_addr.map(Source::from),
+            datagram,
+            dst,
+            &mut authenticated,
+        )
     }
 
     /// [`Self::decapsulate`] given the datagram's whole UDP source endpoint.
@@ -1042,7 +1075,21 @@ impl Tunn {
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
-        self.decapsulate_source(src.map(Source::from), datagram, dst)
+        self.decapsulate_from_with_metadata(src, datagram, dst).0
+    }
+
+    /// Return authentication proof independently of the resulting action or commit error.
+    /// Only cryptographic acceptance yields Some; empty drains and cookie demands yield None.
+    pub fn decapsulate_from_with_metadata<'a>(
+        &mut self,
+        src: Option<SocketAddr>,
+        datagram: &[u8],
+        dst: &'a mut [u8],
+    ) -> (TunnResult<'a>, Option<AuthenticatedPacketKind>) {
+        let mut authenticated = None;
+        let result =
+            self.decapsulate_source(src.map(Source::from), datagram, dst, &mut authenticated);
+        (result, authenticated)
     }
 
     fn decapsulate_source<'a>(
@@ -1050,6 +1097,7 @@ impl Tunn {
         source: Option<Source>,
         datagram: &[u8],
         dst: &'a mut [u8],
+        authenticated: &mut Option<AuthenticatedPacketKind>,
     ) -> TunnResult<'a> {
         // Auto imitation evidence stays keyed on the address, as it was.
         let src_addr = source.map(Source::address);
@@ -1103,6 +1151,7 @@ impl Tunn {
 
         match outcome {
             Inbound::Accepted(packet) => {
+                *authenticated = Some(packet.kind());
                 let hint = self.auto_imitation.hint(src_addr);
                 self.commit_with_imitation(packet, datagram, hint, dst)
             }

@@ -1,0 +1,306 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
+use super::amnezia::{AmneziaConfig, AmneziaImitationProtocol};
+use super::errors::WireGuardError;
+use super::inbound::fixtures::{bare_ipv4, colliding, handshake, network, pair};
+use super::{AuthenticatedPacketKind as Kind, Tunn, TunnResult};
+use std::convert::TryInto;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+fn source() -> Option<SocketAddr> {
+    Some("198.51.100.7:40000".parse().unwrap())
+}
+
+fn profiles() -> [AmneziaConfig; 4] {
+    [
+        AmneziaConfig::default(),
+        colliding(None),
+        colliding(Some([0x5a; 32])),
+        colliding(Some([0x5a; 32])).with_random_trailers(true),
+    ]
+}
+
+fn ipv6() -> Vec<u8> {
+    let mut packet = vec![0; 43];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&3u16.to_be_bytes());
+    packet[6] = 17;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+    packet[24..40].copy_from_slice(&Ipv6Addr::from(2u128).octets());
+    packet[40..].copy_from_slice(&[1, 2, 3]);
+    packet
+}
+
+fn establish(mine: &mut Tunn, theirs: &mut Tunn) {
+    let mut buf = [0; 4096];
+    let init = network(mine.format_handshake_initiation(&mut buf, false));
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
+    assert_eq!(kind, Some(Kind::HandshakeInitiation));
+    assert!(kind.unwrap().moves_endpoint());
+    let response = network(result);
+    let (result, kind) = mine.decapsulate_from_with_metadata(source(), &response, &mut buf);
+    assert_eq!(kind, Some(Kind::HandshakeResponse));
+    assert!(kind.unwrap().moves_endpoint());
+    let keepalive = network(result);
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &keepalive, &mut buf);
+    assert_eq!(kind, Some(Kind::Transport));
+    assert!(kind.unwrap().moves_endpoint());
+    assert!(matches!(result, TunnResult::Done));
+}
+
+#[test]
+fn authenticated_handshakes_keepalives_and_both_ip_families_have_proof() {
+    profiles().iter().for_each(|config| {
+        let (mut mine, mut theirs) = pair(config, None);
+        establish(&mut mine, &mut theirs);
+        let mut buf = [0; 4096];
+        [bare_ipv4(), ipv6()].iter().for_each(|packet| {
+            let wire = network(mine.encapsulate(packet, &mut buf));
+            let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &wire, &mut buf);
+            assert_eq!(kind, Some(Kind::Transport));
+            match result {
+                TunnResult::WriteToTunnelV4(bytes, addr) => {
+                    assert_eq!(bytes, packet.as_slice());
+                    assert_eq!(addr, Ipv4Addr::new(10, 0, 0, 2));
+                }
+                TunnResult::WriteToTunnelV6(bytes, addr) => {
+                    assert_eq!(bytes, packet.as_slice());
+                    assert_eq!(addr, Ipv6Addr::LOCALHOST);
+                }
+                other => panic!("expected IP output, got {:?}", other),
+            }
+            let wire = network(theirs.encapsulate(packet, &mut buf));
+            let (result, kind) = mine.decapsulate_from_with_metadata(None, &wire, &mut buf);
+            assert_eq!(kind, Some(Kind::Transport));
+            assert!(matches!(
+                result,
+                TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..)
+            ));
+        });
+    });
+}
+
+#[test]
+fn accepted_cookie_is_distinct_from_the_unauthenticated_cookie_demand() {
+    profiles().iter().for_each(|config| {
+        let (mut mine, mut theirs) = pair(config, Some(0));
+        let mut buf = [0; 4096];
+        let init = network(mine.format_handshake_initiation(&mut buf, false));
+        let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
+        assert_eq!(kind, None);
+        let cookie = network(result);
+        let mut bad_cookie = cookie.clone();
+        bad_cookie[config.cookie_packet_junk_size as usize + 40] ^= 1;
+        let (result, kind) = mine.decapsulate_from_with_metadata(source(), &bad_cookie, &mut buf);
+        assert_eq!(kind, None);
+        assert!(matches!(result, TunnResult::Err(_)));
+        let (result, kind) = mine.decapsulate_from_with_metadata(source(), &cookie, &mut buf);
+        assert_eq!(kind, Some(Kind::CookieReply));
+        assert!(!kind.unwrap().moves_endpoint());
+        assert!(matches!(result, TunnResult::Done));
+        let (result, kind) = mine.decapsulate_from_with_metadata(source(), &[0xff], &mut buf);
+        assert_eq!(kind, None);
+        assert!(matches!(result, TunnResult::Err(_)));
+    });
+}
+
+#[test]
+fn authenticated_malformed_plaintext_retains_proof_without_ip_delivery() {
+    profiles().iter().for_each(|config| {
+        let (mut mine, mut theirs) = pair(config, None);
+        handshake(&mut mine, &mut theirs);
+        let mut buf = [0; 4096];
+        let wire = network(mine.encapsulate(&[0x70; 40], &mut buf));
+        let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &wire, &mut buf);
+        assert_eq!(kind, Some(Kind::Transport));
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::InvalidPacket)
+        ));
+        let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &wire, &mut buf);
+        assert_eq!(kind, None);
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::DuplicateCounter)
+        ));
+    });
+}
+
+#[test]
+fn authenticated_initiation_can_prove_identity_before_a_commit_capacity_error() {
+    let (mut mine, mut theirs) = pair(&AmneziaConfig::default(), None);
+    let mut buf = [0; 2048];
+    let init = network(mine.format_handshake_initiation(&mut buf, false));
+    let mut short = [0; 16];
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut short);
+    assert_eq!(kind, Some(Kind::HandshakeInitiation));
+    assert!(matches!(
+        result,
+        TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+    ));
+}
+
+#[test]
+fn rejected_handshakes_transport_and_replays_never_reuse_previous_proof() {
+    let (mut mine, mut theirs) = pair(&AmneziaConfig::default(), None);
+    let mut buf = [0; 4096];
+    let init = network(mine.format_handshake_initiation(&mut buf, false));
+    let mut forged = init.clone();
+    forged[116] ^= 1;
+    [&init[..10], forged.as_slice()].iter().for_each(|wire| {
+        let (result, kind) = theirs.decapsulate_from_with_metadata(source(), wire, &mut buf);
+        assert_eq!(kind, None);
+        assert!(matches!(result, TunnResult::Err(_)));
+    });
+    let (_, mut wrong_peer) = pair(&AmneziaConfig::default(), None);
+    let (result, kind) = wrong_peer.decapsulate_from_with_metadata(source(), &init, &mut buf);
+    assert_eq!(kind, None);
+    assert!(matches!(result, TunnResult::Err(_)));
+
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
+    assert_eq!(kind, Some(Kind::HandshakeInitiation));
+    let response = network(result);
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
+    assert_eq!(kind, None);
+    assert!(matches!(result, TunnResult::Err(_)));
+    let (result, kind) = mine.decapsulate_from_with_metadata(source(), &response, &mut buf);
+    assert_eq!(kind, Some(Kind::HandshakeResponse));
+    let keepalive = network(result);
+    let (result, kind) = mine.decapsulate_from_with_metadata(source(), &response, &mut buf);
+    assert_eq!(kind, None);
+    assert!(matches!(result, TunnResult::Err(_)));
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &keepalive, &mut buf);
+    assert_eq!(kind, Some(Kind::Transport));
+    assert!(matches!(result, TunnResult::Done));
+
+    let wire = network(mine.encapsulate(&bare_ipv4(), &mut buf));
+    let mut wrong_index = wire.clone();
+    wrong_index[4] ^= 0x80;
+    let mut tampered = wire.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    [&wire[..8], wrong_index.as_slice(), tampered.as_slice()]
+        .iter()
+        .for_each(|wire| {
+            let (result, kind) = theirs.decapsulate_from_with_metadata(source(), wire, &mut buf);
+            assert_eq!(kind, None);
+            assert!(matches!(result, TunnResult::Err(_)));
+        });
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &wire, &mut buf);
+    assert_eq!(kind, Some(Kind::Transport));
+    assert!(matches!(result, TunnResult::WriteToTunnelV4(..)));
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &wire, &mut buf);
+    assert_eq!(kind, None);
+    assert!(matches!(
+        result,
+        TunnResult::Err(WireGuardError::DuplicateCounter)
+    ));
+}
+
+#[test]
+fn empty_drain_can_produce_output_but_cannot_inherit_authentication() {
+    let (mut mine, mut theirs) = pair(&AmneziaConfig::default(), None);
+    let mut buf = [0; 4096];
+    let init = network(mine.encapsulate(&bare_ipv4(), &mut buf));
+    let response = network(theirs.decapsulate_from(source(), &init, &mut buf));
+    let (result, kind) = mine.decapsulate_from_with_metadata(source(), &response, &mut buf);
+    assert_eq!(kind, Some(Kind::HandshakeResponse));
+    let keepalive = network(result);
+    assert!(matches!(
+        theirs.decapsulate_from(source(), &keepalive, &mut buf),
+        TunnResult::Done
+    ));
+    let (result, kind) = mine.decapsulate_from_with_metadata(None, &[], &mut buf);
+    assert_eq!(kind, None);
+    let queued = network(result);
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &queued, &mut buf);
+    assert_eq!(kind, Some(Kind::Transport));
+    assert!(matches!(result, TunnResult::WriteToTunnelV4(..)));
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &[], &mut buf);
+    assert_eq!(kind, None);
+    assert!(matches!(result, TunnResult::Done));
+    assert!(matches!(theirs.update_timers(&mut buf), TunnResult::Done));
+    let (_, kind) = theirs.decapsulate_from_with_metadata(None, &[], &mut buf);
+    assert_eq!(kind, None);
+}
+
+#[test]
+fn imitation_observation_is_not_authentication() {
+    let config = AmneziaConfig::new(128, 128, 128, 128)
+        .with_protocol_imitation(AmneziaImitationProtocol::Auto, None);
+    let (_, mut theirs) = pair(&config, None);
+    let mut buf = [0; 2048];
+    let prelude = super::auto_imitation_fixtures::recorded_stun_prelude();
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &prelude[0], &mut buf);
+    assert_eq!(kind, None);
+    assert!(matches!(result, TunnResult::Done));
+    assert!(theirs.has_imitation_hint());
+}
+
+#[derive(Debug, PartialEq)]
+enum ActionShape {
+    Done,
+    Error(std::mem::Discriminant<WireGuardError>),
+    Network(usize, u32),
+    Ipv4(Vec<u8>, Ipv4Addr),
+    Ipv6(Vec<u8>, Ipv6Addr),
+}
+
+fn shape(result: TunnResult) -> ActionShape {
+    match result {
+        TunnResult::Done => ActionShape::Done,
+        TunnResult::Err(error) => ActionShape::Error(std::mem::discriminant(&error)),
+        TunnResult::WriteToNetwork(bytes) => ActionShape::Network(
+            bytes.len(),
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+        ),
+        TunnResult::WriteToTunnelV4(bytes, addr) => ActionShape::Ipv4(bytes.to_vec(), addr),
+        TunnResult::WriteToTunnelV6(bytes, addr) => ActionShape::Ipv6(bytes.to_vec(), addr),
+    }
+}
+
+#[test]
+fn legacy_receive_actions_match_metadata_receive_on_fresh_equivalent_states() {
+    let config = AmneziaConfig::default();
+    let (mut old_mine, mut old_theirs) = pair(&config, None);
+    let (mut new_mine, mut new_theirs) = pair(&config, None);
+    let mut buf = [0; 4096];
+    let old_init = network(old_mine.format_handshake_initiation(&mut buf, false));
+    let new_init = network(new_mine.format_handshake_initiation(&mut buf, false));
+    let old_response = network(old_theirs.decapsulate_from(source(), &old_init, &mut buf));
+    let (new_result, kind) =
+        new_theirs.decapsulate_from_with_metadata(source(), &new_init, &mut buf);
+    assert_eq!(kind, Some(Kind::HandshakeInitiation));
+    let new_response = network(new_result);
+    assert_eq!(
+        shape(TunnResult::WriteToNetwork(&mut old_response.clone())),
+        shape(TunnResult::WriteToNetwork(&mut new_response.clone()))
+    );
+    let old_keepalive = network(old_mine.decapsulate_from(source(), &old_response, &mut buf));
+    let (new_result, kind) =
+        new_mine.decapsulate_from_with_metadata(source(), &new_response, &mut buf);
+    assert_eq!(kind, Some(Kind::HandshakeResponse));
+    let new_keepalive = network(new_result);
+    assert_eq!(
+        shape(old_theirs.decapsulate(None, &old_keepalive, &mut buf)),
+        ActionShape::Done
+    );
+    let (result, kind) = new_theirs.decapsulate_from_with_metadata(None, &new_keepalive, &mut buf);
+    assert_eq!(kind, Some(Kind::Transport));
+    assert_eq!(shape(result), ActionShape::Done);
+    [bare_ipv4(), ipv6(), vec![0x70; 40]]
+        .iter()
+        .for_each(|packet| {
+            let old_wire = network(old_mine.encapsulate(packet, &mut buf));
+            let new_wire = network(new_mine.encapsulate(packet, &mut buf));
+            let old = shape(old_theirs.decapsulate_from(source(), &old_wire, &mut buf));
+            let (result, kind) =
+                new_theirs.decapsulate_from_with_metadata(source(), &new_wire, &mut buf);
+            assert_eq!(kind, Some(Kind::Transport));
+            assert_eq!(shape(result), old);
+        });
+    let old = shape(old_theirs.decapsulate(None, &[0xff], &mut buf));
+    let (result, kind) = new_theirs.decapsulate_from_with_metadata(None, &[0xff], &mut buf);
+    assert_eq!(kind, None);
+    assert_eq!(shape(result), old);
+}
