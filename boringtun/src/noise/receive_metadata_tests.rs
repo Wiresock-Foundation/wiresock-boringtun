@@ -2,7 +2,10 @@
 
 use super::amnezia::{AmneziaConfig, AmneziaImitationProtocol};
 use super::errors::WireGuardError;
-use super::inbound::fixtures::{bare_ipv4, colliding, handshake, network, pair};
+use super::handshake::{b2s_hash, b2s_keyed_mac_16, LABEL_MAC1};
+use super::inbound::fixtures::{
+    bare_ipv4, colliding, handshake, keyed_pair_with_publics, network, pair,
+};
 use super::{AuthenticatedPacketKind as Kind, Tunn, TunnResult};
 use std::convert::TryInto;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -128,7 +131,7 @@ fn authenticated_malformed_plaintext_retains_proof_without_ip_delivery() {
 }
 
 #[test]
-fn authenticated_initiation_can_prove_identity_before_a_commit_capacity_error() {
+fn fixed_mode_initiation_capacity_error_consumes_the_initiation() {
     let (mut mine, mut theirs) = pair(&AmneziaConfig::default(), None);
     let mut buf = [0; 2048];
     let init = network(mine.format_handshake_initiation(&mut buf, false));
@@ -138,6 +141,57 @@ fn authenticated_initiation_can_prove_identity_before_a_commit_capacity_error() 
     assert!(matches!(
         result,
         TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+    ));
+    // Fixed mode records the timestamp before the response-size check, so the
+    // initiation is consumed even though the commit failed. The retry is
+    // refused rather than answered.
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
+    assert_eq!(kind, None);
+    assert!(matches!(
+        result,
+        TunnResult::Err(WireGuardError::WrongTai64nTimestamp)
+    ));
+}
+
+#[test]
+fn auto_mode_initiation_capacity_error_keeps_the_initiation_retryable() {
+    let config = AmneziaConfig::new(128, 128, 128, 128)
+        .with_protocol_imitation(AmneziaImitationProtocol::Auto, None);
+    let (mut mine, mut theirs) = pair(&config, None);
+    let mut buf = [0; 4096];
+    let init = network(mine.format_handshake_initiation(&mut buf, false));
+    let mut short = [0; 16];
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut short);
+    assert_eq!(kind, Some(Kind::HandshakeInitiation));
+    assert!(matches!(
+        result,
+        TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+    ));
+    // Auto mode refuses before committing, so the same initiation can be
+    // retried with a larger buffer.
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
+    assert_eq!(kind, Some(Kind::HandshakeInitiation));
+    assert!(matches!(result, TunnResult::WriteToNetwork(_)));
+}
+
+#[test]
+fn tampered_aead_with_a_valid_mac1_has_no_proof() {
+    let (mut mine, mut theirs, _, their_public) =
+        keyed_pair_with_publics(&AmneziaConfig::default(), None);
+    let mut buf = [0; 2048];
+    let init = network(mine.format_handshake_initiation(&mut buf, false));
+    let mut forged = init.clone();
+    forged[40] ^= 1; // first byte of encrypted_static
+    let mac1 = b2s_keyed_mac_16(
+        &b2s_hash(LABEL_MAC1, their_public.as_bytes()),
+        &forged[..116],
+    );
+    forged[116..132].copy_from_slice(&mac1);
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &forged, &mut buf);
+    assert_eq!(kind, None);
+    assert!(matches!(
+        result,
+        TunnResult::Err(WireGuardError::InvalidAeadTag)
     ));
 }
 

@@ -99,7 +99,16 @@ pub enum TunnResult<'a> {
     WriteToTunnelV6(&'a mut [u8], Ipv6Addr),
 }
 
-/// Cryptographic proof classification, independent of subsequent packet/action validation.
+/// Cryptographic proof classification of a received datagram.
+///
+/// The proof is reported independently of the action that follows it: a
+/// commit can still fail, for example when the caller's `dst` cannot hold a
+/// handshake response. `Some` therefore means "this datagram authenticated as
+/// this kind", not "the tunnel committed it". A caller that learns a peer
+/// endpoint from the proof must require
+/// [`AuthenticatedPacketKind::moves_endpoint`] *and* a result that is not a
+/// [`TunnResult::Err`]; the in-tree device also resets its path window around
+/// that decision, which this API does not expose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthenticatedPacketKind {
     HandshakeInitiation,
@@ -109,7 +118,17 @@ pub enum AuthenticatedPacketKind {
 }
 
 impl AuthenticatedPacketKind {
-    /// Cookie keys derive from public material, so accepted cookies never authorize roaming.
+    /// Whether the device roams when this kind authenticates **and commits**.
+    ///
+    /// Every authenticated handshake message and transport frame does; a
+    /// cookie reply does not. Its key is derived from public material and it
+    /// is bound only to the mac1 of our last handshake message, which
+    /// travelled in clear, so anyone who saw that message can relay a valid
+    /// reply from any address.
+    ///
+    /// This predicate does not include the commit result. A caller that
+    /// adopts an endpoint must also require the returned [`TunnResult`] not
+    /// to be an error; see [`AuthenticatedPacketKind`].
     pub fn moves_endpoint(self) -> bool {
         !matches!(self, Self::CookieReply)
     }
@@ -1044,6 +1063,13 @@ impl Tunn {
     /// session the drain only drives the handshake, so `Done` there does not
     /// mean the queue is empty.
     ///
+    /// A handshake initiation can authenticate and still fail to commit with
+    /// `DestinationBufferTooSmall`. With a fixed imitation protocol that
+    /// failure consumes the initiation, so retrying with a larger `dst` is
+    /// refused as `WrongTai64nTimestamp`; with `Auto` imitation the initiation
+    /// is not consumed and the retry can succeed. This is the commit
+    /// contract, independent of the metadata method.
+    ///
     /// `src_addr` is the datagram's source address, which the under-load
     /// cookie is bound to. A caller that knows the source UDP port as well
     /// should use [`Self::decapsulate_from`], so the cookie covers the whole
@@ -1078,8 +1104,37 @@ impl Tunn {
         self.decapsulate_from_with_metadata(src, datagram, dst).0
     }
 
-    /// Return authentication proof independently of the resulting action or commit error.
-    /// Only cryptographic acceptance yields Some; empty drains and cookie demands yield None.
+    /// Receives a datagram and returns both the action and its cryptographic
+    /// proof, if any.
+    ///
+    /// The proof is reported independently of the action and of a commit
+    /// error: `Some` means the datagram authenticated as that kind, not that
+    /// the tunnel committed it. To move a peer endpoint, require
+    /// `kind.moves_endpoint()` **and** a result that is not a
+    /// [`TunnResult::Err`]; the in-tree device also resets its path window
+    /// around that decision, which this API does not expose. Only
+    /// cryptographic acceptance yields `Some`: refused, cookie-demand and
+    /// empty-drain calls yield `None`.
+    ///
+    /// An empty `datagram` is a drain request, exactly as for
+    /// [`Self::decapsulate`], not a received packet. A network receive loop
+    /// **must** drop zero-length datagrams before calling this method:
+    /// otherwise a forged empty datagram on a peer's 4-tuple can release
+    /// queued packets or advance a pending handshake burst, the hazard the
+    /// device guards on its connected socket. Empty calls return `None`.
+    ///
+    /// A handshake initiation can authenticate and still fail to commit with
+    /// `DestinationBufferTooSmall`. With a fixed imitation protocol that
+    /// failure consumes the initiation, so retrying with a larger `dst` is
+    /// refused as `WrongTai64nTimestamp`; with `Auto` imitation the initiation
+    /// is not consumed and the retry can succeed. The returned kind describes
+    /// the authentication, not whether the commit consumed the packet.
+    ///
+    /// This takes the full [`SocketAddr`] because the under-load cookie binds
+    /// the address and port together. Callers that only have an [`IpAddr`]
+    /// keep using [`Self::decapsulate`] and do not receive metadata. The
+    /// legacy methods retain their signatures and actions and share the same
+    /// parser, authenticator and commit path.
     pub fn decapsulate_from_with_metadata<'a>(
         &mut self,
         src: Option<SocketAddr>,

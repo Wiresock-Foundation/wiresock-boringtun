@@ -388,6 +388,16 @@ pub(crate) mod fixtures {
         amnezia: &AmneziaConfig,
         their_budget: Option<u64>,
     ) -> (Tunn, Tunn, x25519::PublicKey) {
+        let (mine, theirs, my_public, _) = keyed_pair_with_publics(amnezia, their_budget);
+        (mine, theirs, my_public)
+    }
+
+    /// [`keyed_pair`], also returning the responder's static public key -- what
+    /// a test needs to compute a valid mac1 for a message *to* the responder.
+    pub(crate) fn keyed_pair_with_publics(
+        amnezia: &AmneziaConfig,
+        their_budget: Option<u64>,
+    ) -> (Tunn, Tunn, x25519::PublicKey, x25519::PublicKey) {
         let my_secret = x25519::StaticSecret::random_from_rng(OsRng);
         let my_public = x25519::PublicKey::from(&my_secret);
         let their_secret = x25519::StaticSecret::random_from_rng(OsRng);
@@ -414,7 +424,7 @@ pub(crate) mod fixtures {
             amnezia.clone(),
         )
         .unwrap();
-        (mine, theirs, my_public)
+        (mine, theirs, my_public, their_public)
     }
 
     pub(crate) fn network(result: TunnResult) -> Vec<u8> {
