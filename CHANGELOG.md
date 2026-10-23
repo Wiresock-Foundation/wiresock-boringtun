@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `Tunn::decapsulate_from`, which takes the datagram's whole `SocketAddr`.
+- `noise::AuthenticatedPacketKind` and `Tunn::decapsulate_from_with_metadata`, which report the cryptographic proof for an authenticated datagram separately from the resulting action. `AuthenticatedPacketKind::moves_endpoint` excludes `CookieReply` (see Security); a caller that adopts a source endpoint must also require the action not to be an error, because a failed commit leaves the peer's endpoint where it was. The metadata receive entry point refuses empty datagrams (returns `Done` with no proof) instead of draining them; the legacy methods keep their drain contract.
 
 ### Changed
 - Breaking (Rust): `noise::errors::WireGuardError` gains `PacketQueueFull`; exhaustive `match`es need an arm. All discriminants are now explicit and the existing values 0-16 are unchanged; C and JNI callers see the new error as code 17 through the existing `WIREGUARD_ERROR` result, with no ABI change.

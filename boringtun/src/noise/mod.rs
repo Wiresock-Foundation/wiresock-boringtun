@@ -29,6 +29,8 @@ mod live_reframe_tests;
 #[cfg(test)]
 mod random_trailers_tests;
 #[cfg(test)]
+mod receive_metadata_tests;
+#[cfg(test)]
 mod upstream_collision_tests;
 // R3 write admission, owned drain, burst lifecycle and burst-output goldens.
 #[cfg(test)]
@@ -95,6 +97,53 @@ pub enum TunnResult<'a> {
     WriteToNetwork(&'a mut [u8]),
     WriteToTunnelV4(&'a mut [u8], Ipv4Addr),
     WriteToTunnelV6(&'a mut [u8], Ipv6Addr),
+}
+
+/// Cryptographic proof classification of a received datagram.
+///
+/// The proof is reported independently of the action that follows it: a
+/// commit can still fail, for example when the caller's `dst` cannot hold a
+/// handshake response. `Some` therefore means "this datagram authenticated as
+/// this kind", not "the tunnel committed it".
+///
+/// A caller that learns a peer endpoint from the proof must require
+/// [`Self::moves_endpoint`] *and* a result that is not a [`TunnResult::Err`].
+/// This API performs no path bookkeeping: the in-tree device brackets a
+/// committed roam with `begin_new_path`/`restore_udp_window` and discards the
+/// pending Auto imitation hint on success. An embedder that adopts an endpoint
+/// therefore keeps the old path's UDP window -- so `content_padding_for_frame`
+/// can size the first frames on the new path against the old path's width --
+/// and can keep an Auto hint keyed on the old source IP across a
+/// same-IP/different-port roam. Reproduce those steps when they matter, or
+/// accept the camouflage divergence; the helpers are `pub(crate)` today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticatedPacketKind {
+    /// A handshake initiation accepted by the Noise handshake.
+    HandshakeInitiation,
+    /// A handshake response accepted by the Noise handshake.
+    HandshakeResponse,
+    /// A transport frame whose AEAD tag and replay window accepted it.
+    Transport,
+    /// A cookie reply accepted for our last handshake message.
+    CookieReply,
+}
+
+impl AuthenticatedPacketKind {
+    /// Whether the device roams when this kind authenticates **and commits**.
+    ///
+    /// Every authenticated handshake message and transport frame does; a
+    /// cookie reply does not. Its key is derived from public material and it
+    /// is bound only to the mac1 of our last handshake message, which
+    /// travelled in clear, so anyone who saw that message can relay a valid
+    /// reply from any address.
+    ///
+    /// This predicate does not include the commit result. Endpoint adoption
+    /// requires this method to return `true` and the receive result not to be
+    /// an error; see [`AuthenticatedPacketKind`] for the path bookkeeping this
+    /// API does not perform.
+    pub fn moves_endpoint(self) -> bool {
+        !matches!(self, Self::CookieReply)
+    }
 }
 
 impl<'a> From<WireGuardError> for TunnResult<'a> {
@@ -254,6 +303,15 @@ pub(crate) enum Authenticated {
 }
 
 impl Authenticated {
+    fn kind(&self) -> AuthenticatedPacketKind {
+        match self {
+            Self::HandshakeInit(_) => AuthenticatedPacketKind::HandshakeInitiation,
+            Self::HandshakeResponse(_) => AuthenticatedPacketKind::HandshakeResponse,
+            Self::CookieReply(_) => AuthenticatedPacketKind::CookieReply,
+            Self::Data { .. } => AuthenticatedPacketKind::Transport,
+        }
+    }
+
     /// Whether accepting this packet makes its source the peer's endpoint.
     ///
     /// Every authenticated handshake message and transport frame does; a
@@ -264,7 +322,7 @@ impl Authenticated {
     /// Roaming on it would hand them the endpoint and the connected socket.
     #[cfg(feature = "device")]
     pub(crate) fn moves_endpoint(&self) -> bool {
-        !matches!(self, Authenticated::CookieReply(_))
+        self.kind().moves_endpoint()
     }
 }
 
@@ -1017,6 +1075,13 @@ impl Tunn {
     /// session the drain only drives the handshake, so `Done` there does not
     /// mean the queue is empty.
     ///
+    /// A handshake initiation can authenticate and still fail to commit with
+    /// `DestinationBufferTooSmall`. With a fixed imitation protocol that
+    /// failure consumes the initiation, so retrying with a larger `dst` is
+    /// refused as `WrongTai64nTimestamp`; with `Auto` imitation the initiation
+    /// is not consumed and the retry can succeed. This is the commit
+    /// contract, independent of the metadata method.
+    ///
     /// `src_addr` is the datagram's source address, which the under-load
     /// cookie is bound to. A caller that knows the source UDP port as well
     /// should use [`Self::decapsulate_from`], so the cookie covers the whole
@@ -1028,7 +1093,13 @@ impl Tunn {
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
-        self.decapsulate_source(src_addr.map(Source::from), datagram, dst)
+        let mut authenticated = None;
+        self.decapsulate_source(
+            src_addr.map(Source::from),
+            datagram,
+            dst,
+            &mut authenticated,
+        )
     }
 
     /// [`Self::decapsulate`] given the datagram's whole UDP source endpoint.
@@ -1042,7 +1113,57 @@ impl Tunn {
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
-        self.decapsulate_source(src.map(Source::from), datagram, dst)
+        let mut authenticated = None;
+        self.decapsulate_source(src.map(Source::from), datagram, dst, &mut authenticated)
+    }
+
+    /// Receives a datagram and returns both the action and its cryptographic
+    /// proof, if any.
+    ///
+    /// The proof is reported independently of the action and of a commit
+    /// error: `Some` means the datagram authenticated as that kind, not that
+    /// the tunnel committed it. To move a peer endpoint, require
+    /// `kind.moves_endpoint()` **and** a result that is not a
+    /// [`TunnResult::Err`]. See [`AuthenticatedPacketKind`] for the path
+    /// bookkeeping the in-tree device performs on a roam and this API does not.
+    ///
+    /// An empty `datagram` is refused as `(TunnResult::Done, None)` and is
+    /// never drained here. This method is the network-receive entry point; a
+    /// forged zero-length datagram on a peer's 4-tuple must not release queued
+    /// packets or advance a handshake burst (the hazard the device guards on
+    /// its connected socket). Use [`Self::decapsulate`] or
+    /// [`Self::decapsulate_from`] with an empty slice for the legacy drain
+    /// contract.
+    ///
+    /// A handshake initiation can authenticate and still fail to commit with
+    /// `DestinationBufferTooSmall`. With a fixed imitation protocol that
+    /// failure consumes the initiation, so retrying with a larger `dst` is
+    /// refused as `WrongTai64nTimestamp`; with `Auto` imitation the initiation
+    /// is not consumed and the retry can succeed. The returned kind describes
+    /// the authentication, not whether the commit consumed the packet.
+    ///
+    /// A valid handshake response with a too-small `dst` is refused as
+    /// `DestinationBufferTooSmall` with no proof: the capacity check runs
+    /// before the response AEAD, so the pending initiation is not retired and a
+    /// retry with a larger `dst` can succeed.
+    ///
+    /// This takes the full [`SocketAddr`] because the under-load cookie binds
+    /// the address and port together. Callers that only have an [`IpAddr`]
+    /// keep using [`Self::decapsulate`] and do not receive metadata. The
+    /// legacy methods retain their signatures and actions.
+    pub fn decapsulate_from_with_metadata<'a>(
+        &mut self,
+        src: Option<SocketAddr>,
+        datagram: &[u8],
+        dst: &'a mut [u8],
+    ) -> (TunnResult<'a>, Option<AuthenticatedPacketKind>) {
+        if datagram.is_empty() {
+            return (TunnResult::Done, None);
+        }
+        let mut authenticated = None;
+        let result =
+            self.decapsulate_source(src.map(Source::from), datagram, dst, &mut authenticated);
+        (result, authenticated)
     }
 
     fn decapsulate_source<'a>(
@@ -1050,6 +1171,7 @@ impl Tunn {
         source: Option<Source>,
         datagram: &[u8],
         dst: &'a mut [u8],
+        authenticated: &mut Option<AuthenticatedPacketKind>,
     ) -> TunnResult<'a> {
         // Auto imitation evidence stays keyed on the address, as it was.
         let src_addr = source.map(Source::address);
@@ -1103,6 +1225,7 @@ impl Tunn {
 
         match outcome {
             Inbound::Accepted(packet) => {
+                *authenticated = Some(packet.kind());
                 let hint = self.auto_imitation.hint(src_addr);
                 self.commit_with_imitation(packet, datagram, hint, dst)
             }
