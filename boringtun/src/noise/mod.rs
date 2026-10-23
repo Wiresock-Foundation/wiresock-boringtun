@@ -104,16 +104,27 @@ pub enum TunnResult<'a> {
 /// The proof is reported independently of the action that follows it: a
 /// commit can still fail, for example when the caller's `dst` cannot hold a
 /// handshake response. `Some` therefore means "this datagram authenticated as
-/// this kind", not "the tunnel committed it". A caller that learns a peer
-/// endpoint from the proof must require
-/// [`AuthenticatedPacketKind::moves_endpoint`] *and* a result that is not a
-/// [`TunnResult::Err`]; the in-tree device also resets its path window around
-/// that decision, which this API does not expose.
+/// this kind", not "the tunnel committed it".
+///
+/// A caller that learns a peer endpoint from the proof must require
+/// [`Self::moves_endpoint`] *and* a result that is not a [`TunnResult::Err`].
+/// This API performs no path bookkeeping: the in-tree device brackets a
+/// committed roam with `begin_new_path`/`restore_udp_window` and discards the
+/// pending Auto imitation hint on success. An embedder that adopts an endpoint
+/// therefore keeps the old path's UDP window -- so `content_padding_for_frame`
+/// can size the first frames on the new path against the old path's width --
+/// and can keep an Auto hint keyed on the old source IP across a
+/// same-IP/different-port roam. Reproduce those steps when they matter, or
+/// accept the camouflage divergence; the helpers are `pub(crate)` today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthenticatedPacketKind {
+    /// A handshake initiation accepted by the Noise handshake.
     HandshakeInitiation,
+    /// A handshake response accepted by the Noise handshake.
     HandshakeResponse,
+    /// A transport frame whose AEAD tag and replay window accepted it.
     Transport,
+    /// A cookie reply accepted for our last handshake message.
     CookieReply,
 }
 
@@ -126,9 +137,10 @@ impl AuthenticatedPacketKind {
     /// travelled in clear, so anyone who saw that message can relay a valid
     /// reply from any address.
     ///
-    /// This predicate does not include the commit result. A caller that
-    /// adopts an endpoint must also require the returned [`TunnResult`] not
-    /// to be an error; see [`AuthenticatedPacketKind`].
+    /// This predicate does not include the commit result. Endpoint adoption
+    /// requires this method to return `true` and the receive result not to be
+    /// an error; see [`AuthenticatedPacketKind`] for the path bookkeeping this
+    /// API does not perform.
     pub fn moves_endpoint(self) -> bool {
         !matches!(self, Self::CookieReply)
     }
@@ -1101,7 +1113,8 @@ impl Tunn {
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
-        self.decapsulate_from_with_metadata(src, datagram, dst).0
+        let mut authenticated = None;
+        self.decapsulate_source(src.map(Source::from), datagram, dst, &mut authenticated)
     }
 
     /// Receives a datagram and returns both the action and its cryptographic
@@ -1111,17 +1124,16 @@ impl Tunn {
     /// error: `Some` means the datagram authenticated as that kind, not that
     /// the tunnel committed it. To move a peer endpoint, require
     /// `kind.moves_endpoint()` **and** a result that is not a
-    /// [`TunnResult::Err`]; the in-tree device also resets its path window
-    /// around that decision, which this API does not expose. Only
-    /// cryptographic acceptance yields `Some`: refused, cookie-demand and
-    /// empty-drain calls yield `None`.
+    /// [`TunnResult::Err`]. See [`AuthenticatedPacketKind`] for the path
+    /// bookkeeping the in-tree device performs on a roam and this API does not.
     ///
-    /// An empty `datagram` is a drain request, exactly as for
-    /// [`Self::decapsulate`], not a received packet. A network receive loop
-    /// **must** drop zero-length datagrams before calling this method:
-    /// otherwise a forged empty datagram on a peer's 4-tuple can release
-    /// queued packets or advance a pending handshake burst, the hazard the
-    /// device guards on its connected socket. Empty calls return `None`.
+    /// An empty `datagram` is refused as `(TunnResult::Done, None)` and is
+    /// never drained here. This method is the network-receive entry point; a
+    /// forged zero-length datagram on a peer's 4-tuple must not release queued
+    /// packets or advance a handshake burst (the hazard the device guards on
+    /// its connected socket). Use [`Self::decapsulate`] or
+    /// [`Self::decapsulate_from`] with an empty slice for the legacy drain
+    /// contract.
     ///
     /// A handshake initiation can authenticate and still fail to commit with
     /// `DestinationBufferTooSmall`. With a fixed imitation protocol that
@@ -1130,17 +1142,24 @@ impl Tunn {
     /// is not consumed and the retry can succeed. The returned kind describes
     /// the authentication, not whether the commit consumed the packet.
     ///
+    /// A valid handshake response with a too-small `dst` is refused as
+    /// `DestinationBufferTooSmall` with no proof: the capacity check runs
+    /// before the response AEAD, so the pending initiation is not retired and a
+    /// retry with a larger `dst` can succeed.
+    ///
     /// This takes the full [`SocketAddr`] because the under-load cookie binds
     /// the address and port together. Callers that only have an [`IpAddr`]
     /// keep using [`Self::decapsulate`] and do not receive metadata. The
-    /// legacy methods retain their signatures and actions and share the same
-    /// parser, authenticator and commit path.
+    /// legacy methods retain their signatures and actions.
     pub fn decapsulate_from_with_metadata<'a>(
         &mut self,
         src: Option<SocketAddr>,
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> (TunnResult<'a>, Option<AuthenticatedPacketKind>) {
+        if datagram.is_empty() {
+            return (TunnResult::Done, None);
+        }
         let mut authenticated = None;
         let result =
             self.decapsulate_source(src.map(Source::from), datagram, dst, &mut authenticated);

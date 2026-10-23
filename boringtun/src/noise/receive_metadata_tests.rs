@@ -229,17 +229,24 @@ fn rejected_handshakes_transport_and_replays_never_reuse_previous_proof() {
     assert!(matches!(result, TunnResult::Done));
 
     let wire = network(mine.encapsulate(&bare_ipv4(), &mut buf));
+    let mut wrong_slot = wire.clone();
+    wrong_slot[4] ^= 1; // low bit selects a different session slot
     let mut wrong_index = wire.clone();
-    wrong_index[4] ^= 0x80;
+    wrong_index[4] ^= 0x80; // same slot, different receiver index
     let mut tampered = wire.clone();
     *tampered.last_mut().unwrap() ^= 1;
-    [&wire[..8], wrong_index.as_slice(), tampered.as_slice()]
-        .iter()
-        .for_each(|wire| {
-            let (result, kind) = theirs.decapsulate_from_with_metadata(source(), wire, &mut buf);
-            assert_eq!(kind, None);
-            assert!(matches!(result, TunnResult::Err(_)));
-        });
+    [
+        &wire[..8],
+        wrong_slot.as_slice(),
+        wrong_index.as_slice(),
+        tampered.as_slice(),
+    ]
+    .iter()
+    .for_each(|wire| {
+        let (result, kind) = theirs.decapsulate_from_with_metadata(source(), wire, &mut buf);
+        assert_eq!(kind, None);
+        assert!(matches!(result, TunnResult::Err(_)));
+    });
     let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &wire, &mut buf);
     assert_eq!(kind, Some(Kind::Transport));
     assert!(matches!(result, TunnResult::WriteToTunnelV4(..)));
@@ -252,7 +259,27 @@ fn rejected_handshakes_transport_and_replays_never_reuse_previous_proof() {
 }
 
 #[test]
-fn empty_drain_can_produce_output_but_cannot_inherit_authentication() {
+fn valid_response_with_a_short_buffer_has_no_proof() {
+    let (mut mine, mut theirs) = pair(&AmneziaConfig::default(), None);
+    let mut buf = [0; 2048];
+    let init = network(mine.format_handshake_initiation(&mut buf, false));
+    let response = network(theirs.decapsulate_from(source(), &init, &mut buf));
+    let mut short = [0; 16];
+    let (result, kind) = mine.decapsulate_from_with_metadata(source(), &response, &mut short);
+    assert_eq!(kind, None);
+    assert!(matches!(
+        result,
+        TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+    ));
+    // The capacity check ran before the response AEAD, so the pending
+    // initiation is intact and the retry succeeds.
+    let (result, kind) = mine.decapsulate_from_with_metadata(source(), &response, &mut buf);
+    assert_eq!(kind, Some(Kind::HandshakeResponse));
+    assert!(matches!(result, TunnResult::WriteToNetwork(_)));
+}
+
+#[test]
+fn metadata_receive_refuses_empty_datagrams_but_legacy_receive_drains() {
     let (mut mine, mut theirs) = pair(&AmneziaConfig::default(), None);
     let mut buf = [0; 4096];
     let init = network(mine.encapsulate(&bare_ipv4(), &mut buf));
@@ -264,9 +291,13 @@ fn empty_drain_can_produce_output_but_cannot_inherit_authentication() {
         theirs.decapsulate_from(source(), &keepalive, &mut buf),
         TunnResult::Done
     ));
+    // The metadata receiver refuses the empty network datagram and leaves the
+    // queued packet where it is.
     let (result, kind) = mine.decapsulate_from_with_metadata(None, &[], &mut buf);
     assert_eq!(kind, None);
-    let queued = network(result);
+    assert!(matches!(result, TunnResult::Done));
+    // The legacy wrapper keeps its documented drain contract.
+    let queued = network(mine.decapsulate_from(None, &[], &mut buf));
     let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &queued, &mut buf);
     assert_eq!(kind, Some(Kind::Transport));
     assert!(matches!(result, TunnResult::WriteToTunnelV4(..)));
@@ -315,6 +346,9 @@ fn shape(result: TunnResult) -> ActionShape {
 
 #[test]
 fn legacy_receive_actions_match_metadata_receive_on_fresh_equivalent_states() {
+    // Guards against future divergence between the two entry points; the
+    // empty-input exception is covered by
+    // `metadata_receive_refuses_empty_datagrams_but_legacy_receive_drains`.
     let config = AmneziaConfig::default();
     let (mut old_mine, mut old_theirs) = pair(&config, None);
     let (mut new_mine, mut new_theirs) = pair(&config, None);
