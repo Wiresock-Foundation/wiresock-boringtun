@@ -1629,7 +1629,12 @@ fn a_whole_imitation_datagram_is_refused_and_kept() {
 /// M-CE-4b(a): the handshake latch, no burst. A control budget of 100 refuses
 /// the 148-byte initiation; the latch spent selecting it is restored, so the
 /// next tick with room sends it. (Losing the latch would give DONE: there is
-/// no InitSent and no rekey at 15 s.)
+/// no InitSent and no rekey at 17 s.)
+///
+/// The deadline is KEEPALIVE + REKEY_TIMEOUT plus up to
+/// `REKEY_TIMEOUT_JITTER_MAX_MS` of jitter, measured from the data sent at
+/// 1 s (the reference timer state machine), so 17 s is past it whatever the
+/// jitter drew.
 #[cfg(feature = "mock-instant")]
 #[test]
 fn m_ce_4b_a_a_refused_handshake_demand_keeps_its_latch() {
@@ -1643,7 +1648,7 @@ fn m_ce_4b_a_a_refused_handshake_demand_keeps_its_latch() {
     assert_eq!(legacy(&client, Op::Tick, &mut dst).op, DONE);
     assert_eq!(legacy(&client, Op::Write(&ipv4(1, 40)), &mut dst).op, WTN);
     assert!(demands(&client).0, "the latch armed");
-    at(secs(15));
+    at(secs(17));
     let (r, i) = exb(&client, Op::Tick, &mut dst, 0, 100);
     assert_eq!((r.op, r.size), (ERR, BUDGET));
     assert_eq!(
@@ -1665,7 +1670,8 @@ fn m_ce_4b_a_a_refused_handshake_demand_keeps_its_latch() {
     answered(&server, &dst[..148], 2048);
 }
 
-/// BUD-TICK-01: the same with S1 1100 on both ends, a 1248-byte initiation.
+/// BUD-TICK-01: the same with S1 1100 on both ends, a 1248-byte initiation,
+/// at the same 17 s.
 #[cfg(feature = "mock-instant")]
 #[test]
 fn bud_tick_01_the_restored_latch_sends_the_whole_s1_initiation() {
@@ -1682,7 +1688,7 @@ fn bud_tick_01_the_restored_latch_sends_the_whole_s1_initiation() {
     at(secs(1));
     assert_eq!(legacy(&client, Op::Tick, &mut dst).op, DONE);
     assert_eq!(legacy(&client, Op::Write(&ipv4(1, 40)), &mut dst).op, WTN);
-    at(secs(15));
+    at(secs(17));
     let (r, i) = exb(&client, Op::Tick, &mut dst, 0, 1200);
     assert_eq!((r.op, r.size), (ERR, BUDGET));
     assert_eq!(
@@ -1741,8 +1747,8 @@ fn b_stun_a_burst_prepared_by_the_demand_owns_it() {
     at(secs(1));
     assert_eq!(legacy(&client, Op::Tick, &mut dst).op, DONE);
     assert_eq!(legacy(&client, Op::Write(&ipv4(1, 40)), &mut dst).op, WTN);
-    // b7
-    at(secs(15));
+    // b7, past the jittered deadline as in M-CE-4b(a)
+    at(secs(17));
     let (r, i) = exb(&client, Op::Tick, &mut dst, 0, 99);
     assert_eq!((r.op, r.size), (ERR, BUDGET));
     assert_eq!(
@@ -1764,7 +1770,7 @@ fn b_stun_a_burst_prepared_by_the_demand_owns_it() {
         (r.op, i.output_kind, i.burst_due_ms),
         (WTN, k(PacketKind::Imitation), 15)
     );
-    at(secs(15) + Duration::from_millis(15));
+    at(secs(17) + Duration::from_millis(15));
     let (r, i) = exb(&client, Op::Tick, &mut dst, 0, 1200);
     assert_eq!(
         (r.op, i.output_kind, i.burst_due_ms),
@@ -1782,14 +1788,18 @@ fn b_stun_a_burst_prepared_by_the_demand_owns_it() {
 /// the 32-byte keepalive. Exactly what was spent is restored -- the latch,
 /// the stamp, or both -- so the next tick without a budget sends it. (A lost
 /// demand would give DONE there.)
+///
+/// The passive keepalive is due KEEPALIVE after the data received at 1 s, and
+/// that authenticated receive also restarts the periodic interval (the
+/// reference timer state machine): both are due at 11 s in (c) and (e).
 #[cfg(feature = "mock-instant")]
 #[test]
 fn m_ce_4b_cde_refused_keepalives_keep_what_they_spent() {
     // (case, client KA, peer data at 1 s, target time)
     for (case, ka, peer_data, target) in [
-        ("c", 0u16, true, 10u64),
+        ("c", 0u16, true, 11u64),
         ("d", 1, false, 1),
-        ("e", 10, true, 10),
+        ("e", 10, true, 11),
     ] {
         at(Duration::ZERO);
         let (a, b) = (party(), party());
@@ -1804,7 +1814,7 @@ fn m_ce_4b_cde_refused_keepalives_keep_what_they_spent() {
             let r = legacy(&server, Op::Write(&ipv4(1, 40)), &mut sb);
             assert_eq!(delivered(&client, &sb[..r.size]).0, 1);
         }
-        let before = demands(&client);
+        let before = client.with(|t| t.timer_demand_state());
         at(secs(target));
         let (r, i) = exb(&client, Op::Tick, &mut dst, 16, 0);
         assert_eq!((r.op, r.size), (ERR, BUDGET), "{}", case);
@@ -1814,7 +1824,12 @@ fn m_ce_4b_cde_refused_keepalives_keep_what_they_spent() {
             "{}",
             case
         );
-        assert_eq!(demands(&client), before, "{}: restored exactly", case);
+        assert_eq!(
+            client.with(|t| t.timer_demand_state()),
+            before,
+            "{}: restored exactly",
+            case
+        );
         let (r, i) = ex(&client, Op::Tick, &mut dst);
         assert_eq!(
             (r.op, r.size, i.output_kind),
@@ -1883,9 +1898,13 @@ fn f0_stun_an_entry_pending_burst_refusal_selects_no_demand() {
 /// which prepares a STUN burst whose first item exceeds a control budget of
 /// 99: the empty entry is not admitted, and exactly what was spent is
 /// restored, at once (F8). Then the peer's next initiation is accepted
-/// (F10-F11): that response clears the latch and cancels the burst, and the
-/// following tick (F12) shows the consequences separately -- DONE in f1, and
-/// in f2/f3 the restored stamp producing a new burst and admitting the entry.
+/// (F10-F11): that response clears the latch and cancels the burst. Under the
+/// reference timer state machine the response is an authenticated send, so
+/// it also restarts the periodic interval: the following tick (F12) is DONE
+/// in all three cases, the stamp now the response's.
+///
+/// The data received at 1 s in f1/f3 restarts the periodic interval too, so
+/// F8 is at 62 s, where f3's stamp (1 s) and f2's (0 s) are both due.
 #[cfg(feature = "mock-instant")]
 #[test]
 fn f_stun_a_refused_no_session_keepalive_keeps_its_demand_until_contact() {
@@ -1925,11 +1944,21 @@ fn f_stun_a_refused_no_session_keepalive_keeps_its_demand_until_contact() {
             assert_eq!(delivered(&client, &pb[..r.size]).0, 1);
         }
         let (_, wk_before, tpk_before) = demands(&client);
+        let state_before = client.with(|t| t.timer_demand_state());
         assert_eq!(wk_before, case != "f2", "{}", case);
-        assert_eq!(tpk_before, Duration::ZERO);
+        assert_eq!(
+            tpk_before,
+            if case == "f2" {
+                Duration::ZERO
+            } else {
+                secs(1)
+            },
+            "{}",
+            case
+        );
 
         // F8
-        at(secs(61));
+        at(secs(62));
         let (r, i) = exb(&client, Op::Tick, &mut cb, 0, 99);
         assert_eq!((r.op, r.size), (ERR, BUDGET), "{}", case);
         let changed = if case == "f2" {
@@ -1954,8 +1983,14 @@ fn f_stun_a_refused_no_session_keepalive_keeps_its_demand_until_contact() {
         let (_, wk, tpk) = demands(&client);
         assert_eq!(
             (wk, tpk),
-            (wk_before, Duration::ZERO),
+            (wk_before, tpk_before),
             "{}: restored at once",
+            case
+        );
+        assert_eq!(
+            client.with(|t| t.timer_demand_state()),
+            state_before,
+            "{}: restored exactly",
             case
         );
         assert_eq!(client.with(|t| t.queued_len()), 0, "{}: not admitted", case);
@@ -1975,27 +2010,13 @@ fn f_stun_a_refused_no_session_keepalive_keeps_its_demand_until_contact() {
 
         // F12
         let (r, i) = exb(&client, Op::Tick, &mut cb, 0, 1200);
-        if case == "f1" {
-            assert_eq!((r.op, facts(&i)), (DONE, (0, 0, 0, 0)), "{}", case);
-        } else {
-            assert_eq!(
-                (r.op, i.output_kind),
-                (WTN, k(PacketKind::Imitation)),
-                "{}",
-                case
-            );
-            assert_eq!(
-                (i.events, i.state, i.burst_due_ms),
-                (
-                    ev::BURST_PREPARED | ev::QUEUE_ADMITTED,
-                    st::BURST_PENDING | st::QUEUE_NONEMPTY,
-                    15
-                ),
-                "{}",
-                case
-            );
-            assert_eq!(demands(&client).2, secs(61));
-        }
+        assert_eq!((r.op, facts(&i)), (DONE, (0, 0, 0, 0)), "{}", case);
+        assert_eq!(
+            demands(&client).2,
+            secs(62),
+            "{}: the response's stamp",
+            case
+        );
     }
 }
 

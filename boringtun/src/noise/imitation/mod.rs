@@ -19,6 +19,7 @@
 //! unconditionally too, which [`detect`] now relies on — it reaches into
 //! `quic::version_negotiation` for the long-header parse.
 
+pub(crate) mod auto;
 pub(crate) mod detect;
 pub(crate) mod dns;
 pub(crate) mod sip;

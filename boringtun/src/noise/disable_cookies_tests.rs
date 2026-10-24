@@ -14,7 +14,7 @@ use super::amnezia::{AmneziaConfig, AwgTimers};
 use super::errors::WireGuardError;
 use super::handshake::{b2s_hash, b2s_keyed_mac_16, ObfuscationRanges, LABEL_MAC1};
 use super::inbound::fixtures::*;
-use super::inbound::{receive, Inbound};
+use super::inbound::{receive, Inbound, Refusal};
 use super::rate_limiter::{CookieDefense, HandshakeGate, LoadDecision, RateLimiter};
 use super::{Packet, Tunn, TunnResult, COOKIE_REPLY_SZ, HANDSHAKE_INIT_SZ, HANDSHAKE_RESP_SZ};
 use crate::x25519;
@@ -185,7 +185,13 @@ fn the_bypassed_gate_passes_a_valid_mac1_without_deciding_load() {
     for src in [SRC, None] {
         let mut load = LoadDecision::default();
         assert!(matches!(
-            starved.gate_handshake(src, &message, 7, CookieDefense::Bypassed, &mut load),
+            starved.gate_handshake(
+                src.map(Into::into),
+                &message,
+                7,
+                CookieDefense::Bypassed,
+                &mut load
+            ),
             HandshakeGate::Pass
         ));
         assert!(!load.is_decided(), "the load decision was taken");
@@ -194,7 +200,7 @@ fn the_bypassed_gate_passes_a_valid_mac1_without_deciding_load() {
 
     // The same message with the defense armed: the starved limiter's answers.
     match starved.gate_handshake(
-        SRC,
+        SRC.map(Into::into),
         &message,
         7,
         CookieDefense::Armed,
@@ -227,7 +233,13 @@ fn the_bypassed_gate_still_requires_mac1() {
     for defense in [CookieDefense::Bypassed, CookieDefense::Armed] {
         for src in [SRC, None] {
             assert!(matches!(
-                limiter.gate_handshake(src, &message, 7, defense, &mut LoadDecision::default()),
+                limiter.gate_handshake(
+                    src.map(Into::into),
+                    &message,
+                    7,
+                    defense,
+                    &mut LoadDecision::default()
+                ),
                 HandshakeGate::BadMac
             ));
         }
@@ -693,11 +705,30 @@ fn the_driver_hands_a_bypassed_reading_to_its_trial() {
     let fails =
         |_: Packet<'_>| -> Result<(), WireGuardError> { Err(WireGuardError::InvalidAeadTag) };
     assert!(matches!(
-        receive(&amnezia, obf, &starved, SRC, &candidates, &wire, fails),
-        Inbound::Refused(WireGuardError::InvalidAeadTag)
+        receive(
+            &amnezia,
+            obf,
+            &starved,
+            SRC.map(Into::into),
+            &candidates,
+            &wire,
+            fails
+        ),
+        Inbound::Refused(Refusal {
+            error: WireGuardError::InvalidAeadTag,
+            allows_imitation_hint: true
+        })
     ));
     assert!(matches!(
-        receive(&armed, obf, &starved, SRC, &candidates, &wire, fails),
+        receive(
+            &armed,
+            obf,
+            &starved,
+            SRC.map(Into::into),
+            &candidates,
+            &wire,
+            fails
+        ),
         Inbound::Cookie(_)
     ));
 }

@@ -1062,7 +1062,8 @@ fn an_error_after_acceptance_keeps_what_really_happened() {
 }
 
 /// A tick's keepalive demand whose producer is refused for capacity reports
-/// the refusal along with the error. Needs a second of tunnel time.
+/// the refusal along with the error. Needs a second of tunnel time. The
+/// refused keepalive stays owed, so the next tick with room sends it.
 #[cfg(feature = "mock-instant")]
 #[test]
 fn a_refused_tick_demand_is_reported() {
@@ -1079,13 +1080,16 @@ fn a_refused_tick_demand_is_reported() {
         (0, 0, ev::TICK_DEMAND_REFUSED, st::SESSION_CURRENT)
     );
     let (r, i) = ex(&client, Op::Tick, &mut dst);
-    assert_eq!((r.op, i.events), (DONE, 0));
+    assert_eq!(
+        (r.op, r.size, i.output_kind, i.events),
+        (WTN, 32, k(PacketKind::TransportKeepalive), 0)
+    );
 }
 
 /// The tick that ends a handshake cycle -- here the untuned 90-second bound,
-/// with a packet queued behind the initiation -- reports the expiry, and the
-/// queue it cleared. The next tick finds it already expired: the same error,
-/// no event.
+/// widened by the retransmissions' jitter (`untuned_attempt_window`), with a
+/// packet queued behind the initiation -- reports the expiry, and the queue it
+/// cleared. The next tick finds it already expired: the same error, no event.
 #[cfg(feature = "mock-instant")]
 #[test]
 fn an_expiry_is_reported_by_the_tick_that_expires() {
@@ -1095,7 +1099,7 @@ fn an_expiry_is_reported_by_the_tick_that_expires() {
     let (r, i) = ex(&client, Op::Write(&ipv4(1, 40)), &mut dst);
     assert_eq!(r.op, WTN);
     assert_eq!(i.state, st::INITIATION_PENDING | st::QUEUE_NONEMPTY);
-    advance(Duration::from_secs(91));
+    advance(crate::noise::timers::untuned_attempt_window() + Duration::from_secs(1));
     let (r, i) = ex(&client, Op::Tick, &mut dst);
     assert_eq!((r.op, r.size), (ERR, 15));
     assert_eq!(

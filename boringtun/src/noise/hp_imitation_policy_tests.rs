@@ -58,7 +58,9 @@ const INSTALLER: [u16; 4] = [136, 59, 149, 16];
 fn each_imitation_protocol_has_its_header_protection_nonce_class() {
     use HeaderProtectionNonce::*;
     let expected = |p: AmneziaImitationProtocol, s: [u16; 4]| match p {
-        AmneziaImitationProtocol::None | AmneziaImitationProtocol::Quic => Full,
+        AmneziaImitationProtocol::None
+        | AmneziaImitationProtocol::Auto
+        | AmneziaImitationProtocol::Quic => Full,
         AmneziaImitationProtocol::Stun => Bounded32,
         AmneziaImitationProtocol::Dns => Weak16,
         AmneziaImitationProtocol::Sip if s.iter().all(|&s| s <= 30) => Full,

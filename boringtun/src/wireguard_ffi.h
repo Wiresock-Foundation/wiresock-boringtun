@@ -246,6 +246,9 @@ enum wireguard_amnezia_imitation_protocol {
     WIREGUARD_AMNEZIA_IMITATION_QUIC = 2,
     WIREGUARD_AMNEZIA_IMITATION_SIP = 3,
     WIREGUARD_AMNEZIA_IMITATION_STUN = 4,
+    // Responder mode: feed initial client datagrams to wireguard_read; the
+    // detected protocol is pinned after an authenticated handshake initiation.
+    WIREGUARD_AMNEZIA_IMITATION_AUTO = 5,
 };
 
 /// Allocates a new tunnel with AmneziaWG S1-S4 junk prefix handling and protocol

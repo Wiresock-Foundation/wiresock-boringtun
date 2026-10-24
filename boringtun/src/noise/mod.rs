@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 pub mod amnezia;
+#[cfg(test)]
+pub(crate) mod auto_imitation_fixtures;
+#[cfg(test)]
+mod auto_imitation_tests;
 pub mod errors;
 pub mod handshake;
 // `pub(crate)` rather than private: `device::probe_reply` builds the replies
@@ -57,13 +61,13 @@ use op_report::{event, PacketKind};
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::inbound::Inbound;
-use crate::noise::rate_limiter::RateLimiter;
+use crate::noise::rate_limiter::{RateLimiter, Source};
 use crate::noise::timers::{TimerName, Timers};
 use crate::x25519;
 
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,6 +128,7 @@ pub struct Tunn {
     tx_bytes: usize,
     rx_bytes: usize,
     amnezia: AmneziaConfig,
+    auto_imitation: imitation::auto::AutoImitation,
     pending_amnezia_junk: Option<PendingAmneziaJunk>,
     rate_limiter: Arc<RateLimiter>,
     /// The largest transport frame this tunnel has sent or authenticated, in
@@ -259,6 +264,21 @@ pub(crate) enum Authenticated {
         receiver_idx: u32,
         len: usize,
     },
+}
+
+impl Authenticated {
+    /// Whether accepting this packet makes its source the peer's endpoint.
+    ///
+    /// Every authenticated handshake message and transport frame does; a
+    /// cookie reply does not, as in Linux and wireguard-go. Its key is derived
+    /// from our peer's *public* key and it is bound only to the mac1 of our
+    /// last handshake message, which travelled in clear -- so anyone who saw
+    /// that message can relay a valid reply, or make one, from any address.
+    /// Roaming on it would hand them the endpoint and the connected socket.
+    #[cfg(feature = "device")]
+    pub(crate) fn moves_endpoint(&self) -> bool {
+        !matches!(self, Authenticated::CookieReply(_))
+    }
 }
 
 /// `window` grown to cover a frame of `size` bytes, as measured by the two
@@ -519,6 +539,7 @@ impl Tunn {
             tx_bytes: Default::default(),
             rx_bytes: Default::default(),
             amnezia,
+            auto_imitation: Default::default(),
             pending_amnezia_junk: None,
             udp_window: AtomicU32::new(amnezia::DEFAULT_UDP_WINDOW),
 
@@ -550,6 +571,7 @@ impl Tunn {
         });
         self.handshake
             .set_static_private(static_private, static_public);
+        self.auto_imitation = Default::default();
         for s in &mut self.sessions {
             *s = None;
         }
@@ -648,6 +670,26 @@ impl Tunn {
     /// [`Self::try_set_obfuscation`], and directly in tests that need a
     /// configuration no door lets in, to pin the send-time backstops.
     fn apply_obfuscation(&mut self, obf: ObfuscationRanges, amnezia: AmneziaConfig) {
+        use amnezia::AmneziaImitationProtocol as P;
+        if self.amnezia.imitation.protocol != P::Auto || amnezia.imitation.protocol != P::Auto {
+            self.auto_imitation = Default::default();
+        } else if self.amnezia != amnezia || self.handshake.obf != obf {
+            self.auto_imitation.clear_pending();
+            if let Some(protocol) = self.auto_imitation.learned {
+                let resolved = amnezia.resolve_imitation(protocol);
+                if resolved.imitation.protocol != protocol {
+                    self.auto_imitation.learned = None;
+                    tracing::warn!("clearing learned imitation: incompatible with new header-protection settings");
+                } else if self
+                    .amnezia
+                    .resolve_imitation(protocol)
+                    .header_protection_nonce()
+                    != resolved.header_protection_nonce()
+                {
+                    resolved.warn_header_protection_nonce();
+                }
+            }
+        }
         let timers_changed = self.amnezia.timers != amnezia.timers;
         let burst = self.amnezia.pending_burst_change(&amnezia);
         self.handshake.set_obfuscation(obf);
@@ -702,11 +744,34 @@ impl Tunn {
         self.udp_window.store(window, AtomicOrdering::Relaxed);
     }
 
+    /// Drop unverified auto-imitation evidence; a learned mode is kept. For
+    /// the device, when the peer's endpoint moves: the tunnel binds evidence
+    /// only to a source IP, so it would otherwise follow the peer to another
+    /// UDP port of the same host and shape a rekey there.
+    #[cfg(feature = "device")]
+    pub(crate) fn discard_imitation_hint(&mut self) {
+        self.auto_imitation.clear_pending();
+    }
+
+    /// Reseed the handshake jitter, so two runs of the same tunnel retransmit
+    /// at the same times. For the device tests, which cannot see the field.
+    #[cfg(all(test, feature = "device"))]
+    pub(crate) fn seed_jitter(&mut self, seed: u64) {
+        self.timers.jitter_rng = rand_core::SeedableRng::seed_from_u64(seed);
+    }
+
     /// Whether a pre-handshake burst is queued, the initiation behind it not
     /// yet sent. For the device tests, which cannot see the field.
     #[cfg(all(test, feature = "device"))]
     pub(crate) fn has_pending_burst(&self) -> bool {
         self.pending_amnezia_junk.is_some()
+    }
+
+    /// Whether unverified auto-imitation evidence is held for this peer. For
+    /// the tests, which cannot all see the field.
+    #[cfg(test)]
+    pub(crate) fn has_imitation_hint(&self) -> bool {
+        self.auto_imitation.has_pending()
     }
 
     /// This tunnel's AmneziaWG configuration. For the device and FFI tests,
@@ -874,12 +939,21 @@ impl Tunn {
         self.admit_without_session(src, dst, budget)
     }
 
-    /// Whether a session is selected for sending: the occupant of `current`'s
-    /// slot. Only selection puts one there -- an accepted response's session
-    /// is selected as it is stored, and a responder session is never stored
-    /// there (`commit_handshake_init`) but selected by transport on it.
+    /// Whether a session is selected for sending and can still send: the
+    /// occupant of `current`'s slot. Only selection puts one there -- an
+    /// accepted response's session is selected as it is stored, and a
+    /// responder session is never stored there (`commit_handshake_init`) but
+    /// selected by transport on it.
+    ///
+    /// One whose nonces are spent (`Session::sending_exhausted`,
+    /// Reject-After-Messages) counts as none: a write then takes the
+    /// no-session path -- queued, and a handshake started -- rather than
+    /// failing on a session that may not send again. The session stays in its
+    /// slot and keeps receiving until it expires.
     fn has_current_session(&self) -> bool {
-        self.sessions[self.current % N_SESSIONS].is_some()
+        self.sessions[self.current % N_SESSIONS]
+            .as_ref()
+            .is_some_and(|session| !session.sending_exhausted())
     }
 
     /// Format `src` on the current session -- a new submission from
@@ -1002,13 +1076,43 @@ impl Tunn {
     /// the drain with a larger `dst`, never resubmit the packet. Without a
     /// session the drain only drives the handshake, so `Done` there does not
     /// mean the queue is empty.
+    ///
+    /// `src_addr` is the datagram's source address, which the under-load
+    /// cookie is bound to. A caller that knows the source UDP port as well
+    /// should use [`Self::decapsulate_from`], so the cookie covers the whole
+    /// endpoint. With `None` no cookie can be demanded: under load, a
+    /// handshake message is refused as `UnderLoad`.
     pub fn decapsulate<'a>(
         &mut self,
         src_addr: Option<IpAddr>,
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
-        self.receive(src_addr, datagram, dst, OutputBudget::UNBOUNDED)
+        self.decapsulate_source(
+            src_addr.map(Source::from),
+            datagram,
+            dst,
+            OutputBudget::UNBOUNDED,
+        )
+    }
+
+    /// [`Self::decapsulate`] given the datagram's whole UDP source endpoint.
+    /// The under-load cookie is then bound to the address and port together,
+    /// as the whitepaper specifies (section 5.4.7), so a cookie issued to one
+    /// endpoint -- say, another client behind the same NAT -- does not
+    /// validate a handshake from another.
+    pub fn decapsulate_from<'a>(
+        &mut self,
+        src: Option<SocketAddr>,
+        datagram: &[u8],
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        self.decapsulate_source(
+            src.map(Source::from),
+            datagram,
+            dst,
+            OutputBudget::UNBOUNDED,
+        )
     }
 
     /// [`Self::decapsulate`] under `budget`, for `wireguard_read_ex`: the
@@ -1026,16 +1130,18 @@ impl Tunn {
         dst: &'a mut [u8],
         budget: OutputBudget,
     ) -> TunnResult<'a> {
-        self.receive(None, datagram, dst, budget)
+        self.decapsulate_source(None, datagram, dst, budget)
     }
 
-    fn receive<'a>(
+    fn decapsulate_source<'a>(
         &mut self,
-        src_addr: Option<IpAddr>,
+        source: Option<Source>,
         datagram: &[u8],
         dst: &'a mut [u8],
         budget: OutputBudget,
     ) -> TunnResult<'a> {
+        // Auto imitation evidence stays keyed on the address, as it was.
+        let src_addr = source.map(Source::address);
         if datagram.is_empty() {
             // Indicates a repeated call
             return self.send_queued_packet(dst, budget);
@@ -1065,13 +1171,19 @@ impl Tunn {
         // when a key is set; the unprotected path borrows.
         let obf = self.handshake.obf;
         let candidates = self.amnezia.inbound_candidates(obf, datagram);
+        if candidates.iter().next().is_none()
+            && self.amnezia.imitation.protocol == amnezia::AmneziaImitationProtocol::Auto
+            && self.auto_imitation.observe(src_addr, datagram)
+        {
+            return TunnResult::Done;
+        }
         let outcome = {
             let this = &*self;
             inbound::receive(
                 &this.amnezia,
                 obf,
                 &this.rate_limiter,
-                src_addr,
+                source,
                 &candidates,
                 datagram,
                 |packet| this.authenticate_with_budget(packet, dst, budget),
@@ -1079,9 +1191,24 @@ impl Tunn {
         };
 
         match outcome {
-            Inbound::Accepted(packet) => self.commit_with_budget(packet, dst, budget),
+            Inbound::Accepted(packet) => {
+                let hint = self.auto_imitation.hint(src_addr);
+                self.commit_with_imitation_and_budget(packet, datagram, hint, dst, budget)
+            }
             Inbound::NotOurs => TunnResult::Err(WireGuardError::InvalidPacket),
-            Inbound::Refused(e) => TunnResult::Err(e),
+            Inbound::Refused(refusal) => {
+                // A prelude whose bytes happen to fit a packet shape was
+                // offered to Auto detection above only if it fit none. Its
+                // readings have now failed for reasons that established
+                // nothing, so it is still evidence -- recorded only, under
+                // `observe`'s rules, and the refusal is reported unchanged.
+                if self.amnezia.imitation.protocol == amnezia::AmneziaImitationProtocol::Auto
+                    && refusal.allows_imitation_hint
+                {
+                    let _ = self.auto_imitation.observe(src_addr, datagram);
+                }
+                TunnResult::Err(refusal.error)
+            }
             Inbound::Cookie(demand) => {
                 let mut cookie = [0u8; COOKIE_REPLY_SZ];
                 let cookie = match self.rate_limiter.format_cookie_demand(
@@ -1174,10 +1301,17 @@ impl Tunn {
                 // turn an attenuating reply into an amplifying one. The check
                 // on what actually came out stays anyway: it is the guard, and
                 // the bound above is only how the draw avoids tripping it.
-                let result = match self.write_to_network_with(
+                let protocol = self
+                    .auto_imitation
+                    .learned
+                    .or_else(|| self.auto_imitation.hint(src_addr))
+                    .or_else(|| imitation::detect::detect(datagram).map(|p| p.protocol()))
+                    .unwrap_or(amnezia::AmneziaImitationProtocol::None);
+                let result = match self.write_to_network_with_imitation(
                     dst,
                     packet_size,
                     amnezia::TrailerRoom::cookie_reply(wire_len),
+                    protocol,
                 ) {
                     TunnResult::WriteToNetwork(reply)
                         if amnezia::reply_amplifies(wire_len, reply.len()) =>
@@ -1377,6 +1511,92 @@ impl Tunn {
         .unwrap_or_else(TunnResult::from)
     }
 
+    /// Effective outbound imitation. An unresolved auto responder reports `None`.
+    /// The requested configuration remains `Auto`; this choice belongs to this peer.
+    pub fn imitation_protocol(&self) -> amnezia::AmneziaImitationProtocol {
+        use amnezia::AmneziaImitationProtocol as P;
+        if self.amnezia.imitation.protocol == P::Auto {
+            self.auto_imitation.learned.unwrap_or(P::None)
+        } else {
+            self.amnezia.imitation.protocol
+        }
+    }
+
+    /// Pin camouflage only while committing an authenticated initiation. The
+    /// hint and outer datagram are untrusted metadata, never authentication.
+    ///
+    /// Unbudgeted, for the device's anonymous ingress; receive uses
+    /// [`Self::commit_with_imitation_and_budget`].
+    #[cfg(feature = "device")]
+    pub(crate) fn commit_with_imitation<'a>(
+        &mut self,
+        packet: Authenticated,
+        datagram: &[u8],
+        hint: Option<amnezia::AmneziaImitationProtocol>,
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        self.commit_with_imitation_and_budget(packet, datagram, hint, dst, OutputBudget::UNBOUNDED)
+    }
+
+    /// `commit_with_imitation` under the `budget` the answer was admitted
+    /// against ([`Self::commit_with_budget`]).
+    pub(crate) fn commit_with_imitation_and_budget<'a>(
+        &mut self,
+        packet: Authenticated,
+        datagram: &[u8],
+        hint: Option<amnezia::AmneziaImitationProtocol>,
+        dst: &'a mut [u8],
+        budget: OutputBudget,
+    ) -> TunnResult<'a> {
+        use amnezia::AmneziaImitationProtocol as P;
+        let previous = self.auto_imitation.learned;
+        // Auto must not consume an initiation or pin its hint when the caller
+        // cannot hold the imitated response. Preserve fixed-mode commit semantics.
+        // Every reading that reaches here has already passed the same room
+        // check, and the control budget's, before authentication
+        // (`authenticate_with_budget`, AWG-R1-003); this stays as the guard for
+        // the commit itself.
+        if self.amnezia.imitation.protocol == P::Auto
+            && matches!(&packet, Authenticated::HandshakeInit(_))
+            && dst.len() < HANDSHAKE_RESP_SZ + self.amnezia.response_packet_junk_size as usize
+        {
+            return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+        }
+        if self.amnezia.imitation.protocol == P::Auto
+            && previous.is_none()
+            && matches!(&packet, Authenticated::HandshakeInit(_))
+        {
+            if let Some(protocol) =
+                hint.or_else(|| imitation::detect::detect(datagram).map(|p| p.protocol()))
+            {
+                let resolved = self.amnezia.resolve_imitation(protocol);
+                if resolved.imitation.protocol == protocol
+                    && protocol != P::None
+                    && protocol != P::Auto
+                {
+                    self.auto_imitation.learned = Some(protocol);
+                } else if !self.auto_imitation.warned {
+                    tracing::warn!(protocol = protocol.as_str(), "auto imitation refused by header-protection policy; retaining random prefixes");
+                    self.auto_imitation.warned = true;
+                }
+            }
+        }
+        let result = self.commit_with_budget(packet, dst, budget);
+        if matches!(&result, TunnResult::Err(_)) {
+            self.auto_imitation.learned = previous;
+        } else if previous != self.auto_imitation.learned {
+            self.auto_imitation.clear_pending();
+            tracing::debug!(
+                protocol = self.imitation_protocol().as_str(),
+                "learned peer imitation protocol"
+            );
+            self.amnezia
+                .resolve_imitation(self.imitation_protocol())
+                .warn_header_protection_nonce();
+        }
+        result
+    }
+
     fn commit_handshake_init<'a>(
         &mut self,
         init: handshake::AuthenticatedInit,
@@ -1451,6 +1671,11 @@ impl Tunn {
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick_session_established(true, index); // New session established, we are the initiator
         self.set_current_session(l_idx);
+        // The keepalive below is an authenticated send like any other
+        // (wireguard-go sends it through `SendKeepalive`): it answers data the
+        // old session received meanwhile, and restarts the persistent
+        // keepalive interval.
+        self.timer_tick(TimerName::TimeLastPacketSent);
 
         tracing::debug!("Sending keepalive");
 
@@ -1466,7 +1691,11 @@ impl Tunn {
         cookie: [u8; 16],
     ) -> Result<TunnResult<'a>, WireGuardError> {
         self.handshake.commit_cookie(cookie);
-        self.timer_tick(TimerName::TimeLastPacketReceived);
+        // Not `TimeLastPacketReceived`: that tick is evidence the peer is
+        // alive, and a cookie reply is not -- see
+        // `Authenticated::moves_endpoint`. Ticking it here let relayed replies
+        // keep the KEEPALIVE + REKEY_TIMEOUT new-handshake trigger from ever
+        // firing on a dead path. Linux and wireguard-go do not tick it.
         self.timer_tick(TimerName::TimeCookieReceived);
 
         tracing::debug!("Did set cookie");
@@ -1671,7 +1900,8 @@ impl Tunn {
                 self.timers.retransmit_current = self
                     .amnezia
                     .timers
-                    .retransmit_timeout(&mut self.handshake.rng);
+                    .retransmit_timeout(&mut self.handshake.rng)
+                    + self.timers.jitter();
                 if starting_new_handshake {
                     // The cycle's first initiation is not a retransmission, so
                     // the counter starts empty; the budget is drawn once here
@@ -1920,7 +2150,18 @@ impl Tunn {
                 // rather than the bytes received. wireguard-go rejects the same case
                 // (`int(length) < ipv4.HeaderLen`). The v6 branch needs no equivalent:
                 // it adds IPV6_MIN_HEADER_SIZE to the payload length.
-                if computed_len < IPV4_MIN_HEADER_SIZE {
+                //
+                // The bound is the header the packet itself declares, not the
+                // 20-byte minimum: IHL counts 32-bit words, and a total length
+                // between 20 and `IHL * 4` hands the caller a buffer shorter
+                // than the header it describes. A TUN's stack drops that (and
+                // an IHL below 5) as a header error, but an FFI caller that
+                // takes `ihl * 4` as the payload offset -- to clamp an MSS, or
+                // rewrite an address -- would read past what it was given. The
+                // source address at 12..16 lies inside the 20 bytes checked
+                // above whatever IHL says, so it is read before this.
+                let header_len = usize::from(packet[0] & 0x0f) * 4;
+                if header_len < IPV4_MIN_HEADER_SIZE || computed_len < header_len {
                     return TunnResult::Err(WireGuardError::InvalidPacket);
                 }
                 (computed_len, IpAddr::from(addr_bytes))
@@ -2067,13 +2308,26 @@ impl Tunn {
         packet_size: usize,
         room: amnezia::TrailerRoom,
     ) -> TunnResult<'a> {
-        match self.amnezia.prepend_outbound_with_trailer(
-            self.handshake.obf,
-            dst,
-            packet_size,
-            Some(room),
-            &mut self.handshake.rng,
-        ) {
+        self.write_to_network_with_imitation(dst, packet_size, room, self.imitation_protocol())
+    }
+
+    fn write_to_network_with_imitation<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+        packet_size: usize,
+        room: amnezia::TrailerRoom,
+        protocol: amnezia::AmneziaImitationProtocol,
+    ) -> TunnResult<'a> {
+        match self
+            .amnezia
+            .resolve_imitation(protocol)
+            .prepend_outbound_with_trailer(
+                self.handshake.obf,
+                dst,
+                packet_size,
+                Some(room),
+                &mut self.handshake.rng,
+            ) {
             Ok(packet) => TunnResult::WriteToNetwork(packet),
             Err(e) => TunnResult::Err(e),
         }
@@ -2127,7 +2381,7 @@ impl Tunn {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "mock-instant")]
-    use crate::noise::timers::{REKEY_AFTER_TIME, REKEY_TIMEOUT};
+    use crate::noise::timers::{KEEPALIVE_TIMEOUT, REKEY_AFTER_TIME, REKEY_TIMEOUT};
 
     use super::*;
     use rand_core::{OsRng, RngCore};
@@ -2432,7 +2686,10 @@ mod tests {
         let packet = Tunn::parse_incoming_packet(my_tun.handshake.obf, &init).unwrap();
         assert!(matches!(packet, Packet::HandshakeInit(_)));
 
-        mock_instant::thread_local::MockClock::advance(REKEY_TIMEOUT);
+        // Past the retransmission deadline whatever its jitter drew.
+        mock_instant::thread_local::MockClock::advance(
+            REKEY_TIMEOUT + Duration::from_millis(u64::from(timers::REKEY_TIMEOUT_JITTER_MAX_MS)),
+        );
         update_timer_results_in_handshake(&mut my_tun)
     }
 
@@ -2527,7 +2784,7 @@ mod tests {
                 P::Dns => 3,
                 P::Sip | P::Stun => 2,
                 P::Quic => 1,
-                P::None => 0,
+                P::None | P::Auto => 0,
             };
             let mut dst = vec![0u8; 2048];
             let mut result = my_tun.format_handshake_initiation(&mut dst, false);
@@ -2648,6 +2905,64 @@ mod tests {
             before + 1,
             "four rejected calls advanced the nonce"
         );
+    }
+
+    /// Reject-After-Messages at the `Tunn` level: the last usable nonce is
+    /// sent and delivered, the next write is accepted onto the queue and
+    /// starts a handshake instead of reusing or wrapping a nonce, the spent
+    /// session still receives meanwhile, and the queued packet is delivered on
+    /// the new session.
+    #[test]
+    fn an_exhausted_session_rekeys_instead_of_reusing_a_nonce() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let packet = create_ipv4_udp_packet();
+        let mut dst = vec![0u8; 2048];
+        let mut their_dst = vec![0u8; 2048];
+
+        my_tun.sessions[my_tun.current % N_SESSIONS]
+            .as_ref()
+            .unwrap()
+            .set_sending_counter(session::REJECT_AFTER_MESSAGES - 1);
+
+        let last = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        assert_eq!(counter_of(&last), session::REJECT_AFTER_MESSAGES - 1);
+        assert!(matches!(
+            their_tun.decapsulate(None, &last, &mut their_dst),
+            TunnResult::WriteToTunnelV4(p, _) if p == packet.as_slice()
+        ));
+
+        // Accepted (queued), and the output is an initiation, not data. Under
+        // a frozen mock clock it would carry the first handshake's TAI64N
+        // timestamp, and the responder would rightly refuse it as a replay.
+        advance_past_pacing_gate(Duration::from_millis(5));
+        let init = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        assert!(matches!(
+            Tunn::parse_incoming_packet(my_tun.handshake.obf, &init),
+            Ok(Packet::HandshakeInit(_))
+        ));
+        assert_eq!(my_tun.packet_queue.len(), 1);
+
+        // The spent session can no longer send but still receives.
+        let reply = unwrap_network_packet(their_tun.encapsulate(&packet, &mut their_dst));
+        assert!(matches!(
+            my_tun.decapsulate(None, &reply, &mut dst),
+            TunnResult::WriteToTunnelV4(p, _) if p == packet.as_slice()
+        ));
+
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+
+        let queued = unwrap_network_packet(my_tun.decapsulate(None, &[], &mut dst));
+        assert!(
+            counter_of(&queued) < 2,
+            "the queued packet went out on the new session"
+        );
+        assert!(my_tun.packet_queue.is_empty());
+        assert!(matches!(
+            their_tun.decapsulate(None, &queued, &mut their_dst),
+            TunnResult::WriteToTunnelV4(p, _) if p == packet.as_slice()
+        ));
     }
 
     #[test]
@@ -2786,6 +3101,93 @@ mod tests {
                 "a total length of exactly the header size must be accepted, got {:?}",
                 other
             ),
+        }
+    }
+
+    /// Set IHL (the low nibble of byte 0) and the total length of `packet`.
+    fn with_ihl_and_total_len(mut packet: Vec<u8>, ihl: u8, total_len: u16) -> Vec<u8> {
+        packet[0] = 0x40 | ihl;
+        packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ].copy_from_slice(&total_len.to_be_bytes());
+        packet
+    }
+
+    /// The total length must cover the header IHL declares, and IHL must
+    /// declare at least the 20-byte fixed header. A packet carrying options
+    /// is still delivered, trimmed to its total length.
+    #[test]
+    fn an_ipv4_header_length_the_packet_does_not_cover_is_rejected() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut dst = vec![0u8; 2048];
+        let mut their_dst = vec![0u8; 2048];
+        // 20-byte header, 8-byte UDP header and payload, padded with room for
+        // up to 40 bytes of options.
+        let mut base = create_ipv4_udp_packet();
+        base.resize(base.len() + 40, 0);
+
+        let mut refused = Vec::new();
+        // IHL below the fixed header, with an otherwise valid total length.
+        for ihl in 0..5u8 {
+            refused.push((ihl, 32u16));
+        }
+        // IHL 6 (24 bytes) and 15 (60 bytes) with a total length short of it.
+        for total in 20..24u16 {
+            refused.push((6, total));
+        }
+        refused.push((15, 59));
+        for (ihl, total) in refused {
+            let bogus = with_ihl_and_total_len(base.clone(), ihl, total);
+            let sent = unwrap_network_packet(my_tun.encapsulate(&bogus, &mut dst));
+            match their_tun.decapsulate(None, &sent, &mut their_dst) {
+                TunnResult::Err(WireGuardError::InvalidPacket) => {}
+                other => panic!(
+                    "IHL {} with total length {} must be InvalidPacket, got {:?}",
+                    ihl, total, other
+                ),
+            }
+        }
+
+        // Exactly the declared header, and a header with options followed by
+        // a payload and trailing bytes: both delivered, trimmed, byte-exact.
+        for (ihl, total) in [(6u8, 24u16), (6, 30), (15, 60), (5, 20)] {
+            let packet = with_ihl_and_total_len(base.clone(), ihl, total);
+            let sent = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+            match their_tun.decapsulate(None, &sent, &mut their_dst) {
+                TunnResult::WriteToTunnelV4(recv, src) => {
+                    assert_eq!(recv, &packet[..usize::from(total)]);
+                    assert_eq!(src, std::net::Ipv4Addr::new(192, 168, 1, 2));
+                }
+                other => panic!(
+                    "IHL {} with total length {} must be delivered, got {:?}",
+                    ihl, total, other
+                ),
+            }
+        }
+    }
+
+    /// Fragments and the header checksum are deliberately not interpreted:
+    /// reassembly and checksum verification belong to the stack the packet is
+    /// delivered to, as in Linux WireGuard and wireguard-go, and the AEAD
+    /// already proved the bytes are the peer's. Pinned so that neither starts
+    /// happening by accident.
+    #[test]
+    fn ipv4_fragments_and_checksums_are_delivered_as_sent() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut dst = vec![0u8; 2048];
+        let mut their_dst = vec![0u8; 2048];
+        // More-fragments with offset 0; a later fragment (offset 64 bytes);
+        // a header checksum that cannot be right.
+        let mut first_fragment = create_ipv4_udp_packet();
+        first_fragment[6] = 0x20;
+        let mut later_fragment = create_ipv4_udp_packet();
+        later_fragment[6..8].copy_from_slice(&8u16.to_be_bytes());
+        let mut bad_checksum = create_ipv4_udp_packet();
+        bad_checksum[10] ^= 0xff;
+        for packet in [first_fragment, later_fragment, bad_checksum] {
+            let sent = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+            match their_tun.decapsulate(None, &sent, &mut their_dst) {
+                TunnResult::WriteToTunnelV4(recv, _) => assert_eq!(recv, &packet[..]),
+                other => panic!("expected delivery, got {:?}", other),
+            }
         }
     }
 
@@ -3152,6 +3554,86 @@ mod tests {
         )
         .unwrap();
         (my_tun, their_tun)
+    }
+
+    /// The whole cookie exchange through `decapsulate_from`: the cookie is
+    /// issued to one endpoint, and the initiation that carries it is accepted
+    /// from that endpoint only. From another port of the same address --
+    /// another client behind the same NAT -- a fresh cookie is demanded.
+    #[test]
+    fn a_cookie_is_honoured_only_from_the_endpoint_it_was_issued_to() {
+        let (mut my_tun, mut their_tun) = cookie_provoking_pair(AmneziaConfig::default());
+        let mut dst = vec![0u8; 2048];
+        let issued: SocketAddr = "198.51.100.7:40000".parse().unwrap();
+        let neighbour: SocketAddr = "198.51.100.7:40001".parse().unwrap();
+
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        let cookie =
+            unwrap_network_packet(their_tun.decapsulate_from(Some(issued), &init, &mut dst));
+        assert_eq!(cookie.len(), COOKIE_REPLY_SZ);
+        assert!(matches!(
+            my_tun.decapsulate(None, &cookie, &mut dst),
+            TunnResult::Done
+        ));
+
+        // A fresh initiation, now carrying mac2 under that cookie (and, under
+        // a frozen mock clock, a timestamp the responder has not seen).
+        advance_past_pacing_gate(Duration::from_millis(5));
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, true));
+        let refused =
+            unwrap_network_packet(their_tun.decapsulate_from(Some(neighbour), &init, &mut dst));
+        assert_eq!(
+            refused.len(),
+            COOKIE_REPLY_SZ,
+            "a neighbour's mac2 was honoured"
+        );
+        let response =
+            unwrap_network_packet(their_tun.decapsulate_from(Some(issued), &init, &mut dst));
+        assert!(matches!(
+            Tunn::parse_incoming_packet(their_tun.handshake.obf, &response),
+            Ok(Packet::HandshakeResponse(_))
+        ));
+    }
+
+    /// An accepted cookie reply stores the cookie and is not evidence that the
+    /// peer is alive: `TimeLastPacketReceived` stays where it was, so the
+    /// new-handshake trigger it gates is not deferred. A second delivery of the
+    /// same reply is refused, since the mac1 it answers is spent.
+    #[test]
+    fn a_cookie_reply_is_stored_once_and_does_not_tick_last_packet_received() {
+        let (mut my_tun, mut their_tun) = cookie_provoking_pair(AmneziaConfig::default());
+        let mut dst = vec![0u8; 2048];
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        let src = Some(std::net::IpAddr::from([10, 0, 0, 1]));
+        let cookie = unwrap_network_packet(their_tun.decapsulate(src, &init, &mut dst));
+        assert_eq!(cookie.len(), COOKIE_REPLY_SZ);
+
+        // A tick would record the current poll time; move it off zero first,
+        // or the assertion below could not tell a tick from none.
+        advance_past_pacing_gate(Duration::from_millis(50));
+        my_tun.update_timers(&mut dst);
+        let received_before = my_tun.timers[TimerName::TimeLastPacketReceived];
+        assert!(my_tun.timers[TimerName::TimeCurrent] > received_before);
+
+        assert!(matches!(
+            my_tun.decapsulate(src, &cookie, &mut dst),
+            TunnResult::Done
+        ));
+        assert!(my_tun.handshake.has_cookie());
+        assert_eq!(
+            my_tun.timers[TimerName::TimeLastPacketReceived],
+            received_before,
+            "a cookie reply ticked TimeLastPacketReceived"
+        );
+        assert_eq!(
+            my_tun.timers[TimerName::TimeCookieReceived],
+            my_tun.timers[TimerName::TimeCurrent]
+        );
+
+        assert!(matches!(
+            my_tun.decapsulate(src, &cookie, &mut dst),
+            TunnResult::Err(WireGuardError::UnexpectedPacket)
+        ));
     }
 
     /// A cookie reply the caller's buffer cannot hold is an error, not a panic.
@@ -4505,8 +4987,14 @@ mod tests {
             TunnResult::WriteToTunnelV4(..)
         ));
 
+        // The reply is data nothing has answered: the passive keepalive
+        // follows KEEPALIVE_TIMEOUT later, as in wireguard-go.
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(10));
+        let keepalive = unwrap_network_packet(my_tun.update_timers(&mut my_dst));
+        assert_eq!(keepalive.len(), DATA_OVERHEAD_SZ);
+
         // 29 seconds into the session: not yet.
-        mock_instant::thread_local::MockClock::advance(Duration::from_secs(28));
+        mock_instant::thread_local::MockClock::advance(Duration::from_secs(18));
         assert!(matches!(
             my_tun.update_timers(&mut my_dst),
             TunnResult::Done
@@ -4925,6 +5413,446 @@ mod tests {
             their_tun.update_timers(&mut their_dst),
             TunnResult::WriteToNetwork(_)
         ));
+    }
+
+    /// What `update_timers` emitted, by kind: `None` for `Done`.
+    #[cfg(feature = "mock-instant")]
+    fn poll_kind(tun: &mut Tunn) -> Option<&'static str> {
+        let mut dst = vec![0u8; 2048];
+        let obf = tun.handshake.obf;
+        match tun.update_timers(&mut dst) {
+            TunnResult::Done => None,
+            TunnResult::WriteToNetwork(p) => match Tunn::parse_incoming_packet(obf, p) {
+                Ok(Packet::HandshakeInit(_)) => Some("initiation"),
+                Ok(Packet::PacketData(d)) if p.len() == DATA_OVERHEAD_SZ => {
+                    let _ = d;
+                    Some("keepalive")
+                }
+                Ok(Packet::PacketData(_)) => Some("data"),
+                other => panic!("unexpected timer output {:?}", other.map(|_| ())),
+            },
+            other => panic!("unexpected timer result {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "mock-instant")]
+    fn advance(d: Duration) {
+        mock_instant::thread_local::MockClock::advance(d);
+    }
+
+    /// `from` sends `packet` (data, or a keepalive when empty) and `to`
+    /// receives it, each having polled first so their ticks carry the current
+    /// time.
+    #[cfg(feature = "mock-instant")]
+    fn deliver(from: &mut Tunn, to: &mut Tunn, packet: &[u8]) {
+        let mut dst = vec![0u8; 2048];
+        let mut out = vec![0u8; 2048];
+        assert_eq!(poll_kind(from), None);
+        assert_eq!(poll_kind(to), None);
+        let wire = unwrap_network_packet(from.encapsulate(packet, &mut dst));
+        let r = to.decapsulate(None, &wire, &mut out);
+        assert!(!matches!(r, TunnResult::Err(_)), "{:?}", r);
+    }
+
+    /// A received keepalive is not answered with one: only data owes a
+    /// passive keepalive, or two idle peers ping each other forever.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_keepalive_is_not_answered_with_a_keepalive() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        advance(Duration::from_secs(1));
+        deliver(&mut my_tun, &mut their_tun, &[]);
+        for _ in 0..30 {
+            advance(Duration::from_secs(1));
+            assert_eq!(poll_kind(&mut their_tun), None);
+        }
+    }
+
+    /// The passive keepalive is due KEEPALIVE_TIMEOUT after the data that
+    /// owes it, not after whatever this side last sent: a tunnel idle for
+    /// minutes does not answer the first packet at once.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn the_passive_keepalive_waits_a_full_timeout_after_long_idle() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        for _ in 0..100 {
+            advance(Duration::from_secs(1));
+            assert_eq!(poll_kind(&mut their_tun), None);
+        }
+        deliver(&mut my_tun, &mut their_tun, &create_ipv4_udp_packet());
+        advance(Duration::from_millis(250));
+        assert_eq!(poll_kind(&mut their_tun), None, "answered at once");
+        advance(KEEPALIVE_TIMEOUT - Duration::from_millis(350));
+        assert_eq!(poll_kind(&mut their_tun), None);
+        advance(Duration::from_millis(100));
+        assert_eq!(poll_kind(&mut their_tun), Some("keepalive"));
+        // Once: the keepalive answered it.
+        advance(KEEPALIVE_TIMEOUT);
+        assert_eq!(poll_kind(&mut their_tun), None);
+    }
+
+    /// The new-handshake deadline runs from the data that went unanswered,
+    /// plus at most the jitter, not from the last packet heard: after a long
+    /// quiet spell the first packet sent does not start a handshake at once.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn an_unanswered_packet_after_idle_rekeys_only_after_the_timeout() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        for _ in 0..60 {
+            advance(Duration::from_secs(1));
+            assert_eq!(poll_kind(&mut my_tun), None);
+        }
+        let mut dst = vec![0u8; 2048];
+        unwrap_network_packet(my_tun.encapsulate(&create_ipv4_udp_packet(), &mut dst));
+        advance(Duration::from_millis(250));
+        assert_eq!(poll_kind(&mut my_tun), None, "rekeyed at once");
+        let deadline = KEEPALIVE_TIMEOUT + REKEY_TIMEOUT;
+        advance(deadline - Duration::from_millis(500));
+        assert_eq!(poll_kind(&mut my_tun), None);
+        advance(Duration::from_millis(
+            250 + u64::from(timers::REKEY_TIMEOUT_JITTER_MAX_MS),
+        ));
+        assert_eq!(poll_kind(&mut my_tun), Some("initiation"));
+
+        // And an answer in time cancels it.
+        let (mut my_tun, mut their_tun2) = create_two_tuns_and_handshake();
+        let _ = &mut their_tun;
+        advance(Duration::from_secs(1));
+        deliver(&mut my_tun, &mut their_tun2, &create_ipv4_udp_packet());
+        advance(Duration::from_secs(5));
+        deliver(&mut their_tun2, &mut my_tun, &create_ipv4_udp_packet());
+        for _ in 0..30 {
+            advance(Duration::from_secs(1));
+            assert_ne!(poll_kind(&mut my_tun), Some("initiation"));
+        }
+    }
+
+    /// The persistent keepalive is due one interval after the last
+    /// authenticated packet either way, so with traffic flowing it is never
+    /// sent (`deliver` polls both sides and asserts nothing is due; before,
+    /// one went out every 25 seconds regardless).
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn persistent_keepalives_are_not_sent_while_traffic_flows() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake_with_keepalive(Some(25));
+        // The handshake settled the keepalive owed at activation.
+        assert_eq!(poll_kind(&mut my_tun), None);
+        // Idle: the next one is a full interval after the handshake.
+        for _ in 0..24 {
+            advance(Duration::from_secs(1));
+            assert_eq!(poll_kind(&mut my_tun), None);
+        }
+        advance(Duration::from_secs(1));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+
+        let packet = create_ipv4_udp_packet();
+        for _ in 0..12 {
+            advance(Duration::from_secs(5));
+            deliver(&mut my_tun, &mut their_tun, &packet);
+            deliver(&mut their_tun, &mut my_tun, &packet);
+        }
+        // A received packet restarts the interval too: we last received.
+        advance(Duration::from_secs(5));
+        deliver(&mut my_tun, &mut their_tun, &[]);
+        deliver(&mut their_tun, &mut my_tun, &[]);
+        for _ in 0..24 {
+            advance(Duration::from_secs(1));
+            assert_eq!(poll_kind(&mut my_tun), None);
+        }
+        advance(Duration::from_secs(1));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+    }
+
+    /// Either direction alone restarts the persistent-keepalive interval:
+    /// keepalives only sent, or only received, every five seconds.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn either_direction_alone_restarts_the_persistent_keepalive() {
+        for sending in [true, false] {
+            let (mut my_tun, mut their_tun) =
+                create_two_tuns_and_handshake_with_keepalive(Some(25));
+            for _ in 0..12 {
+                advance(Duration::from_secs(5));
+                if sending {
+                    deliver(&mut my_tun, &mut their_tun, &[]);
+                } else {
+                    deliver(&mut their_tun, &mut my_tun, &[]);
+                }
+            }
+        }
+    }
+
+    /// A persistent keepalive is sent at once when the interval is first
+    /// configured -- to bring the tunnel up, without a session -- or turned
+    /// on later; changing an interval that was already on owes nothing.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_persistent_keepalive_is_sent_at_once_on_activation() {
+        let (mut fresh, _) = create_two_tuns_with_keepalive(Some(25));
+        assert_eq!(poll_kind(&mut fresh), Some("initiation"));
+
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        advance(Duration::from_secs(1));
+        assert_eq!(poll_kind(&mut my_tun), None);
+        my_tun.set_persistent_keepalive(Some(25));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+        my_tun.set_persistent_keepalive(Some(30));
+        advance(Duration::from_secs(1));
+        assert_eq!(poll_kind(&mut my_tun), None);
+        my_tun.set_persistent_keepalive(None);
+        my_tun.set_persistent_keepalive(Some(30));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+    }
+
+    /// Retransmission and new-handshake deadlines carry 0-333 ms of jitter,
+    /// untuned and on top of a configured range alike.
+    #[test]
+    fn handshake_deadlines_are_jittered() {
+        let ms = |d: Duration| d.as_millis() as u64;
+        for amnezia in [
+            AmneziaConfig::default(),
+            AmneziaConfig::default().with_tunable_timers(amnezia::AwgTimers {
+                rekey_timeout: (7, 7),
+                ..amnezia::AwgTimers::default()
+            }),
+        ] {
+            let base = amnezia.timers.retransmit_timeout(&mut OsRng);
+            let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+            let mut seen = std::collections::BTreeSet::new();
+            let mut dst = vec![0u8; 2048];
+            for _ in 0..64 {
+                unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, true));
+                let drawn = my_tun.timers.retransmit_current;
+                assert!(drawn >= base && ms(drawn) < ms(base) + 334, "{:?}", drawn);
+                seen.insert(drawn);
+            }
+            assert!(seen.len() > 1, "no jitter: {:?}", seen);
+        }
+    }
+
+    /// A clock that steps back behind the tunnel's own ticks does not make the
+    /// timers panic: elapsed times are measured from a `now` that never goes
+    /// back.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_clock_stepping_back_does_not_panic_the_timers() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        advance(Duration::from_secs(20));
+        let mut dst = vec![0u8; 2048];
+        let _ = my_tun.update_timers(&mut dst);
+        let _ = their_tun.update_timers(&mut dst);
+        // Established, and every tick taken, at 20 s.
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+        assert_eq!(
+            my_tun.timers[TimerName::TimeSessionEstablished],
+            my_tun.timers[TimerName::TimeCurrent]
+        );
+        let now = mock_instant::thread_local::MockClock::time();
+        mock_instant::thread_local::MockClock::set_time(now - Duration::from_secs(15));
+        for _ in 0..3 {
+            let _ = my_tun.update_timers(&mut dst);
+            let _ = their_tun.update_timers(&mut dst);
+            let _ = my_tun.time_since_last_handshake();
+            advance(Duration::from_secs(1));
+        }
+        // The timer reset reads the clock too, and the next poll compares the
+        // session timers it leaves against it.
+        my_tun.clear_all();
+        let _ = my_tun.update_timers(&mut dst);
+        let _ = my_tun.time_since_last_handshake();
+    }
+
+    /// The keepalive owed at activation is settled by any authenticated send:
+    /// a handshake started by hand first is not followed by a redundant one.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn an_owed_persistent_keepalive_is_settled_by_any_send() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_with_keepalive(Some(25));
+        let mut dst = vec![0u8; 2048];
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, true));
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+        assert_eq!(poll_kind(&mut my_tun), None, "a redundant keepalive");
+    }
+
+    /// Tick once a second until the cycle expires, within `limit`.
+    #[cfg(feature = "mock-instant")]
+    fn tick_until_expired(tun: &mut Tunn, limit: Duration) {
+        let mut dst = vec![0u8; 2048];
+        let mut waited = Duration::ZERO;
+        loop {
+            match tun.update_timers(&mut dst) {
+                TunnResult::Err(WireGuardError::ConnectionExpired) => return,
+                TunnResult::Err(e) => panic!("unexpected timer error {:?}", e),
+                _ => {}
+            }
+            assert!(waited < limit, "the cycle never expired");
+            advance(Duration::from_secs(1));
+            waited += Duration::from_secs(1);
+        }
+    }
+
+    /// A persistent keepalive turned on after an idle tunnel's keys expired
+    /// is owed like any other: the next tick restarts the cycle with an
+    /// initiation, and the handshake it starts completes.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_keepalive_turned_on_after_idle_expiry_restarts_the_cycle() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        tick_until_expired(
+            &mut my_tun,
+            timers::REJECT_AFTER_TIME * 3 + Duration::from_secs(5),
+        );
+        let mut dst = vec![0u8; 2048];
+        assert!(matches!(
+            my_tun.update_timers(&mut dst),
+            TunnResult::Err(WireGuardError::ConnectionExpired)
+        ));
+
+        my_tun.set_persistent_keepalive(Some(25));
+        let init = unwrap_network_packet(my_tun.update_timers(&mut dst));
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+        assert!(my_tun.time_since_last_handshake().is_some());
+        assert_eq!(poll_kind(&mut my_tun), None, "a redundant keepalive");
+    }
+
+    /// The same after a handshake that ran out of attempts, and the restarted
+    /// cycle is a fresh one: it retransmits instead of expiring at once on the
+    /// old cycle's start time.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_keepalive_turned_on_after_exhausted_attempts_restarts_the_cycle() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let _ = create_handshake_init(&mut my_tun);
+        tick_until_expired(&mut my_tun, timers::untuned_attempt_window() * 2);
+
+        my_tun.set_persistent_keepalive(Some(25));
+        assert_eq!(poll_kind(&mut my_tun), Some("initiation"));
+        advance(
+            REKEY_TIMEOUT + Duration::from_millis(u64::from(timers::REKEY_TIMEOUT_JITTER_MAX_MS)),
+        );
+        assert_eq!(poll_kind(&mut my_tun), Some("initiation"));
+    }
+
+    /// A restart the caller's buffer cannot hold stays owed, and the next tick
+    /// with room sends it.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_keepalive_owed_after_expiry_survives_a_short_dst() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let _ = create_handshake_init(&mut my_tun);
+        tick_until_expired(&mut my_tun, timers::untuned_attempt_window() * 2);
+
+        my_tun.set_persistent_keepalive(Some(25));
+        assert!(matches!(
+            my_tun.update_timers(&mut [0u8; 64]),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+        advance(Duration::from_millis(250));
+        assert_eq!(poll_kind(&mut my_tun), Some("initiation"));
+    }
+
+    /// The same restart refused by a control budget (`wireguard_tick_ex`):
+    /// the initiation it needs does not fit, nothing is queued, and the
+    /// keepalive stays owed exactly as it does after a short `dst` -- the
+    /// next tick with room sends the initiation.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_keepalive_owed_after_expiry_survives_a_budget_refusal() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let _ = create_handshake_init(&mut my_tun);
+        tick_until_expired(&mut my_tun, timers::untuned_attempt_window() * 2);
+
+        my_tun.set_persistent_keepalive(Some(25));
+        let budget = OutputBudget {
+            control: HANDSHAKE_INIT_SZ as u32 - 1,
+            ..OutputBudget::UNBOUNDED
+        };
+        assert!(matches!(
+            my_tun.update_timers_with_budget(&mut [0u8; 2048], budget),
+            TunnResult::Err(WireGuardError::OutputBudgetExceeded)
+        ));
+        assert!(my_tun.packet_queue.is_empty(), "the keepalive was admitted");
+        advance(Duration::from_millis(250));
+        assert_eq!(poll_kind(&mut my_tun), Some("initiation"));
+    }
+
+    /// Only turning the interval on owes a keepalive: an interval that was
+    /// already on, or one that is changed, leaves an expired cycle expired.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn an_interval_already_on_does_not_restart_an_expired_cycle() {
+        let (mut my_tun, _their_tun) = create_two_tuns_with_keepalive(Some(25));
+        let _ = create_handshake_init(&mut my_tun);
+        tick_until_expired(&mut my_tun, timers::untuned_attempt_window() * 2);
+        my_tun.set_persistent_keepalive(Some(30));
+        for _ in 0..40 {
+            advance(Duration::from_secs(1));
+            assert!(matches!(
+                my_tun.update_timers(&mut [0u8; 2048]),
+                TunnResult::Err(WireGuardError::ConnectionExpired)
+            ));
+        }
+    }
+
+    /// A keepalive the caller's buffer cannot hold keeps its demand: the one
+    /// owed at activation goes out at the next tick that has room, not an
+    /// interval later.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_keepalive_refused_for_capacity_stays_owed() {
+        let (mut fresh, _) = create_two_tuns_with_keepalive(Some(25));
+        assert!(matches!(
+            fresh.update_timers(&mut [0u8; 64]),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+        advance(Duration::from_millis(250));
+        assert_eq!(poll_kind(&mut fresh), Some("initiation"));
+
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        advance(Duration::from_secs(1));
+        deliver(&mut their_tun, &mut my_tun, &create_ipv4_udp_packet());
+        advance(KEEPALIVE_TIMEOUT);
+        let mut small = vec![0u8; DATA_OVERHEAD_SZ - 1];
+        assert!(matches!(
+            my_tun.update_timers(&mut small),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+        advance(Duration::from_millis(250));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+    }
+
+    /// An untuned cycle sends every one of its retransmissions even when
+    /// each one's jitter is at its largest: the absolute bound leaves room
+    /// for the jitter, so the attempt count is what ends the cycle.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn an_untuned_cycle_keeps_its_last_retransmission_under_maximal_jitter() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let mut dst = vec![0u8; 2048];
+        unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        let step = REKEY_TIMEOUT
+            + Duration::from_millis(u64::from(timers::REKEY_TIMEOUT_JITTER_MAX_MS) - 1);
+        let mut retransmissions = 0;
+        loop {
+            advance(step);
+            match my_tun.update_timers(&mut dst) {
+                TunnResult::WriteToNetwork(_) => retransmissions += 1,
+                TunnResult::Err(WireGuardError::ConnectionExpired) => break,
+                other => panic!("{:?}", other),
+            }
+            assert!(retransmissions < 100);
+        }
+        assert_eq!(
+            retransmissions,
+            (timers::REKEY_ATTEMPT_TIME.as_secs() / REKEY_TIMEOUT.as_secs() - 1) as u32
+        );
     }
 
     /// A live `set_obfuscation` reaches the cached timer draws.
