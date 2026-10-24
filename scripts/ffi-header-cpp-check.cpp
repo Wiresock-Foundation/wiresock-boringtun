@@ -52,13 +52,45 @@ static_assert(offsetof(struct wireguard_awg_params, random_trailers) == 160,
 static_assert(offsetof(struct wireguard_awg_params, disable_cookies) == 164,
               "disable_cookies moved");
 
+// The metadata entry points and their struct, as the C++ consumer sees them.
+static struct wireguard_result (*const check_read_ex)(
+    const struct wireguard_tunnel *, const uint8_t *, uint32_t, uint8_t *, uint32_t,
+    struct wireguard_packet_info *) = wireguard_read_ex;
+static struct wireguard_result (*const check_write_ex)(
+    const struct wireguard_tunnel *, const uint8_t *, uint32_t, uint8_t *, uint32_t,
+    struct wireguard_packet_info *) = wireguard_write_ex;
+static struct wireguard_result (*const check_tick_ex)(
+    const struct wireguard_tunnel *, uint8_t *, uint32_t,
+    struct wireguard_packet_info *) = wireguard_tick_ex;
+static struct wireguard_result (*const check_force_ex)(
+    const struct wireguard_tunnel *, uint8_t *, uint32_t,
+    struct wireguard_packet_info *) = wireguard_force_handshake_ex;
+static_assert(sizeof(struct wireguard_packet_info) == 48, "packet_info must be 48 bytes");
+static_assert(alignof(struct wireguard_packet_info) == 4, "packet_info must be 4-aligned");
+static_assert(offsetof(struct wireguard_packet_info, written_size) == 16, "written_size moved");
+static_assert(offsetof(struct wireguard_packet_info, op_seq_lo) == 36, "op_seq_lo moved");
+static_assert(offsetof(struct wireguard_packet_info, burst_due_ms) == 44, "burst_due_ms moved");
+
 // Returns the addresses OF the pointers, never the pointers themselves: a
 // function pointer compared against null is a diagnosable tautology under
 // -Wall, and converting one to an object pointer is not conforming.
 extern "C" const void *wg_ffi_cpp_check_anchor(int which);
 const void *wg_ffi_cpp_check_anchor(int which)
 {
-    if (which == 0)
+    switch (which) {
+    case 0:
         return (const void *)&check_ctor;
-    return which == 1 ? (const void *)&check_legacy : (const void *)&check_mtu;
+    case 1:
+        return (const void *)&check_legacy;
+    case 2:
+        return (const void *)&check_read_ex;
+    case 3:
+        return (const void *)&check_write_ex;
+    case 4:
+        return (const void *)&check_tick_ex;
+    case 5:
+        return (const void *)&check_force_ex;
+    default:
+        return (const void *)&check_mtu;
+    }
 }

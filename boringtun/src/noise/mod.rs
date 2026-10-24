@@ -37,6 +37,10 @@ mod burst_lifecycle_tests;
 mod jc_golden_tests;
 #[cfg(test)]
 mod write_admission_tests;
+// A peer's initiation neither selects its responder session nor overwrites
+// the selected one (LC-REV-01).
+#[cfg(test)]
+mod session_preservation_tests;
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
 pub(crate) mod quic;
 mod session;
@@ -44,9 +48,15 @@ mod session;
 // no consumer outside `noise` on this branch yet. Present tense would be a claim
 // this tree does not support -- this PR is mergeable to master on its own.
 pub(crate) mod timers;
+// What one operation did, for the C `wireguard_*_ex` entry points.
+pub(crate) mod op_report;
+// What one operation may produce, from the same entry points.
+pub(crate) mod budget;
 
 use amnezia::AmneziaConfig;
+use budget::{ControlOutput, OutputBudget};
 use handshake::ObfuscationRanges;
+use op_report::{event, PacketKind};
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -139,6 +149,9 @@ pub struct Tunn {
     /// nothing. Every other access has `&mut Tunn`; the device holds the
     /// peer's lock around all of them anyway, so the ordering is `Relaxed`.
     udp_window: AtomicU32,
+    /// Operation sequence, session serials and the facts of the operation in
+    /// progress, for the C `_ex` entry points (`op_report`).
+    meta: op_report::OpState,
 }
 
 struct PendingAmneziaJunk {
@@ -536,6 +549,7 @@ impl Tunn {
             rate_limiter: rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
+            meta: Default::default(),
         })
     }
 
@@ -561,6 +575,7 @@ impl Tunn {
         for s in &mut self.sessions {
             *s = None;
         }
+        self.meta.all_sessions_removed();
     }
 
     /// Replace this tunnel's AmneziaWG obfuscation settings.
@@ -863,6 +878,7 @@ impl Tunn {
         for s in &mut self.sessions {
             *s = None;
         }
+        self.meta.all_sessions_removed();
     }
 
     /// Encapsulate a single packet from the tunnel interface.
@@ -903,17 +919,37 @@ impl Tunn {
     /// queued packets are still dropped by the existing handshake-expiry,
     /// reset and teardown rules.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
-        if self.has_current_session() {
-            return self.encapsulate_on_session(src, dst);
-        }
-        self.admit_without_session(src, dst)
+        self.encapsulate_with_budget(src, dst, OutputBudget::UNBOUNDED)
     }
 
-    /// A current session that can still send. One whose nonces are spent
-    /// (`Session::sending_exhausted`, Reject-After-Messages) counts as none:
-    /// a write then takes the no-session path -- queued, and a handshake
-    /// started -- rather than failing on a session that may not send again.
-    /// The session stays in its slot and keeps receiving until it expires.
+    /// [`Self::encapsulate`] under `budget`, for `wireguard_write_ex`. With a
+    /// session the frame is transport and `budget.transport` applies; without
+    /// one the output is the handshake's and `budget.control` applies to it --
+    /// never a transport bound on the plaintext waiting for that session. An
+    /// `OutputBudgetExceeded` admits nothing, like any other error.
+    pub(crate) fn encapsulate_with_budget<'a>(
+        &mut self,
+        src: &[u8],
+        dst: &'a mut [u8],
+        budget: OutputBudget,
+    ) -> TunnResult<'a> {
+        if self.has_current_session() {
+            return self.encapsulate_on_session(src, dst, budget);
+        }
+        self.admit_without_session(src, dst, budget)
+    }
+
+    /// Whether a session is selected for sending and can still send: the
+    /// occupant of `current`'s slot. Only selection puts one there -- an
+    /// accepted response's session is selected as it is stored, and a
+    /// responder session is never stored there (`commit_handshake_init`) but
+    /// selected by transport on it.
+    ///
+    /// One whose nonces are spent (`Session::sending_exhausted`,
+    /// Reject-After-Messages) counts as none: a write then takes the
+    /// no-session path -- queued, and a handshake started -- rather than
+    /// failing on a session that may not send again. The session stays in its
+    /// slot and keeps receiving until it expires.
     fn has_current_session(&self) -> bool {
         self.sessions[self.current % N_SESSIONS]
             .as_ref()
@@ -923,7 +959,12 @@ impl Tunn {
     /// Format `src` on the current session -- a new submission from
     /// `encapsulate`, or a queue head `send_queued_packet` already owns. No
     /// admission happens here. `NoCurrentSession` if there is none.
-    fn encapsulate_on_session<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
+    fn encapsulate_on_session<'a>(
+        &mut self,
+        src: &[u8],
+        dst: &'a mut [u8],
+        budget: OutputBudget,
+    ) -> TunnResult<'a> {
         let current = self.current;
         let transport_junk = self.amnezia.transport_junk_size();
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
@@ -931,7 +972,9 @@ impl Tunn {
             // checks only `src.len() + DATA_OVERHEAD_SZ` and then advances the
             // sending counter, while the S4 prefix is added afterwards by
             // `write_to_network` -- so a dst falling between those two sizes
-            // used to burn a nonce on every rejected call.
+            // used to burn a nonce on every rejected call. The transport budget
+            // is checked here too, first, and its ceiling is the room the
+            // padding below may use.
             //
             // This has to stay inside the established-session path. The
             // no-session path (`admit_without_session`) emits a handshake
@@ -939,9 +982,14 @@ impl Tunn {
             // neither size has anything to do with `src.len()` or S4. Gating
             // those on a transport-shaped bound would refuse every write that
             // has to bring the tunnel up.
-            if dst.len() < src.len() + DATA_OVERHEAD_SZ + transport_junk {
-                return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
-            }
+            let ceiling = match budget::admit(
+                budget::transport_frame(src.len(), transport_junk),
+                dst.len(),
+                budget.transport,
+            ) {
+                Ok(ceiling) => ceiling,
+                Err(e) => return TunnResult::Err(e),
+            };
 
             // The frame is observed before its padding is drawn, as upstream's
             // `RoutineEncryption` does, so the window already covers it.
@@ -956,7 +1004,7 @@ impl Tunn {
             // keepalive site both, so the two bounds cannot drift apart.
             let pad = self.amnezia.content_padding_for_frame(
                 src.len(),
-                dst.len(),
+                ceiling,
                 transport_junk,
                 self.udp_window.load(AtomicOrdering::Relaxed),
                 &mut self.handshake.rng,
@@ -979,7 +1027,14 @@ impl Tunn {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes += src.len();
-            return self.write_to_network(dst, packet_size);
+            let result = self.write_to_network(dst, packet_size);
+            let kind = if src.is_empty() {
+                PacketKind::TransportKeepalive
+            } else {
+                PacketKind::TransportData
+            };
+            self.meta.note_output(kind, &result);
+            return result;
         }
         TunnResult::Err(WireGuardError::NoCurrentSession)
     }
@@ -987,11 +1042,16 @@ impl Tunn {
     /// A new application packet with no session: refuse it outright when the
     /// queue is full; otherwise drive the handshake output first and admit
     /// `src` -- once -- only when that output is not an error.
-    fn admit_without_session<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
+    fn admit_without_session<'a>(
+        &mut self,
+        src: &[u8],
+        dst: &'a mut [u8],
+        budget: OutputBudget,
+    ) -> TunnResult<'a> {
         if !self.queue_has_room() {
             return TunnResult::Err(WireGuardError::PacketQueueFull);
         }
-        let result = self.format_handshake_initiation(dst, false);
+        let result = self.format_handshake_initiation_with_budget(dst, false, budget);
         if matches!(result, TunnResult::Err(_)) {
             return result;
         }
@@ -1028,7 +1088,12 @@ impl Tunn {
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
-        self.decapsulate_source(src_addr.map(Source::from), datagram, dst)
+        self.decapsulate_source(
+            src_addr.map(Source::from),
+            datagram,
+            dst,
+            OutputBudget::UNBOUNDED,
+        )
     }
 
     /// [`Self::decapsulate`] given the datagram's whole UDP source endpoint.
@@ -1042,7 +1107,30 @@ impl Tunn {
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
-        self.decapsulate_source(src.map(Source::from), datagram, dst)
+        self.decapsulate_source(
+            src.map(Source::from),
+            datagram,
+            dst,
+            OutputBudget::UNBOUNDED,
+        )
+    }
+
+    /// [`Self::decapsulate`] under `budget`, for `wireguard_read_ex`: the
+    /// response is control output, the keepalive a response produces and a
+    /// drained queue head are transport. A decrypted plaintext is not output
+    /// and is never budgeted.
+    ///
+    /// No source address, as `wireguard_read_ex` has none -- so the limiter
+    /// answers `UnderLoad` rather than demanding a cookie, and the one producer
+    /// this does not budget, the cookie reply, is never reached with a budget.
+    #[cfg(feature = "ffi-bindings")]
+    pub(crate) fn decapsulate_with_budget<'a>(
+        &mut self,
+        datagram: &[u8],
+        dst: &'a mut [u8],
+        budget: OutputBudget,
+    ) -> TunnResult<'a> {
+        self.decapsulate_source(None, datagram, dst, budget)
     }
 
     fn decapsulate_source<'a>(
@@ -1050,12 +1138,13 @@ impl Tunn {
         source: Option<Source>,
         datagram: &[u8],
         dst: &'a mut [u8],
+        budget: OutputBudget,
     ) -> TunnResult<'a> {
         // Auto imitation evidence stays keyed on the address, as it was.
         let src_addr = source.map(Source::address);
         if datagram.is_empty() {
             // Indicates a repeated call
-            return self.send_queued_packet(dst);
+            return self.send_queued_packet(dst, budget);
         }
 
         // The received datagram's length as it arrived on the wire, junk prefix
@@ -1097,14 +1186,14 @@ impl Tunn {
                 source,
                 &candidates,
                 datagram,
-                |packet| this.authenticate(packet, dst),
+                |packet| this.authenticate_with_budget(packet, dst, budget),
             )
         };
 
         match outcome {
             Inbound::Accepted(packet) => {
                 let hint = self.auto_imitation.hint(src_addr);
-                self.commit_with_imitation(packet, datagram, hint, dst)
+                self.commit_with_imitation_and_budget(packet, datagram, hint, dst, budget)
             }
             Inbound::NotOurs => TunnResult::Err(WireGuardError::InvalidPacket),
             Inbound::Refused(refusal) => {
@@ -1218,7 +1307,7 @@ impl Tunn {
                     .or_else(|| self.auto_imitation.hint(src_addr))
                     .or_else(|| imitation::detect::detect(datagram).map(|p| p.protocol()))
                     .unwrap_or(amnezia::AmneziaImitationProtocol::None);
-                match self.write_to_network_with_imitation(
+                let result = match self.write_to_network_with_imitation(
                     dst,
                     packet_size,
                     amnezia::TrailerRoom::cookie_reply(wire_len),
@@ -1230,7 +1319,9 @@ impl Tunn {
                         TunnResult::Done
                     }
                     other => other,
-                }
+                };
+                self.meta.note_output(PacketKind::CookieReply, &result);
+                result
             }
         }
     }
@@ -1264,10 +1355,27 @@ impl Tunn {
     /// The receiver index of a response, cookie reply or transport packet is
     /// used to find the state to check it against, and a mismatch is refused
     /// before any cryptography -- but it is a routing hint, never the proof.
+    ///
+    /// Unbudgeted, for the device's anonymous ingress and the tests; receive
+    /// uses [`Self::authenticate_with_budget`].
+    #[cfg(any(test, feature = "device"))]
     pub(crate) fn authenticate(
         &self,
         packet: Packet,
         dst: &mut [u8],
+    ) -> Result<Authenticated, WireGuardError> {
+        self.authenticate_with_budget(packet, dst, OutputBudget::UNBOUNDED)
+    }
+
+    /// `authenticate`, with the capacity checks of the datagram an
+    /// accepted handshake message must be answered with made against `budget`
+    /// as well as `dst`. Both are refusals of this reading only: the next one
+    /// is still tried (`inbound::receive`).
+    pub(crate) fn authenticate_with_budget(
+        &self,
+        packet: Packet,
+        dst: &mut [u8],
+        budget: OutputBudget,
     ) -> Result<Authenticated, WireGuardError> {
         match packet {
             Packet::HandshakeInit(p) => {
@@ -1275,6 +1383,21 @@ impl Tunn {
                     message = "Received handshake_initiation",
                     remote_idx = p.sender_idx
                 );
+
+                // The response, `HANDSHAKE_RESP_SZ` plus its S2 prefix, is a
+                // fixed requirement knowable here, so it is checked here,
+                // before authentication -- for the reason the response branch
+                // below checks its keepalive first. Accepting an initiation
+                // commits its timestamp and replaces the handshake state; a
+                // refusal raised after that would leave the retry with room
+                // failing as a replay. The rate limiter's mac1 and load checks
+                // have already passed (`inbound::receive`); a trailer is
+                // optional and shrinks to what is left.
+                budget::admit(
+                    Some(HANDSHAKE_RESP_SZ + self.amnezia.handshake_response_junk_size()),
+                    dst.len(),
+                    budget.control_for(ControlOutput::Other),
+                )?;
                 self.handshake
                     .authenticate_initiation(&p)
                     .map(Authenticated::HandshakeInit)
@@ -1295,10 +1418,13 @@ impl Tunn {
                 // after it would discard a valid response and leave the retry
                 // -- with a correct buffer -- failing as UnexpectedPacket.
                 // Unlike the data path, whose equivalent error is retryable,
-                // that would cost the keepalive for good.
-                if dst.len() < DATA_OVERHEAD_SZ + self.amnezia.transport_junk_size() {
-                    return Err(WireGuardError::DestinationBufferTooSmall);
-                }
+                // that would cost the keepalive for good. The same holds for
+                // the transport budget, checked first.
+                budget::admit(
+                    budget::transport_frame(0, self.amnezia.transport_junk_size()),
+                    dst.len(),
+                    budget.transport,
+                )?;
 
                 self.handshake
                     .authenticate_response(&p)
@@ -1337,15 +1463,49 @@ impl Tunn {
     /// a transport plaintext that is not a well-formed IP packet, a `dst` too
     /// small for the handshake response -- is reported, but the datagram has
     /// been accepted as what it authenticated as, and is not read any other way.
+    ///
+    /// Unbudgeted, for the device tests that commit a packet directly; the
+    /// device's anonymous ingress commits through
+    /// [`Self::commit_with_imitation`], and receive uses
+    /// [`Self::commit_with_budget`].
+    #[cfg(all(test, feature = "device"))]
     pub(crate) fn commit<'a>(
         &mut self,
         packet: Authenticated,
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
+        self.commit_with_budget(packet, dst, OutputBudget::UNBOUNDED)
+    }
+
+    /// `commit` under the `budget` [`Self::authenticate_with_budget`]
+    /// already admitted the answer against: it bounds only the optional
+    /// trailer or padding of that answer.
+    pub(crate) fn commit_with_budget<'a>(
+        &mut self,
+        packet: Authenticated,
+        dst: &'a mut [u8],
+        budget: OutputBudget,
+    ) -> TunnResult<'a> {
+        // Accepted, irreversibly, as what it authenticated as -- whatever the
+        // commit below then reports. A cookie reply authenticates no peer.
+        // Transport is told apart by the receiver's own keepalive rule
+        // (`validate_decapsulated_packet`), malformed inner packets included
+        // as data.
+        let (kind, authenticated) = match &packet {
+            Authenticated::HandshakeInit(_) => (PacketKind::HandshakeInitiation, true),
+            Authenticated::HandshakeResponse(_) => (PacketKind::HandshakeResponse, true),
+            Authenticated::CookieReply(_) => (PacketKind::CookieReply, false),
+            Authenticated::Data { len, .. } => match dst.get(..*len).and_then(<[u8]>::first) {
+                None | Some(&0) => (PacketKind::TransportKeepalive, true),
+                Some(_) => (PacketKind::TransportData, true),
+            },
+        };
+        self.meta.note_input(kind, authenticated);
+
         match packet {
-            Authenticated::HandshakeInit(init) => self.commit_handshake_init(init, dst),
+            Authenticated::HandshakeInit(init) => self.commit_handshake_init(init, dst, budget),
             Authenticated::HandshakeResponse(response) => {
-                self.commit_handshake_response(*response, dst)
+                self.commit_handshake_response(*response, dst, budget)
             }
             Authenticated::CookieReply(cookie) => self.commit_cookie_reply(cookie),
             Authenticated::Data { receiver_idx, len } => self.commit_data(receiver_idx, len, dst),
@@ -1366,6 +1526,10 @@ impl Tunn {
 
     /// Pin camouflage only while committing an authenticated initiation. The
     /// hint and outer datagram are untrusted metadata, never authentication.
+    ///
+    /// Unbudgeted, for the device's anonymous ingress; receive uses
+    /// [`Self::commit_with_imitation_and_budget`].
+    #[cfg(feature = "device")]
     pub(crate) fn commit_with_imitation<'a>(
         &mut self,
         packet: Authenticated,
@@ -1373,10 +1537,27 @@ impl Tunn {
         hint: Option<amnezia::AmneziaImitationProtocol>,
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
+        self.commit_with_imitation_and_budget(packet, datagram, hint, dst, OutputBudget::UNBOUNDED)
+    }
+
+    /// `commit_with_imitation` under the `budget` the answer was admitted
+    /// against ([`Self::commit_with_budget`]).
+    pub(crate) fn commit_with_imitation_and_budget<'a>(
+        &mut self,
+        packet: Authenticated,
+        datagram: &[u8],
+        hint: Option<amnezia::AmneziaImitationProtocol>,
+        dst: &'a mut [u8],
+        budget: OutputBudget,
+    ) -> TunnResult<'a> {
         use amnezia::AmneziaImitationProtocol as P;
         let previous = self.auto_imitation.learned;
         // Auto must not consume an initiation or pin its hint when the caller
         // cannot hold the imitated response. Preserve fixed-mode commit semantics.
+        // Every reading that reaches here has already passed the same room
+        // check, and the control budget's, before authentication
+        // (`authenticate_with_budget`, AWG-R1-003); this stays as the guard for
+        // the commit itself.
         if self.amnezia.imitation.protocol == P::Auto
             && matches!(&packet, Authenticated::HandshakeInit(_))
             && dst.len() < HANDSHAKE_RESP_SZ + self.amnezia.response_packet_junk_size as usize
@@ -1402,7 +1583,7 @@ impl Tunn {
                 }
             }
         }
-        let result = self.commit(packet, dst);
+        let result = self.commit_with_budget(packet, dst, budget);
         if matches!(&result, TunnResult::Err(_)) {
             self.auto_imitation.learned = previous;
         } else if previous != self.auto_imitation.learned {
@@ -1422,13 +1603,23 @@ impl Tunn {
         &mut self,
         init: handshake::AuthenticatedInit,
         dst: &'a mut [u8],
+        budget: OutputBudget,
     ) -> Result<TunnResult<'a>, WireGuardError> {
-        let (packet, session) = self.handshake.commit_initiation(init, dst)?;
+        let ceiling = budget::ceiling(dst.len(), budget.control_for(ControlOutput::Other));
+        // Never in the selected session's slot. Stored there, this session --
+        // unconfirmed until transport arrives on it (`commit_data`) -- would
+        // overwrite the session in use and, as the occupant of `current`'s
+        // slot, be sent on before the peer has it, with no session selected
+        // as much as with one.
+        let selected_slot = self.current % N_SESSIONS;
+        let (packet, session) = self.handshake.commit_initiation(init, dst, selected_slot)?;
         let packet_size = packet.len();
 
         // Store new session in ring buffer
         let index = session.local_index();
+        debug_assert_ne!(index % N_SESSIONS, selected_slot);
         self.sessions[index % N_SESSIONS] = Some(session);
+        self.meta.session_stored(index % N_SESSIONS);
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeLastPacketSent);
@@ -1436,13 +1627,17 @@ impl Tunn {
 
         tracing::debug!(message = "Sending handshake_response", local_idx = index);
 
-        Ok(self.write_to_network(dst, packet_size))
+        let result = self.write_handshake_to_network(dst, packet_size, ceiling);
+        self.meta
+            .note_output(PacketKind::HandshakeResponse, &result);
+        Ok(result)
     }
 
     fn commit_handshake_response<'a>(
         &mut self,
         response: handshake::AuthenticatedResponse,
         dst: &'a mut [u8],
+        budget: OutputBudget,
     ) -> Result<TunnResult<'a>, WireGuardError> {
         let transport_junk = self.amnezia.transport_junk_size();
         let session = self.handshake.commit_response(response);
@@ -1455,7 +1650,7 @@ impl Tunn {
         *window = grown_window(*window, self.amnezia.transport_window_observation(0));
         let pad = self.amnezia.content_padding_for_frame(
             0,
-            dst.len(),
+            budget::ceiling(dst.len(), budget.transport),
             transport_junk,
             self.udp_window.load(AtomicOrdering::Relaxed),
             &mut self.handshake.rng,
@@ -1473,6 +1668,7 @@ impl Tunn {
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
         self.sessions[index] = Some(session);
+        self.meta.session_stored(index);
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick_session_established(true, index); // New session established, we are the initiator
@@ -1485,7 +1681,11 @@ impl Tunn {
 
         tracing::debug!("Sending keepalive");
 
-        Ok(self.write_to_network(dst, keepalive_packet_size)) // Send a keepalive as a response
+        // Send a keepalive as a response
+        let result = self.write_to_network(dst, keepalive_packet_size);
+        self.meta
+            .note_output(PacketKind::TransportKeepalive, &result);
+        Ok(result)
     }
 
     fn commit_cookie_reply<'a>(
@@ -1551,8 +1751,22 @@ impl Tunn {
         dst: &'a mut [u8],
         force_resend: bool,
     ) -> TunnResult<'a> {
+        self.format_handshake_initiation_with_budget(dst, force_resend, OutputBudget::UNBOUNDED)
+    }
+
+    /// [`Self::format_handshake_initiation`] with every datagram it may
+    /// produce -- burst item, junk, initiation -- bounded by the control
+    /// budget [`OutputBudget::control_for`] gives its kind
+    /// (`wireguard_force_handshake_ex`, and the no-session write, drain and
+    /// tick paths).
+    pub(crate) fn format_handshake_initiation_with_budget<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+        force_resend: bool,
+        budget: OutputBudget,
+    ) -> TunnResult<'a> {
         if self.pending_amnezia_junk.is_some() {
-            return self.advance_amnezia_junk(dst);
+            return self.advance_amnezia_junk(dst, budget);
         }
 
         if self.handshake.is_in_progress() && !force_resend {
@@ -1567,10 +1781,16 @@ impl Tunn {
         if self.amnezia.emits_pre_handshake() {
             self.pending_amnezia_junk =
                 Some(self.new_pre_handshake_burst(None, reset_expired_timers));
-            return self.advance_amnezia_junk(dst);
+            self.meta.note(event::BURST_PREPARED);
+            return self.advance_amnezia_junk(dst, budget);
         }
 
-        self.format_handshake_initiation_now(dst, force_resend, reset_expired_timers)
+        self.format_handshake_initiation_now_with_budget(
+            dst,
+            force_resend,
+            reset_expired_timers,
+            budget,
+        )
     }
 
     /// The pre-handshake burst the current configuration calls for, ahead of
@@ -1621,25 +1841,48 @@ impl Tunn {
         }
     }
 
-    /// Shared body of every initiation send -- direct, burst completion and
-    /// timer-driven: the mandatory-capacity preflight, then the Expired-cycle
-    /// timer reset if `reset_expired_timers`, then the handshake.
+    /// [`Self::format_handshake_initiation_now_with_budget`] with no budget.
+    #[cfg(test)]
     fn format_handshake_initiation_now<'a>(
         &mut self,
         dst: &'a mut [u8],
         force_resend: bool,
         reset_expired_timers: bool,
     ) -> TunnResult<'a> {
+        self.format_handshake_initiation_now_with_budget(
+            dst,
+            force_resend,
+            reset_expired_timers,
+            OutputBudget::UNBOUNDED,
+        )
+    }
+
+    /// Shared body of every initiation send -- direct, burst completion and
+    /// timer-driven: the mandatory-capacity preflight, then the Expired-cycle
+    /// timer reset if `reset_expired_timers`, then the handshake.
+    fn format_handshake_initiation_now_with_budget<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+        force_resend: bool,
+        reset_expired_timers: bool,
+        budget: OutputBudget,
+    ) -> TunnResult<'a> {
         if self.handshake.is_in_progress() && !force_resend {
             return TunnResult::Done;
         }
 
-        // Mandatory frame: the base initiation and its S1 prefix. Checked before
-        // the handshake consumes an index, an ephemeral key or its state, and
-        // before any deadline draw, attempt count or timer tick below.
-        if dst.len() < self.initiation_wire_floor() {
-            return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
-        }
+        // Mandatory frame: the base initiation and its S1 prefix, against the
+        // control budget and then `dst`. Checked before the handshake consumes
+        // an index, an ephemeral key or its state, and before any deadline
+        // draw, attempt count or timer tick below.
+        let ceiling = match budget::admit(
+            Some(self.initiation_wire_floor()),
+            dst.len(),
+            budget.control_for(ControlOutput::Other),
+        ) {
+            Ok(ceiling) => ceiling,
+            Err(e) => return TunnResult::Err(e),
+        };
 
         if reset_expired_timers && self.handshake.is_expired() {
             self.timers.clear();
@@ -1676,7 +1919,14 @@ impl Tunn {
                         self.timers.handshake_attempts.saturating_add(1);
                 }
                 self.timer_tick(TimerName::TimeLastPacketSent);
-                self.write_to_network(dst, packet_size)
+                let result = self.write_handshake_to_network(dst, packet_size, ceiling);
+                // Produced and returned -- not sent: the caller has yet to.
+                if matches!(result, TunnResult::WriteToNetwork(_)) {
+                    self.meta.note(event::INITIATION_PRODUCED);
+                }
+                self.meta
+                    .note_output(PacketKind::HandshakeInitiation, &result);
+                result
             }
             Err(e) => TunnResult::Err(e),
         }
@@ -1711,7 +1961,15 @@ impl Tunn {
         }
     }
 
-    fn advance_amnezia_junk<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+    /// Emit the pending burst's next datagram, if it is due: an imitation
+    /// datagram, a Jc junk datagram, or the deferred initiation. Each is a
+    /// control datagram; a refusal -- budget or `dst` -- keeps it pending, as
+    /// it was, for a later call.
+    fn advance_amnezia_junk<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+        budget: OutputBudget,
+    ) -> TunnResult<'a> {
         let Some(pending) = self.pending_amnezia_junk.as_ref() else {
             return TunnResult::Done;
         };
@@ -1740,15 +1998,21 @@ impl Tunn {
                 .as_mut()
                 .expect("pending checked above");
             // Check capacity before dequeuing so a too-small buffer can be
-            // retried without losing the datagram.
+            // retried without losing the datagram. An imitation datagram is
+            // generated whole and is never cut to fit a budget either: over
+            // one, it waits, in its place, for a call whose budget holds it.
             let size = pending
                 .imitation_datagrams
                 .front()
                 .expect("queue checked non-empty above")
                 .1
                 .len();
-            if dst.len() < size {
-                return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+            if let Err(e) = budget::admit(
+                Some(size),
+                dst.len(),
+                budget.control_for(ControlOutput::Other),
+            ) {
+                return TunnResult::Err(e);
             }
             let (_, datagram) = pending.imitation_datagrams.pop_front().unwrap();
             // wgbooster uses a delay-AFTER model: the imitation sequence has no
@@ -1764,7 +2028,9 @@ impl Tunn {
             };
             self.reset_expired_timers_on_first_emit();
             dst[..size].copy_from_slice(&datagram);
-            return TunnResult::WriteToNetwork(&mut dst[..size]);
+            let result = TunnResult::WriteToNetwork(&mut dst[..size]);
+            self.meta.note_output(PacketKind::Imitation, &result);
+            return result;
         }
 
         if remaining == 0 {
@@ -1783,35 +2049,46 @@ impl Tunn {
                 .pending_amnezia_junk
                 .as_ref()
                 .is_some_and(|p| p.reset_expired_timers);
-            let result = self.format_handshake_initiation_now(dst, true, reset);
+            let result = self.format_handshake_initiation_now_with_budget(dst, true, reset, budget);
             if matches!(result, TunnResult::WriteToNetwork(_)) {
                 self.pending_amnezia_junk = None;
             }
             return result;
         }
 
-        // Preflight against the largest size the draw can produce, before the
-        // draw: deterministic admission, no RNG spent on a refusal, and no
-        // retry-dependent size.
-        if dst.len() < self.amnezia.pre_handshake_junk_max_size() {
+        // The size range this datagram is drawn from under the control
+        // budget -- ordinary junk clamped at both ends, protocol junk refused
+        // when the budget is below its protocol's minimum, unless the call
+        // bounds ordinary junk only -- then the preflight against the largest
+        // size that range can produce, before the draw: deterministic
+        // admission, no RNG spent on a refusal, and no retry-dependent size.
+        // `dst` never narrows the range.
+        let range = match self.amnezia.pre_handshake_junk_range_within(budget) {
+            Ok(range) => range,
+            Err(e) => return TunnResult::Err(e),
+        };
+        if dst.len() < self.amnezia.pre_handshake_junk_max_size_in(range) {
             return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
         }
         self.reset_expired_timers_on_first_emit();
 
-        let packet = match self
-            .amnezia
-            .fill_pre_handshake_junk(dst, &mut self.handshake.rng)
-        {
-            Ok(packet) => packet,
-            Err(e) => return TunnResult::Err(e),
-        };
+        let packet =
+            match self
+                .amnezia
+                .fill_pre_handshake_junk_in(dst, range, &mut self.handshake.rng)
+            {
+                Ok(packet) => packet,
+                Err(e) => return TunnResult::Err(e),
+            };
 
         if let Some(pending) = &mut self.pending_amnezia_junk {
             pending.remaining -= 1;
             pending.last_packet_at = Some(Instant::now());
         }
 
-        TunnResult::WriteToNetwork(packet)
+        let result = TunnResult::WriteToNetwork(packet);
+        self.meta.note_output(PacketKind::Junk, &result);
+        result
     }
 
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
@@ -1925,28 +2202,58 @@ impl Tunn {
     /// queue untouched. A session: format the head on it; on a refusal the
     /// same head goes back to the front and a capacity error is reported
     /// rather than hidden as `Done`.
-    fn send_queued_packet<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+    ///
+    /// With a session and a finite transport budget, a head whose mandatory
+    /// frame is larger than that budget is deleted (owner decision 2A): it is
+    /// never encrypted, so it takes no nonce and counts no sent bytes, the
+    /// call reports `QUEUE_HEAD_DROPPED`, and the next head is tried. Only the
+    /// mandatory frame decides: a head short only of `dst`, or of room for
+    /// its padding, stays. One call makes at most as many head operations as
+    /// the queue held when it began, and emits at most one packet; when every
+    /// head was deleted it returns `Done`.
+    fn send_queued_packet<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+        budget: OutputBudget,
+    ) -> TunnResult<'a> {
         if self.packet_queue.is_empty() {
             return TunnResult::Done;
         }
         if !self.has_current_session() {
-            return self.format_handshake_initiation(dst, false);
+            return self.format_handshake_initiation_with_budget(dst, false, budget);
         }
-        let packet = self
-            .dequeue_packet()
-            .expect("queue checked non-empty above");
-        match self.encapsulate_on_session(&packet, dst) {
-            TunnResult::Err(e) => {
-                self.requeue_packet(packet);
-                match e {
-                    WireGuardError::DestinationBufferTooSmall => TunnResult::Err(e),
-                    // Unreachable today (the session was checked above and
-                    // formatting reports nothing else); kept as it was.
-                    _ => TunnResult::Done,
-                }
+        let transport_junk = self.amnezia.transport_junk_size();
+        for _ in 0..self.packet_queue.len() {
+            let Some(head) = self.packet_queue.front() else {
+                break;
+            };
+            if budget::exceeds(
+                budget::transport_frame(head.len(), transport_junk),
+                budget.transport,
+            ) {
+                self.dequeue_packet();
+                self.meta.note(event::QUEUE_HEAD_DROPPED);
+                continue;
             }
-            r => r,
+            let Some(packet) = self.dequeue_packet() else {
+                break;
+            };
+            return match self.encapsulate_on_session(&packet, dst, budget) {
+                TunnResult::Err(e) => {
+                    self.requeue_packet(packet);
+                    match e {
+                        WireGuardError::DestinationBufferTooSmall
+                        | WireGuardError::OutputBudgetExceeded => TunnResult::Err(e),
+                        // Unreachable today (the session was checked above,
+                        // the budget just now, and formatting reports nothing
+                        // else); kept as it was.
+                        _ => TunnResult::Done,
+                    }
+                }
+                r => r,
+            };
         }
+        TunnResult::Done
     }
 
     fn queue_has_room(&self) -> bool {
@@ -1960,6 +2267,7 @@ impl Tunn {
             return Err(WireGuardError::PacketQueueFull);
         }
         self.packet_queue.push_back(packet.to_vec());
+        self.meta.note(event::QUEUE_ADMITTED);
         Ok(())
     }
 
@@ -1979,6 +2287,20 @@ impl Tunn {
     /// none (its addition was drawn as padding, inside the AEAD).
     fn write_to_network<'a>(&mut self, dst: &'a mut [u8], packet_size: usize) -> TunnResult<'a> {
         let room = amnezia::TrailerRoom::window(*self.udp_window.get_mut());
+        self.write_to_network_with(dst, packet_size, room)
+    }
+
+    /// [`Self::write_to_network`] for an initiation or a response, whose
+    /// RandomTrailers suffix must also keep the whole datagram within
+    /// `ceiling` -- the [`budget::ceiling`] of the control budget the
+    /// mandatory frame was admitted under.
+    fn write_handshake_to_network<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+        packet_size: usize,
+        ceiling: usize,
+    ) -> TunnResult<'a> {
+        let room = amnezia::TrailerRoom::window(*self.udp_window.get_mut()).within(ceiling);
         self.write_to_network_with(dst, packet_size, room)
     }
 
@@ -5434,6 +5756,31 @@ mod tests {
             my_tun.update_timers(&mut [0u8; 64]),
             TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
         ));
+        advance(Duration::from_millis(250));
+        assert_eq!(poll_kind(&mut my_tun), Some("initiation"));
+    }
+
+    /// The same restart refused by a control budget (`wireguard_tick_ex`):
+    /// the initiation it needs does not fit, nothing is queued, and the
+    /// keepalive stays owed exactly as it does after a short `dst` -- the
+    /// next tick with room sends the initiation.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_keepalive_owed_after_expiry_survives_a_budget_refusal() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let _ = create_handshake_init(&mut my_tun);
+        tick_until_expired(&mut my_tun, timers::untuned_attempt_window() * 2);
+
+        my_tun.set_persistent_keepalive(Some(25));
+        let budget = OutputBudget {
+            control: HANDSHAKE_INIT_SZ as u32 - 1,
+            ..OutputBudget::UNBOUNDED
+        };
+        assert!(matches!(
+            my_tun.update_timers_with_budget(&mut [0u8; 2048], budget),
+            TunnResult::Err(WireGuardError::OutputBudgetExceeded)
+        ));
+        assert!(my_tun.packet_queue.is_empty(), "the keepalive was admitted");
         advance(Duration::from_millis(250));
         assert_eq!(poll_kind(&mut my_tun), Some("initiation"));
     }

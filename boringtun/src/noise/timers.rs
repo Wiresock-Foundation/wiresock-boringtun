@@ -1,7 +1,9 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+use super::budget::OutputBudget;
 use super::errors::WireGuardError;
+use super::op_report::event;
 use crate::noise::{Tunn, TunnResult};
 use rand_chacha::ChaCha8Rng;
 use rand_core::{OsRng, RngCore, SeedableRng};
@@ -310,6 +312,7 @@ impl Tunn {
         for session in &mut self.sessions {
             *session = None;
         }
+        self.meta.all_sessions_removed();
 
         self.packet_queue.clear();
         self.pending_amnezia_junk = None;
@@ -339,6 +342,8 @@ impl Tunn {
                         session = session.receiving_index,
                         after_secs = reject_after_time.as_secs()
                     );
+                    self.meta.session_removed(i);
+                    self.meta.note(event::SESSIONS_AGED_OUT);
                 }
                 *t = time_now;
             }
@@ -366,6 +371,7 @@ impl Tunn {
             );
             self.handshake.set_expired();
             self.clear_all();
+            self.meta.note(event::HANDSHAKE_EXPIRED);
             return true;
         }
 
@@ -402,6 +408,7 @@ impl Tunn {
             tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
             self.handshake.set_expired();
             self.clear_all();
+            self.meta.note(event::HANDSHAKE_EXPIRED);
             return true;
         }
         false
@@ -417,13 +424,34 @@ impl Tunn {
     }
 
     pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+        self.update_timers_with_budget(dst, OutputBudget::UNBOUNDED)
+    }
+
+    /// [`Self::update_timers`] under `budget`, for `wireguard_tick_ex`.
+    ///
+    /// A demand this tick selects and then cannot produce because the
+    /// datagram is over the budget gives back exactly what selecting it
+    /// spent, at once, as a `dst` capacity refusal does: the handshake latch
+    /// -- unless a burst prepared by this call now owns that initiation -- or
+    /// what the keepalive demand took (the passive-keepalive latch, the
+    /// persistent-keepalive stamp and the owed persistent keepalive, as they
+    /// stood on entry). Nothing else is rolled back: what the tick did before
+    /// (ageing, expiry, a burst it prepared) stands, and a later handshake
+    /// still clears the latch as it would have. A burst pending on entry is
+    /// served before any demand is selected, so its refusal selects and gives
+    /// back nothing. The other errors keep their existing handling.
+    pub(crate) fn update_timers_with_budget<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+        budget: OutputBudget,
+    ) -> TunnResult<'a> {
         let mut handshake_initiation_required = false;
         let mut consumed_handshake_latch = None;
         let mut keepalive_required = false;
         // What selecting a keepalive spends, put back if it then does not fit
-        // `dst`: as with the handshake latch below, a capacity refusal must
-        // not cost the demand -- a persistent keepalive owed at activation
-        // would otherwise wait a whole interval.
+        // `dst` or the budget: as with the handshake latch below, a capacity
+        // refusal must not cost the demand -- a persistent keepalive owed at
+        // activation would otherwise wait a whole interval.
         let keepalive_rollback = (
             self.timers.persistent_keepalive_due,
             self.timers[TimePersistentKeepalive],
@@ -451,7 +479,7 @@ impl Tunn {
         // burst prepared, which stays pending across capacity refusals (see
         // `PendingAmneziaJunk::reset_expired_timers`).
         if self.burst_owes_expired_reset() {
-            return self.advance_amnezia_junk(dst);
+            return self.advance_amnezia_junk(dst, budget);
         }
 
         // Any other burst belongs to a cycle whose lifetime has begun. The
@@ -461,7 +489,7 @@ impl Tunn {
             if self.expire_past_absolute_bounds(now) {
                 return TunnResult::Err(WireGuardError::ConnectionExpired);
             }
-            return self.advance_amnezia_junk(dst);
+            return self.advance_amnezia_junk(dst, budget);
         }
 
         if self.handshake.is_expired() {
@@ -476,7 +504,7 @@ impl Tunn {
             tracing::debug!("KEEPALIVE(PERSISTENT_KEEPALIVE)");
             self.timers.persistent_keepalive_due = false;
             self.timer_tick(TimePersistentKeepalive);
-            return self.send_keepalive(dst, keepalive_rollback);
+            return self.send_keepalive(dst, keepalive_rollback, budget);
         }
 
         // Load timers only once:
@@ -533,6 +561,7 @@ impl Tunn {
                         );
                         self.handshake.set_expired();
                         self.clear_all();
+                        self.meta.note(event::HANDSHAKE_EXPIRED);
                         return TunnResult::Err(WireGuardError::ConnectionExpired);
                     }
 
@@ -611,49 +640,92 @@ impl Tunn {
         }
 
         if handshake_initiation_required {
-            let result = self.format_handshake_initiation(dst, true);
+            let result = self.format_handshake_initiation_with_budget(dst, true, budget);
             // The edge-triggered latch was spent selecting this demand. A
-            // capacity refusal now happens before any handshake state exists
-            // to retransmit, so re-arm it -- unless a burst was prepared, which
-            // carries the demand itself.
+            // capacity refusal -- `dst` or budget -- now happens before any
+            // handshake state exists to retransmit, so re-arm it -- unless a
+            // burst was prepared, which carries the demand itself.
             if let Some(armed) = consumed_handshake_latch {
                 if self.pending_amnezia_junk.is_none()
                     && matches!(
                         result,
-                        TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+                        TunnResult::Err(
+                            WireGuardError::DestinationBufferTooSmall
+                                | WireGuardError::OutputBudgetExceeded
+                        )
                     )
                 {
                     self.timers.want_handshake = Some(armed);
                 }
             }
+            if matches!(result, TunnResult::Err(_)) {
+                self.meta.note(event::TICK_DEMAND_REFUSED);
+            }
             return result;
         }
 
         if keepalive_required {
-            return self.send_keepalive(dst, keepalive_rollback);
+            return self.send_keepalive(dst, keepalive_rollback, budget);
         }
 
         TunnResult::Done
     }
 
-    /// Send the keepalive a tick selected. If `dst` cannot hold it, put back
-    /// what selecting it spent, `rollback` as `update_timers` captured it.
+    /// Send the keepalive a tick selected. If `dst` or `budget` cannot hold
+    /// it, put back what selecting it spent, `rollback` as `update_timers`
+    /// captured it. Over the budget the keepalive was not produced, nor --
+    /// without a session -- its empty packet queued; a burst the no-session
+    /// path prepared owns only the initiation.
     fn send_keepalive<'a>(
         &mut self,
         dst: &'a mut [u8],
         rollback: (bool, Duration, Option<Duration>),
+        budget: OutputBudget,
     ) -> TunnResult<'a> {
-        let result = self.encapsulate(&[], dst);
+        let result = self.encapsulate_with_budget(&[], dst, budget);
         if matches!(
             result,
-            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+            TunnResult::Err(
+                WireGuardError::DestinationBufferTooSmall | WireGuardError::OutputBudgetExceeded
+            )
         ) {
             let (due, persistent, passive) = rollback;
             self.timers.persistent_keepalive_due = due;
             self.timers[TimePersistentKeepalive] = persistent;
             self.timers.want_keepalive = passive;
         }
+        if matches!(result, TunnResult::Err(_)) {
+            self.meta.note(event::TICK_DEMAND_REFUSED);
+        }
         result
+    }
+
+    /// The tick's edge-triggered demands and the persistent-keepalive stamp:
+    /// `(want_handshake armed, want_keepalive armed, TimePersistentKeepalive)`.
+    /// For the FFI tests that check what a refused tick spent and gave back.
+    #[cfg(all(test, feature = "ffi-bindings", feature = "mock-instant"))]
+    pub(crate) fn timer_demands(&self) -> (bool, bool, Duration) {
+        (
+            self.timers.want_handshake.is_some(),
+            self.timers.want_keepalive.is_some(),
+            self.timers[TimePersistentKeepalive],
+        )
+    }
+
+    /// Everything a selected keepalive or handshake demand spends, exactly:
+    /// both armed instants, the persistent-keepalive stamp and whether a
+    /// persistent keepalive is owed. For the FFI tests that check a refusal
+    /// gives back what it took, not merely a demand of the same kind.
+    #[cfg(all(test, feature = "ffi-bindings", feature = "mock-instant"))]
+    pub(crate) fn timer_demand_state(
+        &self,
+    ) -> (Option<Duration>, Option<Duration>, Duration, bool) {
+        (
+            self.timers.want_handshake,
+            self.timers.want_keepalive,
+            self.timers[TimePersistentKeepalive],
+            self.timers.persistent_keepalive_due,
+        )
     }
 
     pub fn time_since_last_handshake(&self) -> Option<Duration> {

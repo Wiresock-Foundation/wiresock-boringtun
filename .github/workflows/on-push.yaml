@@ -139,7 +139,9 @@ jobs:
             # The `_Z` grep above only proves nothing is mangled -- it passes
             # just as happily when a symbol stopped being referenced at all,
             # which is precisely how a guard stops guarding without failing.
-            for sym in new_tunnel_with_awg_params wireguard_set_content_padding_mtu; do
+            for sym in new_tunnel_with_awg_params wireguard_set_content_padding_mtu \
+                       wireguard_read_ex wireguard_write_ex wireguard_tick_ex \
+                       wireguard_force_handshake_ex; do
               nm -u "/tmp/cpp$bits.o" | grep -qE "(^| )U $sym\$" || {
                 echo "::error::$sym is not referenced at -m$bits; scripts/ffi-header-cpp-check.cpp must keep a reference to it"; exit 1; }
             done

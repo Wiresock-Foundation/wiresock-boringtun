@@ -26,4 +26,14 @@ pub enum WireGuardError {
     /// A new application packet was refused because the queue of packets
     /// waiting for a handshake is full; the packet was not accepted.
     PacketQueueFull = 17,
+    /// The datagram this operation must produce is larger than the finite
+    /// output budget the `wireguard_*_ex` caller gave it (`max_*_output` in
+    /// `wireguard_packet_info`). Checked before the producer consumes
+    /// anything; reported in preference to `DestinationBufferTooSmall` when
+    /// both apply. The operation ran: earlier facts of the call stand.
+    OutputBudgetExceeded = 18,
+    /// A `wireguard_*_ex` call's `wireguard_packet_info` was refused before the
+    /// operation ran: nothing was read beyond what the check needed, nothing
+    /// was written, and the tunnel was not touched.
+    InvalidPacketInfo = 19,
 }

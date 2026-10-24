@@ -33,6 +33,18 @@ use std::slice;
 #[cfg(not(test))]
 use std::sync::Once;
 
+mod packet_info;
+pub use packet_info::{
+    wireguard_packet_info, WIREGUARD_INFO_F_CONTROL_ORDINARY_JUNK_ONLY,
+    WIREGUARD_PACKET_INFO_OUTPUT_START, WIREGUARD_PACKET_INFO_SIZE_MAX,
+    WIREGUARD_PACKET_INFO_SIZE_V1,
+};
+
+#[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
+mod metadata_tests;
+
 #[cfg(not(test))]
 static PANIC_HOOK: Once = Once::new();
 
@@ -1980,11 +1992,26 @@ pub unsafe extern "C" fn wireguard_write(
     dst: *mut u8,
     dst_size: u32,
 ) -> wireguard_result {
-    let mut tunnel = tunnel.as_ref().unwrap().lock();
-    // Slices are not owned, and therefore will not be freed by Rust
-    let src = slice::from_raw_parts(src, src_size as usize);
-    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    wireguard_result::from(tunnel.encapsulate(src, dst))
+    wireguard_write_ex(tunnel, src, src_size, dst, dst_size, ptr::null_mut())
+}
+
+/// `wireguard_write`, plus what the operation did in `*info` when `info` is
+/// not NULL. See [`wireguard_packet_info`].
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_write_ex(
+    tunnel: *const Mutex<Tunn>,
+    src: *const u8,
+    src_size: u32,
+    dst: *mut u8,
+    dst_size: u32,
+    info: *mut wireguard_packet_info,
+) -> wireguard_result {
+    packet_info::run(tunnel, info, |tunnel, budget| {
+        // Slices are not owned, and therefore will not be freed by Rust
+        let src = slice::from_raw_parts(src, src_size as usize);
+        let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
+        tunnel.encapsulate_with_budget(src, dst, budget)
+    })
 }
 
 /// Read a UDP packet from the server.
@@ -1997,21 +2024,40 @@ pub unsafe extern "C" fn wireguard_read(
     dst: *mut u8,
     dst_size: u32,
 ) -> wireguard_result {
-    let mut tunnel = tunnel.as_ref().unwrap().lock();
-    // Slices are not owned, and therefore will not be freed by Rust
-    let src = slice::from_raw_parts(src, src_size as usize);
-    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    // `None` is not just "the C ABI has no sockaddr": `RateLimiter::verify_packet`
-    // returns `UnderLoad` on a `None` source before it formats a cookie reply, so
-    // no tunnel driven through this entry point emits one at all.
-    //
-    // That is no longer what makes an amplifying S3 safe to accept in
-    // `new_tunnel_with_awg_params` -- `Tunn::decapsulate` refuses to emit an
-    // amplifying reply at its own emit site, for every tunnel however it was
-    // built and however it is driven. So a future `wireguard_read_from` that
-    // plumbs a real address through here needs no new guard; it inherits that
-    // one. This `None` is now a second line, not the only one.
-    wireguard_result::from(tunnel.decapsulate(None, src, dst))
+    wireguard_read_ex(tunnel, src, src_size, dst, dst_size, ptr::null_mut())
+}
+
+/// `wireguard_read`, plus what the operation did in `*info` when `info` is
+/// not NULL. See [`wireguard_packet_info`].
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_read_ex(
+    tunnel: *const Mutex<Tunn>,
+    src: *const u8,
+    src_size: u32,
+    dst: *mut u8,
+    dst_size: u32,
+    info: *mut wireguard_packet_info,
+) -> wireguard_result {
+    packet_info::run(tunnel, info, |tunnel, budget| {
+        // Slices are not owned, and therefore will not be freed by Rust
+        let src = slice::from_raw_parts(src, src_size as usize);
+        let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
+        // `None` is not just "the C ABI has no sockaddr": `RateLimiter::verify_packet`
+        // returns `UnderLoad` on a `None` source before it formats a cookie reply, so
+        // no tunnel driven through this entry point emits one at all.
+        //
+        // That is no longer what makes an amplifying S3 safe to accept in
+        // `new_tunnel_with_awg_params` -- `Tunn::decapsulate` refuses to emit an
+        // amplifying reply at its own emit site, for every tunnel however it was
+        // built and however it is driven. So a future `wireguard_read_from` that
+        // plumbs a real address through here needs no new guard; it inherits that
+        // one. This `None` is now a second line, not the only one.
+        //
+        // `decapsulate_with_budget` is `decapsulate(None, ..)` under the call's
+        // budgets. A `wireguard_read_from` would also have to budget the cookie
+        // reply, which that function leaves unbudgeted because it is unreachable.
+        tunnel.decapsulate_with_budget(src, dst, budget)
+    })
 }
 
 /// This is a state keeping function, that need to be called periodically.
@@ -2022,10 +2068,23 @@ pub unsafe extern "C" fn wireguard_tick(
     dst: *mut u8,
     dst_size: u32,
 ) -> wireguard_result {
-    let mut tunnel = tunnel.as_ref().unwrap().lock();
-    // Slices are not owned, and therefore will not be freed by Rust
-    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    wireguard_result::from(tunnel.update_timers(dst))
+    wireguard_tick_ex(tunnel, dst, dst_size, ptr::null_mut())
+}
+
+/// `wireguard_tick`, plus what the operation did in `*info` when `info` is
+/// not NULL. See [`wireguard_packet_info`].
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_tick_ex(
+    tunnel: *const Mutex<Tunn>,
+    dst: *mut u8,
+    dst_size: u32,
+    info: *mut wireguard_packet_info,
+) -> wireguard_result {
+    packet_info::run(tunnel, info, |tunnel, budget| {
+        // Slices are not owned, and therefore will not be freed by Rust
+        let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
+        tunnel.update_timers_with_budget(dst, budget)
+    })
 }
 
 /// Force the tunnel to initiate a new handshake, dst buffer must be at least 148 byte long.
@@ -2035,10 +2094,23 @@ pub unsafe extern "C" fn wireguard_force_handshake(
     dst: *mut u8,
     dst_size: u32,
 ) -> wireguard_result {
-    let mut tunnel = tunnel.as_ref().unwrap().lock();
-    // Slices are not owned, and therefore will not be freed by Rust
-    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    wireguard_result::from(tunnel.format_handshake_initiation(dst, true))
+    wireguard_force_handshake_ex(tunnel, dst, dst_size, ptr::null_mut())
+}
+
+/// `wireguard_force_handshake`, plus what the operation did in `*info` when
+/// `info` is not NULL. See [`wireguard_packet_info`].
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_force_handshake_ex(
+    tunnel: *const Mutex<Tunn>,
+    dst: *mut u8,
+    dst_size: u32,
+    info: *mut wireguard_packet_info,
+) -> wireguard_result {
+    packet_info::run(tunnel, info, |tunnel, budget| {
+        // Slices are not owned, and therefore will not be freed by Rust
+        let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
+        tunnel.format_handshake_initiation_with_budget(dst, true, budget)
+    })
 }
 
 /// Returns stats from the tunnel:
