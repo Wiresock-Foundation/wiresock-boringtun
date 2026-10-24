@@ -1464,9 +1464,11 @@ impl Tunn {
     /// small for the handshake response -- is reported, but the datagram has
     /// been accepted as what it authenticated as, and is not read any other way.
     ///
-    /// Unbudgeted, for the device's anonymous ingress; receive uses
+    /// Unbudgeted, for the device tests that commit a packet directly; the
+    /// device's anonymous ingress commits through
+    /// [`Self::commit_with_imitation`], and receive uses
     /// [`Self::commit_with_budget`].
-    #[cfg(feature = "device")]
+    #[cfg(all(test, feature = "device"))]
     pub(crate) fn commit<'a>(
         &mut self,
         packet: Authenticated,
