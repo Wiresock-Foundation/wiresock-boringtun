@@ -3340,13 +3340,16 @@ mod ingress_tests {
         assert_eq!(r.endpoint(), Some(b));
     }
 
-    /// The other way a commit fails after authenticating: an initiation from a
-    /// new address whose response cannot be written -- here, a buffer too
-    /// small for the response's S2 prefix. The initiation is still consumed (as
-    /// it always was), but the endpoint does not move, so the window goes back
-    /// to A's.
+    /// An initiation from a new address whose response cannot be written --
+    /// here, a buffer too small for the response's S2 prefix -- no longer
+    /// reaches the commit. The room for the response is checked before
+    /// authentication (AWG-R1-003), so nothing is consumed: the endpoint does
+    /// not move and the window is never replaced. Offered again with room,
+    /// the same initiation is answered and the endpoint moves to B. (A commit
+    /// that fails after authenticating, and puts the window back, is the
+    /// transport case above.)
     #[test]
-    fn a_failed_initiation_commit_from_a_new_address_restores_the_window() {
+    fn an_initiation_from_a_new_address_without_room_for_its_response_is_refused() {
         let a = addr("198.51.100.1:40000");
         let b = addr("203.0.113.9:51000");
         let mut r = Roaming::new().settled_at(a);
@@ -3358,9 +3361,14 @@ mod ingress_tests {
             other => panic!("expected an initiation, got {:?}", other),
         };
         // Room for the 92-byte response, not for its 24-byte prefix as well.
-        assert!(matches!(r.ingress_into(&init, b, 100), Delivered::Error));
+        assert!(matches!(r.ingress_into(&init, b, 100), Delivered::Refused));
         assert_eq!(r.endpoint(), Some(a));
         assert_eq!(r.window(), OLD_WINDOW);
+        assert!(
+            matches!(r.ingress(&init, b), Delivered::Network(_)),
+            "refused before it was accepted: the retry is answered"
+        );
+        assert_eq!(r.endpoint(), Some(b));
     }
 
     /// A server whose peer tunnel and device ingress share one starved limiter

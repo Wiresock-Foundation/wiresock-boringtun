@@ -6,7 +6,7 @@ use super::handshake::{b2s_hash, b2s_keyed_mac_16, LABEL_MAC1};
 use super::inbound::fixtures::{
     bare_ipv4, colliding, handshake, keyed_pair_with_publics, network, pair,
 };
-use super::{AuthenticatedPacketKind as Kind, Tunn, TunnResult};
+use super::{AuthenticatedPacketKind as Kind, Tunn, TunnResult, HANDSHAKE_RESP_SZ};
 use std::convert::TryInto;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -102,10 +102,65 @@ fn accepted_cookie_is_distinct_from_the_unauthenticated_cookie_demand() {
         assert_eq!(kind, Some(Kind::CookieReply));
         assert!(!kind.unwrap().moves_endpoint());
         assert!(matches!(result, TunnResult::Done));
+        // A reply is accepted once per handshake message we send; a captured
+        // copy is refused and accepted as nothing.
+        let (result, kind) = mine.decapsulate_from_with_metadata(source(), &cookie, &mut buf);
+        assert_eq!(kind, None);
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::UnexpectedPacket)
+        ));
         let (result, kind) = mine.decapsulate_from_with_metadata(source(), &[0xff], &mut buf);
         assert_eq!(kind, None);
         assert!(matches!(result, TunnResult::Err(_)));
     });
+}
+
+#[test]
+fn an_initiation_proven_by_its_cookie_is_accepted_under_load() {
+    profiles().iter().for_each(|config| {
+        let (mut mine, mut theirs) = pair(config, Some(0));
+        let mut buf = [0; 4096];
+        let init = network(mine.format_handshake_initiation(&mut buf, false));
+        let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
+        assert_eq!(kind, None, "a cookie demand accepts nothing");
+        let cookie = network(result);
+        let (_, kind) = mine.decapsulate_from_with_metadata(source(), &cookie, &mut buf);
+        assert_eq!(kind, Some(Kind::CookieReply));
+        // The retransmission carries a mac2 under the cookie, bound to the
+        // same source, and is admitted although the responder is under load.
+        let init = network(mine.format_handshake_initiation(&mut buf, true));
+        let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
+        assert_eq!(kind, Some(Kind::HandshakeInitiation));
+        assert!(kind.unwrap().moves_endpoint());
+        let response = network(result);
+        let (result, kind) = mine.decapsulate_from_with_metadata(source(), &response, &mut buf);
+        assert_eq!(kind, Some(Kind::HandshakeResponse));
+        assert!(matches!(result, TunnResult::WriteToNetwork(_)));
+    });
+}
+
+#[test]
+fn an_acceptance_by_another_entry_point_is_not_reported_by_the_next_metadata_receive() {
+    // The kind is tunnel state between the commit that records it and the
+    // end of the metadata receive. A legacy receive records acceptance too;
+    // it must not surface in a later metadata receive that accepts nothing.
+    let (mut mine, mut theirs) = pair(&AmneziaConfig::default(), None);
+    let mut buf = [0; 4096];
+    let init = network(mine.format_handshake_initiation(&mut buf, false));
+    assert!(matches!(
+        theirs.decapsulate_from(source(), &init, &mut buf),
+        TunnResult::WriteToNetwork(_)
+    ));
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
+    assert_eq!(kind, None);
+    assert!(matches!(
+        result,
+        TunnResult::Err(WireGuardError::WrongTai64nTimestamp)
+    ));
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &[0xff], &mut buf);
+    assert_eq!(kind, None);
+    assert!(matches!(result, TunnResult::Err(_)));
 }
 
 #[test]
@@ -131,47 +186,42 @@ fn authenticated_malformed_plaintext_retains_proof_without_ip_delivery() {
 }
 
 #[test]
-fn fixed_mode_initiation_capacity_error_consumes_the_initiation() {
-    let (mut mine, mut theirs) = pair(&AmneziaConfig::default(), None);
-    let mut buf = [0; 2048];
-    let init = network(mine.format_handshake_initiation(&mut buf, false));
-    let mut short = [0; 16];
-    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut short);
-    assert_eq!(kind, Some(Kind::HandshakeInitiation));
-    assert!(matches!(
-        result,
-        TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
-    ));
-    // Fixed mode records the timestamp before the response-size check, so the
-    // initiation is consumed even though the commit failed. The retry is
-    // refused rather than answered.
-    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
-    assert_eq!(kind, None);
-    assert!(matches!(
-        result,
-        TunnResult::Err(WireGuardError::WrongTai64nTimestamp)
-    ));
-}
-
-#[test]
-fn auto_mode_initiation_capacity_error_keeps_the_initiation_retryable() {
-    let config = AmneziaConfig::new(128, 128, 128, 128)
-        .with_protocol_imitation(AmneziaImitationProtocol::Auto, None);
-    let (mut mine, mut theirs) = pair(&config, None);
-    let mut buf = [0; 4096];
-    let init = network(mine.format_handshake_initiation(&mut buf, false));
-    let mut short = [0; 16];
-    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut short);
-    assert_eq!(kind, Some(Kind::HandshakeInitiation));
-    assert!(matches!(
-        result,
-        TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
-    ));
-    // Auto mode refuses before committing, so the same initiation can be
-    // retried with a larger buffer.
-    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
-    assert_eq!(kind, Some(Kind::HandshakeInitiation));
-    assert!(matches!(result, TunnResult::WriteToNetwork(_)));
+fn initiation_without_room_for_its_response_has_no_kind_and_stays_retryable() {
+    // The room for the response is checked before the initiation is
+    // authenticated (AWG-R1-003), so a short buffer consumes nothing in any
+    // imitation mode: no kind, and the same initiation is answered on retry.
+    [
+        AmneziaConfig::default(),
+        AmneziaConfig::new(128, 128, 128, 128)
+            .with_protocol_imitation(AmneziaImitationProtocol::Auto, None),
+    ]
+    .iter()
+    .for_each(|config| {
+        let (mut mine, mut theirs) = pair(config, None);
+        let mut buf = [0; 4096];
+        let init = network(mine.format_handshake_initiation(&mut buf, false));
+        // Below the bare response, and one byte below the prefixed one.
+        let tight = HANDSHAKE_RESP_SZ + config.response_packet_junk_size as usize - 1;
+        [16, tight].iter().for_each(|&room| {
+            let (result, kind) =
+                theirs.decapsulate_from_with_metadata(source(), &init, &mut buf[..room]);
+            assert_eq!(kind, None);
+            assert!(matches!(
+                result,
+                TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+            ));
+        });
+        let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
+        assert_eq!(kind, Some(Kind::HandshakeInitiation));
+        assert!(matches!(result, TunnResult::WriteToNetwork(_)));
+        // Accepted now, so the same initiation is a replay.
+        let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
+        assert_eq!(kind, None);
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::WrongTai64nTimestamp)
+        ));
+    });
 }
 
 #[test]
@@ -197,6 +247,9 @@ fn tampered_aead_with_a_valid_mac1_has_no_proof() {
 
 #[test]
 fn rejected_handshakes_transport_and_replays_never_reuse_previous_proof() {
+    // The kind is tunnel state between the commit that records it and the end
+    // of the receive, so each refusal below follows an acceptance that must
+    // not carry over.
     let (mut mine, mut theirs) = pair(&AmneziaConfig::default(), None);
     let mut buf = [0; 4096];
     let init = network(mine.format_handshake_initiation(&mut buf, false));

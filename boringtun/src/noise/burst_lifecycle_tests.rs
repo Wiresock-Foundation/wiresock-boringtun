@@ -976,10 +976,28 @@ fn t_b13_the_exemption_ends_when_the_handshake_leaves_expired() {
     let mut big = vec![0u8; 2048];
     expired_with_owed_burst(&mut c);
     let init = net(s.format_handshake_initiation_now(&mut big, false, false));
-    // The response does not fit: the handshake holds InitReceived state.
+    // The response does not fit. Receive checks that before it authenticates
+    // the initiation (AWG-R1-003), so the handshake stays Expired, untouched.
     assert!(
         is_dbts(&c.decapsulate(None, &init, &mut [0u8; 50])),
         "[R3:TB13:IS-DBTS-DECAPSULATE-NONE-INIT]"
+    );
+    assert!(
+        c.handshake.is_expired() && !c.handshake.is_in_progress(),
+        "[R3:TB13:REFUSED-BEFORE-AUTHENTICATION]"
+    );
+    // The handshake layer's own commit can still leave InitReceived state
+    // with no answer -- here driven directly, with a buffer too short for
+    // the response -- and the exemption must not shield that state either.
+    let packet = Tunn::parse_incoming_packet(c.handshake.obf, &init[S1 as usize..]).unwrap();
+    let Ok(Authenticated::HandshakeInit(auth)) = c.authenticate(packet, &mut big) else {
+        panic!("[R3:TB13:THE-INITIATION-AUTHENTICATES]");
+    };
+    assert!(
+        c.handshake
+            .commit_initiation(auth, &mut [0u8; 50], c.current % N_SESSIONS)
+            .is_err(),
+        "[R3:TB13:THE-COMMIT-CANNOT-ANSWER]"
     );
     assert!(
         !c.handshake.is_expired() && c.handshake.is_in_progress(),

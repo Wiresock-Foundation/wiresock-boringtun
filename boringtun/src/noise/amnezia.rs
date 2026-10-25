@@ -14,6 +14,7 @@ use super::{
     handshake::ObfuscationRanges, COOKIE_REPLY_SZ, DATA_OVERHEAD_SZ, HANDSHAKE_INIT_SZ,
     HANDSHAKE_RESP_SZ,
 };
+use crate::noise::budget::{self, ControlOutput, OutputBudget};
 use crate::noise::errors::WireGuardError;
 use crate::noise::header_protection::{HeaderProtectionKey, NONCE_SIZE, TYPE_MASK_SIZE};
 use crate::noise::rate_limiter::CookieDefense;
@@ -443,6 +444,16 @@ impl TrailerRoom {
         Self {
             udp_window: DEFAULT_UDP_WINDOW,
             max_wire: request_len,
+        }
+    }
+
+    /// The same room with the whole datagram also kept within `max_wire`:
+    /// an output budget's ceiling. Equal to the buffer when unbounded, which
+    /// the trailer is bounded by anyway.
+    pub(crate) fn within(self, max_wire: usize) -> Self {
+        Self {
+            max_wire: self.max_wire.min(max_wire),
+            ..self
         }
     }
 }
@@ -1030,7 +1041,7 @@ impl AmneziaConfig {
         if lo != 0 || hi != 0 {
             random_usize_inclusive(lo as usize, hi as usize, rng).min(headroom)
         } else {
-            random_below(headroom, rng)
+            optional_below(headroom, rng)
         }
     }
 
@@ -1652,6 +1663,13 @@ impl AmneziaConfig {
     /// tag at `HANDSHAKE_INIT_SZ`, so it always classifies as an initiation).
     pub(crate) fn handshake_init_junk_size(&self) -> usize {
         self.outbound_junk_size(PacketKind::HandshakeInit)
+    }
+
+    /// The S2 prefix a self-formatted handshake response carries on the wire;
+    /// the same accessor and argument as [`Self::handshake_init_junk_size`]
+    /// (an H2 tag at `HANDSHAKE_RESP_SZ`).
+    pub(crate) fn handshake_response_junk_size(&self) -> usize {
+        self.outbound_junk_size(PacketKind::HandshakeResponse)
     }
 
     /// The message-type tag at `offset`, with `mask` XORed off it.
@@ -2407,7 +2425,7 @@ impl AmneziaConfig {
             .min(MAX_SENDABLE_DATAGRAM)
             .min(room.max_wire)
             .saturating_sub(base);
-        random_below(headroom.min(ceiling.saturating_add(1)), rng)
+        optional_below(headroom.min(ceiling.saturating_add(1)), rng)
     }
 
     pub fn fill_pre_handshake_junk<'a>(
@@ -2415,11 +2433,23 @@ impl AmneziaConfig {
         buffer: &'a mut [u8],
         rng: &mut impl RngCore,
     ) -> Result<&'a mut [u8], WireGuardError> {
+        self.fill_pre_handshake_junk_in(buffer, self.pre_handshake_junk_size_range(), rng)
+    }
+
+    /// [`Self::fill_pre_handshake_junk`] with the size drawn from `range` --
+    /// the configured one, or the one an output budget leaves
+    /// ([`Self::pre_handshake_junk_range_within`]).
+    pub(crate) fn fill_pre_handshake_junk_in<'a>(
+        &self,
+        buffer: &'a mut [u8],
+        (lo, hi): (usize, usize),
+        rng: &mut impl RngCore,
+    ) -> Result<&'a mut [u8], WireGuardError> {
         if !self.pre_handshake_junk.is_enabled() {
             return Ok(&mut buffer[..0]);
         }
 
-        let size = self.pre_handshake_junk_size(rng);
+        let size = random_usize_inclusive(lo, hi, rng);
         if buffer.len() < size {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
@@ -2453,19 +2483,49 @@ impl AmneziaConfig {
         }
     }
 
+    #[cfg(test)]
     fn pre_handshake_junk_size(&self, rng: &mut impl RngCore) -> usize {
         let (lo, hi) = self.pre_handshake_junk_size_range();
         random_usize_inclusive(lo, hi, rng)
     }
 
+    /// The range the next Jc junk datagram is drawn from under `budget`'s
+    /// control budget for it (0: the configured range). Ordinary junk is
+    /// clamped at both ends; a protocol's junk keeps its protocol minimum and
+    /// is `OutputBudgetExceeded` below it (`budget::junk_range`) -- unless the
+    /// budget bounds ordinary junk only, when it has no control budget at all
+    /// ([`OutputBudget::control_for`]). The stored configuration, Jc
+    /// included, is not touched.
+    pub(crate) fn pre_handshake_junk_range_within(
+        &self,
+        budget: OutputBudget,
+    ) -> Result<(usize, usize), WireGuardError> {
+        let protocol_shaped = self.imitation.protocol != AmneziaImitationProtocol::None;
+        let kind = if protocol_shaped {
+            ControlOutput::Other
+        } else {
+            ControlOutput::OrdinaryJunk
+        };
+        budget::junk_range(
+            self.pre_handshake_junk_size_range(),
+            protocol_shaped,
+            budget.control_for(kind),
+        )
+    }
+
     /// The largest Jc junk datagram the next draw can produce, without
     /// drawing: 0 when Jc is off (the fill then writes nothing).
     /// `random_usize_inclusive` never exceeds `max(lo, hi)`.
+    #[cfg(test)]
     pub(crate) fn pre_handshake_junk_max_size(&self) -> usize {
+        self.pre_handshake_junk_max_size_in(self.pre_handshake_junk_size_range())
+    }
+
+    /// [`Self::pre_handshake_junk_max_size`] for a draw from `range`.
+    pub(crate) fn pre_handshake_junk_max_size_in(&self, (lo, hi): (usize, usize)) -> usize {
         if !self.pre_handshake_junk.is_enabled() {
             return 0;
         }
-        let (lo, hi) = self.pre_handshake_junk_size_range();
         lo.max(hi)
     }
 
@@ -2553,6 +2613,62 @@ fn random_below(n: usize, rng: &mut impl RngCore) -> usize {
         return 0;
     }
     random_usize_inclusive(0, n - 1, rng)
+}
+
+/// [`random_below`] at the two *optional* RandomTrailers draws -- the
+/// handshake trailer and the transport window padding -- and nowhere else.
+///
+/// Outside tests it is exactly `random_below`. Under `cfg(test)` a test can
+/// arm [`OPTIONAL_DRAW_WORD`] with one 64-bit word, which the next such draw
+/// of a range of at least two values feeds through the unchanged production
+/// mapping in place of the generator's first word; that makes a capped draw
+/// observable as a size. The word is taken once: a rejected word falls back
+/// to the generator, and a range of 0 or 1 values -- which draws nothing --
+/// leaves it armed, so a test can tell "no draw" from "drawn and clipped".
+fn optional_below(n: usize, rng: &mut impl RngCore) -> usize {
+    #[cfg(test)]
+    if n >= 2 {
+        if let Some(word) = OPTIONAL_DRAW_WORD.with(|c| c.take()) {
+            return random_below(
+                n,
+                &mut OneWord {
+                    word: Some(word),
+                    rng,
+                },
+            );
+        }
+    }
+    random_below(n, rng)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The test-armed word for the next [`optional_below`] on this thread.
+    pub(crate) static OPTIONAL_DRAW_WORD: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One armed word, then the real generator.
+#[cfg(test)]
+struct OneWord<'a, R: RngCore> {
+    word: Option<u64>,
+    rng: &'a mut R,
+}
+
+#[cfg(test)]
+impl<R: RngCore> RngCore for OneWord<'_, R> {
+    fn next_u32(&mut self) -> u32 {
+        self.rng.next_u32()
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.word.take().unwrap_or_else(|| self.rng.next_u64())
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.rng.fill_bytes(dest)
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        self.rng.try_fill_bytes(dest)
+    }
 }
 
 fn random_usize_inclusive(min: usize, max: usize, rng: &mut impl RngCore) -> usize {
