@@ -181,6 +181,9 @@ impl AuthenticatedPacketKind {
     /// last handshake message, which travelled in clear. Anyone who saw that
     /// message and knows the peer's public key can therefore forge a valid
     /// reply, with any cookie, from any address -- not just relay a real one.
+    /// Under AmneziaWG obfuscation the forger also needs the shared
+    /// parameters (the H3 header and S3 prefix, and the header-protection key
+    /// when one is set), which any holder of a client configuration has.
     ///
     /// This predicate does not include the commit result. Endpoint adoption
     /// requires this method to return `true` and the receive result not to be
@@ -371,9 +374,10 @@ impl Authenticated {
     ///
     /// Every authenticated handshake message and transport frame does; a
     /// cookie reply does not, as in Linux and wireguard-go. Its key is derived
-    /// from our peer's *public* key and it is bound only to the mac1 of our
-    /// last handshake message, which travelled in clear -- so anyone who saw
-    /// that message can relay a valid reply, or make one, from any address.
+    /// from our peer's *public* key and it is bound only to the index and mac1
+    /// of our last handshake message -- so anyone who saw that message and
+    /// knows that key can forge a valid reply from any address (see
+    /// [`AuthenticatedPacketKind::moves_endpoint`] for the AmneziaWG case).
     /// Roaming on it would hand them the endpoint and the connected socket.
     #[cfg(feature = "device")]
     pub(crate) fn moves_endpoint(&self) -> bool {
@@ -1186,7 +1190,8 @@ impl Tunn {
     /// cookie is bound to. A caller that knows the source UDP port as well
     /// should use [`Self::decapsulate_from`], so the cookie covers the whole
     /// endpoint. With `None` no cookie can be demanded: under load, a
-    /// handshake message is refused as `UnderLoad`.
+    /// handshake message is refused as `UnderLoad`, unless AmneziaWG
+    /// `DisableCookies` is set, which skips the load check.
     pub fn decapsulate<'a>(
         &mut self,
         src_addr: Option<IpAddr>,
@@ -1248,7 +1253,9 @@ impl Tunn {
     /// This takes the full [`SocketAddr`] because the under-load cookie binds
     /// the address and port together. With `src` `None` no cookie can be
     /// demanded: under load, a handshake message is refused as
-    /// `Err(UnderLoad)` with no kind, as for [`Self::decapsulate`]. Callers
+    /// `Err(UnderLoad)` with no kind, as for [`Self::decapsulate`] -- unless
+    /// AmneziaWG `DisableCookies` is set, which skips the load check, so the
+    /// handshake is accepted as if the tunnel were not under load. Callers
     /// that only have an [`IpAddr`] keep using [`Self::decapsulate`] and do
     /// not receive metadata. The legacy methods retain their signatures and
     /// actions.
