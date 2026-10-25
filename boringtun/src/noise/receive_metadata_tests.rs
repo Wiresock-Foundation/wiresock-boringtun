@@ -141,7 +141,7 @@ fn an_initiation_proven_by_its_cookie_is_accepted_under_load() {
 }
 
 #[test]
-fn an_acceptance_by_another_entry_point_is_not_reported_by_the_next_metadata_receive() {
+fn an_acceptance_on_the_legacy_path_is_not_reported_by_the_next_metadata_receive() {
     // The kind is tunnel state between the commit that records it and the
     // end of the metadata receive. A legacy receive records acceptance too;
     // it must not surface in a later metadata receive that accepts nothing.
@@ -161,6 +161,29 @@ fn an_acceptance_by_another_entry_point_is_not_reported_by_the_next_metadata_rec
     let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &[0xff], &mut buf);
     assert_eq!(kind, None);
     assert!(matches!(result, TunnResult::Err(_)));
+}
+
+#[cfg(feature = "device")]
+#[test]
+fn an_acceptance_on_the_device_path_is_not_reported_by_the_next_metadata_receive() {
+    // The device's anonymous ingress authenticates and commits through
+    // `authenticate` and `commit_with_imitation`, which record acceptance too.
+    let (mut mine, mut theirs) = pair(&AmneziaConfig::default(), None);
+    let mut buf = [0; 4096];
+    let init = network(mine.format_handshake_initiation(&mut buf, false));
+    let packet = Tunn::parse_incoming_packet(theirs.handshake.obf, &init).unwrap();
+    let packet = theirs.authenticate(packet, &mut buf).unwrap();
+    assert!(packet.moves_endpoint());
+    assert!(matches!(
+        theirs.commit_with_imitation(packet, &init, None, &mut buf),
+        TunnResult::WriteToNetwork(_)
+    ));
+    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &init, &mut buf);
+    assert_eq!(kind, None);
+    assert!(matches!(
+        result,
+        TunnResult::Err(WireGuardError::WrongTai64nTimestamp)
+    ));
 }
 
 #[test]
@@ -247,9 +270,10 @@ fn tampered_aead_with_a_valid_mac1_has_no_proof() {
 
 #[test]
 fn rejected_handshakes_transport_and_replays_never_reuse_previous_proof() {
-    // The kind is tunnel state between the commit that records it and the end
-    // of the receive, so each refusal below follows an acceptance that must
-    // not carry over.
+    // Every refusal here reports no kind. Those that follow an acceptance
+    // also show a kind does not carry from one metadata receive to the next;
+    // a kind left by another entry point is covered by the
+    // `an_acceptance_*_is_not_reported_by_the_next_metadata_receive` tests.
     let (mut mine, mut theirs) = pair(&AmneziaConfig::default(), None);
     let mut buf = [0; 4096];
     let init = network(mine.format_handshake_initiation(&mut buf, false));
@@ -366,13 +390,24 @@ fn metadata_receive_refuses_empty_datagrams_but_legacy_receive_drains() {
 fn imitation_observation_is_not_authentication() {
     let config = AmneziaConfig::new(128, 128, 128, 128)
         .with_protocol_imitation(AmneziaImitationProtocol::Auto, None);
-    let (_, mut theirs) = pair(&config, None);
-    let mut buf = [0; 2048];
     let prelude = super::auto_imitation_fixtures::recorded_stun_prelude();
-    let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &prelude[0], &mut buf);
-    assert_eq!(kind, None);
-    assert!(matches!(result, TunnResult::Done));
-    assert!(theirs.has_imitation_hint());
+    // On a fresh tunnel, and on one whose last commit accepted an initiation
+    // through the legacy receive, so a recorded kind is there to leak.
+    [false, true].iter().for_each(|&after_acceptance| {
+        let (mut mine, mut theirs) = pair(&config, None);
+        let mut buf = [0; 2048];
+        if after_acceptance {
+            let init = network(mine.format_handshake_initiation(&mut buf, false));
+            assert!(matches!(
+                theirs.decapsulate_from(source(), &init, &mut buf),
+                TunnResult::WriteToNetwork(_)
+            ));
+        }
+        let (result, kind) = theirs.decapsulate_from_with_metadata(source(), &prelude[0], &mut buf);
+        assert_eq!(kind, None);
+        assert!(matches!(result, TunnResult::Done));
+        assert!(theirs.has_imitation_hint());
+    });
 }
 
 #[derive(Debug, PartialEq)]

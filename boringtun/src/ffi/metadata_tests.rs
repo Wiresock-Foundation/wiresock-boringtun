@@ -1616,3 +1616,51 @@ fn the_rust_metadata_receive_agrees_with_the_c_report() {
         );
     }
 }
+
+/// Rust and C receives on one tunnel stay out of each other's reports. A C
+/// acceptance does not surface in a later Rust metadata receive. A Rust
+/// receive, accepting or not, is not a C operation: the next C operation is
+/// numbered one past the last C one and reports none of the Rust receive's
+/// facts.
+#[test]
+fn rust_and_c_receives_on_one_tunnel_stay_out_of_each_others_reports() {
+    use crate::noise::AuthenticatedPacketKind as Kind;
+    let (a, b) = (party(), party());
+    let client = plain(&a, &b, 1, 0);
+    let server = plain(&b, &a, 2, 0);
+    let (mut cb, mut sb) = (vec![0u8; 2048], vec![0u8; 2048]);
+
+    let (r, _) = ex(&client, Op::Force, &mut cb);
+    let init = cb[..r.size].to_vec();
+    let (r, i) = ex(&server, Op::Read(&init), &mut sb);
+    assert_eq!(r.op, WTN);
+    assert_eq!(
+        i.events & (ev::INPUT_ACCEPTED | ev::PEER_AUTHENTICATED),
+        ev::INPUT_ACCEPTED | ev::PEER_AUTHENTICATED
+    );
+    let resp = sb[..r.size].to_vec();
+    let last_c_op = op_seq(&i);
+
+    // The C acceptance is the tunnel's last recorded input; the Rust receive
+    // of the replay accepts nothing and must not report it.
+    let (r, kind) = rust_read(&server, &init, &mut sb);
+    assert_eq!((r.op, r.size, kind), (ERR, 7, None));
+
+    // A Rust acceptance, then a C operation on the same tunnel.
+    let (r, _) = ex(&client, Op::Read(&resp), &mut cb);
+    let keepalive = cb[..r.size].to_vec();
+    let (r, kind) = rust_read(&server, &keepalive, &mut sb);
+    assert_eq!((r.op, kind), (DONE, Some(Kind::Transport)));
+    let (_, i) = ex(&server, Op::Tick, &mut sb);
+    assert_eq!(
+        op_seq(&i),
+        last_c_op + 1,
+        "a Rust receive is not a C operation"
+    );
+    assert_eq!(
+        i.events & (ev::INPUT_ACCEPTED | ev::PEER_AUTHENTICATED),
+        0,
+        "the Rust acceptance is not reported to C"
+    );
+    assert_eq!(i.input_kind, k(PacketKind::None));
+}

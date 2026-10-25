@@ -114,9 +114,10 @@ pub enum TunnResult<'a> {
 ///
 /// `Some(kind)` means the tunnel accepted the datagram as `kind`: it
 /// authenticated as that message under the tunnel's keys and was not a
-/// replay. It is the only reading of the datagram the tunnel acted on. It does **not** by itself mean the peer was
-/// authenticated: a [`Self::CookieReply`] is accepted without proving
-/// anything about the peer, and only [`Self::moves_endpoint`] says that.
+/// replay. It is the only reading of the datagram the tunnel acted on. It
+/// does **not** by itself mean the peer was authenticated: a
+/// [`Self::CookieReply`] is accepted without proving anything about the
+/// peer, and only [`Self::moves_endpoint`] says that.
 ///
 /// It also does not mean the commit that followed succeeded. The kind is
 /// reported whatever the receive returned, for example `Some(Transport)` with
@@ -131,17 +132,24 @@ pub enum TunnResult<'a> {
 /// `WIREGUARD_PACKET_TRANSPORT_KEEPALIVE` (a keepalive returns `Done`).
 /// More kinds may be added, so the enum is `#[non_exhaustive]`.
 ///
+/// The metadata receive never drains: an empty datagram returns
+/// `(TunnResult::Done, None)`. After a `WriteToNetwork`, repeat the drain
+/// through [`Tunn::decapsulate`] or [`Tunn::decapsulate_from`] with an empty
+/// slice, as before; repeating the metadata call instead leaves queued
+/// packets queued.
+///
 /// A caller that learns a peer endpoint from the kind must require
 /// [`Self::moves_endpoint`] *and* a result that is not a [`TunnResult::Err`].
-/// This API performs no path bookkeeping: the in-tree device brackets a
-/// committed roam with `begin_new_path`/`restore_udp_window` and discards the
-/// pending Auto imitation hint on success. An embedder that adopts an endpoint
-/// therefore keeps the old path's UDP window -- so `content_padding_for_frame`
-/// can size the first frames on the new path against the old path's width --
-/// and can keep an Auto hint keyed on the old source IP across a
-/// same-IP/different-port roam. Reproduce those steps when they matter, or
-/// accept the camouflage divergence; the helpers are `pub(crate)` today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// This API performs no path bookkeeping. On a committed roam the in-tree
+/// device also restarts the tunnel's UDP-size window for the new path
+/// (restoring the old one if the commit fails) and drops a pending Auto
+/// imitation hint. This API does neither, so an embedder that adopts an
+/// endpoint keeps the old path's window -- random trailers on the first
+/// frames of the new path can be sized for the old path's width -- and can
+/// keep an Auto hint keyed on the old source IP across a
+/// same-IP/different-port roam. Accept that camouflage divergence, or ask
+/// for a public path-transition API if exact device parity matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum AuthenticatedPacketKind {
     /// A handshake initiation accepted by the Noise handshake.
@@ -172,7 +180,14 @@ impl AuthenticatedPacketKind {
     /// an error; see [`AuthenticatedPacketKind`] for the path bookkeeping this
     /// API does not perform.
     pub fn moves_endpoint(self) -> bool {
-        !matches!(self, Self::CookieReply)
+        // Spelled out, with no wildcard, so a new kind cannot authenticate the
+        // peer -- and roam, and set PEER_AUTHENTICATED -- by default: inside
+        // this crate the match stays exhaustive and a new variant fails to
+        // compile here until it is classified.
+        match self {
+            Self::HandshakeInitiation | Self::HandshakeResponse | Self::Transport => true,
+            Self::CookieReply => false,
+        }
     }
 }
 

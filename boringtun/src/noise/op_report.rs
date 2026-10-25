@@ -102,11 +102,13 @@ pub(crate) struct OpState {
     events: u32,
     input_kind: PacketKind,
     output_kind: PacketKind,
-    /// What the current [`Tunn::decapsulate_from_with_metadata`] call
-    /// accepted: the same fact as `INPUT_ACCEPTED` and `input_kind`, recorded
-    /// by the same call, so the Rust and C reports cannot disagree. Scoped to
-    /// that call by `begin_receive`, not by `begin_op`, so a Rust receive
-    /// never advances the C operation sequence.
+    /// The last input any commit accepted, from any entry point -- the same
+    /// fact as `INPUT_ACCEPTED` and `input_kind`, written by the same
+    /// `note_input`, so the Rust and C reports cannot disagree. Every commit
+    /// writes it, and only [`Tunn::decapsulate_from_with_metadata`] reads or
+    /// clears it: it clears it first (`begin_receive`) and takes it last, so
+    /// a value left by a legacy, device or C call is never reported. Scoped by `begin_receive` rather than `begin_op`, so a
+    /// Rust receive never advances the C operation sequence.
     receive_input: Option<AuthenticatedPacketKind>,
 }
 
