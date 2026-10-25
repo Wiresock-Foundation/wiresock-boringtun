@@ -140,6 +140,10 @@ pub enum TunnResult<'a> {
 ///
 /// A caller that learns a peer endpoint from the kind must require
 /// [`Self::moves_endpoint`] *and* a result that is not a [`TunnResult::Err`].
+/// That is the in-tree device's rule. It is slightly stricter than Linux and
+/// wireguard-go, which also roam on an authenticated transport frame whose
+/// decrypted packet is malformed (here `Some(Transport)` with
+/// `Err(InvalidPacket)`); the peer's next valid frame roams either way.
 /// This API performs no path bookkeeping. When the in-tree device accepts a
 /// peer-authenticating datagram from a new source endpoint (a new port
 /// counts), it restarts the tunnel's UDP-size window before the commit,
@@ -172,10 +176,11 @@ impl AuthenticatedPacketKind {
     /// Every accepted handshake message and transport frame authenticates the
     /// peer; a cookie reply does not. This is the C report's
     /// `WIREGUARD_EV_PEER_AUTHENTICATED`, and the device's roaming rule, from
-    /// one definition. A cookie reply's key is derived from public material
-    /// and it is bound only to the mac1 of our last handshake message, which
-    /// travelled in clear, so anyone who saw that message can relay a valid
-    /// reply from any address.
+    /// one definition. A cookie reply's key is derived from the peer's public
+    /// key alone, and the reply is bound only to the index and mac1 of our
+    /// last handshake message, which travelled in clear. Anyone who saw that
+    /// message and knows the peer's public key can therefore forge a valid
+    /// reply, with any cookie, from any address -- not just relay a real one.
     ///
     /// This predicate does not include the commit result. Endpoint adoption
     /// requires this method to return `true` and the receive result not to be
@@ -1241,9 +1246,12 @@ impl Tunn {
     /// a larger `dst` is answered.
     ///
     /// This takes the full [`SocketAddr`] because the under-load cookie binds
-    /// the address and port together. Callers that only have an [`IpAddr`]
-    /// keep using [`Self::decapsulate`] and do not receive metadata. The
-    /// legacy methods retain their signatures and actions.
+    /// the address and port together. With `src` `None` no cookie can be
+    /// demanded: under load, a handshake message is refused as
+    /// `Err(UnderLoad)` with no kind, as for [`Self::decapsulate`]. Callers
+    /// that only have an [`IpAddr`] keep using [`Self::decapsulate`] and do
+    /// not receive metadata. The legacy methods retain their signatures and
+    /// actions.
     pub fn decapsulate_from_with_metadata<'a>(
         &mut self,
         src: Option<SocketAddr>,

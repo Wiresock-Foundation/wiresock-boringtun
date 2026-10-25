@@ -117,6 +117,18 @@ fn accepted_cookie_is_distinct_from_the_unauthenticated_cookie_demand() {
 }
 
 #[test]
+fn under_load_without_a_source_a_handshake_is_refused_with_no_kind() {
+    // With no source there is nothing to bind a cookie to, so none is
+    // demanded: the initiation is refused outright.
+    let (mut mine, mut theirs) = pair(&AmneziaConfig::default(), Some(0));
+    let mut buf = [0; 4096];
+    let init = network(mine.format_handshake_initiation(&mut buf, false));
+    let (result, kind) = theirs.decapsulate_from_with_metadata(None, &init, &mut buf);
+    assert_eq!(kind, None);
+    assert!(matches!(result, TunnResult::Err(WireGuardError::UnderLoad)));
+}
+
+#[test]
 fn an_initiation_proven_by_its_cookie_is_accepted_under_load() {
     profiles().iter().for_each(|config| {
         let (mut mine, mut theirs) = pair(config, Some(0));
