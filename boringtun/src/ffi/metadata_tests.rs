@@ -1455,3 +1455,212 @@ fn the_sequence_counts_every_operation_and_carries() {
     assert_eq!((i.op_seq_hi, i.op_seq_lo), (1, 0));
     assert_eq!(op_seq(&i), 1 << 32);
 }
+
+// ---------------------------------------------------------------------------
+// The Rust metadata receive against the C report
+// ---------------------------------------------------------------------------
+
+/// `Tunn::decapsulate_from_with_metadata` on the tunnel behind `t`, with no
+/// source, as `wireguard_read_ex` has none; the action in C encoding.
+fn rust_read(
+    t: &Owned,
+    src: &[u8],
+    dst: &mut [u8],
+) -> (Res, Option<crate::noise::AuthenticatedPacketKind>) {
+    let mut tunnel = unsafe { &*t.0 }.lock();
+    let (result, kind) = tunnel.decapsulate_from_with_metadata(None, src, dst);
+    (res(wireguard_result::from(result)), kind)
+}
+
+/// The Rust kind and the C report describe the same acceptance: `Some` is
+/// INPUT_ACCEPTED, `moves_endpoint` is PEER_AUTHENTICATED, and the kind is
+/// the reported input kind (transport covering data and keepalive).
+fn agree(
+    step: &str,
+    (c, info): (Res, wireguard_packet_info),
+    (rust, kind): (Res, Option<crate::noise::AuthenticatedPacketKind>),
+) {
+    use crate::noise::AuthenticatedPacketKind as Kind;
+    assert_eq!(c, rust, "{}: same action", step);
+    assert_eq!(
+        info.events & ev::INPUT_ACCEPTED != 0,
+        kind.is_some(),
+        "{}: accepted",
+        step
+    );
+    assert_eq!(
+        info.events & ev::PEER_AUTHENTICATED != 0,
+        kind.is_some_and(Kind::moves_endpoint),
+        "{}: peer authenticated",
+        step
+    );
+    let kinds: &[PacketKind] = match kind {
+        None => &[PacketKind::None],
+        Some(Kind::HandshakeInitiation) => &[PacketKind::HandshakeInitiation],
+        Some(Kind::HandshakeResponse) => &[PacketKind::HandshakeResponse],
+        Some(Kind::CookieReply) => &[PacketKind::CookieReply],
+        Some(Kind::Transport) => &[PacketKind::TransportData, PacketKind::TransportKeepalive],
+    };
+    assert!(
+        kinds.iter().any(|&kind| k(kind) == info.input_kind),
+        "{}: input kind {} for {:?}",
+        step,
+        info.input_kind,
+        kind
+    );
+}
+
+/// Two identical worlds, one received through `wireguard_read_ex` and one
+/// through the Rust metadata receive, agree on every input both contracts
+/// cover: each handshake role, a keepalive, data, an authenticated frame
+/// whose plaintext is malformed (accepted, then an error), forgeries and
+/// replays (nothing accepted), and a cookie reply (accepted, but no peer
+/// authentication) and its replay.
+#[test]
+fn the_rust_metadata_receive_agrees_with_the_c_report() {
+    let (a, b) = (party(), party());
+    let (c_client, c_server) = (plain(&a, &b, 1, 0), plain(&b, &a, 2, 0));
+    let (r_client, r_server) = (plain(&a, &b, 1, 0), plain(&b, &a, 2, 0));
+    let (mut cb, mut sb) = (vec![0u8; 2048], vec![0u8; 2048]);
+    let (mut rcb, mut rsb) = (vec![0u8; 2048], vec![0u8; 2048]);
+
+    let (r, _) = ex(&c_client, Op::Force, &mut cb);
+    let c_init = cb[..r.size].to_vec();
+    let (r, _) = ex(&r_client, Op::Force, &mut rcb);
+    let r_init = rcb[..r.size].to_vec();
+
+    let c = ex(&c_server, Op::Read(&c_init), &mut sb);
+    let c_resp = sb[..c.0.size].to_vec();
+    let rust = rust_read(&r_server, &r_init, &mut rsb);
+    let r_resp = rsb[..rust.0.size].to_vec();
+    agree("initiation", c, rust);
+    agree(
+        "replayed initiation",
+        ex(&c_server, Op::Read(&c_init), &mut sb),
+        rust_read(&r_server, &r_init, &mut rsb),
+    );
+
+    let c = ex(&c_client, Op::Read(&c_resp), &mut cb);
+    let c_keepalive = cb[..c.0.size].to_vec();
+    let rust = rust_read(&r_client, &r_resp, &mut rcb);
+    let r_keepalive = rcb[..rust.0.size].to_vec();
+    agree("response", c, rust);
+    agree(
+        "keepalive",
+        ex(&c_server, Op::Read(&c_keepalive), &mut sb),
+        rust_read(&r_server, &r_keepalive, &mut rsb),
+    );
+
+    let mut short_ip = ipv4(5, 40);
+    short_ip[2..4].copy_from_slice(&10u16.to_be_bytes());
+    for (step, plaintext) in [
+        ("data", ipv4(1, 60)),
+        ("malformed plaintext", vec![0x99u8; 40]),
+        ("short IP header", short_ip),
+    ] {
+        let (r, _) = ex(&c_client, Op::Write(&plaintext), &mut cb);
+        let c_data = cb[..r.size].to_vec();
+        let (r, _) = ex(&r_client, Op::Write(&plaintext), &mut rcb);
+        let r_data = rcb[..r.size].to_vec();
+        let (mut c_forged, mut r_forged) = (c_data.clone(), r_data.clone());
+        *c_forged.last_mut().unwrap() ^= 1;
+        *r_forged.last_mut().unwrap() ^= 1;
+        agree(
+            "forged transport",
+            ex(&c_server, Op::Read(&c_forged), &mut sb),
+            rust_read(&r_server, &r_forged, &mut rsb),
+        );
+        agree(
+            step,
+            ex(&c_server, Op::Read(&c_data), &mut sb),
+            rust_read(&r_server, &r_data, &mut rsb),
+        );
+        agree(
+            "replayed transport",
+            ex(&c_server, Op::Read(&c_data), &mut sb),
+            rust_read(&r_server, &r_data, &mut rsb),
+        );
+    }
+
+    // A responder under load answers with a cookie reply.
+    let loaded = || {
+        Tunn::new_with_obfuscation(
+            b.secret.clone(),
+            a.public,
+            None,
+            None,
+            2,
+            Some(Arc::new(RateLimiter::new(&b.public, 0))),
+            Default::default(),
+            AmneziaConfig::default(),
+        )
+        .unwrap()
+    };
+    let (c_client, r_client) = (plain(&a, &b, 1, 0), plain(&a, &b, 1, 0));
+    let cookie_for = |client: &Owned, dst: &mut [u8]| {
+        let (r, _) = ex(client, Op::Force, dst);
+        let init = dst[..r.size].to_vec();
+        let mut reply = vec![0u8; 2048];
+        match loaded().decapsulate(Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), &init, &mut reply) {
+            TunnResult::WriteToNetwork(c) => c.to_vec(),
+            other => panic!("no cookie reply: {:?}", other),
+        }
+    };
+    let c_cookie = cookie_for(&c_client, &mut cb);
+    let r_cookie = cookie_for(&r_client, &mut rcb);
+    for step in ["cookie reply", "replayed cookie reply"] {
+        agree(
+            step,
+            ex(&c_client, Op::Read(&c_cookie), &mut cb),
+            rust_read(&r_client, &r_cookie, &mut rcb),
+        );
+    }
+}
+
+/// Rust and C receives on one tunnel stay out of each other's reports. A C
+/// acceptance does not surface in a later Rust metadata receive. A Rust
+/// receive, accepting or not, is not a C operation: the next C operation is
+/// numbered one past the last C one and reports none of the Rust receive's
+/// facts.
+#[test]
+fn rust_and_c_receives_on_one_tunnel_stay_out_of_each_others_reports() {
+    use crate::noise::AuthenticatedPacketKind as Kind;
+    let (a, b) = (party(), party());
+    let client = plain(&a, &b, 1, 0);
+    let server = plain(&b, &a, 2, 0);
+    let (mut cb, mut sb) = (vec![0u8; 2048], vec![0u8; 2048]);
+
+    let (r, _) = ex(&client, Op::Force, &mut cb);
+    let init = cb[..r.size].to_vec();
+    let (r, i) = ex(&server, Op::Read(&init), &mut sb);
+    assert_eq!(r.op, WTN);
+    assert_eq!(
+        i.events & (ev::INPUT_ACCEPTED | ev::PEER_AUTHENTICATED),
+        ev::INPUT_ACCEPTED | ev::PEER_AUTHENTICATED
+    );
+    let resp = sb[..r.size].to_vec();
+    let last_c_op = op_seq(&i);
+
+    // The C acceptance is the tunnel's last recorded input; the Rust receive
+    // of the replay accepts nothing and must not report it.
+    let (r, kind) = rust_read(&server, &init, &mut sb);
+    assert_eq!((r.op, r.size, kind), (ERR, 7, None));
+
+    // A Rust acceptance, then a C operation on the same tunnel.
+    let (r, _) = ex(&client, Op::Read(&resp), &mut cb);
+    let keepalive = cb[..r.size].to_vec();
+    let (r, kind) = rust_read(&server, &keepalive, &mut sb);
+    assert_eq!((r.op, kind), (DONE, Some(Kind::Transport)));
+    let (_, i) = ex(&server, Op::Tick, &mut sb);
+    assert_eq!(
+        op_seq(&i),
+        last_c_op + 1,
+        "a Rust receive is not a C operation"
+    );
+    assert_eq!(
+        i.events & (ev::INPUT_ACCEPTED | ev::PEER_AUTHENTICATED),
+        0,
+        "the Rust acceptance is not reported to C"
+    );
+    assert_eq!(i.input_kind, k(PacketKind::None));
+}

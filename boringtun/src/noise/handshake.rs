@@ -842,9 +842,12 @@ impl Handshake {
     /// session whose local index is never in ring slot `reserved_slot`.
     ///
     /// The timestamp is recorded first, so a destination buffer too small for
-    /// the response fails *after* the initiation has been accepted -- as it
-    /// always has. Nothing between the two halves can have moved the timestamp:
-    /// both run under the one `&mut Tunn` borrow of a single receive.
+    /// the response would fail *after* the initiation has been accepted. Every
+    /// caller therefore checks the response's room before authenticating it
+    /// (`Tunn::authenticate_with_budget`, AWG-R1-003), and that failure is a
+    /// last-resort guard here. Nothing between the two halves can have moved
+    /// the timestamp: both run under the one `&mut Tunn` borrow of a single
+    /// receive.
     pub(super) fn commit_initiation<'a>(
         &mut self,
         init: AuthenticatedInit,

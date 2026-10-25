@@ -13,21 +13,26 @@
 //! selected session's serial.
 //!
 //! Everything here lives in the `Tunn` and is written and read under the one
-//! lock hold of a single operation ([`Tunn::begin_op`] .. [`Tunn::finish_op`]).
-//! There is no "last result" to query later: the report is returned with the
-//! result it describes, or not at all.
+//! lock hold of a single operation ([`Tunn::begin_op`] .. [`Tunn::finish_op`]),
+//! except the accepted input kind kept for the Rust metadata receive: every
+//! commit writes it, from any entry point, and that receive reads it outside
+//! any `begin_op` (see below). There is no "last result" to query later: the
+//! report is returned with the result it describes, or not at all.
 //!
 //! The vocabulary is the accepted P1-prime metadata contract (WRS-225 V1-V6).
 //! Nothing here changes what the operation does; the output budgets the same
 //! entry points carry are applied by the producers (`budget`), and their
 //! effects are recorded here like any other fact.
 //!
-//! Only the C entry points read a report. A build without them still records
-//! the facts -- a few bit operations at the sites -- and never reads them back,
-//! which is all the allowance below covers.
+//! Only the C entry points read a report. The one exception is the accepted
+//! input kind, which `Tunn::decapsulate_from_with_metadata` reads back for the
+//! receive it scopes (`begin_receive` .. `take_receive_input`), so the Rust
+//! and C reports share one recording site. A build without the C entry points
+//! still records the facts -- a few bit operations at the sites -- and never
+//! reads the rest back, which is all the allowance below covers.
 #![cfg_attr(not(feature = "ffi-bindings"), allow(dead_code))]
 
-use super::{PendingAmneziaJunk, Tunn, TunnResult, N_SESSIONS};
+use super::{AuthenticatedPacketKind, PendingAmneziaJunk, Tunn, TunnResult, N_SESSIONS};
 use std::convert::TryFrom;
 use std::time::Duration;
 
@@ -99,6 +104,16 @@ pub(crate) struct OpState {
     events: u32,
     input_kind: PacketKind,
     output_kind: PacketKind,
+    /// The input the latest commit accepted, from any entry point, unless a
+    /// metadata receive has since cleared or taken it. It is the same fact as
+    /// `INPUT_ACCEPTED` and `input_kind`, written by the same `note_input`, so
+    /// the Rust and C reports cannot disagree. Every commit writes it, and only
+    /// [`Tunn::decapsulate_from_with_metadata`] reads or clears it: it clears
+    /// it first (`begin_receive`) and takes it last, so a value left by a
+    /// legacy, device or C call is never reported. Scoped by `begin_receive`
+    /// rather than `begin_op`, so a Rust receive never advances the C
+    /// operation sequence.
+    receive_input: Option<AuthenticatedPacketKind>,
 }
 
 impl Default for OpState {
@@ -110,6 +125,7 @@ impl Default for OpState {
             events: 0,
             input_kind: PacketKind::None,
             output_kind: PacketKind::None,
+            receive_input: None,
         }
     }
 }
@@ -119,14 +135,28 @@ impl OpState {
         self.events |= events;
     }
 
-    /// The input was accepted as `kind`; `authenticated` unless it is a cookie
-    /// reply, which proves nothing about the peer.
-    pub(super) fn note_input(&mut self, kind: PacketKind, authenticated: bool) {
+    /// The input was accepted as `accepted`, reported to C as `kind`. The
+    /// peer is authenticated unless it is a cookie reply, which proves nothing
+    /// about the peer: [`AuthenticatedPacketKind::moves_endpoint`] is that
+    /// rule, for the C report, the Rust report and the device's roaming alike.
+    pub(super) fn note_input(&mut self, kind: PacketKind, accepted: AuthenticatedPacketKind) {
         self.input_kind = kind;
         self.events |= event::INPUT_ACCEPTED;
-        if authenticated {
+        if accepted.moves_endpoint() {
             self.events |= event::PEER_AUTHENTICATED;
         }
+        self.receive_input = Some(accepted);
+    }
+
+    /// Start a [`Tunn::decapsulate_from_with_metadata`] call: forget what an
+    /// earlier operation accepted.
+    pub(super) fn begin_receive(&mut self) {
+        self.receive_input = None;
+    }
+
+    /// What the receive `begin_receive` started accepted, if anything.
+    pub(super) fn take_receive_input(&mut self) -> Option<AuthenticatedPacketKind> {
+        self.receive_input.take()
     }
 
     /// `result` was produced as `kind`. Recorded only when it really is

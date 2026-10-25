@@ -29,6 +29,8 @@ mod live_reframe_tests;
 #[cfg(test)]
 mod random_trailers_tests;
 #[cfg(test)]
+mod receive_metadata_tests;
+#[cfg(test)]
 mod upstream_collision_tests;
 // R3 write admission, owned drain, burst lifecycle and burst-output goldens.
 #[cfg(test)]
@@ -105,6 +107,98 @@ pub enum TunnResult<'a> {
     WriteToNetwork(&'a mut [u8]),
     WriteToTunnelV4(&'a mut [u8], Ipv4Addr),
     WriteToTunnelV6(&'a mut [u8], Ipv6Addr),
+}
+
+/// What a received datagram was accepted as, from
+/// [`Tunn::decapsulate_from_with_metadata`].
+///
+/// `Some(kind)` means the tunnel accepted the datagram as `kind`: it
+/// authenticated as that message under the tunnel's keys and was not a
+/// replay. It is the only reading of the datagram the tunnel acted on. It
+/// does **not** by itself mean the peer was authenticated: a
+/// [`Self::CookieReply`] is accepted without proving anything about the
+/// peer, and only [`Self::moves_endpoint`] says that.
+///
+/// It also does not mean the commit that followed succeeded. The kind is
+/// reported whatever the receive returned, for example `Some(Transport)` with
+/// `Err(InvalidPacket)` for an authenticated frame whose decrypted packet is
+/// malformed. A handshake message whose answer cannot fit `dst` is refused
+/// before it is authenticated, so it returns no kind.
+///
+/// This is the fact the C `wireguard_read_ex` reports, recorded at the same
+/// point by the same code: `Some` is `WIREGUARD_EV_INPUT_ACCEPTED`,
+/// [`Self::moves_endpoint`] is `WIREGUARD_EV_PEER_AUTHENTICATED`, and
+/// [`Self::Transport`] covers both `WIREGUARD_PACKET_TRANSPORT_DATA` and
+/// `WIREGUARD_PACKET_TRANSPORT_KEEPALIVE` (a keepalive returns `Done`).
+/// More kinds may be added, so the enum is `#[non_exhaustive]`.
+///
+/// The metadata receive never drains: an empty datagram returns
+/// `(TunnResult::Done, None)`. After a `WriteToNetwork`, repeat the drain
+/// through [`Tunn::decapsulate`] or [`Tunn::decapsulate_from`] with an empty
+/// slice, as before; repeating the metadata call instead leaves queued
+/// packets queued.
+///
+/// A caller that learns a peer endpoint from the kind must require
+/// [`Self::moves_endpoint`] *and* a result that is not a [`TunnResult::Err`].
+/// That is the in-tree device's rule. It is slightly stricter than Linux and
+/// wireguard-go, which also roam on an authenticated transport frame whose
+/// decrypted packet is malformed (here `Some(Transport)` with
+/// `Err(InvalidPacket)`); the peer's next valid frame roams either way.
+/// This API performs no path bookkeeping. When the in-tree device accepts a
+/// peer-authenticating datagram from a new source endpoint (a new port
+/// counts), it restarts the tunnel's UDP-size window before the commit,
+/// restores the old window if the commit fails, and drops a pending Auto
+/// imitation hint once the commit succeeds. This API does none of that. An
+/// embedder that adopts an endpoint keeps the old path's window, which only
+/// ever grows, until a reset; with RandomTrailers on, the handshake suffixes
+/// and transport padding it sizes can stay wider than anything the new path
+/// has carried. It can also keep an Auto hint keyed on the old source IP
+/// across a same-IP/different-port roam. Accept that camouflage divergence,
+/// or ask for a public path-transition API if exact device parity matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AuthenticatedPacketKind {
+    /// A handshake initiation accepted by the Noise handshake.
+    HandshakeInitiation,
+    /// A handshake response accepted by the Noise handshake.
+    HandshakeResponse,
+    /// A transport frame whose AEAD tag and replay window accepted it.
+    Transport,
+    /// A cookie reply accepted for our last handshake message. Accepted, but
+    /// not proof of the peer; see [`Self::moves_endpoint`].
+    CookieReply,
+}
+
+impl AuthenticatedPacketKind {
+    /// Whether accepting this kind authenticates the peer, and so whether the
+    /// device roams when it is accepted **and commits**.
+    ///
+    /// Every accepted handshake message and transport frame authenticates the
+    /// peer; a cookie reply does not. This is the C report's
+    /// `WIREGUARD_EV_PEER_AUTHENTICATED`, and the device's roaming rule, from
+    /// one definition. A cookie reply's key is derived from the peer's public
+    /// key alone, and the reply is bound only to the index and mac1 of our
+    /// last handshake message, which travelled in clear. Anyone who saw that
+    /// message and knows the peer's public key can therefore forge a valid
+    /// reply, with any cookie, from any address -- not just relay a real one.
+    /// Under AmneziaWG obfuscation the forger also needs the shared
+    /// parameters (the H3 header and S3 prefix, and the header-protection key
+    /// when one is set), which any holder of a client configuration has.
+    ///
+    /// This predicate does not include the commit result. Endpoint adoption
+    /// requires this method to return `true` and the receive result not to be
+    /// an error; see [`AuthenticatedPacketKind`] for the path bookkeeping this
+    /// API does not perform.
+    pub fn moves_endpoint(self) -> bool {
+        // Spelled out, with no wildcard, so a new kind cannot authenticate the
+        // peer -- and roam, and set PEER_AUTHENTICATED -- by default: inside
+        // this crate the match stays exhaustive and a new variant fails to
+        // compile here until it is classified.
+        match self {
+            Self::HandshakeInitiation | Self::HandshakeResponse | Self::Transport => true,
+            Self::CookieReply => false,
+        }
+    }
 }
 
 impl<'a> From<WireGuardError> for TunnResult<'a> {
@@ -267,17 +361,27 @@ pub(crate) enum Authenticated {
 }
 
 impl Authenticated {
+    fn kind(&self) -> AuthenticatedPacketKind {
+        match self {
+            Self::HandshakeInit(_) => AuthenticatedPacketKind::HandshakeInitiation,
+            Self::HandshakeResponse(_) => AuthenticatedPacketKind::HandshakeResponse,
+            Self::CookieReply(_) => AuthenticatedPacketKind::CookieReply,
+            Self::Data { .. } => AuthenticatedPacketKind::Transport,
+        }
+    }
+
     /// Whether accepting this packet makes its source the peer's endpoint.
     ///
     /// Every authenticated handshake message and transport frame does; a
     /// cookie reply does not, as in Linux and wireguard-go. Its key is derived
-    /// from our peer's *public* key and it is bound only to the mac1 of our
-    /// last handshake message, which travelled in clear -- so anyone who saw
-    /// that message can relay a valid reply, or make one, from any address.
+    /// from our peer's *public* key and it is bound only to the index and mac1
+    /// of our last handshake message -- so anyone who saw that message and
+    /// knows that key can forge a valid reply from any address (see
+    /// [`AuthenticatedPacketKind::moves_endpoint`] for the AmneziaWG case).
     /// Roaming on it would hand them the endpoint and the connected socket.
     #[cfg(feature = "device")]
     pub(crate) fn moves_endpoint(&self) -> bool {
-        !matches!(self, Authenticated::CookieReply(_))
+        self.kind().moves_endpoint()
     }
 }
 
@@ -1077,11 +1181,17 @@ impl Tunn {
     /// session the drain only drives the handshake, so `Done` there does not
     /// mean the queue is empty.
     ///
+    /// A handshake initiation or response whose answer cannot fit `dst` is
+    /// refused as `DestinationBufferTooSmall` before it is authenticated, in
+    /// every imitation mode: nothing is consumed, and the same datagram
+    /// retried with a larger `dst` is answered.
+    ///
     /// `src_addr` is the datagram's source address, which the under-load
     /// cookie is bound to. A caller that knows the source UDP port as well
     /// should use [`Self::decapsulate_from`], so the cookie covers the whole
     /// endpoint. With `None` no cookie can be demanded: under load, a
-    /// handshake message is refused as `UnderLoad`.
+    /// handshake message is refused as `UnderLoad`, unless AmneziaWG
+    /// `DisableCookies` is set, which skips the load check.
     pub fn decapsulate<'a>(
         &mut self,
         src_addr: Option<IpAddr>,
@@ -1113,6 +1223,59 @@ impl Tunn {
             dst,
             OutputBudget::UNBOUNDED,
         )
+    }
+
+    /// Receives a datagram and returns both the action and what the datagram
+    /// was accepted as, if anything.
+    ///
+    /// `Some(kind)` means the tunnel accepted the datagram as `kind`; it is
+    /// reported whatever the commit that followed returned. It does not by
+    /// itself mean the peer was authenticated: see [`AuthenticatedPacketKind`]
+    /// for what `Some` does and does not establish, how it maps onto the C
+    /// `wireguard_read_ex` report, and what a caller that moves a peer
+    /// endpoint must check. Refused datagrams, cookie demands and imitation
+    /// evidence return `None`.
+    ///
+    /// An empty `datagram` is refused as `(TunnResult::Done, None)` and is
+    /// never drained here. This method is the network-receive entry point; a
+    /// forged zero-length datagram on a peer's 4-tuple must not release queued
+    /// packets or advance a handshake burst (the hazard the device guards on
+    /// its connected socket). Use [`Self::decapsulate`] or
+    /// [`Self::decapsulate_from`] with an empty slice for the drain. This
+    /// differs from the C `wireguard_read_ex`, which keeps the legacy contract
+    /// and drains on `src_size` 0.
+    ///
+    /// A handshake initiation or response whose answer cannot fit `dst` is
+    /// refused as `DestinationBufferTooSmall` with no kind, before it is
+    /// authenticated: nothing is consumed, and the same datagram retried with
+    /// a larger `dst` is answered.
+    ///
+    /// This takes the full [`SocketAddr`] because the under-load cookie binds
+    /// the address and port together. With `src` `None` no cookie can be
+    /// demanded: under load, a handshake message is refused as
+    /// `Err(UnderLoad)` with no kind, as for [`Self::decapsulate`] -- unless
+    /// AmneziaWG `DisableCookies` is set, which skips the load check, so the
+    /// handshake is accepted as if the tunnel were not under load. Callers
+    /// that only have an [`IpAddr`] keep using [`Self::decapsulate`] and do
+    /// not receive metadata. The legacy methods retain their signatures and
+    /// actions.
+    pub fn decapsulate_from_with_metadata<'a>(
+        &mut self,
+        src: Option<SocketAddr>,
+        datagram: &[u8],
+        dst: &'a mut [u8],
+    ) -> (TunnResult<'a>, Option<AuthenticatedPacketKind>) {
+        if datagram.is_empty() {
+            return (TunnResult::Done, None);
+        }
+        self.meta.begin_receive();
+        let result = self.decapsulate_source(
+            src.map(Source::from),
+            datagram,
+            dst,
+            OutputBudget::UNBOUNDED,
+        );
+        (result, self.meta.take_receive_input())
     }
 
     /// [`Self::decapsulate`] under `budget`, for `wireguard_read_ex`: the
@@ -1487,20 +1650,22 @@ impl Tunn {
         budget: OutputBudget,
     ) -> TunnResult<'a> {
         // Accepted, irreversibly, as what it authenticated as -- whatever the
-        // commit below then reports. A cookie reply authenticates no peer.
+        // commit below then reports. This is the one place acceptance is
+        // recorded, for the C report and `decapsulate_from_with_metadata`
+        // alike; a cookie reply authenticates no peer (`note_input`).
         // Transport is told apart by the receiver's own keepalive rule
         // (`validate_decapsulated_packet`), malformed inner packets included
         // as data.
-        let (kind, authenticated) = match &packet {
-            Authenticated::HandshakeInit(_) => (PacketKind::HandshakeInitiation, true),
-            Authenticated::HandshakeResponse(_) => (PacketKind::HandshakeResponse, true),
-            Authenticated::CookieReply(_) => (PacketKind::CookieReply, false),
+        let kind = match &packet {
+            Authenticated::HandshakeInit(_) => PacketKind::HandshakeInitiation,
+            Authenticated::HandshakeResponse(_) => PacketKind::HandshakeResponse,
+            Authenticated::CookieReply(_) => PacketKind::CookieReply,
             Authenticated::Data { len, .. } => match dst.get(..*len).and_then(<[u8]>::first) {
-                None | Some(&0) => (PacketKind::TransportKeepalive, true),
-                Some(_) => (PacketKind::TransportData, true),
+                None | Some(&0) => PacketKind::TransportKeepalive,
+                Some(_) => PacketKind::TransportData,
             },
         };
-        self.meta.note_input(kind, authenticated);
+        self.meta.note_input(kind, packet.kind());
 
         match packet {
             Authenticated::HandshakeInit(init) => self.commit_handshake_init(init, dst, budget),
