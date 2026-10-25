@@ -397,7 +397,16 @@ fn imitation_observation_is_not_authentication() {
         let (mut mine, mut theirs) = pair(&config, None);
         let mut buf = [0; 2048];
         if after_acceptance {
-            let init = network(mine.format_handshake_initiation(&mut buf, false));
+            // An initiation's random S1 prefix can, rarely, read as a probe
+            // (QUIC, say), and accepting it would then teach Auto that
+            // protocol and leave no hint to observe. Use one that reads as
+            // none, so the test does not depend on chance.
+            let init = loop {
+                let init = network(mine.format_handshake_initiation(&mut buf, true));
+                if super::imitation::detect::detect(&init).is_none() {
+                    break init;
+                }
+            };
             assert!(matches!(
                 theirs.decapsulate_from(source(), &init, &mut buf),
                 TunnResult::WriteToNetwork(_)

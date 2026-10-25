@@ -140,15 +140,17 @@ pub enum TunnResult<'a> {
 ///
 /// A caller that learns a peer endpoint from the kind must require
 /// [`Self::moves_endpoint`] *and* a result that is not a [`TunnResult::Err`].
-/// This API performs no path bookkeeping. On a committed roam the in-tree
-/// device also restarts the tunnel's UDP-size window for the new path
-/// (restoring the old one if the commit fails) and drops a pending Auto
-/// imitation hint. This API does neither, so an embedder that adopts an
-/// endpoint keeps the old path's window -- random trailers on the first
-/// frames of the new path can be sized for the old path's width -- and can
-/// keep an Auto hint keyed on the old source IP across a
-/// same-IP/different-port roam. Accept that camouflage divergence, or ask
-/// for a public path-transition API if exact device parity matters.
+/// This API performs no path bookkeeping. When the in-tree device accepts a
+/// peer-authenticating datagram from a new source endpoint (a new port
+/// counts), it restarts the tunnel's UDP-size window before the commit,
+/// restores the old window if the commit fails, and drops a pending Auto
+/// imitation hint once the commit succeeds. This API does none of that. An
+/// embedder that adopts an endpoint keeps the old path's window, which only
+/// ever grows, until a reset; with RandomTrailers on, the handshake suffixes
+/// and transport padding it sizes can stay wider than anything the new path
+/// has carried. It can also keep an Auto hint keyed on the old source IP
+/// across a same-IP/different-port roam. Accept that camouflage divergence,
+/// or ask for a public path-transition API if exact device parity matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum AuthenticatedPacketKind {

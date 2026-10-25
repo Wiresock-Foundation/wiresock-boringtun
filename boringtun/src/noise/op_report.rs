@@ -13,9 +13,11 @@
 //! selected session's serial.
 //!
 //! Everything here lives in the `Tunn` and is written and read under the one
-//! lock hold of a single operation ([`Tunn::begin_op`] .. [`Tunn::finish_op`]).
-//! There is no "last result" to query later: the report is returned with the
-//! result it describes, or not at all.
+//! lock hold of a single operation ([`Tunn::begin_op`] .. [`Tunn::finish_op`]),
+//! except the accepted input kind kept for the Rust metadata receive: every
+//! commit writes it, from any entry point, and that receive reads it outside
+//! any `begin_op` (see below). There is no "last result" to query later: the
+//! report is returned with the result it describes, or not at all.
 //!
 //! The vocabulary is the accepted P1-prime metadata contract (WRS-225 V1-V6).
 //! Nothing here changes what the operation does; the output budgets the same
@@ -102,13 +104,15 @@ pub(crate) struct OpState {
     events: u32,
     input_kind: PacketKind,
     output_kind: PacketKind,
-    /// The last input any commit accepted, from any entry point -- the same
-    /// fact as `INPUT_ACCEPTED` and `input_kind`, written by the same
-    /// `note_input`, so the Rust and C reports cannot disagree. Every commit
-    /// writes it, and only [`Tunn::decapsulate_from_with_metadata`] reads or
-    /// clears it: it clears it first (`begin_receive`) and takes it last, so
-    /// a value left by a legacy, device or C call is never reported. Scoped by `begin_receive` rather than `begin_op`, so a
-    /// Rust receive never advances the C operation sequence.
+    /// The input the latest commit accepted, from any entry point, unless a
+    /// metadata receive has since cleared or taken it. It is the same fact as
+    /// `INPUT_ACCEPTED` and `input_kind`, written by the same `note_input`, so
+    /// the Rust and C reports cannot disagree. Every commit writes it, and only
+    /// [`Tunn::decapsulate_from_with_metadata`] reads or clears it: it clears
+    /// it first (`begin_receive`) and takes it last, so a value left by a
+    /// legacy, device or C call is never reported. Scoped by `begin_receive`
+    /// rather than `begin_op`, so a Rust receive never advances the C
+    /// operation sequence.
     receive_input: Option<AuthenticatedPacketKind>,
 }
 
