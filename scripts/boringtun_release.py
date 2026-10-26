@@ -367,10 +367,26 @@ class GitHub:
         self.prefix = "/repos/" + policy.REPOSITORY
 
     def request(self, method, path, body=None, *, binary=False, upload=False, absent=False):
-        require(any(path.startswith("/repos/" + repo + "/") or path == "/repos/" + repo for repo in self.allowed),
-                "API target outside allowlist")
-        require(".." not in path and "#" not in path, "unsafe API path")
         require(method in ("GET", "POST", "PATCH"), "unsupported mutation")
+        require(type(path) is str and re.fullmatch(r"[\x21-\x7e]+", path) and
+                "#" not in path and "\\" not in path, "unsafe API path")
+        resource, query_separator, _query = path.partition("?")
+        repository = next((repo for repo in self.allowed if resource == "/repos/" + repo or
+                           resource.startswith("/repos/" + repo + "/")), None)
+        require(repository is not None, "API target outside allowlist")
+        # All supported endpoints use literal URL-safe path components. Reject
+        # encoded separators/dots (including nested encodings) before HTTP can
+        # normalize them; URL-encoded query values remain independent of paths.
+        require(re.fullmatch(r"(?:/[A-Za-z0-9_.-]+)+", resource) and
+                all(part not in (".", "..") for part in resource.split("/")[1:]), "unsafe API path")
+        suffix = resource[len("/repos/" + repository):]
+        if suffix.startswith("/compare/"):
+            branch = "master" if repository == policy.REPOSITORY else "main"
+            require(re.fullmatch(r"/compare/[0-9a-f]{40}\.\.\." + branch, suffix) and
+                    method == "GET" and not query_separator and body is None and not binary and not upload,
+                    "unsafe ancestry comparison")
+        else:
+            require(".." not in path, "unsafe API path")
         host = "uploads.github.com" if upload else "api.github.com"
         headers = {"Accept": "application/octet-stream" if binary else "application/vnd.github+json",
                    "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "boringtun-release-policy/1"}
