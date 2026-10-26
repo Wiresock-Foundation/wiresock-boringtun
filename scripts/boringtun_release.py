@@ -42,11 +42,18 @@ REQUIRED_JOBS = {"Resolve merged PR", "License and dependency gate", "Release re
 MAX_TOTAL = 256 * 1024 * 1024
 MANIFEST_KEYS = ("artifact_format name version source_repository source_commit source_date_epoch target os arch libc "
                  "linkage rust_toolchain rustc cargo build_command build_profile rustflags binary binary_sha256 license third_party_licenses").split()
+AUTH_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+                 "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN")
 
 
 def require(value, message):
     if not value:
         raise policy.PolicyError(message)
+
+
+def local_environment():
+    """Keep network credentials out of Git and static verification subprocesses."""
+    return {key: value for key, value in os.environ.items() if key not in AUTH_ENV_VARS}
 
 
 def digest(data):
@@ -388,7 +395,11 @@ class GitHub:
         else:
             require(".." not in path, "unsafe API path")
         host = "uploads.github.com" if upload else "api.github.com"
-        headers = {"Accept": "application/octet-stream" if binary else "application/vnd.github+json",
+        # Actions ZIP downloads negotiate the JSON API before redirecting to
+        # storage. Only release-asset downloads require octet-stream; binary
+        # controls response decoding independently of the endpoint's media type.
+        release_asset = binary and re.fullmatch(r"/releases/assets/[1-9][0-9]*", suffix)
+        headers = {"Accept": "application/octet-stream" if release_asset else "application/vnd.github+json",
                    "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "boringtun-release-policy/1"}
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
@@ -401,6 +412,7 @@ class GitHub:
             with self.opener.open(request, timeout=60) as response:
                 raw = response.read(MAX_TOTAL + 1)
         except urllib.error.HTTPError as exc:
+            exc.close()
             if exc.code == 404 and absent and method == "GET":
                 return None
             if exc.code in (301, 302, 303, 307, 308) and method == "GET" and binary:
@@ -644,7 +656,7 @@ def static_archive_gate(files, request, version):
         root = Path(directory)
         pin = root / "pin.env"
         pin.write_text(pin_text(request, version), encoding="utf-8", newline="\n")
-        environment = dict(os.environ, BORINGTUN_PIN_FILE=str(pin))
+        environment = dict(local_environment(), BORINGTUN_PIN_FILE=str(pin))
         # Verify each archive independently. The helper reads only trusted R
         # packaging configuration; it must never be loaded from files/artifacts.
         for index, (name, raw) in enumerate(sorted(files.items())):
@@ -744,7 +756,8 @@ def trusted_context(api, config):
     triggered_build()
     recipe = policy._sha(os.environ.get("GITHUB_WORKFLOW_SHA"))
     require(os.environ.get("GITHUB_SHA") == recipe, "workflow recipe and OIDC source digest differ")
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, env=local_environment(),
+                          check=True, capture_output=True, text=True).stdout.strip()
     require(head == recipe, "trusted checkout is not workflow revision R")
     run_id, attempt = int(os.environ["GITHUB_RUN_ID"]), int(os.environ["GITHUB_RUN_ATTEMPT"])
     workflow = api.get(api.prefix + "/actions/workflows/" + policy.PUBLISH_WORKFLOW.split("/")[-1])
@@ -1124,7 +1137,7 @@ def main(argv=None):
                 request = resolve_build_request(api, retained)
                 event_path = Path(os.environ["GITHUB_EVENT_PATH"])
                 require(event_path.stat().st_size <= 1024 * 1024, "oversized push event")
-                checkout = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, check=True,
+                checkout = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, env=local_environment(), check=True,
                                           capture_output=True, text=True).stdout.strip()
                 check_push_context(request, policy.load_json(event_path.read_bytes()), os.environ, checkout)
             else:

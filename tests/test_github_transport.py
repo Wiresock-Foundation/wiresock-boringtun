@@ -3,6 +3,7 @@ import io
 from pathlib import Path
 import sys
 import unittest
+import urllib.error
 from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -91,6 +92,77 @@ class GitHubTransportTests(unittest.TestCase):
                 host = "uploads.github.com" if options.get("upload") else "api.github.com"
                 self.assertEqual(request.full_url, "https://" + host + path)
                 self.assertEqual(request.get_method(), method)
+
+    def test_actions_zip_negotiates_json_but_returns_unparsed_binary(self):
+        payload = b"PK\x03\x04\xff\x00archive"
+        def serve(request, **_options):
+            if request.get_header("Accept") != "application/vnd.github+json":
+                raise urllib.error.HTTPError(request.full_url, 415, "Unsupported Accept header", {}, io.BytesIO())
+            return io.BytesIO(payload)
+        self.api.opener.open.side_effect = serve
+        self.assertEqual(self.api.request("GET", self.api.prefix + "/actions/artifacts/12681307359/zip",
+                                          binary=True), payload)
+
+    def test_actions_zip_redirect_keeps_json_api_header_and_strips_auth_at_storage(self):
+        payload = b"PK\x03\x04\xffarchive"
+        destination = "https://example.blob.core.windows.net/artifacts/archive.zip?sig=test"
+        def serve(request, **_options):
+            if request.full_url == destination:
+                self.assertIsNone(request.get_header("Authorization"))
+                self.assertIsNone(request.get_header("Accept"))
+                return io.BytesIO(payload)
+            self.assertEqual(request.get_header("Accept"), "application/vnd.github+json")
+            self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
+            raise urllib.error.HTTPError(request.full_url, 302, "Found", {"Location": destination}, io.BytesIO())
+        self.api.opener.open.side_effect = serve
+        self.assertEqual(self.api.request("GET", self.api.prefix + "/actions/artifacts/123/zip", binary=True), payload)
+        self.assertEqual(self.api.opener.open.call_count, 2)
+
+    def test_release_asset_retains_octet_stream_for_direct_and_redirected_downloads(self):
+        payload = b"\xffrelease-asset"
+        for redirect in (False, True):
+            with self.subTest(redirect=redirect):
+                destination = "https://release-assets.githubusercontent.com/asset"
+                def serve(request, **_options):
+                    if request.full_url == destination:
+                        self.assertIsNone(request.get_header("Authorization"))
+                        return io.BytesIO(payload)
+                    self.assertEqual(request.get_header("Accept"), "application/octet-stream")
+                    if redirect:
+                        raise urllib.error.HTTPError(request.full_url, 302, "Found", {"Location": destination}, io.BytesIO())
+                    return io.BytesIO(payload)
+                self.api.opener.open.side_effect = serve
+                self.assertEqual(self.api.request("GET", self.api.prefix + "/releases/assets/123", binary=True), payload)
+
+    def test_binary_redirect_does_not_broaden_storage_authority(self):
+        for destination in ("http://example.blob.core.windows.net/file", "https://evil.example/file",
+                            "https://release-assets.githubusercontent.com.evil.example/file",
+                            "https://user:pass@example.blob.core.windows.net/file",
+                            "https://example.blob.core.windows.net:444/file"):
+            with self.subTest(destination=destination):
+                self.api.opener.reset_mock()
+                self.api.opener.open.side_effect = urllib.error.HTTPError(
+                    "https://api.github.com" + self.api.prefix, 302, "Found", {"Location": destination}, io.BytesIO())
+                with self.assertRaises(policy.PolicyError):
+                    self.api.request("GET", self.api.prefix + "/actions/artifacts/123/zip", binary=True)
+                self.assertEqual(self.api.opener.open.call_count, 1)
+
+    def test_upload_accept_and_body_content_type_remain_independent(self):
+        self.api.request("POST", self.api.prefix + "/releases/123/assets?name=RELEASE.json", b"{}", upload=True)
+        request = self.api.opener.open.call_args.args[0]
+        self.assertEqual(request.get_header("Accept"), "application/vnd.github+json")
+        self.assertEqual(request.get_header("Content-type"), "application/octet-stream")
+
+    def test_api_error_response_is_closed_on_absence_and_redirect(self):
+        for code in (404, 302):
+            with self.subTest(code=code):
+                body = io.BytesIO(b"API response")
+                error = urllib.error.HTTPError("https://api.github.com" + self.api.prefix, code, "response",
+                                               {"Location": "https://example.blob.core.windows.net/file"}, body)
+                self.addCleanup(error.close)
+                self.api.opener.open.side_effect = [error, io.BytesIO(b"artifact")]
+                self.api.request("GET", self.api.prefix + "/actions/artifacts/123/zip", binary=True, absent=True)
+                self.assertTrue(body.closed)
 
 
 if __name__ == "__main__":
