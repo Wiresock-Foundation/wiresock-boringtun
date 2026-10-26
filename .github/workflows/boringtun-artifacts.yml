@@ -1,0 +1,398 @@
+name: BoringTun merged PR artifacts
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Explicit merged PR for a maintenance dry run (cannot publish)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# No branch-wide concurrency: every merged PR retains its own run and attempt.
+env:
+  RUST_TOOLCHAIN: 1.98.1
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_ABOUT_VERSION: 0.9.2
+  GO_VERSION: 1.27.1
+
+jobs:
+  resolve:
+    name: Resolve merged PR
+    if: >-
+      github.repository == 'Wiresock-Foundation/wiresock-boringtun' &&
+      ((github.event_name == 'pull_request' && github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == 'master') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      source: ${{ steps.resolve.outputs.source }}
+      pr: ${{ steps.resolve.outputs.pr }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Re-read merged PR, ancestry and source manifest
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          python3 scripts/boringtun_release.py resolve --pr "$PR_NUMBER" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/request"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request/*
+          if-no-files-found: error
+          retention-days: 14
+
+  licenses:
+    name: License and dependency gate
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Set temporary source pin path
+        run: echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/request/pin.env" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.source }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - name: Install exact Rust and license tools
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup target add --toolchain "$RUST_TOOLCHAIN" x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf x86_64-apple-darwin aarch64-apple-darwin
+          cargo "+$RUST_TOOLCHAIN" install --locked "cargo-deny@$CARGO_DENY_VERSION"
+          cargo "+$RUST_TOOLCHAIN" install --locked --features cli "cargo-about@$CARGO_ABOUT_VERSION"
+      - name: Source tests, attribution and complete notices
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/validation-target
+        run: |
+          (cd source && cargo "+$RUST_TOOLCHAIN" test --workspace --locked)
+          python3 source/scripts/check-attribution.py
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf x86_64-apple-darwin aarch64-apple-darwin; do
+            mkdir -p "$RUNNER_TEMP/licenses/$target"
+            bash source/scripts/boringtun-artifact.sh licenses source "$RUNNER_TEMP/licenses/$target/THIRD-PARTY-LICENSES" "$target"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: notices-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/licenses/
+          if-no-files-found: error
+
+  build:
+    name: Build (${{ matrix.label }})
+    needs: [resolve, licenses]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            artifact: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            platform: linux
+          - label: linux-aarch64
+            artifact: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            platform: linux
+          - label: linux-armv7-cross
+            artifact: linux-armv7
+            runner: ubuntu-24.04
+            target: armv7-unknown-linux-musleabihf
+            platform: armv7
+          - label: macos-x86_64
+            artifact: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+          - label: macos-aarch64
+            artifact: macos-aarch64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            platform: macos
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    permissions:
+      contents: read
+    steps:
+      - name: Set temporary source pin path
+        run: |
+          echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/request/pin.env" >> "$GITHUB_ENV"
+          echo "BTA_BASH=$(command -v bash)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.source }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - uses: actions/download-artifact@v8
+        with:
+          name: notices-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/licenses
+      - name: Select reviewed compiler and exact Rust
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          case "$PLATFORM" in
+            linux)
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends musl-tools
+              ;;
+            armv7)
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends clang-18 qemu-user iproute2
+              ;;
+            macos)
+              export DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
+              xcodebuild -version
+              xcrun --sdk macosx --show-sdk-version
+              command -v gtar
+              checked_bash="$(python3 source/scripts/boringtun-bash.py install "$RUNNER_TEMP/bash-toolchain")" || exit 1
+              python3 source/scripts/boringtun-bash.py verify "$checked_bash" || exit 1
+              echo "BTA_BASH=$checked_bash" >> "$GITHUB_ENV"
+              dirname "$checked_bash" >> "$GITHUB_PATH"
+              ;;
+            *) exit 1 ;;
+          esac
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+      - name: Build and package independently twice
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          "$BTA_BASH" source/scripts/boringtun-artifact.sh build source "$TARGET" "$RUNNER_TEMP/build-1"
+          "$BTA_BASH" source/scripts/boringtun-artifact.sh build source "$TARGET" "$RUNNER_TEMP/build-2"
+          cmp "$RUNNER_TEMP/build-1/boringtun-cli" "$RUNNER_TEMP/build-2/boringtun-cli"
+          mkdir "$RUNNER_TEMP/dist" "$RUNNER_TEMP/package-2"
+          "$BTA_BASH" source/scripts/boringtun-artifact.sh package "$RUNNER_TEMP/build-1" source "$RUNNER_TEMP/licenses/$TARGET/THIRD-PARTY-LICENSES" "$RUNNER_TEMP/dist"
+          "$BTA_BASH" source/scripts/boringtun-artifact.sh package "$RUNNER_TEMP/build-2" source "$RUNNER_TEMP/licenses/$TARGET/THIRD-PARTY-LICENSES" "$RUNNER_TEMP/package-2"
+          cmp "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP"/package-2/*.tar.gz
+      - name: Verify native archive
+        if: matrix.platform != 'armv7'
+        run: '"$BTA_BASH" source/scripts/boringtun-artifact.sh verify-archive "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP/extract"'
+      - name: Native Linux TUN and UAPI
+        if: matrix.platform == 'linux'
+        run: |
+          binary="$(find "$RUNNER_TEMP/extract" -type f -name boringtun-cli)"
+          sudo env BORINGTUN_PIN_FILE="$BORINGTUN_PIN_FILE" bash source/scripts/boringtun-artifact.sh device-smoke "$binary"
+      - name: ARMv7 static archive and emulated version, TUN and UAPI
+        if: matrix.platform == 'armv7'
+        run: |
+          binary="$(bash source/scripts/boringtun-artifact.sh verify-archive-static "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP/extract")"
+          /usr/bin/qemu-arm "$binary" --version
+          /usr/bin/qemu-arm "$binary" --help >/dev/null
+          cat > "$RUNNER_TEMP/boringtun-armv7" <<'SH'
+          #!/usr/bin/env bash
+          exec /usr/bin/qemu-arm "${BORINGTUN_ARM_CLI:?}" "$@"
+          SH
+          chmod 755 "$RUNNER_TEMP/boringtun-armv7"
+          sudo env BORINGTUN_PIN_FILE="$BORINGTUN_PIN_FILE" BORINGTUN_ARM_CLI="$binary" bash source/scripts/boringtun-artifact.sh device-smoke "$RUNNER_TEMP/boringtun-armv7"
+      - name: Retain compiler and SDK receipts from both builds
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-toolchain-${{ matrix.artifact }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/build-1/NATIVE-TOOLCHAIN.json
+            ${{ runner.temp }}/build-2/NATIVE-TOOLCHAIN.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: archive-${{ matrix.artifact }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dist/*.tar.gz
+          if-no-files-found: error
+
+  interop:
+    name: Interop (${{ matrix.label }})
+    needs: [resolve, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            artifact: linux-x86_64
+            runner: ubuntu-24.04
+            emulated: false
+          - label: linux-aarch64
+            artifact: linux-aarch64
+            runner: ubuntu-24.04-arm
+            emulated: false
+          - label: linux-armv7-emulated
+            artifact: linux-armv7
+            runner: ubuntu-24.04
+            emulated: true
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Set temporary source pin path
+        run: echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/request/pin.env" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.source }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - name: Read exact peer commit from source harness
+        id: peer
+        run: |
+          commit="$(sed -n 's/^readonly PINNED_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' source/scripts/awg31-interop.sh)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        with:
+          repository: amnezia-vpn/amneziawg-go
+          ref: ${{ steps.peer.outputs.commit }}
+          path: peer
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Build pinned peer and install harness dependencies
+        run: |
+          (cd peer && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/amneziawg-go" .)
+          bash source/scripts/awg31-interop.sh --check-go "$RUNNER_TEMP/amneziawg-go"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-cryptography iproute2 iputils-ping
+      - name: Install ARMv7 user-mode emulator
+        if: matrix.emulated
+        run: sudo apt-get install -y --no-install-recommends qemu-user
+      - uses: actions/download-artifact@v8
+        with:
+          name: archive-${{ matrix.artifact }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dist
+      - name: Verify archive and exercise both existing interop harnesses
+        env:
+          EMULATED: ${{ matrix.emulated }}
+        run: |
+          arm_binary=''
+          if [[ "$EMULATED" == true ]]; then
+            arm_binary="$(bash source/scripts/boringtun-artifact.sh verify-archive-static "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP/extract")"
+            /usr/bin/qemu-arm "$arm_binary" --version
+            cat > "$RUNNER_TEMP/boringtun-armv7" <<'SH'
+          #!/usr/bin/env bash
+          exec /usr/bin/qemu-arm "${BORINGTUN_ARM_CLI:?}" "$@"
+          SH
+            chmod 755 "$RUNNER_TEMP/boringtun-armv7"
+            binary="$RUNNER_TEMP/boringtun-armv7"
+          else
+            binary="$(bash source/scripts/boringtun-artifact.sh verify-archive "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP/extract")"
+          fi
+          launcher="$GITHUB_WORKSPACE/source/tests/helpers/boringtun-foreground-launcher.sh"
+          (cd source && timeout --signal=TERM --kill-after=20s 300s sudo env BORINGTUN_REAL_CLI="$binary" BORINGTUN_ARM_CLI="$arm_binary" \
+            bash scripts/awg-go-interop.sh "$launcher" "$RUNNER_TEMP/amneziawg-go")
+          (cd source && timeout --signal=TERM --kill-after=20s 1200s sudo env BORINGTUN_REAL_CLI="$binary" BORINGTUN_ARM_CLI="$arm_binary" \
+            bash scripts/awg31-interop.sh "$launcher" "$RUNNER_TEMP/amneziawg-go")
+
+  utun:
+    name: Utun (${{ matrix.label }})
+    needs: [resolve, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-x86_64
+            runner: macos-15-intel
+          - label: macos-aarch64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Set temporary source pin path
+        run: echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/request/pin.env" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.source }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - uses: actions/download-artifact@v8
+        with:
+          name: archive-${{ matrix.label }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dist
+      - name: Build and select checksum-pinned GNU Bash
+        run: |
+          checked_bash="$(python3 source/scripts/boringtun-bash.py install "$RUNNER_TEMP/bash-toolchain")" || exit 1
+          python3 source/scripts/boringtun-bash.py verify "$checked_bash" || exit 1
+          echo "BTA_BASH=$checked_bash" >> "$GITHUB_ENV"
+          dirname "$checked_bash" >> "$GITHUB_PATH"
+      - name: Native Mach-O and utun/UAPI lifecycle gate
+        run: |
+          binary="$("$BTA_BASH" source/scripts/boringtun-artifact.sh verify-archive "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP/extract")"
+          sudo env BORINGTUN_PIN_FILE="$BORINGTUN_PIN_FILE" "$BTA_BASH" source/scripts/boringtun-artifact.sh device-smoke "$binary"
+
+  bundle:
+    name: Release request bundle
+    needs: [resolve, licenses, build, interop, utun]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.source }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: archive-*-${{ github.run_id }}-${{ github.run_attempt }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/archives
+      - name: Assemble exact request, archives and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 source/scripts/boringtun_release.py bundle --request "$RUNNER_TEMP/request/REQUEST.json" \
+            --archives "$RUNNER_TEMP/archives" --output "$RUNNER_TEMP/release-request"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: boringtun-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-request/*
+          if-no-files-found: error
+          retention-days: 90

@@ -1,4 +1,4 @@
-// Copyright (c) 2024-2026 WireSock. All rights reserved.
+// Copyright (c) 2024-2026 Vadim Smirnov (doing business as WireSock). All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Assembly of a complete, protected QUIC v1 Initial packet (RFC 9000 §17.2 /

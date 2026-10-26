@@ -1,0 +1,185 @@
+name: BoringTun trusted promotion
+
+on:
+  workflow_run:
+    workflows: [BoringTun merged PR artifacts]
+    types: [completed]
+
+# Publication is dormant: release-policy.json is disabled, attribution remains
+# unresolved, and every activation blocker must be cleared by a reviewed change.
+# Deliberately no workflow_run branch filter or shared concurrency group: a
+# different merged PR must never replace another PR's pending release request.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: Validate completed build
+    if: >-
+      github.repository == 'Wiresock-Foundation/wiresock-boringtun' &&
+      github.event_name == 'workflow_run' && github.ref == 'refs/heads/master' &&
+      github.event.workflow_run.repository.full_name == github.repository &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      publishable: ${{ steps.prepare.outputs.publishable }}
+      action: ${{ steps.prepare.outputs.action }}
+      attest: ${{ steps.prepare.outputs.attest }}
+      pr: ${{ steps.prepare.outputs.pr }}
+      tag: ${{ steps.prepare.outputs.tag }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - name: Check out trusted promoter revision R
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Install checksum-pinned GitHub CLI
+        run: |
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/gh.tar.gz"
+          python3 scripts/boringtun_release.py install-gh --archive "$RUNNER_TEMP/gh.tar.gz" --output "$RUNNER_TEMP/gh"
+      - name: Revalidate exact triggering build, five archives and live gates
+        id: prepare
+        env:
+          BUILD_RUN: ${{ github.event.workflow_run.id }}
+          BUILD_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          python3 scripts/boringtun_release.py prepare --build-run "$BUILD_RUN" --attempt "$BUILD_ATTEMPT" \
+            --gh "$RUNNER_TEMP/gh" --gh-archive "$RUNNER_TEMP/gh.tar.gz" --output "$RUNNER_TEMP/prepared"
+      - name: Transfer immutable verified preparation for this promoter attempt
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: promotion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/prepared/*
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 7
+      - name: Record activation or recovery status
+        if: always()
+        env:
+          STATE: ${{ steps.prepare.outcome }}
+          PUBLISHABLE: ${{ steps.prepare.outputs.publishable }}
+          ACTION: ${{ steps.prepare.outputs.action }}
+          REASON: ${{ steps.prepare.outputs.reason }}
+        run: |
+          {
+            printf 'Validation: %s\n\n' "$STATE"
+            printf 'Publication gate: %s; planned action: %s\n\n' "$PUBLISHABLE" "$ACTION"
+            printf '%s\n\n' "$REASON"
+            printf '%s\n' 'Missing-event recovery and historical recipe changes require the documented read-only reconciliation and reviewed evidence; this workflow never dispatches a replacement build.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  attest:
+    name: Attest verified content
+    needs: prepare
+    if: >-
+      github.repository == 'Wiresock-Foundation/wiresock-boringtun' &&
+      github.event_name == 'workflow_run' && github.ref == 'refs/heads/master' &&
+      needs.prepare.outputs.publishable == 'true' &&
+      needs.prepare.outputs.action != 'already-published' &&
+      needs.prepare.outputs.attest == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      attestations: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out trusted promoter revision R
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Install checksum-pinned GitHub CLI
+        run: |
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/gh.tar.gz"
+          python3 scripts/boringtun_release.py install-gh --archive "$RUNNER_TEMP/gh.tar.gz" --output "$RUNNER_TEMP/gh"
+      - name: Fetch exact prepared artifact by ID and digest
+        env:
+          ARTIFACT_ID: ${{ needs.prepare.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.prepare.outputs.artifact_digest }}
+        run: |
+          python3 scripts/boringtun_release.py fetch-prepared --artifact-id "$ARTIFACT_ID" \
+            --artifact-digest "$ARTIFACT_DIGEST" --output "$RUNNER_TEMP/prepared"
+      - name: Revalidate live policy and emit the exact six subject paths
+        id: subjects
+        run: |
+          python3 scripts/boringtun_release.py attest-ready --directory "$RUNNER_TEMP/prepared" \
+            --gh "$RUNNER_TEMP/gh" --gh-archive "$RUNNER_TEMP/gh.tar.gz"
+      - name: Attest descriptor and all five archives together
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4, delegates to pinned attest v4.2.1
+        with:
+          subject-path: ${{ steps.subjects.outputs.paths }}
+          push-to-registry: false
+          create-storage-record: false
+
+  publish:
+    name: Publish verified release
+    needs: [prepare, attest]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' &&
+      github.repository == 'Wiresock-Foundation/wiresock-boringtun' &&
+      github.event_name == 'workflow_run' && github.ref == 'refs/heads/master' &&
+      needs.prepare.outputs.publishable == 'true' &&
+      needs.prepare.outputs.action != 'already-published' &&
+      ((needs.prepare.outputs.attest == 'true' && needs.attest.result == 'success') ||
+      (needs.prepare.outputs.attest == 'false' && needs.attest.result == 'skipped'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: boringtun-release-pr-${{ needs.prepare.outputs.pr }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out trusted promoter revision R
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Install checksum-pinned GitHub CLI
+        run: |
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/gh.tar.gz"
+          python3 scripts/boringtun_release.py install-gh --archive "$RUNNER_TEMP/gh.tar.gz" --output "$RUNNER_TEMP/gh"
+      - name: Fetch exact prepared artifact by ID and digest
+        env:
+          ARTIFACT_ID: ${{ needs.prepare.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.prepare.outputs.artifact_digest }}
+        run: |
+          python3 scripts/boringtun_release.py fetch-prepared --artifact-id "$ARTIFACT_ID" \
+            --artifact-digest "$ARTIFACT_DIGEST" --output "$RUNNER_TEMP/prepared"
+      - name: Verify signatures, recheck gates and publish immutable assets
+        run: |
+          python3 scripts/boringtun_release.py publish --directory "$RUNNER_TEMP/prepared" \
+            --gh "$RUNNER_TEMP/gh" --gh-archive "$RUNNER_TEMP/gh.tar.gz" --execute
+      - name: Record safe retry boundary
+        if: failure()
+        run: |
+          printf '%s\n' 'Publication stopped. Preserve the original signed RELEASE.json and existing assets. The orchestrator reads back uncertain writes and never replaces assets. Historical-source tag permission failures require documented owner action; do not broaden credentials or create a replacement release identity.' >> "$GITHUB_STEP_SUMMARY"

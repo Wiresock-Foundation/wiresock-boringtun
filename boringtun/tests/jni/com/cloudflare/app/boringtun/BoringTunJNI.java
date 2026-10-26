@@ -1,4 +1,4 @@
-// Copyright (c) 2024-2026 WireSock. All rights reserved.
+// Copyright (c) 2024-2026 Vadim Smirnov (doing business as WireSock). All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 //
 // A smoke test for the JNI bindings, run against a real JVM.
