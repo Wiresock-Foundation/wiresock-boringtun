@@ -5,8 +5,8 @@ on:
     workflows: [BoringTun merged PR artifacts]
     types: [completed]
 
-# Publication is dormant: release-policy.json is disabled, attribution remains
-# unresolved, and every activation blocker must be cleared by a reviewed change.
+# Publication is dormant: release-policy.json is disabled, and every remaining
+# activation blocker must be cleared by a reviewed change.
 # Deliberately no workflow_run branch filter or shared concurrency group: a
 # different merged PR must never replace another PR's pending release request.
 permissions:
@@ -23,7 +23,8 @@ jobs:
       github.repository == 'Wiresock-Foundation/wiresock-boringtun' &&
       github.event_name == 'workflow_run' && github.ref == 'refs/heads/master' &&
       github.event.workflow_run.repository.full_name == github.repository &&
-      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'master' &&
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 30

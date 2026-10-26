@@ -108,7 +108,7 @@ class OrchestrationTests(unittest.TestCase):
         with self.assertRaises(policy.PolicyError):
             release.publication_gate(config)
         self.assertIs(config["enabled"], False)
-        self.assertEqual(config["attribution_status"], "unresolved")
+        self.assertEqual(config["attribution_status"], "reviewed")
 
     def test_gate_failure_and_failed_verification_cause_zero_writes(self):
         destination = MemoryDestination()
@@ -407,7 +407,7 @@ class OrchestrationTests(unittest.TestCase):
         event = {"action": "completed", "repository": {"full_name": policy.REPOSITORY},
                  "workflow_run": dict(fixtures.run_fixture())}
         self.assertEqual(release.check_trigger(event), (100, 2))
-        for field, value in [("id", True), ("run_attempt", 0), ("event", "push"),
+        for field, value in [("id", True), ("run_attempt", 0), ("event", "pull_request"),
                              ("conclusion", "failure"), ("status", "in_progress")]:
             changed = copy.deepcopy(event)
             changed["workflow_run"][field] = value
@@ -447,7 +447,7 @@ class OrchestrationTests(unittest.TestCase):
                 test.assertEqual(tag, test.descriptor["tag"])
                 return test.existing()
         request = policy.merged_request(fixtures.pr_fixture(), 42)
-        with patch.object(release, "resolve_request", return_value=request), \
+        with patch.object(release, "resolve_build_request", return_value=request), \
              patch.object(release, "source_metadata", return_value={"version": "0.7.1"}), \
              patch.object(release, "build_run_evidence", return_value=fixtures.run_fixture()), \
              patch.object(release, "verify_release") as verify, \
@@ -485,8 +485,8 @@ class OrchestrationTests(unittest.TestCase):
                 return api_run_fixture()
             def pages(self, path, key=None):
                 if "/pulls?" in path:
-                    return [{"number": 42, "merged_at": "2026-10-25T12:00:00Z"},
-                            {"number": 43, "merged_at": "2026-10-25T12:00:00Z"}]
+                    return [{"number": 42, "merged_at": "2026-10-25T12:00:00Z", "merge_commit_sha": C},
+                            {"number": 43, "merged_at": "2026-10-25T12:00:00Z", "merge_commit_sha": "d" * 40}]
                 return [api_run_fixture()]
             def read_release(self, tag):
                 return None
@@ -501,6 +501,10 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual([item["status"] for item in result["requests"]], ["blocked_build", "blocked_missing_build"])
         self.assertIn("historical recipe differs", result["requests"][0]["reason"])
         self.assertFalse(result["writes_performed"])
+        self.assertEqual(result['requests'][0]['recovery']['mode'], 'review-existing-attempts')
+        self.assertEqual(result['requests'][0]['recovery']['attempts'], [{'id': 100, 'attempt': 2}])
+        self.assertEqual(result['requests'][1]['recovery']['mode'], 'missing-event-no-release-route')
+        self.assertFalse(result['requests'][1]['recovery']['automatic'])
 
     def test_prepared_zip_bounds_member_count_before_descriptor_read(self):
         raw = self.zip([("RELEASE.json", self.files["RELEASE.json"], stat.S_IFREG | 0o644),
@@ -542,7 +546,7 @@ class OrchestrationTests(unittest.TestCase):
         publisher = fixtures.publisher_fixture()
         for key in metadata:
             publisher.pop(key)
-        with patch.object(release, "resolve_request", return_value=request), \
+        with patch.object(release, "resolve_build_request", return_value=request), \
              patch.object(release, "source_metadata", return_value=metadata), \
              patch.object(release, "build_run_evidence", return_value=run), \
              patch.object(release, "build_evidence", return_value=(run, artifact)) as evidence, \
@@ -565,7 +569,7 @@ class OrchestrationTests(unittest.TestCase):
         class Api:
             prefix = "/repos/" + policy.REPOSITORY
             def pages(self, path, key=None):
-                return ([{"number": 42, "merged_at": "2026-10-25T12:00:00Z"}]
+                return ([{"number": 42, "merged_at": "2026-10-25T12:00:00Z", "merge_commit_sha": C}]
                         if "/pulls?" in path else [run])
             def get(self, path):
                 return {"id": 200, "path": policy.BUILD_WORKFLOW} if "/workflows/" in path else run
@@ -577,6 +581,7 @@ class OrchestrationTests(unittest.TestCase):
              patch.object(release, "build_evidence", side_effect=AssertionError("active build must not enter promotion")):
             result = release.reconcile(Api(), "2026-10-25T00:00:00Z", {"build_workflow_id": 200}, "gh")
         self.assertEqual(result["requests"][0]["status"], "active_build")
+        self.assertEqual(result['requests'][0]['recovery']['mode'], 'wait-existing-run')
 
     def test_all_five_archive_manifests_bind_platform_and_individual_notices(self):
         hashes = set()
@@ -625,7 +630,7 @@ class OrchestrationTests(unittest.TestCase):
                 return b"license"
             def read_release(self, _tag):
                 return None
-        with patch.object(release, "resolve_request", return_value=request), \
+        with patch.object(release, "resolve_build_request", return_value=request), \
              patch.object(release, "source_metadata", return_value=metadata), \
              patch.object(release, "build_run_evidence", return_value=fixtures.run_fixture()), \
              patch.object(release, "build_evidence", return_value=(fixtures.run_fixture(), artifact)), \

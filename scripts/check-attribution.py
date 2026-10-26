@@ -37,7 +37,7 @@ def check():
             count += 1
     if count < 39:
         raise ValueError("fork source notices unexpectedly missing")
-    print(f"Attribution checks passed ({count} files); historical years still require owner confirmation.")
+    print(f"Attribution checks passed ({count} files); existing year ranges are preserved, not independently verified.")
 
 if __name__ == "__main__":
     check()

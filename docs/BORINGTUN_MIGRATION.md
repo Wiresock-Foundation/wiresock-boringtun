@@ -6,7 +6,7 @@ The local patch implements the read-only five-platform build workflow, strict
 release policy/orchestration, dormant publisher workflow and AWG adoption
 tooling. The fork's `.github/workflows/boringtun-release.yml` separates read-only
 validation, attestation and publication jobs. `release-policy.json` remains
-disabled, with attribution unresolved; signing and publication jobs require the
+disabled; existing attribution notices have a documented preservation review. Signing and publication jobs require the
 validated activation output and independently recheck live policy. Nothing in
 this patch activates publication or changes existing releases or production.
 
@@ -30,14 +30,16 @@ Each merged PR targeting its master branch has a distinct source-based tag:
 `boringtun-cli-<CLI version>-g<source SHA first 12>-b<PR number>`. The complete
 40-character source SHA is retained in MANIFEST and signed RELEASE.json.
 The PR's merged result identifies the source for merge, squash and rebase
-strategies; the PR head alone is not the release source. Direct pushes do not
-request releases. AWG adoption remains an explicit, reviewed version/hash patch.
+strategies; the PR head alone is not the release source. The read-only master-push builder admits only a commit that independently
+identifies exactly one merged master PR. Unmerged direct pushes cannot release;
+a replay of an eligible source retains its immutable identity. AWG adoption remains an explicit, reviewed version/hash patch.
 
 ## Phased activation
 
-1. Review both repository changes and resolve the source attribution gate.
-   The fork's release-policy configuration starts disabled, with unresolved
-   evidence listed. This implementation task does not activate or dispatch it.
+1. Both initial repository changes are merged with publication disabled.
+   Retained attribution notices now have a documented preservation review;
+   see ATTRIBUTION.md and BORINGTUN_ACTIVATION_AUDIT.md. The source binding
+   repair still requires independent review and a successful installed run.
 2. Merge the AWG retirement change only with owner approval. Its current Release
    workflow has no publisher, and its Artifacts workflow runs consumer checks.
    The Runtime workflow tests the exact published installer release rather than
@@ -87,7 +89,8 @@ used for read-only local adoption; no new credentials are introduced.
 
 The publisher accepts only successful completed runs of the merged-PR build
 workflow, then validates the exact event, repository, workflow ID, source and
-attempt. It has no direct-push or manual publication trigger. A manually
+attempt. It has no manual publication trigger; the eligible build must be a canonical
+master push independently bound to one merged PR, not an arbitrary direct push. A manually
 dispatched maintenance build remains a dry run because its triggering event is
 not eligible for promotion. Checkout, preparation upload and attestation actions
 in the privileged workflow use immutable commit pins. Attestation receives the
@@ -139,9 +142,11 @@ empty ARMv7 release fields. Existing runnable ARM64 stores on mixed-bitness
 hosts remain valid rollback candidates. This does not establish ARM32 support
 for the full web/proxy stack or validate a physical Pi.
 
-Native ARM64 and macOS execution, ARMv7 emulation/interop, actual GitHub
-event/attestation behavior and disposable host upgrade/rollback must be validated in their real environments before
-activation. Local fixture tests are not substitutes for those checks.
+The initial reviewed candidate run40331516759 passed native ARM64 and both
+macOS lanes, ARMv7 QEMU and all three Linux interop lanes. This is evidence for
+that exact candidate, not this repair. Actual installed push/attestation behavior
+and disposable host upgrade/rollback remain live validation tasks. Local fixture
+tests are not substitutes for those checks.
 
 ### Exact Bash for native macOS validation
 
@@ -169,4 +174,5 @@ build was Linux-only; it is not native macOS validation.
 CI provenance. These receipt bytes and the Bash input manifest are not included
 in the release descriptor's existing `toolchain_sha256` projection. This change
 does not clear the native host/tool provenance activation gate or enable
-publication; both native macOS CI lanes must still pass.
+publication. Both native macOS lanes passed in candidate run40331516759;
+subsequent source changes still require their own exact-head CI.

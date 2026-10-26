@@ -324,7 +324,7 @@ def project_pr(data, association=None, canonical_repository_id=None):
 
 def project_run(data):
     try:
-        result = projection(data, "id run_attempt workflow_id path event status conclusion head_sha created_at")
+        result = projection(data, "id run_attempt workflow_id path event status conclusion head_sha head_branch created_at")
         result["repository"] = projection(data["repository"], "full_name")
         require(type(data["pull_requests"]) is list, "missing run PR associations")
         result["pull_requests"] = [{"number": pr["number"], "head": project_head(pr["head"]),
@@ -476,8 +476,8 @@ def resolve_request(api, number, retained_run=None):
     association, repository_id = None, None
     if retained_run is not None:
         associations = retained_run.get("pull_requests")
-        require(type(associations) is list and len(associations) == 1, "exact build must retain one PR identity")
-        association = associations[0]
+        require(type(associations) is list and len(associations) <= 1, "ambiguous retained PR identities")
+        association = associations[0] if associations else None
         repository = api.get(api.prefix)
         repository_id = policy._int(repository["id"], "canonical repository ID")
         policy._int(retained_run["repository"]["id"], "build repository ID")
@@ -485,8 +485,42 @@ def resolve_request(api, number, retained_run=None):
                 retained_run["repository"]["id"] == repository_id and
                 retained_run["repository"]["full_name"] == policy.REPOSITORY, "build repository identity differs")
     request = policy.merged_request(project_pr(raw, association, repository_id), number)
+    if retained_run is not None:
+        require(raw["base"]["repo"]["id"] == repository_id, "PR base repository identity differs")
+        policy._check_build_identity(project_run(retained_run), request, retained_run["workflow_id"])
     check_ancestry(api.get(api.prefix + "/compare/" + request["source_commit"] + "...master"), request["source_commit"])
     return request
+
+
+def resolve_build_request(api, raw_run):
+    """Resolve server push C through paginated commit association and fresh PR.
+
+    Titles, Actions PR associations and REQUEST.json do not select the source.
+    This proves merged-source eligibility, not that this push caused the merge.
+    Replayed eligible C retains the same immutable release identity.
+    """
+    require(raw_run.get("event") == "push" and raw_run.get("head_branch") == "master",
+            "release build must be a master push")
+    source = policy._sha(raw_run.get("head_sha"))
+    number = policy.merged_pr_number(api.pages(api.prefix + f"/commits/{source}/pulls"), source)
+    return resolve_request(api, number, raw_run)
+
+
+def check_push_context(request, event, context, checkout):
+    """Defense in depth after the workflow's pre-checkout push guard."""
+    source = request["source_commit"]
+    require(context.get("GITHUB_EVENT_NAME") == "push" and
+            context.get("GITHUB_REPOSITORY") == policy.REPOSITORY and
+            context.get("GITHUB_REF") == policy.MASTER_REF and
+            context.get("GITHUB_SHA") == context.get("GITHUB_WORKFLOW_SHA") == checkout == source,
+            "push context or checkout differs from merged source C")
+    require(type(event) is dict and event.get("ref") == policy.MASTER_REF and
+            event.get("repository", {}).get("full_name") == policy.REPOSITORY and
+            event.get("after") == source and
+            all(event.get(key) is False for key in ("created", "deleted", "forced")),
+            "push must be an ordinary canonical master update")
+    before = policy._sha(event.get("before"))
+    require(before != "0" * 40 and before != source, "push has no prior distinct commit")
 
 
 def check_retirement(api, config):
@@ -652,10 +686,10 @@ def build_run_evidence(api, request, run_id, attempt, config):
     run = policy.check_build_run(project_run(raw_run), request, expected_id)
     require(run["id"] == run_id and run["run_attempt"] == attempt, "API returned wrong run or attempt")
     check_jobs([projection(job, "name run_id status conclusion") for job in jobs], run_id)
-    # Bind event semantics to the reviewed workflow, not an untrusted claim of
-    # event.action in REQUEST.json. Differing historical workflows fail closed.
+    # Push head_sha identifies the executed workflow C. Never compare to moving
+    # master; incompatible historical recipes remain explicitly blocked.
     require(api.contents(policy.BUILD_WORKFLOW, request["source_commit"]) == (ROOT / policy.BUILD_WORKFLOW).read_bytes(),
-            "build workflow at C differs from trusted closed-only recipe")
+            "build workflow at C differs from trusted master-push recipe")
     return run
 
 
@@ -675,7 +709,7 @@ def check_trigger(event):
             "wrong promotion trigger")
     run = event.get("workflow_run")
     require(type(run) is dict and run.get("repository", {}).get("full_name") == policy.REPOSITORY and
-            run.get("event") == "pull_request" and run.get("status") == "completed" and
+            run.get("event") == "push" and run.get("head_branch") == "master" and run.get("status") == "completed" and
             run.get("conclusion") == "success" and run.get("path") == policy.BUILD_WORKFLOW,
             "trigger is not a successful canonical build")
     return policy._int(run.get("id"), "trigger run"), policy._int(run.get("run_attempt"), "trigger attempt")
@@ -709,7 +743,8 @@ def verify_release(api, descriptor, files, config, gh):
     _check_files(descriptor, files, complete=False)
     build = descriptor["build_run"]
     retained = api.get(api.prefix + f"/actions/runs/{build['id']}/attempts/{build['run_attempt']}")
-    request = resolve_request(api, descriptor["pr"], retained)
+    request = resolve_build_request(api, retained)
+    require(request["pr"] == descriptor["pr"], "signed PR differs from independently discovered merged source")
     require(request["source_commit"] == descriptor["source_commit"], "signed source differs from merged PR")
     metadata = source_metadata(api, request)
     require(all(descriptor[key] == value for key, value in metadata.items()), "signed source metadata mismatch")
@@ -772,9 +807,7 @@ def check_publisher_evidence(raw, jobs, publisher):
 
 def prepare_release(api, run_id, attempt, publisher, config, gh):
     raw = api.get(api.prefix + f"/actions/runs/{run_id}/attempts/{attempt}")
-    require(type(raw.get("pull_requests")) is list and len(raw["pull_requests"]) == 1, "build has no unique PR association")
-    number = raw["pull_requests"][0]["number"]
-    request = resolve_request(api, number, raw)
+    request = resolve_build_request(api, raw)
     metadata = source_metadata(api, request)
     build_run_evidence(api, request, run_id, attempt, config)
     # Fully recorded releases and complete drafts remain verifiable after the
@@ -896,13 +929,13 @@ def reconcile(api, since, config, gh):
     boundary = policy._date(since)
     pulls = api.pages(api.prefix + "/pulls?state=closed&base=master&sort=updated&direction=asc")
     runs = api.pages(api.prefix + "/actions/workflows/" + policy.BUILD_WORKFLOW.split("/")[-1] +
-                     "/runs?event=pull_request&created=" + urllib.parse.quote(">=" + since, safe=""), "workflow_runs")
+                     "/runs?event=push&created=" + urllib.parse.quote(">=" + since, safe=""), "workflow_runs")
     results = []
     for pull in sorted(pulls, key=lambda value: value["number"]):
         if pull.get("merged_at") is None or policy._date(pull["merged_at"]) < boundary:
             continue
         number = policy._int(pull["number"], "reconciliation PR")
-        candidates = [run for run in runs if any(pr.get("number") == number for pr in run.get("pull_requests", []))]
+        candidates = [run for run in runs if run.get("head_sha") == pull.get("merge_commit_sha")]
         candidates.sort(key=lambda value: (value["id"], value["run_attempt"]), reverse=True)
         row = {"pr": number, "source_commit": None, "tag": None, "status": "blocked_request", "reason": ""}
         try:
@@ -957,6 +990,14 @@ def reconcile(api, since, config, gh):
                         row.update(status="blocked_build", reason="; ".join(failures))
         except (policy.PolicyError, OSError, KeyError, TypeError, ValueError, subprocess.CalledProcessError) as exc:
             row["reason"] = str(exc)
+        modes = {"active_build": "wait-existing-run", "blocked_missing_build": "missing-event-no-release-route",
+                 "blocked_build": "review-existing-attempts", "blocked_request": "review-source-evidence",
+                 "draft_verified": "review-original-signed-draft", "published_verified": "none",
+                 "build_evidence_present": "review-promotion-gates"}
+        # Diagnostic preparation only: never turn a dispatch into eligible push
+        # evidence or emit commands which could mutate tags/branches/releases.
+        row["recovery"] = {"automatic": False, "mode": modes[row["status"]],
+                           "attempts": [{"id": item["id"], "attempt": item["run_attempt"]} for item in candidates]}
         results.append(row)
     return {"schema": 1, "repository": policy.REPOSITORY, "since": since, "writes_performed": False,
             "publication_enabled": config.get("enabled") is True,
@@ -1006,7 +1047,7 @@ def parser():
     reconciliation.add_argument("--gh", required=True)
     reconciliation.add_argument("--gh-archive", required=True)
     resolve = commands.add_parser("resolve", help="read-only merged-PR request and temporary pin")
-    resolve.add_argument("--pr", type=int, required=True)
+    resolve.add_argument("--pr", type=int, help="explicit merged PR for maintenance dry runs only")
     resolve.add_argument("--run-id", type=int, required=True)
     resolve.add_argument("--attempt", type=int, required=True)
     resolve.add_argument("--output", required=True)
@@ -1058,10 +1099,20 @@ def main(argv=None):
             return 0
         if args.command == "resolve":
             require(os.environ.get("GITHUB_REPOSITORY") == policy.REPOSITORY and
-                    os.environ.get("GITHUB_EVENT_NAME") in ("pull_request", "workflow_dispatch"), "wrong build context")
-            retained = (api.get(api.prefix + f"/actions/runs/{args.run_id}/attempts/{args.attempt}")
-                        if os.environ.get("GITHUB_EVENT_NAME") == "pull_request" else None)
-            request = resolve_request(api, args.pr, retained)
+                    os.environ.get("GITHUB_EVENT_NAME") in ("push", "workflow_dispatch"), "wrong build context")
+            if os.environ.get("GITHUB_EVENT_NAME") == "push":
+                require(args.pr is None, "automatic source cannot be selected by a CLI PR argument")
+                retained = api.get(api.prefix + f"/actions/runs/{args.run_id}/attempts/{args.attempt}")
+                require(retained["id"] == args.run_id and retained["run_attempt"] == args.attempt,
+                        "resolver received wrong run or attempt")
+                request = resolve_build_request(api, retained)
+                event_path = Path(os.environ["GITHUB_EVENT_PATH"])
+                require(event_path.stat().st_size <= 1024 * 1024, "oversized push event")
+                checkout = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, check=True,
+                                          capture_output=True, text=True).stdout.strip()
+                check_push_context(request, policy.load_json(event_path.read_bytes()), os.environ, checkout)
+            else:
+                request = resolve_request(api, args.pr)
             metadata = source_metadata(api, request, trusted=False)
             envelope = dict(schema=1, request=request, run_id=args.run_id, run_attempt=args.attempt, **metadata)
             check_request_envelope(envelope, request, args.run_id, args.attempt, metadata)
@@ -1071,8 +1122,9 @@ def main(argv=None):
         if args.command == "bundle":
             envelope = policy.load_json(Path(args.request).read_bytes())
             retained = (api.get(api.prefix + f"/actions/runs/{envelope['run_id']}/attempts/{envelope['run_attempt']}")
-                        if os.environ.get("GITHUB_EVENT_NAME") == "pull_request" else None)
-            request = resolve_request(api, envelope["request"]["pr"], retained)
+                        if os.environ.get("GITHUB_EVENT_NAME") == "push" else None)
+            request = (resolve_build_request(api, retained) if retained is not None
+                       else resolve_request(api, envelope["request"]["pr"]))
             metadata = source_metadata(api, request, trusted=False)
             check_request_envelope(envelope, request, int(os.environ["GITHUB_RUN_ID"]), int(os.environ["GITHUB_RUN_ATTEMPT"]), metadata)
             expected = {policy.archive_name(metadata["version"], request["source_commit"], target) for target in policy.TARGETS}

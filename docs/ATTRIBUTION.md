@@ -6,9 +6,10 @@ in [AWG issue 175](https://github.com/wiresock/awg-server-tools/issues/175) and
 The ownership-name correction preserves all 39 existing notice year ranges.
 It does not assign other contributors' rights to him. Cloudflare's original
 LICENSE.md is preserved verbatim, followed by the fork notice and the same BSD
-terms. The fork notice's range preserves the existing source claims; **2024
-has not been independently verified and is a release gate requiring the owner's
-source evidence or explicit correction**.
+terms. The fork notice's range preserves existing source claims. **2024 remains
+unverified in both start and scope; preservation does not assert it is a creation
+or adaptation date.** Following the owner's clarification below, that historical
+uncertainty alone is not a release blocker. Independent pipeline gates remain.
 
 ## Evidence and limits
 
@@ -113,7 +114,24 @@ unchanged.
 | `scripts/ffi-header-cpp-check.cpp` | [2026-08-20 (fadae9dd9746)](https://github.com/Wiresock-Foundation/wiresock-boringtun/blob/fadae9dd9746761ca867a83d915ee56e4c819945/scripts/ffi-header-cpp-check.cpp) | Current |
 | `scripts/ffi-layout-check.c` | [2026-08-20 (fadae9dd9746)](https://github.com/Wiresock-Foundation/wiresock-boringtun/blob/fadae9dd9746761ca867a83d915ee56e4c819945/scripts/ffi-layout-check.c) | Current |
 
-## Remaining attribution question
+## Owner testimony and notice-preservation decision
+
+On 2026-10-26, the owner stated in the rollout conversation
+(`Sentinel_60342faca6b4819185a7fe4581100bd9`):
+
+> wgbooster/netlib were created before 2024, even before 2022
+
+This is first-party testimony, not a commit or dated source snapshot. It places
+the original projects before 2022; it does not date every ported function,
+establish an exact first year, or verify what the existing 2024-2026 headers cover.
+The original projects' history is distinct from their later BoringTun lineage.
+
+The reviewed minimum action is to preserve all existing notices and ranges,
+including the unchanged upstream text and other contributors' attribution.
+Do not substitute 2022 or label 2024 a verified adaptation date. The bounded
+review found no concrete missing-holder or removed-license issue. Therefore the
+date-only evidence demand is removed; attribution review here means reviewed
+notice preservation, not independent verification of every ownership/year claim.
 
 The unresolved evidence is the original WireSock client history for the ported
 components. Source comments identify `wgbooster` protocol-aware padding,
@@ -123,12 +141,10 @@ components. Source comments identify `wgbooster` protocol-aware padding,
 absent from the archived BoringTun history. `noise/imitation/detect.rs` instead
 names the AWG proxy responder.
 
-The owner can resolve the remaining question with client source history or a
-dated source snapshot supporting the 2024 start for the ported components, or
-an explicit correction if that year was carried from a header template. The
-archived BoringTun lineage is now accounted for; separate per-file explanations
-are unnecessary. Existing notices remain preserved. Release remains blocked until this evidence
-or correction settles the year claims.
+Further client history could clarify these dates if it becomes available. The
+archived BoringTun lineage is accounted for; neither an exhaustive history search
+nor separate per-file explanations are required to retain the existing notices.
+No year or third-party ownership claim is silently rewritten.
 
 ## Other contributors
 

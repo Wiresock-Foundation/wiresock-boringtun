@@ -38,7 +38,7 @@ def pr_fixture():
 def run_fixture():
     pr = pr_fixture()
     return {"id": 100, "run_attempt": 2, "workflow_id": 200,
-            "path": BUILD_PATH, "event": "pull_request", "status": "completed",
+            "path": BUILD_PATH, "event": "push", "head_branch": "master", "status": "completed",
             "conclusion": "success", "repository": {"full_name": REPO},
             "head_sha": C, "created_at": "2026-10-25T12:00:01Z",
             "pull_requests": [{"number": 42, "head": pr["head"], "base": pr["base"]}]}
@@ -165,9 +165,9 @@ class PolicyTests(unittest.TestCase):
 
     def test_run_rejects_wrong_workflow_event_attempt_and_pr_association(self):
         request = policy.merged_request(pr_fixture(), 42)
-        cases = [("workflow_id", 201), ("path", PUBLISH_PATH), ("event", "push"),
+        cases = [("workflow_id", 201), ("path", PUBLISH_PATH), ("event", "pull_request"),
                  ("run_attempt", True), ("run_attempt", 0), ("conclusion", "failure"),
-                 ("status", "in_progress"), ("pull_requests", []),
+                 ("status", "in_progress"), ("pull_requests", None),
                  ("created_at", "2026-10-25T11:59:59Z"),
                  ("repository", {"full_name": "attacker/fork"}), ("unexpected", 1)]
         for key, value in cases:
