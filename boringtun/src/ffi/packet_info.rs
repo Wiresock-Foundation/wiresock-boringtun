@@ -1,4 +1,4 @@
-// Copyright (c) 2026 WireSock. All rights reserved.
+// Copyright (c) 2026 Vadim Smirnov (doing business as WireSock). All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! `struct wireguard_packet_info`: what a `wireguard_*_ex` call did, returned

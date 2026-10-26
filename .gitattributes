@@ -1,3 +1,6 @@
 # Shell scripts must keep LF endings: bash cannot parse CRLF, and this repo
 # is developed on Windows where git would otherwise convert them on checkout.
 *.sh text eol=lf
+packaging/boringtun/** text eol=lf
+packaging/boringtun/runtime-notices.txt whitespace=-blank-at-eol
+packaging/boringtun/runtime-notices-macos.txt whitespace=-blank-at-eol

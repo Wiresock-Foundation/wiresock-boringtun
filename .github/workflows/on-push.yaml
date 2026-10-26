@@ -41,8 +41,20 @@ jobs:
       - win7-msrv
       - jni-smoke
       - ffi-header-layout
+      - attribution
     steps:
       - run: exit 0
+
+  attribution:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 scripts/check-attribution.py
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - run: python3 tests/test-boringtun-notices.py
+      - run: python3 tests/test-boringtun-platform.py
 
   # `src/jni.rs` cannot be reached by `cargo test`: its entry points take a
   # `JNIEnv` and only exist to be called through JNI dispatch, so every other

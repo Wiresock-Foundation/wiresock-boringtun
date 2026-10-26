@@ -1,4 +1,4 @@
-// Copyright (c) 2024-2026 WireSock. All rights reserved.
+// Copyright (c) 2024-2026 Vadim Smirnov (doing business as WireSock). All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 //
 // Check that wireguard_ffi.h is usable from C++ and that its declarations keep
