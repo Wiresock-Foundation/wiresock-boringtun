@@ -144,6 +144,20 @@ class CandidateWorkflowTests(unittest.TestCase):
         self.assertNotIn("github-token:", text)
         self.assertNotIn("overwrite:", text)
 
+    def test_downloads_use_resolved_ids_and_setup_steps_are_bounded(self):
+        text = self.read()
+        for producer in ("notices", "archive"):
+            self.assertIn("artifact-ids: ${{ steps." + producer + ".outputs.artifact-id }}", text)
+        self.assertEqual(text.count("merge-multiple: true"), 2)
+        self.assertEqual(text.count("digest-mismatch: error"), 2)
+        self.assertEqual(text.count("actions: read"), 2)
+        self.assertNotIn("sudo apt-get", text)
+        for step in ("Select reviewed compiler and exact Rust", "Build pinned peer and install harness dependencies",
+                     "Install ARMv7 user-mode emulator"):
+            block = text.split("- name: " + step + "\n", 1)[1].split("\n      - ", 1)[0]
+            self.assertIn("timeout-minutes: 10", block)
+            self.assertIn("boringtun-ci-apt.sh", block)
+
 
 if __name__ == "__main__":
     unittest.main()

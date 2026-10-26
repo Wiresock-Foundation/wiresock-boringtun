@@ -1,0 +1,46 @@
+{
+  "provenance": "Read-only GitHub API capture for PR97 run40352730902/job121676867759 on 2026-10-26; supports the original successful notice producer after the x86 setup timeout.",
+  "run": {
+    "id": 40352730902,
+    "run_attempt": 1,
+    "head_sha": "d5f620750bc9bd971cd62c76c0c964db0e027f22",
+    "event": "pull_request",
+    "path": ".github/workflows/boringtun-platform-validation.yml",
+    "repository": {
+      "id": 1328564271,
+      "full_name": "Wiresock-Foundation/wiresock-boringtun"
+    },
+    "head_repository": {
+      "id": 1328564271
+    }
+  },
+  "jobs": [
+    {
+      "id": 121676867759,
+      "run_id": 40352730902,
+      "run_attempt": 1,
+      "head_sha": "d5f620750bc9bd971cd62c76c0c964db0e027f22",
+      "name": "Candidate licenses and source checks",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-26T15:47:12Z",
+      "completed_at": "2026-10-26T15:52:25Z"
+    }
+  ],
+  "artifacts": [
+    {
+      "id": 12665186712,
+      "name": "candidate-notices-40352730902-1",
+      "expired": false,
+      "digest": "sha256:d68a422c05b4e821ac5982de2a7ddeed2a0474104cc8dde2c987bc2639b8f326",
+      "created_at": "2026-10-26T15:52:22Z",
+      "workflow_run": {
+        "id": 40352730902,
+        "repository_id": 1328564271,
+        "head_repository_id": 1328564271,
+        "head_branch": "fix/merged-pr-run-binding",
+        "head_sha": "d5f620750bc9bd971cd62c76c0c964db0e027f22"
+      }
+    }
+  ]
+}
