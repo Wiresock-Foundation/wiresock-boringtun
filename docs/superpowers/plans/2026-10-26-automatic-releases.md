@@ -10,15 +10,14 @@
 
 ## Local handoff status
 
-Completed implementation covers reviewed notice profiles/runtime inventories,
-strict five-target policy/orchestration, the read-only build workflow, and AWG
-adoption/ARMv7 selection. Independent code and notice reviews found no blocking
-defect in those completed portions. The publisher workflow file is absent after
-an automatic approval review denial; do not interpret this plan as a completed
-publisher or as permission to retry its creation. Local-file approval, subsequent
-publisher review, real platform/GitHub evidence and historical attribution gates
-remain outstanding. The checklist below retains the full intended plan; tasks
-that include missing publisher work or live activation are not marked complete.
+Completed local implementation covers reviewed notice profiles/runtime
+inventories, strict five-target policy/orchestration, read-only builds, dormant
+publisher wiring and AWG adoption/ARMv7 selection. The owner explicitly approved
+local publisher-file creation after the earlier approval-review denial.
+Activation remains disabled. Real platform/GitHub evidence and historical
+attribution gates remain outstanding. The checklist below retains the full
+intended plan; tasks that include unavailable live evidence or activation are
+not marked complete.
 
 ## Global constraints
 

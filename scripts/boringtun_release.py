@@ -972,6 +972,23 @@ def output_values(values):
     print(json.dumps(values, sort_keys=True))
 
 
+def output_subject_paths(directory, descriptor):
+    """Emit the six validated subjects, excluding derived SHA256SUMS.
+
+    Called only after attest-ready rechecks the live gates and compares every
+    prepared byte against the exact triggering build. No glob can add a file.
+    """
+    root = Path(directory).resolve()
+    names = set(policy.release_assets(descriptor)) - {"SHA256SUMS"}
+    require(len(names) == len(policy.TARGETS) + 1, "wrong signing subject count")
+    paths = [str(root / name) for name in sorted(names)]
+    require(all("\n" not in path and "\r" not in path for path in paths), "unsafe attestation subject path")
+    output = os.environ.get("GITHUB_OUTPUT")
+    require(output, "attestation subject output file is unavailable")
+    with open(output, "a", encoding="utf-8", newline="\n") as handle:
+        handle.write("paths<<boringtun_signed_subjects\n" + "\n".join(paths) + "\nboringtun_signed_subjects\n")
+
+
 def live_gate(api, config):
     publication_gate(config)
     require(api.contents("packaging/boringtun/release-policy.json", "master") == POLICY_FILE.read_bytes(),
@@ -1104,6 +1121,7 @@ def main(argv=None):
             live_gate(api, config)
             rebuilt, expected, _action, attest = prepare_release(api, *triggered_build(), context, config, gh)
             require(attest and rebuilt == descriptor and expected == files, "prepared data changed before signing")
+            output_subject_paths(args.directory, descriptor)
             return 0
         action = publish_release(api, descriptor, files,
             lambda original, present: verify_release(api, original, present, config, gh),

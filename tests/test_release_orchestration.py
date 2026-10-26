@@ -649,6 +649,112 @@ class OrchestrationTests(unittest.TestCase):
                      self.assertRaises(policy.PolicyError):
                     release.read_prepared(root)
 
+    def test_prepare_cli_rejects_build_other_than_trigger_without_preparation(self):
+        stderr = io.StringIO()
+        with patch.object(release, "GitHub"), patch.object(release, "trusted_context", return_value={}), \
+             patch.object(release, "pinned_gh", return_value="gh"), \
+             patch.object(release, "triggered_build", return_value=(100, 2)), \
+             patch.object(release, "prepare_release") as prepare, contextlib.redirect_stderr(stderr):
+            result = release.main(["prepare", "--build-run", "101", "--attempt", "2", "--output", "unused",
+                                   "--gh", "gh", "--gh-archive", "gh.tgz"])
+        self.assertEqual(result, 2)
+        self.assertIn("requested build differs from triggering event", stderr.getvalue())
+        prepare.assert_not_called()
+
+    def test_execute_cli_still_cannot_bypass_checked_in_disabled_policy(self):
+        destination = MemoryDestination()
+        stderr = io.StringIO()
+        with patch.object(release, "GitHub", return_value=destination), \
+             patch.object(release, "trusted_context", return_value={}), \
+             patch.object(release, "pinned_gh", return_value="gh"), \
+             patch.object(release, "read_prepared", return_value=(self.descriptor, self.files)), \
+             contextlib.redirect_stderr(stderr):
+            result = release.main(["publish", "--directory", "unused", "--gh", "gh",
+                                   "--gh-archive", "gh.tgz", "--execute"])
+        self.assertEqual(result, 2)
+        self.assertIn("publication disabled", stderr.getvalue())
+        self.assertEqual(destination.writes, [])
+
+    def test_attest_ready_emits_only_exact_descriptor_and_five_archive_paths(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tests") as directory:
+            root = Path(directory)
+            output = root / "workflow-output"
+            prepared = root / "prepared"
+            with patch.dict(release.os.environ, {"GITHUB_OUTPUT": str(output)}), \
+                 patch.object(release, "GitHub"), patch.object(release, "trusted_context", return_value={}), \
+                 patch.object(release, "pinned_gh", return_value="gh"), patch.object(release, "live_gate"), \
+                 patch.object(release, "triggered_build", return_value=(100, 2)), \
+                 patch.object(release, "read_prepared", return_value=(self.descriptor, self.files)), \
+                 patch.object(release, "prepare_release", return_value=(self.descriptor, self.files, "create", True)):
+                result = release.main(["attest-ready", "--directory", str(prepared), "--gh", "gh", "--gh-archive", "gh.tgz"])
+            self.assertEqual(result, 0)
+            self.assertTrue(output.is_file(), "attestation action paths were not emitted")
+            lines = output.read_text().splitlines()
+            self.assertEqual(lines[0], "paths<<boringtun_signed_subjects")
+            self.assertEqual(lines[-1], "boringtun_signed_subjects")
+            self.assertEqual({Path(path).name for path in lines[1:-1]}, set(self.files) - {"SHA256SUMS"})
+            self.assertEqual(len(lines[1:-1]), 6)
+            self.assertTrue(all(Path(path).is_absolute() for path in lines[1:-1]))
+
+    def test_signing_stops_if_policy_is_disabled_after_preparation(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tests") as directory:
+            output = Path(directory) / "workflow-output"
+            stderr = io.StringIO()
+            with patch.dict(release.os.environ, {"GITHUB_OUTPUT": str(output)}), \
+                 patch.object(release, "GitHub"), patch.object(release, "trusted_context", return_value={}), \
+                 patch.object(release, "pinned_gh", return_value="gh"), \
+                 patch.object(release, "read_prepared", return_value=(self.descriptor, self.files)), \
+                 patch.object(release, "prepare_release") as prepare, contextlib.redirect_stderr(stderr):
+                result = release.main(["attest-ready", "--directory", "unused", "--gh", "gh", "--gh-archive", "gh.tgz"])
+            self.assertEqual(result, 2)
+            self.assertIn("publication disabled", stderr.getvalue())
+            self.assertFalse(output.exists())
+            prepare.assert_not_called()
+
+
+class PublisherWorkflowTests(unittest.TestCase):
+    def workflow(self):
+        path = ROOT / ".github/workflows/boringtun-release.yml"
+        self.assertTrue(path.is_file(), "dormant trusted publisher workflow is missing")
+        return path.read_text(encoding="utf-8")
+
+    def test_workflow_accepts_completed_builds_without_branch_queue_filter(self):
+        text = self.workflow()
+        self.assertIn("workflows: [BoringTun merged PR artifacts]", text)
+        self.assertIn("types: [completed]", text)
+        self.assertNotIn("branches:", text)
+        self.assertNotIn("workflow_dispatch:", text)
+        self.assertNotIn("pull_request_target:", text)
+        self.assertNotIn("\nconcurrency:", text)
+        self.assertIn("group: boringtun-release-pr-${{ needs.prepare.outputs.pr }}", text)
+        self.assertIn("cancel-in-progress: false", text)
+
+    def test_write_jobs_are_separate_and_guarded_by_trusted_prepare(self):
+        text = self.workflow()
+        prepare = text.split("  prepare:\n", 1)[1].split("  attest:\n", 1)[0]
+        attest = text.split("  attest:\n", 1)[1].split("  publish:\n", 1)[0]
+        publish = text.split("  publish:\n", 1)[1]
+        self.assertNotIn(": write", prepare)
+        self.assertIn("id-token: write", attest)
+        self.assertNotIn("contents: write", attest)
+        self.assertIn("contents: write", publish)
+        self.assertNotIn("id-token: write", publish)
+        for job in (attest, publish):
+            self.assertIn("needs.prepare.outputs.publishable == 'true'", job)
+            self.assertIn("github.event_name == 'workflow_run'", job)
+            self.assertIn("github.ref == 'refs/heads/master'", job)
+        self.assertEqual(text.count("ref: ${{ github.workflow_sha }}"), 3)
+        self.assertEqual(text.count("persist-credentials: false"), 3)
+        self.assertNotIn("actions/download-artifact", text)
+        self.assertNotIn("artifact-metadata: write", text)
+        self.assertNotIn("github.event.workflow_run.head_sha", text)
+        self.assertIn("push-to-registry: false", attest)
+        self.assertIn("create-storage-record: false", attest)
+        self.assertIn("subject-path: ${{ steps.subjects.outputs.paths }}", attest)
+        self.assertIn("boringtun_release.py attest-ready", attest)
+        self.assertIn("boringtun_release.py publish", publish)
+        self.assertIn("--execute", publish)
+
 
 class RepositoryIdentityTests(unittest.TestCase):
     """Independent regressions; no release-schema fixture required."""
