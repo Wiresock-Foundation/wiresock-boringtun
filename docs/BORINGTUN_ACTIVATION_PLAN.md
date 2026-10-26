@@ -1,6 +1,9 @@
-# Proposed automatic release activation
+# Automatic release activation
 
-Status: local proposal, publication disabled; no remote activation authorized.
+Status: owner approved ordinary merged-PR activation on 26 October 2026 after
+independent review and green CI. The approval includes first publication, ongoing
+ordinary-path releases and hosted-toolchain trust; it excludes an actions:write
+recovery dispatcher, new credentials, repository settings and old-asset changes.
 The completed trial and trust limits are in [the audit](BORINGTUN_ACTIVATION_AUDIT.md).
 
 ## First eligible source
@@ -15,10 +18,10 @@ The activation PR itself should start its first release after the gates pass.
 Later policy disablement revokes inflight publication. No approval PR per release
 or recursive approval scheme is introduced.
 
-The local implementation adds that boundary, clears the consumed trial selection
-to null, records real evidence and reduces stale blockers. It leaves enabled:false
-and two remaining requirements: recovery coverage and specific activation/trust
-approval. Do not remove the recovery blocker just to produce a first release.
+The implementation adds that boundary, clears the consumed trial selection to
+null and records real evidence. The enabling change sets enabled:true after the
+owner explicitly accepted narrower ordinary-event coverage and hosted-toolchain
+trust. Missing-event recovery remains a separate unimplemented capability.
 
 ## Recovery required for every merged PR
 
@@ -101,25 +104,24 @@ is proposed. Job-scoped permissions would be:
 | Sign (existing dormant path) | contents:read, actions:read, id-token:write, attestations:write |
 | Publish (existing dormant path) | contents:write, actions:read, attestations:read |
 
-Proposed owner request: **Approve implementing the scoped recovery dispatcher and,
-after independent review and green checks, merging a fork-v1 activation PR that
-enables these job permissions for automatic public releases after eligible
-merged PRs?** This authorizes public tags, five archive assets, RELEASE.json,
-SHA256SUMS and GitHub/Sigstore provenance, including delayed eligible merges.
-It accepts the documented GitHub-hosted compiler/SDK trust boundary. Existing
-releases remain immutable; AWG adoption and Lisbon deployment remain separate
-reviewed stages. No persistent write/signing capability is activated by this
-local proposal. Parent must obtain this specific confirmation before an enabling
-change is pushed or merged.
+Approved scope: merge the reviewed fork-v1 activation after green checks, enabling
+the existing job-scoped id-token:write, attestations:write and contents:write
+normal-push publisher. Its fresh merge publishes the first verified release;
+later ordinary merges publish automatically. Public outputs are tags, five
+archives, RELEASE.json, SHA256SUMS and GitHub/Sigstore provenance. No stored
+credentials are created and existing assets stay immutable. The owner accepted
+the hosted compiler/SDK trust boundary and narrower initial event coverage.
+
+The proposed actions:write dispatcher row above is **not approved or implemented**.
+It remains separate from the normal-path activation. AWG adoption and Lisbon
+deployment remain subsequent reviewed stages after actual release verification.
 
 ## First release, adoption and Lisbon
 
-1. Implement/review/test recovery while publication stays disabled. Install and
-   validate only build-only recovery metadata after appropriate push/merge
-   authorization. Keep old AWG workflow 369920301 disabled.
-2. Obtain the exact activation approval, refresh owner-side retirement audit,
-   review the final enabling diff and merge normally with required checks green.
-   Set enabled:true and clear only satisfied blockers. This fresh activation
+1. Proceed with the explicitly accepted ordinary-push scope. Keep recovery design
+   separate and old AWG workflow 369920301 disabled; no actions:write is added.
+2. Refresh owner-side retirement audit, independently review the enabling diff
+   and merge normally after required exact-head checks pass. This fresh activation
    merge becomes the first eligible C; queued older disabled sources stay out.
 3. Observe its complete five-platform build, same-target two-build byte equality,
    runtime/interoperability checks, exact six-subject attestation verification,

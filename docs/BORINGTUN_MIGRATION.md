@@ -2,13 +2,14 @@
 
 ## Current implementation status
 
-The local patch implements the read-only five-platform build workflow, strict
-release policy/orchestration, dormant publisher workflow and AWG adoption
-tooling. The fork's `.github/workflows/boringtun-release.yml` separates read-only
-validation, attestation and publication jobs. `release-policy.json` remains
-disabled; existing attribution notices have a documented preservation review. Signing and publication jobs require the
-validated activation output and independently recheck live policy. Nothing in
-this patch activates publication or changes existing releases or production.
+The implementation includes a read-only five-platform builder, strict release
+policy, publisher workflow and separate AWG adoption tooling. The owner approved
+normal merged-PR-push activation after independent review and green CI, including
+the first fresh merge-source release. `release-policy.json` enables generation
+fork-v1 with an immutable excluded baseline and source-side enablement checks.
+Signing and publication independently recheck live policy and exact provenance.
+The existing job permissions are unchanged; no actions:write recovery dispatcher
+is added. Old release assets and production remain unchanged.
 
 The sections below describe the implemented contract and remaining live
 validation/activation gates. Local fixture tests do not establish successful
@@ -23,7 +24,7 @@ QEMU-emulated. Each target compares two binaries and archives, and three Linux
 lanes run both existing interoperability harnesses. The seven-day `candidate-*`
 artifacts are validation evidence, carry no attestations and are not releases.
 The publisher does not accept this workflow. Passing candidate CI does not
-clear the unchanged release activation blockers.
+authorize publication; only eligible canonical master sources pass live gates.
 
 The canonical producer moves to `Wiresock-Foundation/wiresock-boringtun`.
 Each merged PR targeting its master branch has a distinct source-based tag:

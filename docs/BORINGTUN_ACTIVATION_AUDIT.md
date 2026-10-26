@@ -1,8 +1,12 @@
 # Activation audit: 26 October 2026
 
-Publication remains disabled. This local proposal records verified evidence and
-remaining work; it does not authorize activation. No release, tag or deployment
-was performed during the attestation trial or this preparation.
+The owner approved normal-path activation on 26 October 2026: push and merge
+this change after independent review and green CI, then publish its first fresh
+merge-source release and later ordinary merged-PR releases. The approval covers
+job-scoped OIDC, attestation and release writes, accepts the hosted compiler/SDK
+trust boundary, and explicitly accepts narrower initial ordinary-event coverage.
+No actions:write dispatcher, new credential or repository setting is authorized.
+No release, tag or deployment was performed during the earlier trial/preparation.
 
 ## Installed evidence
 
@@ -43,7 +47,7 @@ local archival copies preserve exact ZIPs and all prepared bytes beyond expiry.
 ## Retirement and attribution
 
 The refreshed owner-authenticated, paginated read-only audit at
-2026-10-26T21:26:29Z still found workflow 369920301 **disabled_manually**, nine
+2026-10-26T21:45:42Z still found workflow 369920301 **disabled_manually**, nine
 completed successful historical runs, zero active runs, zero drafts and four
 published prereleases. `packaging/boringtun/legacy-retirement-evidence.json`
 contains the IDs and source-file hashes at retired AWG commit
@@ -81,21 +85,29 @@ musl was cross-built and exercised with QEMU. Physical Pi testing and the full
 ARM32 AWG panel/proxy stack remain unvalidated. No Apple signing/notarization
 credential is configured or proposed.
 
-## Remaining activation work
+## Approved activation and remaining recovery work
 
-1. Complete and review missing-event recovery in producer and AWG consumer, or
-   obtain explicit agreement to narrower initial behavior. Current diagnostic
-   reconciliation does not satisfy the requested release after every merged PR.
-2. Obtain specific approval for automatic public publication permissions and
-   the hosted-toolchain trust boundary above, then refresh retirement evidence.
+The owner chose the narrower initial ordinary-push path, with automatic catch-up
+separate. Missing, batched and token-suppressed events remain visible diagnostic
+gaps; there is no automatic recovery implementation or authorization for an
+actions:write dispatcher. A concrete exceptional source requires reviewed manual
+recovery, never a blind signing retry or an invented push. This initial scope is
+not a claim that every merged PR is automatically covered.
 
-The local boundary guard excludes source 1cee itself and all sources whose own
+The owner accepted the hosted-toolchain trust boundary and existing job-scoped
+publication permissions. The remaining installation prerequisites are exact-head
+CI, unchanged independent-review coverage, fresh retirement readback and a normal
+merge. Actual first-release completion must be observed and verified separately.
+
+The boundary guard excludes source 1cee itself and all sources whose own
 policy remains disabled, even if their promoters run after master enablement.
 An eligible source must descend from 1cee and contain the same enabled activation
 generation (`fork-v1`), with no source blockers. Current-master policy must still
 equal trusted publisher policy before signing/publication; revocation remains
-effective. The completed validation selection is locally null. This proposal
-keeps enabled:false and does not alter any workflow permissions.
+effective. The completed validation selection is null. This approved change sets
+enabled:true and clears the resolved activation decisions; workflow job
+permissions are unchanged. The source's own enabled policy means the activation
+PR's fresh merge is the first eligible source; old disabled sources remain out.
 
 Historical tag permission and incompatible historical recipes are conditional
 backfill limitations, not reasons to repeat the completed trial. No pre-activation

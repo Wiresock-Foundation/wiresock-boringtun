@@ -183,10 +183,9 @@ class AttestationValidationTests(unittest.TestCase):
 
 
 class ValidationWorkflowTests(unittest.TestCase):
-    def test_retirement_evidence_records_disabled_workflow_without_enabling_publication(self):
+    def test_retirement_evidence_records_disabled_legacy_workflow(self):
         config = json.loads((ROOT / 'packaging/boringtun/release-policy.json').read_text())
         audit = json.loads((ROOT / config['retirement']['owner_audit']).read_text())
-        self.assertIs(config['enabled'], False)
         self.assertEqual(audit['workflow']['state'], 'disabled_manually')
         self.assertEqual(config['retirement']['workflow_ids'], [audit['workflow']['id']])
         self.assertEqual(config['retirement']['files'], audit['files'])

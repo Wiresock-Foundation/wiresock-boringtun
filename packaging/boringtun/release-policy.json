@@ -1,12 +1,9 @@
 {
   "schema": 1,
   "repository": "Wiresock-Foundation/wiresock-boringtun",
-  "enabled": false,
+  "enabled": true,
   "attribution_status": "reviewed",
-  "activation_blockers": [
-    "Implement and review recovery for every eligible merged PR, including missed, batched and GITHUB_TOKEN-suppressed events; current reconciliation is diagnostic only",
-    "Obtain specific owner approval for persistent automatic publication permissions and the documented hosted compiler/SDK trust boundary; refresh retirement audit immediately before activation"
-  ],
+  "activation_blockers": [],
   "activation": {
     "after_commit": "1cee1afadd6be4251d6a19273b1882090bd2038e",
     "generation": "fork-v1"
