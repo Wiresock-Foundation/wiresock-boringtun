@@ -179,11 +179,8 @@ jobs:
               xcodebuild -version
               xcrun --sdk macosx --show-sdk-version
               command -v gtar
-              brew install bash
-              checked_bash="$(brew --prefix bash)/bin/bash"
-              # BASH_VERSION must expand in the selected child shell.
-              # shellcheck disable=SC2016
-              [[ "$("$checked_bash" -c 'printf "%s" "${BASH_VERSION%%(*}"')" == 5.3.20 ]]
+              checked_bash="$(python3 source/scripts/boringtun-bash.py install "$RUNNER_TEMP/bash-toolchain")" || exit 1
+              python3 source/scripts/boringtun-bash.py verify "$checked_bash" || exit 1
               echo "BTA_BASH=$checked_bash" >> "$GITHUB_ENV"
               dirname "$checked_bash" >> "$GITHUB_PATH"
               ;;
@@ -341,15 +338,6 @@ jobs:
     steps:
       - name: Set temporary source pin path
         run: echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/request/pin.env" >> "$GITHUB_ENV"
-      - name: Install and select checked GNU Bash
-        run: |
-          brew install bash
-          checked_bash="$(brew --prefix bash)/bin/bash"
-          # BASH_VERSION must expand in the selected child shell.
-          # shellcheck disable=SC2016
-          [[ "$("$checked_bash" -c 'printf "%s" "${BASH_VERSION%%(*}"')" == 5.3.20 ]]
-          echo "BTA_BASH=$checked_bash" >> "$GITHUB_ENV"
-          dirname "$checked_bash" >> "$GITHUB_PATH"
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.resolve.outputs.source }}
@@ -363,6 +351,12 @@ jobs:
         with:
           name: archive-${{ matrix.label }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dist
+      - name: Build and select checksum-pinned GNU Bash
+        run: |
+          checked_bash="$(python3 source/scripts/boringtun-bash.py install "$RUNNER_TEMP/bash-toolchain")" || exit 1
+          python3 source/scripts/boringtun-bash.py verify "$checked_bash" || exit 1
+          echo "BTA_BASH=$checked_bash" >> "$GITHUB_ENV"
+          dirname "$checked_bash" >> "$GITHUB_PATH"
       - name: Native Mach-O and utun/UAPI lifecycle gate
         run: |
           binary="$("$BTA_BASH" source/scripts/boringtun-artifact.sh verify-archive "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP/extract")"

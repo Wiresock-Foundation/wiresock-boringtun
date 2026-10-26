@@ -14,7 +14,7 @@
     "Review immutable action dependencies and native toolchain installation provenance",
     "Review historical build recipe/provenance allowlist before recovering queued older C after pipeline changes",
     "Record native macOS two-build equality and utun gates plus ARMv7 cross-build/QEMU TUN and interop results for the five-target contract",
-    "Review and pin macOS Homebrew Bash 5.3.20 package/dependency provenance; runtime version and executable receipts alone are insufficient supply-chain activation evidence"
+    "Review pinned GNU Bash 5.3.20 source/patch build and native compiler provenance plus signed coverage before activation; supplemental version and executable receipts alone are insufficient supply-chain evidence"
   ],
   "build_workflow_id": null,
   "publish_workflow_id": null,

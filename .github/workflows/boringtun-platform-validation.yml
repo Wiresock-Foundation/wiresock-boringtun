@@ -144,11 +144,8 @@ jobs:
               xcodebuild -version
               xcrun --sdk macosx --show-sdk-version
               command -v gtar
-              brew install bash
-              checked_bash="$(brew --prefix bash)/bin/bash"
-              # BASH_VERSION must expand in the selected child shell.
-              # shellcheck disable=SC2016
-              [[ "$("$checked_bash" -c 'printf "%s" "${BASH_VERSION%%(*}"')" == 5.3.20 ]]
+              checked_bash="$(python3 source/scripts/boringtun-bash.py install "$RUNNER_TEMP/bash-toolchain")" || exit 1
+              python3 source/scripts/boringtun-bash.py verify "$checked_bash" || exit 1
               echo "BTA_BASH=$checked_bash" >> "$GITHUB_ENV"
               dirname "$checked_bash" >> "$GITHUB_PATH"
               ;;
