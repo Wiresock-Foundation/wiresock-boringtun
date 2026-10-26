@@ -12,6 +12,9 @@ on:
   pull_request:
     branches: [ "master", "awg-2.0-extensions" ]
 
+permissions:
+  contents: read
+
 # Third-party actions are pinned to commit SHAs; GitHub-owned ones (actions/*)
 # stay on major tags. Neither pin below may be "simplified" to the SHA its
 # moving ref happens to resolve to:
