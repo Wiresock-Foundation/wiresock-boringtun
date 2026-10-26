@@ -105,6 +105,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     permissions:
       contents: read
+      actions: read
     steps:
       - name: Set temporary source pin path
         run: |
@@ -121,23 +122,33 @@ jobs:
         run: |
           python3 source/scripts/boringtun_candidate.py --source source --expected-head "$EXPECTED_HEAD" \
             --output "$RUNNER_TEMP/candidate/pin.env"
+      - name: Resolve exact successful notice producer
+        id: notices
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 source/scripts/boringtun_candidate_artifact.py notices \
+            --expected-head "$EXPECTED_HEAD" --github-output "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          name: candidate-notices-${{ github.run_id }}-${{ github.run_attempt }}
+          artifact-ids: ${{ steps.notices.outputs.artifact-id }}
+          merge-multiple: true
+          digest-mismatch: error
           path: ${{ runner.temp }}/licenses
       - name: Select reviewed compiler and exact Rust
+        timeout-minutes: 10
         env:
           TARGET: ${{ matrix.target }}
           PLATFORM: ${{ matrix.platform }}
         run: |
           case "$PLATFORM" in
             linux)
-              sudo apt-get update
-              sudo apt-get install -y --no-install-recommends musl-tools
+              bash source/scripts/boringtun-ci-apt.sh musl-tools
               ;;
             armv7)
-              sudo apt-get update
-              sudo apt-get install -y --no-install-recommends clang-18 qemu-user iproute2
+              bash source/scripts/boringtun-ci-apt.sh clang-18 qemu-user iproute2
               ;;
             macos)
               export DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
@@ -227,6 +238,7 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+      actions: read
     steps:
       - name: Set temporary source pin path
         run: echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/candidate/pin.env" >> "$GITHUB_ENV"
@@ -259,17 +271,30 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: false
       - name: Build pinned peer and install harness dependencies
+        timeout-minutes: 10
         run: |
           (cd peer && CGO_ENABLED=0 go build -o "$RUNNER_TEMP/amneziawg-go" .)
           bash source/scripts/awg31-interop.sh --check-go "$RUNNER_TEMP/amneziawg-go"
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3-cryptography iproute2 iputils-ping
+          bash source/scripts/boringtun-ci-apt.sh python3-cryptography iproute2 iputils-ping
       - name: Install ARMv7 user-mode emulator
         if: matrix.emulated
-        run: sudo apt-get install -y --no-install-recommends qemu-user
+        timeout-minutes: 10
+        run: bash source/scripts/boringtun-ci-apt.sh qemu-user
+      - name: Resolve exact successful archive producer
+        id: archive
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          TARGET: ${{ matrix.artifact }}
+        run: |
+          python3 source/scripts/boringtun_candidate_artifact.py archive --target "$TARGET" \
+            --expected-head "$EXPECTED_HEAD" --github-output "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          name: candidate-archive-${{ matrix.artifact }}-${{ github.run_id }}-${{ github.run_attempt }}
+          artifact-ids: ${{ steps.archive.outputs.artifact-id }}
+          merge-multiple: true
+          digest-mismatch: error
           path: ${{ runner.temp }}/dist
       - name: Verify archive and exercise both existing interop harnesses
         env:

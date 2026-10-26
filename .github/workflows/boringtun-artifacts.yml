@@ -1,8 +1,7 @@
 name: BoringTun merged PR artifacts
 
 on:
-  pull_request:
-    types: [closed]
+  push:
     branches: [master]
   workflow_dispatch:
     inputs:
@@ -30,11 +29,8 @@ jobs:
     name: Resolve merged PR
     if: >-
       github.repository == 'Wiresock-Foundation/wiresock-boringtun' &&
-      ((github.event_name == 'pull_request' && github.event.action == 'closed' &&
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.base.repo.full_name == github.repository &&
-      github.event.pull_request.base.ref == 'master') ||
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'))
+      github.ref == 'refs/heads/master' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -43,7 +39,21 @@ jobs:
       source: ${{ steps.resolve.outputs.source }}
       pr: ${{ steps.resolve.outputs.pr }}
     steps:
-      - uses: actions/checkout@v6
+      - name: Reject nonordinary push context before checkout
+        if: github.event_name == 'push'
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          assert event['repository']['full_name'] == 'Wiresock-Foundation/wiresock-boringtun'
+          assert event['ref'] == os.environ['GITHUB_REF'] == 'refs/heads/master'
+          assert event['after'] == os.environ['GITHUB_SHA'] == os.environ['GITHUB_WORKFLOW_SHA']
+          assert re.fullmatch(r'[0-9a-f]{40}', event['before'])
+          assert event['before'] not in ('0' * 40, event['after'])
+          assert all(event.get(key) is False for key in ('forced', 'created', 'deleted'))
+          PY
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -51,12 +61,14 @@ jobs:
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
-          python3 scripts/boringtun_release.py resolve --pr "$PR_NUMBER" \
+          request_args=()
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then request_args=(--pr "$PR_NUMBER"); fi
+          python3 scripts/boringtun_release.py resolve "${request_args[@]}" \
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
             --output "$RUNNER_TEMP/request"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: request-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/request/*
@@ -73,12 +85,12 @@ jobs:
     steps:
       - name: Set temporary source pin path
         run: echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/request/pin.env" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.resolve.outputs.source }}
           path: source
           persist-credentials: false
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: request-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/request
@@ -98,7 +110,7 @@ jobs:
             mkdir -p "$RUNNER_TEMP/licenses/$target"
             bash source/scripts/boringtun-artifact.sh licenses source "$RUNNER_TEMP/licenses/$target/THIRD-PARTY-LICENSES" "$target"
           done
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: notices-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/licenses/
@@ -147,16 +159,16 @@ jobs:
         run: |
           echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/request/pin.env" >> "$GITHUB_ENV"
           echo "BTA_BASH=$(command -v bash)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.resolve.outputs.source }}
           path: source
           persist-credentials: false
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: request-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/request
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: notices-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/licenses
@@ -219,14 +231,14 @@ jobs:
           chmod 755 "$RUNNER_TEMP/boringtun-armv7"
           sudo env BORINGTUN_PIN_FILE="$BORINGTUN_PIN_FILE" BORINGTUN_ARM_CLI="$binary" bash source/scripts/boringtun-artifact.sh device-smoke "$RUNNER_TEMP/boringtun-armv7"
       - name: Retain compiler and SDK receipts from both builds
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: native-toolchain-${{ matrix.artifact }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/build-1/NATIVE-TOOLCHAIN.json
             ${{ runner.temp }}/build-2/NATIVE-TOOLCHAIN.json
           if-no-files-found: error
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: archive-${{ matrix.artifact }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dist/*.tar.gz
@@ -258,12 +270,12 @@ jobs:
     steps:
       - name: Set temporary source pin path
         run: echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/request/pin.env" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.resolve.outputs.source }}
           path: source
           persist-credentials: false
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: request-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/request
@@ -273,14 +285,14 @@ jobs:
           commit="$(sed -n 's/^readonly PINNED_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' source/scripts/awg31-interop.sh)"
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: amnezia-vpn/amneziawg-go
           ref: ${{ steps.peer.outputs.commit }}
           path: peer
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -293,7 +305,7 @@ jobs:
       - name: Install ARMv7 user-mode emulator
         if: matrix.emulated
         run: sudo apt-get install -y --no-install-recommends qemu-user
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: archive-${{ matrix.artifact }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dist
@@ -338,16 +350,16 @@ jobs:
     steps:
       - name: Set temporary source pin path
         run: echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/request/pin.env" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.resolve.outputs.source }}
           path: source
           persist-credentials: false
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: request-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/request
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: archive-${{ matrix.label }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dist
@@ -370,16 +382,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.resolve.outputs.source }}
           path: source
           persist-credentials: false
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: request-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/request
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: archive-*-${{ github.run_id }}-${{ github.run_attempt }}
           merge-multiple: true
@@ -390,7 +402,7 @@ jobs:
         run: |
           python3 source/scripts/boringtun_release.py bundle --request "$RUNNER_TEMP/request/REQUEST.json" \
             --archives "$RUNNER_TEMP/archives" --output "$RUNNER_TEMP/release-request"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: boringtun-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/release-request/*
