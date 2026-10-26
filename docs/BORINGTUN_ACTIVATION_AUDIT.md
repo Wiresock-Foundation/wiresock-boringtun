@@ -13,8 +13,8 @@ and production are unchanged.
 | Date provenance | Notice-preservation review completed; exact owner testimony is in ATTRIBUTION.md. Existing dates are retained, not independently verified. No new date question is needed. |
 | Merged-event identity | Real closed-PR run40344057429 had H as head_sha, empty pull_requests, and executed C. The repair uses canonical master-push C with independent exact merged-PR discovery. A successful installed repair run is still required. |
 | Workflow identity | Build397187760 and publisher397187761 are known and pinned. |
-| Live attestation fixture | Pending explicit attestation-only approval. Requiring publication enablement to collect this fixture is circular; use a separate narrow validation path before enabling publication. |
-| Legacy retirement | AWG YAML is retired. Owner-access audit found zero drafts, four published releases and nine completed historical publisher runs. Workflow369920301 remains active; owner approval to disable it is pending. Re-audit immediately before activation. |
+| Live attestation fixture | Owner approved one attestation-only validation on 26 October 2026; implementation and live evidence are still required. Requiring publication enablement to collect this fixture is circular; use a separate narrow validation path before enabling publication. |
+| Legacy retirement | AWG YAML is retired. Owner-access audit found zero drafts, four published releases and nine completed historical publisher runs. Owner approved the exact disable action on 26 October 2026. PUT /repos/wiresock/awg-server-tools/actions/workflows/369920301/disable succeeded; GET readbacks confirmed id369920301, path .github/workflows/boringtun-release.yml, state disabled_manually. Re-audit immediately before activation. |
 | Missed merges | Reconciliation enumerates every merged PR since an explicit boundary, including missing or failed runs. Diagnostic recovery plans do not dispatch or publish. GITHUB_TOKEN-triggered merges may emit no usable push run. No release recovery route for such a missing run is implemented. |
 | Historical tags | Conditional on publishing older C. GitHub may require more than contents:write when historical workflow files differ. Do not broaden credentials; report the blocked PR/tag and obtain a reviewed recovery decision. |
 | Actions/native tools | Build actions now use immutable SHA pins. Coverage and limits are below; source binding does not make host tools hermetic. |
@@ -60,9 +60,9 @@ squash/rebase are synthetic. Merge queues/batched updates and automation merges
 which suppress push events are not yet claimed to deliver every PR. They must
 remain visible in reconciliation and need a reviewed recovery/activation scope.
 
-## Proposed attestation-only permission request
+## Approved attestation-only validation scope
 
-Approve one validation run in Wiresock-Foundation/wiresock-boringtun using the
+The owner approved one validation run in Wiresock-Foundation/wiresock-boringtun using the
 canonical `.github/workflows/boringtun-release.yml` installed on master at a
 reviewed immutable recipe revision. Add a separately gated validation mode with
 a signing job limited to `contents: read`, `actions: read`, `id-token: write`
@@ -75,9 +75,40 @@ run/attempt. GitHub artifact attestations and public Sigstore transparency
 records expose those digests and repository/workflow/source/run metadata. No
 release, tag, asset publication, new credential, signing key or repository
 security-setting change is requested. Preserve the real pinned-gh verification
-JSON as evidence. This mode is a proposal, not implemented or run by this repair.
+JSON as evidence. This scoped follow-up implements the mode; execution still
+requires final review, exact-head CI and parent-approved installation on master.
+
+The machine-readable legacy readback is retained in
+`packaging/boringtun/legacy-retirement-evidence.json`, including all nine run
+IDs, all four published prereleases, zero drafts and SHA-256 values of the
+retired workflow/script at AWG commit514ea073c904a90cfeccda06ad1ea78553273c59.
+It is point-in-time evidence; the publisher's activation check must still reread
+workflow state and inventories. No release was deleted, edited or republished.
 
 Use a workflow_run-origin validation invocation so its verified identity matches
 the eventual publisher contract; a workflow_dispatch certificate would not
 validate the existing workflow_run requirement. Exact selected build and
 validation run gates must be reviewed before this path executes.
+
+
+The tracked attestation-validation.json selects one concrete merged PR. The
+validation gate requires publication disabled, reviewed notices, selected C equal
+to trusted recipe R, first build and publisher attempts, and exactly one total
+matching invocation of each workflow across all statuses. Fresh latest-run reads
+reject ordinary reruns even while historical first-attempt evidence still exists.
+A live selection or release-policy change revokes eligibility. The signing job
+serializes the selected PR, revalidates every prepared byte and signs six exact
+subjects. It cannot reach the publish job. Verification saves untouched gh stdout
+before schema parsing and uploads available evidence even if parsing fails.
+
+These checks bound the approved ordinary GitHub execution; run inventories are
+not an atomic consume ledger under stale listings or owner-deleted history. A
+failed trial requires diagnosis and explicit review, not a blind signing rerun.
+Keep the selection null until the concrete mode PR number is known. Before its
+merge, report security review and CI results. After signing, retain the exact
+source, run and attempt evidence without changing immutable release identities.
+
+Before installing the selected mode PR on master, wait for older canonical
+builders and promoters to finish. A late older build can start another promoter
+at the new master C; the deliberately strict all-status inventory would then
+block this validation. Candidate PR workflows are not canonical build evidence.
