@@ -67,12 +67,17 @@ def json_bytes(data):
 
 def publication_gate(config):
     """No environment variable or CLI switch bypasses repository activation."""
-    policy._keys(config, "schema repository enabled attribution_status activation_blockers build_workflow_id publish_workflow_id gh retirement", "release policy")
+    policy._keys(config, "schema repository enabled attribution_status activation_blockers activation build_workflow_id publish_workflow_id gh retirement", "release policy")
     require(type(config["schema"]) is int and config["schema"] == 1, "unknown policy schema")
     require(config["repository"] == policy.REPOSITORY, "wrong policy repository")
     require(config["enabled"] is True, "publication disabled in reviewed release-policy.json")
     require(config["attribution_status"] == "reviewed", "ownership attribution unresolved")
     require(type(config["activation_blockers"]) is list and not config["activation_blockers"], "activation evidence incomplete")
+    policy._keys(config["activation"], "after_commit generation", "activation boundary")
+    policy._sha(config["activation"]["after_commit"])
+    generation = config["activation"]["generation"]
+    require(type(generation) is str and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", generation),
+            "invalid activation generation")
     for key in ("build_workflow_id", "publish_workflow_id"):
         policy._int(config[key], key)
     policy._keys(config["gh"], "version linux_amd64_sha256", "gh policy")
@@ -389,7 +394,7 @@ class GitHub:
                 all(part not in (".", "..") for part in resource.split("/")[1:]), "unsafe API path")
         suffix = resource[len("/repos/" + repository):]
         if suffix.startswith("/compare/"):
-            branch = "master" if repository == policy.REPOSITORY else "main"
+            branch = "(?:master|[0-9a-f]{40})" if repository == policy.REPOSITORY else "main"
             require(re.fullmatch(r"/compare/[0-9a-f]{40}\.\.\." + branch, suffix) and
                     method == "GET" and not query_separator and body is None and not binary and not upload,
                     "unsafe ancestry comparison")
@@ -1066,11 +1071,23 @@ def output_subject_paths(directory, descriptor):
         handle.write("paths<<boringtun_signed_subjects\n" + "\n".join(paths) + "\nboringtun_signed_subjects\n")
 
 
-def live_gate(api, config):
+def live_gate(api, config, descriptor):
     publication_gate(config)
     require(api.contents("packaging/boringtun/release-policy.json", "master") == POLICY_FILE.read_bytes(),
             "current master enablement differs from trusted recipe")
     trusted_context(api, config)
+    # Master enablement alone must never retroactively authorize a source built
+    # while publication was disabled. Read the immutable source's own policy.
+    source = policy._sha(descriptor["source_commit"])
+    baseline = config["activation"]["after_commit"]
+    require(source != baseline, "source is the excluded activation baseline")
+    source_config = policy.load_json(api.contents("packaging/boringtun/release-policy.json", source))
+    publication_gate(source_config)
+    require(source_config["activation"] == config["activation"], "source activation generation differs")
+    comparison = api.get(api.prefix + "/compare/" + baseline + "..." + source)
+    require(type(comparison) is dict and comparison.get("status") == "ahead" and
+            comparison.get("merge_base_commit", {}).get("sha") == baseline,
+            "source does not descend from activation baseline")
     check_retirement(api, config)
 
 
@@ -1258,7 +1275,7 @@ def main(argv=None):
             publishable = True
             reason = "ready"
             try:
-                live_gate(api, config)
+                live_gate(api, config, descriptor)
             except policy.PolicyError as exc:
                 publishable, reason = False, str(exc)
             validation = False
@@ -1285,14 +1302,14 @@ def main(argv=None):
                 output_values({"validation_verified": True, "tag": descriptor["tag"]})
             return 0
         if args.command == "attest-ready":
-            live_gate(api, config)
+            live_gate(api, config, descriptor)
             rebuilt, expected, _action, attest = prepare_release(api, *triggered_build(), context, config, gh)
             require(attest and rebuilt == descriptor and expected == files, "prepared data changed before signing")
             output_subject_paths(args.directory, descriptor)
             return 0
         action = publish_release(api, descriptor, files,
             lambda original, present: verify_release(api, original, present, config, gh),
-            lambda: live_gate(api, config), dry_run=not args.execute)
+            lambda: live_gate(api, config, descriptor), dry_run=not args.execute)
         output_values({"action": action, "tag": descriptor["tag"]})
         return 0
     except (policy.PolicyError, OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError,

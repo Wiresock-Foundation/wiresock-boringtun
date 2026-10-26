@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "repository": "wiresock/awg-server-tools",
-  "recorded_at": "2026-10-26T16:09:49Z",
+  "recorded_at": "2026-10-26T21:26:29.5279178Z",
   "method": "Owner-authenticated paginated GitHub REST GET; historical source blobs read from Git commit",
   "workflow": {
     "id": 369920301,
@@ -15,75 +15,93 @@
   },
   "runs": [
     {
+      "conclusion": "success",
+      "event": "workflow_dispatch",
+      "head_sha": "cdef1d8e9aa83092008d631c62759b3cc3ad6214",
       "id": 38290356281,
-      "status": "completed",
-      "conclusion": "success"
+      "status": "completed"
     },
     {
+      "conclusion": "success",
+      "event": "workflow_dispatch",
+      "head_sha": "8f426268955516845fc34427589dc37012eff71d",
       "id": 38268697310,
-      "status": "completed",
-      "conclusion": "success"
+      "status": "completed"
     },
     {
+      "conclusion": "success",
+      "event": "workflow_dispatch",
+      "head_sha": "10518d997c950c7b8960b4754dc0e6ae9e31d0af",
       "id": 37593959668,
-      "status": "completed",
-      "conclusion": "success"
+      "status": "completed"
     },
     {
+      "conclusion": "success",
+      "event": "workflow_dispatch",
+      "head_sha": "41fe7d903f1903fc5962baf53b551a2dc27aad15",
       "id": 37531214445,
-      "status": "completed",
-      "conclusion": "success"
+      "status": "completed"
     },
     {
+      "conclusion": "success",
+      "event": "workflow_dispatch",
+      "head_sha": "f1479da30cc8c084c77dc0ff217422f1ea18b460",
       "id": 37373558449,
-      "status": "completed",
-      "conclusion": "success"
+      "status": "completed"
     },
     {
+      "conclusion": "success",
+      "event": "workflow_dispatch",
+      "head_sha": "c77f9b842b72cbcc7c7f2355523171e583ecd431",
       "id": 37329019699,
-      "status": "completed",
-      "conclusion": "success"
+      "status": "completed"
     },
     {
+      "conclusion": "success",
+      "event": "workflow_dispatch",
+      "head_sha": "0df9d4c0321cb97a76ca4daec78c9c2ebca15fd0",
       "id": 36561793065,
-      "status": "completed",
-      "conclusion": "success"
+      "status": "completed"
     },
     {
+      "conclusion": "success",
+      "event": "workflow_dispatch",
+      "head_sha": "0df9d4c0321cb97a76ca4daec78c9c2ebca15fd0",
       "id": 36561473840,
-      "status": "completed",
-      "conclusion": "success"
+      "status": "completed"
     },
     {
+      "conclusion": "success",
+      "event": "workflow_dispatch",
+      "head_sha": "987db34de077c445c1193412e87c4a0d4c956bc1",
       "id": 36542504139,
-      "status": "completed",
-      "conclusion": "success"
+      "status": "completed"
     }
   ],
   "releases": [
     {
+      "draft": false,
       "id": 410888149,
-      "tag_name": "boringtun-cli-0.7.1-ge94c04f3f4fd-b1",
-      "draft": false,
-      "prerelease": true
+      "prerelease": true,
+      "tag_name": "boringtun-cli-0.7.1-ge94c04f3f4fd-b1"
     },
     {
+      "draft": false,
       "id": 405544565,
-      "tag_name": "boringtun-cli-0.7.1-gb94943906b11-b1",
-      "draft": false,
-      "prerelease": true
+      "prerelease": true,
+      "tag_name": "boringtun-cli-0.7.1-gb94943906b11-b1"
     },
     {
+      "draft": false,
       "id": 404095756,
-      "tag_name": "boringtun-cli-0.7.1-gae2ab44e9a68-b1",
-      "draft": false,
-      "prerelease": true
+      "prerelease": true,
+      "tag_name": "boringtun-cli-0.7.1-gae2ab44e9a68-b1"
     },
     {
-      "id": 399079189,
-      "tag_name": "boringtun-cli-0.7.1-g71d88784ad29-b1",
       "draft": false,
-      "prerelease": true
+      "id": 399079189,
+      "prerelease": true,
+      "tag_name": "boringtun-cli-0.7.1-g71d88784ad29-b1"
     }
   ],
   "draft_count": 0,

@@ -4,3 +4,7 @@
 packaging/boringtun/** text eol=lf
 packaging/boringtun/runtime-notices.txt whitespace=-blank-at-eol
 packaging/boringtun/runtime-notices-macos.txt whitespace=-blank-at-eol
+# Preserve exact archived gh stdout and signed descriptor bytes on every host.
+tests/fixtures/attestation-40401950322-1/gh-verification.json -text
+tests/fixtures/attestation-40401950322-1/RELEASE.json -text
+tests/fixtures/attestation-40401950322-1/receipt.json text eol=lf
