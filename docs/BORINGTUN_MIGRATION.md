@@ -14,6 +14,17 @@ The sections below describe the implemented contract and remaining live
 validation/activation gates. Local fixture tests do not establish successful
 GitHub publication, native macOS acceptance or resolution of historical dates.
 
+`BoringTun candidate platform validation` runs on opened, synchronized and
+reopened PRs, including drafts. It checks out the exact PR head and derives a
+temporary pin without a merged-PR or release identity. Its read-only jobs use
+the production notice, runtime, compiler, archive and device helpers for native
+Linux x86_64/ARM64 and macOS Intel/Apple Silicon; ARMv7 is cross-built and
+QEMU-emulated. Each target compares two binaries and archives, and three Linux
+lanes run both existing interoperability harnesses. The seven-day `candidate-*`
+artifacts are validation evidence, carry no attestations and are not releases.
+The publisher does not accept this workflow. Passing candidate CI does not
+clear the unchanged release activation blockers.
+
 The canonical producer moves to `Wiresock-Foundation/wiresock-boringtun`.
 Each merged PR targeting its master branch has a distinct source-based tag:
 `boringtun-cli-<CLI version>-g<source SHA first 12>-b<PR number>`. The complete
