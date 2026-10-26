@@ -5,8 +5,8 @@ on:
     workflows: [BoringTun merged PR artifacts]
     types: [completed]
 
-# Publication is dormant: release-policy.json is disabled, and every remaining
-# activation blocker must be cleared by a reviewed change.
+# Ordinary merged-PR pushes are approved for publication. Live policy, immutable
+# source activation generation, retirement and exact provenance remain mandatory.
 # Deliberately no workflow_run branch filter or shared concurrency group: a
 # different merged PR must never replace another PR's pending release request.
 permissions:

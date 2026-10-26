@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import stat
 import sys
 import tarfile
@@ -20,6 +21,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import boringtun_release_policy as policy
 import test_release_policy as fixtures
 X86, ARM, C = fixtures.X86, fixtures.ARM, fixtures.C
+
+
+def disabled_policy_file():
+    config = policy.load_json((ROOT / "packaging/boringtun/release-policy.json").read_bytes())
+    config["enabled"] = False
+    return SimpleNamespace(read_bytes=lambda: json.dumps(config).encode())
 
 
 def api_run_fixture():
@@ -103,8 +110,16 @@ class OrchestrationTests(unittest.TestCase):
                 "draft": draft, "body": release.descriptor_marker(self.descriptor),
                 "assets": copy.deepcopy(self.files)}
 
-    def test_default_policy_blocks_publication(self):
+    def test_approved_normal_path_policy_has_explicit_future_source_boundary(self):
         config = policy.load_json((ROOT / "packaging/boringtun/release-policy.json").read_bytes())
+        release.publication_gate(config)
+        self.assertIs(config["enabled"], True)
+        self.assertEqual(config["activation"], {
+            "after_commit": "1cee1afadd6be4251d6a19273b1882090bd2038e", "generation": "fork-v1"})
+        self.assertIsNone(policy.load_json((ROOT / "packaging/boringtun/attestation-validation.json").read_bytes())["pr"])
+
+    def test_disabled_policy_blocks_publication(self):
+        config = policy.load_json(disabled_policy_file().read_bytes())
         with self.assertRaises(policy.PolicyError):
             release.publication_gate(config)
         self.assertIs(config["enabled"], False)
@@ -376,10 +391,10 @@ class OrchestrationTests(unittest.TestCase):
             with self.assertRaises(policy.PolicyError):
                 release.check_request_envelope(changed, request, 100, 2, metadata)
 
-    def test_cli_default_gate_reports_disabled_without_network(self):
+    def test_cli_gate_reports_disabled_without_network(self):
         self.assertTrue(hasattr(release, "main"), "CLI missing")
         output = io.StringIO()
-        with contextlib.redirect_stderr(output):
+        with patch.object(release, "POLICY_FILE", disabled_policy_file()), contextlib.redirect_stderr(output):
             self.assertEqual(release.main(["gate"]), 2)
         self.assertIn("publication disabled", output.getvalue())
 
@@ -666,10 +681,11 @@ class OrchestrationTests(unittest.TestCase):
         self.assertIn("requested build differs from triggering event", stderr.getvalue())
         prepare.assert_not_called()
 
-    def test_execute_cli_still_cannot_bypass_checked_in_disabled_policy(self):
+    def test_execute_cli_still_cannot_bypass_disabled_policy(self):
         destination = MemoryDestination()
         stderr = io.StringIO()
-        with patch.object(release, "GitHub", return_value=destination), \
+        with patch.object(release, "POLICY_FILE", disabled_policy_file()), \
+             patch.object(release, "GitHub", return_value=destination), \
              patch.object(release, "trusted_context", return_value={}), \
              patch.object(release, "pinned_gh", return_value="gh"), \
              patch.object(release, "read_prepared", return_value=(self.descriptor, self.files)), \
@@ -705,7 +721,8 @@ class OrchestrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT / "tests") as directory:
             output = Path(directory) / "workflow-output"
             stderr = io.StringIO()
-            with patch.dict(release.os.environ, {"GITHUB_OUTPUT": str(output)}), \
+            with patch.object(release, "POLICY_FILE", disabled_policy_file()), \
+                 patch.dict(release.os.environ, {"GITHUB_OUTPUT": str(output)}), \
                  patch.object(release, "GitHub"), patch.object(release, "trusted_context", return_value={}), \
                  patch.object(release, "pinned_gh", return_value="gh"), \
                  patch.object(release, "read_prepared", return_value=(self.descriptor, self.files)), \

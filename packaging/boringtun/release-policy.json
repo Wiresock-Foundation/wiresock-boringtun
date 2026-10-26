@@ -1,17 +1,13 @@
 {
   "schema": 1,
   "repository": "Wiresock-Foundation/wiresock-boringtun",
-  "enabled": false,
+  "enabled": true,
   "attribution_status": "reviewed",
-  "activation_blockers": [
-    "Validate the installed master-push build with an exact merged-PR source and successful attempt",
-    "Record a real fork-publisher gh 2.100.0 verification JSON fixture with all six signed subjects",
-    "Prove recovery for missed merged-PR events including GITHUB_TOKEN merges",
-    "Verify historical-source tag creation permissions without broadening credentials",
-    "Review immutable action dependencies and native toolchain installation provenance",
-    "Review historical build recipe/provenance allowlist before recovering queued older C after pipeline changes",
-    "Review pinned GNU Bash 5.3.20 source/patch build and native compiler provenance plus signed coverage before activation; supplemental version and executable receipts alone are insufficient supply-chain evidence"
-  ],
+  "activation_blockers": [],
+  "activation": {
+    "after_commit": "1cee1afadd6be4251d6a19273b1882090bd2038e",
+    "generation": "fork-v1"
+  },
   "build_workflow_id": 397187760,
   "publish_workflow_id": 397187761,
   "gh": {

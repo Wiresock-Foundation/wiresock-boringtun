@@ -48,6 +48,22 @@ class GitHubTransportTests(unittest.TestCase):
                 self.assert_rejected(self.api.prefix + "/compare/" + tail)
         self.assert_rejected(f"/repos/{LEGACY}/compare/{SOURCE}...master")
 
+    def test_activation_comparison_accepts_exact_fork_commits_only(self):
+        target = 'c' * 40
+        path = self.api.prefix + f'/compare/{SOURCE}...{target}'
+        self.assertEqual(self.api.get(path), {'ok': True})
+        self.assertEqual(self.api.opener.open.call_args.args[0].full_url,
+                         'https://api.github.com' + path)
+        self.assert_rejected(f'/repos/{LEGACY}/compare/{SOURCE}...{target}')
+        for tail in (target[:12], target.upper(), target + '/extra', target + '?',
+                     target + '#fragment', target + '%2f..', target + ';extra'):
+            with self.subTest(tail=tail):
+                self.assert_rejected(self.api.prefix + f'/compare/{SOURCE}...{tail}')
+        for method in ('POST', 'PATCH', 'DELETE'):
+            self.assert_rejected(path, method)
+        for options in ({'body': {}}, {'binary': True}, {'upload': True}):
+            self.assert_rejected(path, **options)
+
     def test_compare_is_read_only_and_not_an_upload_or_download_route(self):
         path = self.api.prefix + f"/compare/{SOURCE}...master"
         for method in ("POST", "PATCH", "DELETE"):

@@ -2,13 +2,14 @@
 
 ## Current implementation status
 
-The local patch implements the read-only five-platform build workflow, strict
-release policy/orchestration, dormant publisher workflow and AWG adoption
-tooling. The fork's `.github/workflows/boringtun-release.yml` separates read-only
-validation, attestation and publication jobs. `release-policy.json` remains
-disabled; existing attribution notices have a documented preservation review. Signing and publication jobs require the
-validated activation output and independently recheck live policy. Nothing in
-this patch activates publication or changes existing releases or production.
+The implementation includes a read-only five-platform builder, strict release
+policy, publisher workflow and separate AWG adoption tooling. The owner approved
+normal merged-PR-push activation after independent review and green CI, including
+the first fresh merge-source release. `release-policy.json` enables generation
+fork-v1 with an immutable excluded baseline and source-side enablement checks.
+Signing and publication independently recheck live policy and exact provenance.
+The existing job permissions are unchanged; no actions:write recovery dispatcher
+is added. Old release assets and production remain unchanged.
 
 The sections below describe the implemented contract and remaining live
 validation/activation gates. Local fixture tests do not establish successful
@@ -23,7 +24,7 @@ QEMU-emulated. Each target compares two binaries and archives, and three Linux
 lanes run both existing interoperability harnesses. The seven-day `candidate-*`
 artifacts are validation evidence, carry no attestations and are not releases.
 The publisher does not accept this workflow. Passing candidate CI does not
-clear the unchanged release activation blockers.
+authorize publication; only eligible canonical master sources pass live gates.
 
 The canonical producer moves to `Wiresock-Foundation/wiresock-boringtun`.
 Each merged PR targeting its master branch has a distinct source-based tag:
@@ -39,7 +40,8 @@ a replay of an eligible source retains its immutable identity. AWG adoption rema
 1. Both initial repository changes are merged with publication disabled.
    Retained attribution notices now have a documented preservation review;
    see ATTRIBUTION.md and BORINGTUN_ACTIVATION_AUDIT.md. The source binding
-   repair still requires independent review and a successful installed run.
+   repair passed independent review and installed canonical build40398953473/1;
+   see the activation audit for the completed six-subject attestation trial.
 2. Merge the AWG retirement change only with owner approval. Its current Release
    workflow has no publisher, and its Artifacts workflow runs consumer checks.
    The Runtime workflow tests the exact published installer release rather than
@@ -50,9 +52,12 @@ a replay of an eligible source retains its immutable identity. AWG adoption rema
    publishing workflow through GitHub**. A fork token or anonymous release list
    cannot prove drafts are absent. A current-YAML edit cannot prevent historical
    reruns. This repository does not change those settings or create credentials.
-4. Record real merge/squash/rebase event and run-attempt fixtures, canonical
-   repository/workflow IDs, and pinned-gh verified-attestation fixtures. Resolve
-   every activation blocker through review before enabling the fork publisher.
+4. Normal-merge canonical identity and pinned-gh verification are proven by
+   build40398953473/1 and promoter40401950322/1. Squash/rebase strategy tests are
+   synthetic; recovery's new dispatch semantics still require implementation,
+   review and live read-only metadata evidence. Do not repeat the completed
+   signing trial or treat it as evidence of the unimplemented recovery route.
+   Obtain specific activation permission before enabling the fork publisher.
 5. Review the first eligible fork release and use `scripts/boringtun-adopt.py`
    to generate a local adoption patch. Review its exact tag, source, toolchain,
    notices, all five archive/binary hashes and the three Linux installer
@@ -142,11 +147,12 @@ empty ARMv7 release fields. Existing runnable ARM64 stores on mixed-bitness
 hosts remain valid rollback candidates. This does not establish ARM32 support
 for the full web/proxy stack or validate a physical Pi.
 
-The initial reviewed candidate run40331516759 passed native ARM64 and both
-macOS lanes, ARMv7 QEMU and all three Linux interop lanes. This is evidence for
-that exact candidate, not this repair. Actual installed push/attestation behavior
-and disposable host upgrade/rollback remain live validation tasks. Local fixture
-tests are not substitutes for those checks.
+Installed canonical build40398953473/1 passed both native Linux and macOS lanes,
+ARMv7 QEMU and all three Linux interoperability lanes; promoter40401950322/1
+completed six-subject attestation verification with publication skipped. New
+dispatched recovery metadata still needs live read-only validation. Host upgrade/
+rollback waits for an actual verified release and reviewed adoption. Local fixture
+tests are not substitutes for those remaining checks.
 
 ### Exact Bash for native macOS validation
 
@@ -174,5 +180,5 @@ build was Linux-only; it is not native macOS validation.
 CI provenance. These receipt bytes and the Bash input manifest are not included
 in the release descriptor's existing `toolchain_sha256` projection. This change
 does not clear the native host/tool provenance activation gate or enable
-publication. Both native macOS lanes passed in candidate run40331516759;
+publication. Both native macOS lanes passed in canonical build40398953473/1;
 subsequent source changes still require their own exact-head CI.

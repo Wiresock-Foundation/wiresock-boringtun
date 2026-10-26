@@ -1,114 +1,117 @@
 # Activation audit: 26 October 2026
 
-Publication remains disabled. This records evidence and remaining work, not
-permission to enable release jobs. AWG177 merged at
-514ea073c904a90cfeccda06ad1ea78553273c59; fork96 merged at
-d33fa41ad1917846a5a722ff3bfb64830b650941. Existing release assets, installer pins
-and production are unchanged.
+The owner approved normal-path activation on 26 October 2026: push and merge
+this change after independent review and green CI, then publish its first fresh
+merge-source release and later ordinary merged-PR releases. The approval covers
+job-scoped OIDC, attestation and release writes, accepts the hosted compiler/SDK
+trust boundary, and explicitly accepts narrower initial ordinary-event coverage.
+No actions:write dispatcher, new credential or repository setting is authorized.
+No release, tag or deployment was performed during the earlier trial/preparation.
 
-## What the original eleven blockers actually require
+## Installed evidence
 
-| Gate | Evidence and remaining action |
+PR98 merged as `1cee1afadd6be4251d6a19273b1882090bd2038e`. Its tree equals
+the independently reviewed PR head `05e16c9696d629bb7b8423872e11da9b8d09938d`.
+
+| Check | Observed result |
 | --- | --- |
-| Date provenance | Notice-preservation review completed; exact owner testimony is in ATTRIBUTION.md. Existing dates are retained, not independently verified. No new date question is needed. |
-| Merged-event identity | Real closed-PR run40344057429 had H as head_sha, empty pull_requests, and executed C. The repair uses canonical master-push C with independent exact merged-PR discovery. A successful installed repair run is still required. |
-| Workflow identity | Build397187760 and publisher397187761 are known and pinned. |
-| Live attestation fixture | Owner approved one attestation-only validation on 26 October 2026; implementation and live evidence are still required. Requiring publication enablement to collect this fixture is circular; use a separate narrow validation path before enabling publication. |
-| Legacy retirement | AWG YAML is retired. Owner-access audit found zero drafts, four published releases and nine completed historical publisher runs. Owner approved the exact disable action on 26 October 2026. PUT /repos/wiresock/awg-server-tools/actions/workflows/369920301/disable succeeded; GET readbacks confirmed id369920301, path .github/workflows/boringtun-release.yml, state disabled_manually. Re-audit immediately before activation. |
-| Missed merges | Reconciliation enumerates every merged PR since an explicit boundary, including missing or failed runs. Diagnostic recovery plans do not dispatch or publish. GITHUB_TOKEN-triggered merges may emit no usable push run. No release recovery route for such a missing run is implemented. |
-| Historical tags | Conditional on publishing older C. GitHub may require more than contents:write when historical workflow files differ. Do not broaden credentials; report the blocked PR/tag and obtain a reviewed recovery decision. |
-| Actions/native tools | Build actions now use immutable SHA pins. Coverage and limits are below; source binding does not make host tools hermetic. |
-| Historical recipes | C's build workflow must equal trusted R. Older incompatible C remains visibly blocked. An explicit activation boundary and reviewed recovery policy are required, not an unbounded recipe allowlist. |
-| Five-platform checks | Candidate40331516759 passed four native lanes plus ARMv7 cross-build/QEMU, two identical builds/archives per target, native TUN/utun, and all three Linux interop lanes. Physical Pi/full ARM32 web stack remain unvalidated. Repair CI must be recorded separately. |
-| Bash/compiler provenance | Same native-tool coverage decision as above, not a second independent implementation gate. GNU Bash source and twenty patches are pinned; native receipts are supplemental. |
+| [Canonical build 40398953473](https://github.com/Wiresock-Foundation/wiresock-boringtun/actions/runs/40398953473), attempt1 | 13/13 jobs succeeded: real master-push source/merged-PR resolution, notices, five reproducible archives, three Linux interoperability lanes and two macOS utun lanes. |
+| [Standard40398953497](https://github.com/Wiresock-Foundation/wiresock-boringtun/actions/runs/40398953497) | 16/16 succeeded. Semgrep40398953403 also succeeded. |
+| [Promoter40401950322](https://github.com/Wiresock-Foundation/wiresock-boringtun/actions/runs/40401950322), attempt1 | Prepare, attest and verify succeeded; publication job 121850247293 was skipped. Policy was enabled:false; selected PR98 alone was eligible for the approved trial. |
+| [Public attestation60103716](https://github.com/Wiresock-Foundation/wiresock-boringtun/attestations/60103716) | Six subjects: five archives and RELEASE.json. Signing occurred 21:10:12–21:10:18 UTC. Verification job 121850244631 reported validation_verified:true at 21:11:06 UTC. |
 
-## Source and tool coverage
+Pinned gh 2.100.0 performed cryptographic verification in the installed CI job.
+The certificate binds publisher workflow `.github/workflows/boringtun-release.yml`
+at `refs/heads/master`, GitHub OIDC issuer, GitHub-hosted runner, source and signer
+digest `1cee1afadd6be4251d6a19273b1882090bd2038e`, and invocation
+`https://github.com/Wiresock-Foundation/wiresock-boringtun/actions/runs/40401950322/attempts/1`.
+The signed descriptor independently binds build 40398953473/1 and workflow 397187760;
+publisher workflow 397187761 is pinned. No second validation run is authorized.
 
-The signed source C binds Cargo.lock, runtime-provenance.json, the build scripts
-and bash-toolchain.json. Runtime provenance pins Rust1.98.1 distribution/source,
-LLVM/compiler-builtins/native notice inputs for all five targets; distribution
-and source hashes are checked. The descriptor's toolchain_sha256 is only the
-documented Rust/LLVM/input projection, not a digest of every host executable.
+The fixture under `tests/fixtures/attestation-40401950322-1/` retains an untouched
+gh JSON output, the exact descriptor and the receipt for all six reads. All six
+raw outputs were byte-identical and contained the combined six-subject statement.
+Full originals and prepared archives were downloaded and digest-checked locally.
+The fixture tests replay semantic policy only; JSON cannot independently prove
+signature verification. The linked installed CI supplies that evidence.
 
-The Bash manifest pins GNU5.3 source plus twenty ordered patches. Native macOS
-builds select Xcode16.4/16F6, SDK15.5 and deployment target11.0. Compiler, SDK,
-Bash and packaging receipts describe the executing runner; their bytes remain
-supplemental CI artifacts and are not signed subjects. GitHub-hosted image and
-system-tool provenance are therefore trusted platform inputs, not independently
-reproduced toolchains. Review acceptance of that documented boundary before
-activation; stronger receipt attestation would be a separate contract change.
+| Archived artifact | ID | SHA-256 |
+| --- | --- | --- |
+| promotion-40401950322-1 | 12688842832 | 8f3472e2a46beb602652b9fffb59889ddae15581655c14850305cd5938fc304e |
+| attestation-validation-40401950322-1 | 12689855439 | 84bee65f190ab9d3a1b6ca34cd12c280fcf76c2603773d38d5dbc44ce6b040bd |
 
-Checkout, upload, download and setup-go in the release builder are SHA-pinned.
-Version-pinned rustup/Cargo tool installations and Go inputs retain their
-existing checksum/lockfile checks; this repair does not promise a hermetic
-runner or a new toolchain bootstrap proof.
+The prepared artifact expires 2 November 2026; the verification artifact expires
+25 November 2026. Repository fixtures preserve the public verification evidence;
+local archival copies preserve exact ZIPs and all prepared bytes beyond expiry.
 
-## Recovery preparation
+## Retirement and attribution
 
-Run the read-only `reconcile --since <UTC boundary>` command with pinned gh.
-Each row identifies the exact source/tag, existing attempts and a diagnostic
-recovery mode. Wait for active attempts. For a failed ordinary push run, inspect
-its exact failure and original workflow before proposing a rerun; never change
-signed identities or overwrite assets. A missing run cannot be recovered by
-rerunning it. Manual dispatch is maintenance validation only and remains
-ineligible for publication. Do not reset master or manufacture a push to hide
-the gap. Bring a concrete missing PR/source to review before designing recovery.
+The refreshed owner-authenticated, paginated read-only audit at
+2026-10-26T21:45:42Z still found workflow 369920301 **disabled_manually**, nine
+completed successful historical runs, zero active runs, zero drafts and four
+published prereleases. `packaging/boringtun/legacy-retirement-evidence.json`
+contains the IDs and source-file hashes at retired AWG commit
+`514ea073c904a90cfeccda06ad1ea78553273c59`. The earlier approved disable was not
+repeated. Fresh read-only contents checks also confirmed both files on current
+AWG main still match those retired hashes. Recheck immediately before activation;
+public fork tokens cannot prove
+absence of private drafts, so preserve the fresh owner-side audit too.
 
-Normal merge, squash and rebase use GitHub's documented postmerge
-merge_commit_sha. Captured live evidence covers normal merge; strategy tests for
-squash/rebase are synthetic. Merge queues/batched updates and automation merges
-which suppress push events are not yet claimed to deliver every PR. They must
-remain visible in reconciliation and need a reviewed recovery/activation scope.
+Cloudflare's original notice and other-author notices remain intact. Existing
+WireSock 2024–2026 assertions are retained as adaptation notices, not independently
+verified creation dates. Owner testimony that wgbooster/netlib predate 2022 is
+recorded in ATTRIBUTION.md. The date-only blocker is resolved by notice
+preservation; no invented start year or further broad history demand is needed.
 
-## Approved attestation-only validation scope
+## Hosted toolchain trust and signed coverage
 
-The owner approved one validation run in Wiresock-Foundation/wiresock-boringtun using the
-canonical `.github/workflows/boringtun-release.yml` installed on master at a
-reviewed immutable recipe revision. Add a separately gated validation mode with
-a signing job limited to `contents: read`, `actions: read`, `id-token: write`
-and `attestations: write`; verification jobs remain read-only. The validation
-path must have no reachable `contents: write` publication job. Keep enabled:false.
+Signed source C binds Cargo.lock, runtime-provenance.json, build scripts and
+bash-toolchain.json. Checksums cover pinned Rust 1.98.1 distributions and source,
+LLVM/compiler-builtins/native notice inputs for all five targets, GNU Bash 5.3
+source and twenty ordered patches. macOS selects Xcode 16.4/16F6, SDK 15.5 and
+deployment target 11.0. Checkout/upload/download/setup-go actions are SHA-pinned.
 
-It would sign exactly six verified subjects: the five archive digests and
-RELEASE.json, binding source, build run/attempt, workflow revision and validation
-run/attempt. GitHub artifact attestations and public Sigstore transparency
-records expose those digests and repository/workflow/source/run metadata. No
-release, tag, asset publication, new credential, signing key or repository
-security-setting change is requested. Preserve the real pinned-gh verification
-JSON as evidence. This scoped follow-up implements the mode; execution still
-requires final review, exact-head CI and parent-approved installation on master.
+The descriptor's toolchain_sha256 covers its documented Rust/LLVM/input
+projection; it is not a digest of every executing host tool. GitHub-hosted runner
+images, distribution APT tools, host compiler/linker and Apple SDK are trusted
+platform inputs. Version/executable/compiler/SDK/Bash/packaging receipts are
+supplemental CI artifacts, **not signed subjects**. Reproducible outputs from two
+builds on a host do not establish a hermetic bootstrap or independent-host
+reproducibility. Approval must accept this explicit boundary; stronger receipt
+attestation is a separate contract change, not evidence already obtained.
 
-The machine-readable legacy readback is retained in
-`packaging/boringtun/legacy-retirement-evidence.json`, including all nine run
-IDs, all four published prereleases, zero drafts and SHA-256 values of the
-retired workflow/script at AWG commit514ea073c904a90cfeccda06ad1ea78553273c59.
-It is point-in-time evidence; the publisher's activation check must still reread
-workflow state and inventories. No release was deleted, edited or republished.
+Linux x86_64/aarch64 and macOS Intel/Apple Silicon ran natively. ARMv7 hard-float
+musl was cross-built and exercised with QEMU. Physical Pi testing and the full
+ARM32 AWG panel/proxy stack remain unvalidated. No Apple signing/notarization
+credential is configured or proposed.
 
-Use a workflow_run-origin validation invocation so its verified identity matches
-the eventual publisher contract; a workflow_dispatch certificate would not
-validate the existing workflow_run requirement. Exact selected build and
-validation run gates must be reviewed before this path executes.
+## Approved activation and remaining recovery work
 
+The owner chose the narrower initial ordinary-push path, with automatic catch-up
+separate. Missing, batched and token-suppressed events remain visible diagnostic
+gaps; there is no automatic recovery implementation or authorization for an
+actions:write dispatcher. A concrete exceptional source requires reviewed manual
+recovery, never a blind signing retry or an invented push. This initial scope is
+not a claim that every merged PR is automatically covered.
 
-The tracked attestation-validation.json selects one concrete merged PR. The
-validation gate requires publication disabled, reviewed notices, selected C equal
-to trusted recipe R, first build and publisher attempts, and exactly one total
-matching invocation of each workflow across all statuses. Fresh latest-run reads
-reject ordinary reruns even while historical first-attempt evidence still exists.
-A live selection or release-policy change revokes eligibility. The signing job
-serializes the selected PR, revalidates every prepared byte and signs six exact
-subjects. It cannot reach the publish job. Verification saves untouched gh stdout
-before schema parsing and uploads available evidence even if parsing fails.
+The owner accepted the hosted-toolchain trust boundary and existing job-scoped
+publication permissions. The remaining installation prerequisites are exact-head
+CI, unchanged independent-review coverage, fresh retirement readback and a normal
+merge. Actual first-release completion must be observed and verified separately.
 
-These checks bound the approved ordinary GitHub execution; run inventories are
-not an atomic consume ledger under stale listings or owner-deleted history. A
-failed trial requires diagnosis and explicit review, not a blind signing rerun.
-Keep the selection null until the concrete mode PR number is known. Before its
-merge, report security review and CI results. After signing, retain the exact
-source, run and attempt evidence without changing immutable release identities.
+The boundary guard excludes source 1cee itself and all sources whose own
+policy remains disabled, even if their promoters run after master enablement.
+An eligible source must descend from 1cee and contain the same enabled activation
+generation (`fork-v1`), with no source blockers. Current-master policy must still
+equal trusted publisher policy before signing/publication; revocation remains
+effective. The completed validation selection is null. This approved change sets
+enabled:true and clears the resolved activation decisions; workflow job
+permissions are unchanged. The source's own enabled policy means the activation
+PR's fresh merge is the first eligible source; old disabled sources remain out.
 
-Before installing the selected mode PR on master, wait for older canonical
-builders and promoters to finish. A late older build can start another promoter
-at the new master C; the deliberately strict all-status inventory would then
-block this validation. Candidate PR workflows are not canonical build evidence.
+Historical tag permission and incompatible historical recipes are conditional
+backfill limitations, not reasons to repeat the completed trial. No pre-activation
+backfill is proposed. Post-activation queued sources must remain visible through
+pipeline changes; unresolved recovery cannot be called successful coverage.
+See [activation and recovery design](BORINGTUN_ACTIVATION_PLAN.md) for the exact
+approval request and first-release/adoption/Lisbon sequence.

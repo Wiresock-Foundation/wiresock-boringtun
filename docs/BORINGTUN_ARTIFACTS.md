@@ -3,7 +3,8 @@
 The fork-owned workflow and its remaining activation gates are documented in
 [BORINGTUN_MIGRATION.md](BORINGTUN_MIGRATION.md). Exact runtime/native notice
 inputs, distribution hashes and inventories are documented in
-[BORINGTUN_NOTICES.md](BORINGTUN_NOTICES.md). Publication remains disabled.
+[BORINGTUN_NOTICES.md](BORINGTUN_NOTICES.md). Normal merged-PR-push activation
+is owner-approved; publication still requires all live source/provenance gates.
 
 `scripts/boringtun-artifact.sh` builds, packages and verifies the five reviewed
 targets. Run it without arguments to list commands. It reads the source pin as
