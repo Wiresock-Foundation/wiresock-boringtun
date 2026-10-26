@@ -303,9 +303,9 @@ class OrchestrationTests(unittest.TestCase):
                     return None
                 return {"id": 20, "tag_name": "release", "target_commitish": C,
                         "draft": True, "body": "marker"}
-            def pages(self, *_args, **_kwargs):
-                return []
-        self.assertEqual(Api().read_release("release")["target_commit"], C)
+            def pages(self, path, *_args, **_kwargs):
+                return [self.request("GET", path)] if path == self.prefix + "/releases" else []
+        self.assertEqual(Api(token="owner-token").read_release("release")["target_commit"], C)
 
     def tar_archive(self, additions=(), pax=None, target="x86_64-unknown-linux-musl", notices=b"notices", fields=None):
         contents = {"boringtun-cli": b"binary", "LICENSE": b"license",
