@@ -34,6 +34,7 @@ import boringtun_release_policy as policy
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_FILE = ROOT / "packaging/boringtun/release-policy.json"
+VALIDATION_FILE = ROOT / "packaging/boringtun/attestation-validation.json"
 REQUIRED_JOBS = {"Resolve merged PR", "License and dependency gate", "Release request bundle",
                  "Build (linux-x86_64)", "Build (linux-aarch64)", "Build (linux-armv7-cross)",
                  "Build (macos-x86_64)", "Build (macos-aarch64)",
@@ -768,7 +769,7 @@ def trusted_context(api, config):
             "recipe_commit": recipe, "run_id": run_id, "run_attempt": attempt}
 
 
-def verify_release(api, descriptor, files, config, gh):
+def verify_release(api, descriptor, files, config, gh, verification_output=None):
     _check_files(descriptor, files, complete=False)
     build = descriptor["build_run"]
     retained = api.get(api.prefix + f"/actions/runs/{build['id']}/attempts/{build['run_attempt']}")
@@ -803,7 +804,13 @@ def verify_release(api, descriptor, files, config, gh):
             path = root / name
             path.write_bytes(files[name])
             process = subprocess.run([gh, *policy.attestation_arguments(str(path), descriptor)],
-                                     check=True, capture_output=True, env=environment)
+                                     check=False, capture_output=True, env=environment)
+            # Preserve the original stdout even if a real certificate shape is
+            # unexpected; never include stderr or authentication environment.
+            if verification_output is not None:
+                with (Path(verification_output) / (name + ".verification.json")).open("xb") as evidence:
+                    evidence.write(process.stdout)
+            require(process.returncode == 0, "pinned gh cryptographic verification failed")
             results = policy.load_json(process.stdout)
             require(type(results) is list and results, "no verified attestation results")
             matches = 0
@@ -1067,6 +1074,64 @@ def live_gate(api, config):
     check_retirement(api, config)
 
 
+def validation_gate(api, config, context, descriptor):
+    """Authorize only the selected merged PR's first ordinary signing attempt.
+
+    This is not publication enablement or recovery. Latest run reads reject
+    ordinary reruns even though historical /attempts/1 records remain readable.
+    Inventories include every status; ambiguous/duplicate events fail closed.
+    """
+    require(config.get("enabled") is False and config.get("attribution_status") == "reviewed",
+            "attestation validation requires disabled publication and reviewed notices")
+    selection_bytes = VALIDATION_FILE.read_bytes()
+    selection = policy.load_json(selection_bytes)
+    policy._keys(selection, "schema pr", "attestation validation selection")
+    require(type(selection["schema"]) is int and selection["schema"] == 1, "unknown validation selection schema")
+    policy._int(selection["pr"], "selected validation PR")
+    descriptor = policy.check_descriptor(descriptor)
+    require(descriptor["pr"] == selection["pr"], "merged PR is not the selected validation")
+    expected_context = {"repository": policy.REPOSITORY, **descriptor["publisher"]}
+    require(context == expected_context, "validation descriptor differs from current publisher context")
+    source = descriptor["source_commit"]
+    require(context["recipe_commit"] == source, "validation must execute the selected source recipe C == R")
+    build = descriptor["build_run"]
+    require((build["id"], build["run_attempt"]) == triggered_build() and
+            build["run_attempt"] == context["run_attempt"] == 1,
+            "validation requires the exact triggering build and first build/publisher attempts")
+    require(api.contents("packaging/boringtun/attestation-validation.json", "master") == selection_bytes and
+            api.contents("packaging/boringtun/release-policy.json", "master") == POLICY_FILE.read_bytes(),
+            "live validation selection or release policy changed")
+    for recorded, id_key, config_key, workflow, event in (
+            (build, "id", "build_workflow_id", policy.BUILD_WORKFLOW, "push"),
+            (context, "run_id", "publish_workflow_id", policy.PUBLISH_WORKFLOW, "workflow_run")):
+        workflow_id = policy._int(config.get(config_key), config_key)
+        run_id = policy._int(recorded[id_key], "validation run ID")
+        require(recorded["workflow_id"] == workflow_id, "validation workflow ID differs")
+        path = api.prefix + f"/actions/workflows/{workflow_id}/runs?event={event}&head_sha={source}"
+        inventory = api.pages(path, "workflow_runs")
+        require(type(inventory) is list and len(inventory) == 1,
+                "validation requires exactly one total invocation per workflow at C")
+        latest = api.get(api.prefix + f"/actions/runs/{run_id}")
+        fields = {"id": run_id, "run_attempt": 1, "workflow_id": workflow_id, "path": workflow,
+                  "event": event, "head_sha": source, "head_branch": "master"}
+        for run in (inventory[0], latest):
+            require(type(run) is dict and all(run.get(k) == v and type(run.get(k)) is type(v) for k, v in fields.items()),
+                    "validation invocation or latest attempt differs")
+            require(type(run.get("repository")) is dict and run["repository"].get("full_name") == policy.REPOSITORY,
+                    "validation run is not in the canonical repository")
+            if event == "push":
+                require(run.get("status") == "completed" and run.get("conclusion") == "success", "validation build is not successful")
+
+
+def validation_prepared(api, config, context, descriptor, files, gh):
+    validation_gate(api, config, context, descriptor)
+    rebuilt, expected, action, attest = prepare_release(api, *triggered_build(), context, config, gh)
+    require(action == "create" and attest is True and rebuilt == descriptor and expected == files,
+            "validation requires new unchanged prepared content, not release recovery")
+    # A second fresh gate catches revocation/rerun during expensive inspection.
+    validation_gate(api, config, context, descriptor)
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
@@ -1087,7 +1152,7 @@ def parser():
     install = commands.add_parser("install-gh", help="extract only verified pinned gh binary")
     install.add_argument("--archive", required=True)
     install.add_argument("--output", required=True)
-    for command in ("prepare", "attest-ready", "publish"):
+    for command in ("prepare", "attest-ready", "validation-attest-ready", "verify-validation", "publish"):
         sub = commands.add_parser(command)
         sub.add_argument("--gh", required=True)
         sub.add_argument("--gh-archive", required=True)
@@ -1099,6 +1164,8 @@ def parser():
             sub.add_argument("--directory", required=True)
         if command == "publish":
             sub.add_argument("--execute", action="store_true", help="publish only after every live gate; default is dry run")
+        if command == "verify-validation":
+            sub.add_argument("--evidence", required=True, help="new local directory for unmodified gh verification output")
     fetch = commands.add_parser("fetch-prepared", help="fetch immutable trusted preparation artifact safely")
     fetch.add_argument("--artifact-id", type=int, required=True)
     fetch.add_argument("--artifact-digest", required=True)
@@ -1194,10 +1261,29 @@ def main(argv=None):
                 live_gate(api, config)
             except policy.PolicyError as exc:
                 publishable, reason = False, str(exc)
+            validation = False
+            if not publishable and action == "create" and attest is True:
+                try:
+                    validation_gate(api, config, context, descriptor)
+                    validation, reason = True, "selected attestation-only validation; publication disabled"
+                except policy.PolicyError as exc:
+                    reason += "; validation unavailable: " + str(exc)
             output_values({"tag": descriptor["tag"], "pr": descriptor["pr"], "action": action,
-                           "attest": attest, "publishable": publishable, "reason": reason})
+                           "attest": attest, "publishable": publishable, "validation": validation, "reason": reason})
             return 0
         descriptor, files = read_prepared(args.directory)
+        if args.command in ("validation-attest-ready", "verify-validation"):
+            validation_prepared(api, config, context, descriptor, files, gh)
+            if args.command == "validation-attest-ready":
+                output_subject_paths(args.directory, descriptor)
+            else:
+                # Available raw stdout files survive strict schema rejection;
+                # all six are retained on success. Never rerun signing to debug.
+                write_new(args.evidence, {})
+                verify_release(api, descriptor, files, config, gh, verification_output=args.evidence)
+                validation_gate(api, config, context, descriptor)
+                output_values({"validation_verified": True, "tag": descriptor["tag"]})
+            return 0
         if args.command == "attest-ready":
             live_gate(api, config)
             rebuilt, expected, _action, attest = prepare_release(api, *triggered_build(), context, config, gh)
