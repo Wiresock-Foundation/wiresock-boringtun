@@ -5,7 +5,7 @@ use super::dev_lock::LockReadGuard;
 use super::drop_privileges::get_saved_ids;
 use super::{AllowedIP, Device, Error, SocketAddr};
 use crate::device::Action;
-use crate::noise::amnezia::{AmneziaConfig, AwgTimers};
+use crate::noise::amnezia::{AmneziaConfig, AwgTimers, TimerOrderingWarning};
 use crate::noise::handshake::ObfuscationRanges;
 use crate::noise::normalize_persistent_keepalive_range;
 use crate::serialization::KeyBytes;
@@ -189,9 +189,15 @@ impl AwgParams {
     /// Apply the accumulated values, merging with whatever the device already
     /// has. A no-op when the transaction carried no AmneziaWG keys, so plain
     /// WireGuard configurations are untouched.
-    fn apply(&self, device: &mut Device) -> Result<(), i32> {
+    ///
+    /// Returns the timer-ordering warning of the configuration it applied, for
+    /// `api_set` to log once the device write lock and its writer intent are
+    /// released -- a subscriber that reads the device must not wait on the
+    /// lock this runs under. `None` when nothing was applied or the applied
+    /// timers are coherent; a refused merge applies nothing and warns nothing.
+    fn apply(&self, device: &mut Device) -> Result<Option<TimerOrderingWarning>, i32> {
         if !self.seen {
-            return Ok(());
+            return Ok(None);
         }
         // The padding is clamped against the interface MTU. This snapshot is
         // one of three writers keeping it fresh: `Device::new` seeds it at
@@ -203,10 +209,11 @@ impl AwgParams {
         // place that must fail closed.
         let mtu = device.mtu.load(Ordering::Relaxed).min(u16::MAX as usize) as u16;
         let (obf, amnezia) = self.merged(device.config.obf, &device.config.amnezia, mtu)?;
+        let timer_warning = amnezia.timer_ordering_warning();
         if device.set_obfuscation(obf, amnezia) {
             tracing::info!(message = "AmneziaWG parameters updated");
         }
-        Ok(())
+        Ok(timer_warning)
     }
 
     /// Merge this transaction over the device's current settings.
@@ -343,9 +350,11 @@ impl AwgParams {
         amnezia.warn_header_protection_nonce();
 
         // Timer ranges whose order can expire a session before its renewal
-        // are applied exactly as the transaction said, with a WARN once per
-        // `set=1` whose merged result earns it -- never per tick or packet.
-        amnezia.warn_timer_ordering();
+        // are applied exactly as the transaction said. Their WARN is not
+        // logged here, under the device write lock: `apply` prepares it from
+        // the configuration it applies and `api_set` logs it after the lock
+        // is released -- once per `set=1` that applies such a configuration,
+        // never per tick or packet.
 
         Ok((obf, amnezia))
     }
@@ -787,7 +796,17 @@ fn device_errno(e: &Error) -> i32 {
 }
 
 fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -> i32 {
-    d.try_writeable(
+    // The timer-ordering warning of the AmneziaWG configuration this
+    // transaction applies, logged only after `try_writeable` has released the
+    // device write lock and lowered its writer intent: a logging subscriber
+    // that reads the device would otherwise wait on this transaction, and
+    // with it every device worker. It belongs to the configuration actually
+    // applied -- including one a later peer section's error does not roll
+    // back (the parser applies sections as it reads them) -- so it is logged
+    // whatever errno the transaction ends with; a refused merge applies
+    // nothing and leaves it empty.
+    let mut timer_warning = None;
+    let status = d.try_writeable(
         |device| device.trigger_yield(),
         |device| {
             device.cancel_yield();
@@ -804,7 +823,10 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                 cmd.pop(); // remove newline if any
                 if cmd.is_empty() {
                     match awg.apply(device) {
-                        Ok(()) => return 0, // Done
+                        Ok(warning) => {
+                            timer_warning = warning;
+                            return 0; // Done
+                        }
                         Err(code) => return code,
                     }
                 }
@@ -857,8 +879,11 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                             Ok(key_bytes) => {
                                 // Apply before the first peer is built: peers
                                 // snapshot the device's AmneziaWG settings.
-                                if let Err(code) = awg.apply(device) {
-                                    return code;
+                                // Applied now, so warned about even if a peer
+                                // line below fails the transaction.
+                                match awg.apply(device) {
+                                    Ok(warning) => timer_warning = warning,
+                                    Err(code) => return code,
                                 }
                                 return api_set_peer(
                                     reader,
@@ -951,8 +976,14 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
 
             0
         },
-    )
-    .unwrap_or(EIO)
+    );
+    let status = status.unwrap_or(EIO);
+    // Both the write lock and the writer intent are released here; only this
+    // thread's ordinary read guard remains, which other readers share.
+    if let Some(warning) = timer_warning {
+        warning.emit();
+    }
+    status
 }
 
 /// A boolean in exactly the spellings Go's `strconv.ParseBool` accepts, which
@@ -2690,20 +2721,29 @@ mod tests {
         p
     }
 
-    /// The parent's `set=1` failed the reproducer with EINVAL at
-    /// `97 < 137 + 12`. It now applies every value unchanged and warns once
-    /// per application -- two applications, two warnings -- while a coherent
-    /// control (reject 149-180) in the same scope warns nothing.
+    const TIMER_ORDERING_WARNING: &str = "their order can expire a session before it is renewed";
+
+    fn timer_warnings(c: &[(String, String)]) -> Vec<&String> {
+        c.iter()
+            .filter(|(m, _)| m.contains(TIMER_ORDERING_WARNING))
+            .map(|(_, d)| d)
+            .collect()
+    }
+
+    /// The merge that `set=1` runs under the device write lock is silent: it
+    /// returns the reproducer's values unchanged and the warning its
+    /// configuration earns, prepared as owned text, and logs nothing -- the
+    /// warning is logged by `api_set` after the lock is released
+    /// (`timer_warnings_follow_the_configuration_a_set_applies`). A malformed
+    /// timer still fails the merge. The parent refused the reproducer here
+    /// with EINVAL at `97 < 137 + 12`.
     #[test]
-    fn the_wrs225_timer_reproducer_loads_over_the_uapi_with_one_warning_per_set() {
-        const WARNING: &str = "their order can expire a session before it is renewed";
-        let ordering =
-            |c: &[(String, String)]| c.iter().filter(|(m, _)| m.contains(WARNING)).count();
+    fn the_wrs225_timer_reproducer_merges_unchanged_and_silently() {
         let mut applied = Vec::new();
         let captured = capture_warnings(
             || {
                 applied.clear();
-                for reject in ["97-127", "97-127", "149-180"] {
+                for reject in ["97-127", "149-180"] {
                     let (_, cfg) = wrs225_set(reject)
                         .merged(
                             ObfuscationRanges::default(),
@@ -2714,7 +2754,7 @@ mod tests {
                     applied.push(cfg);
                 }
             },
-            |c| ordering(c) >= 2,
+            |_| true,
         );
         let t = applied[0].timers;
         assert_eq!(t.rekey_after_time, (92, 137));
@@ -2723,17 +2763,21 @@ mod tests {
         assert_eq!(t.keepalive_timeout, (8, 22));
         assert_eq!(t.max_handshake_attempts, (24, 30));
         assert_eq!(applied[0].content_padding_addition, (18, 80));
-        assert_eq!(applied[2].timers.reject_after_time, (149, 180));
-        assert_eq!(
-            ordering(&captured),
-            2,
-            "once per application: {:?}",
+        assert_eq!(applied[1].timers.reject_after_time, (149, 180));
+        assert!(
+            timer_warnings(&captured).is_empty(),
+            "the merge logs nothing: {:?}",
             captured
         );
-        assert!(captured
-            .iter()
-            .filter(|(m, _)| m.contains(WARNING))
-            .all(|(_, d)| d.contains("97s") && d.contains("149s")));
+        let prepared = applied[0]
+            .timer_ordering_warning()
+            .expect("the reproducer earns the warning");
+        assert_eq!(
+            prepared,
+            applied[0].timer_ordering_warning().unwrap(),
+            "value only"
+        );
+        assert_eq!(applied[1].timer_ordering_warning(), None, "coherent");
 
         // Malformed timer input still fails the transaction.
         assert_eq!(parse_uint_range("127-97"), None, "inverted");
@@ -2748,5 +2792,231 @@ mod tests {
             .err(),
             Some(EINVAL)
         );
+    }
+
+    /// A `Device` on local socket pairs -- no TUN, root or traffic -- for the
+    /// real `api_set` / `api_get` paths, with its UAPI fd kept open.
+    #[cfg(target_os = "linux")]
+    fn socket_device() -> (
+        crate::device::dev_lock::Lock<Device>,
+        std::os::unix::net::UnixDatagram,
+        UnixStream,
+    ) {
+        use std::os::fd::IntoRawFd;
+        let (tun, tun_peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let (api, api_peer) = UnixStream::pair().unwrap();
+        let config = crate::device::DeviceConfig {
+            n_threads: 1,
+            use_connected_socket: false,
+            use_multi_queue: false,
+            uapi_fd: api.into_raw_fd(),
+            ..Default::default()
+        };
+        let device = Device::new(&tun.into_raw_fd().to_string(), config).unwrap();
+        (
+            crate::device::dev_lock::Lock::new(device),
+            tun_peer,
+            api_peer,
+        )
+    }
+
+    /// One `set=1` transaction body through the production `api_set`, under
+    /// an ordinary device read guard as the UAPI handlers hold one.
+    #[cfg(target_os = "linux")]
+    fn uapi_set(d: &crate::device::dev_lock::Lock<Device>, request: &str) -> i32 {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        drop(client);
+        let mut reader = BufReader::new(&server);
+        api_set(&mut reader, &mut d.read())
+    }
+
+    /// WRS-225 review finding 1. A subscriber that reads the device while
+    /// handling the timer-ordering warning must not wait on the `set=1` that
+    /// logged it. Each warning's callback starts a device reader and waits up
+    /// to two seconds for it:
+    ///
+    /// 1. the production path: `api_set` with `reject_after_time=60-80` --
+    ///    the reader must finish (the parent blocked it until the callback
+    ///    returned: the warning was logged under the write lock);
+    /// 2. outside-lock control: the same prepared warning emitted with no
+    ///    device lock held -- the reader finishes;
+    /// 3. inside-lock control: the same warning emitted inside
+    ///    `try_writeable`'s mutation -- the reader is blocked, which shows the
+    ///    probe detects the dependency rather than passing on timing alone.
+    ///
+    /// Every reader thread is joined before any assertion.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_timer_warning_is_logged_after_the_device_lock_is_released() {
+        use std::sync::{mpsc, Mutex as StdMutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+        let _serialized = crate::tracing_test_lock();
+
+        #[derive(Default)]
+        struct Message(String);
+        impl Visit for Message {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{:?}", value);
+                }
+            }
+        }
+        struct Probe {
+            device: Arc<crate::device::dev_lock::Lock<Device>>,
+            blocked: Arc<StdMutex<Vec<bool>>>,
+            readers: Arc<StdMutex<Vec<std::thread::JoinHandle<()>>>>,
+        }
+        impl<S: Subscriber> Layer<S> for Probe {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let mut message = Message::default();
+                event.record(&mut message);
+                if !message.0.contains(TIMER_ORDERING_WARNING) {
+                    return;
+                }
+                let device = Arc::clone(&self.device);
+                let (started_tx, started_rx) = mpsc::channel();
+                let (done_tx, done_rx) = mpsc::channel();
+                let reader = std::thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    let _guard = device.read();
+                    let _ = done_tx.send(());
+                });
+                started_rx.recv().unwrap();
+                let blocked = done_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_err();
+                self.blocked.lock().unwrap().push(blocked);
+                self.readers.lock().unwrap().push(reader);
+            }
+        }
+
+        let (device, _tun_peer, _api_peer) = socket_device();
+        let device = Arc::new(device);
+        let blocked = Arc::new(StdMutex::new(Vec::new()));
+        let readers = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Probe {
+            device: Arc::clone(&device),
+            blocked: Arc::clone(&blocked),
+            readers: Arc::clone(&readers),
+        });
+        let errno = tracing::subscriber::with_default(subscriber, || {
+            let errno = uapi_set(&device, "reject_after_time=60-80\n\n");
+            let prepared = || {
+                device
+                    .read()
+                    .config
+                    .amnezia
+                    .timer_ordering_warning()
+                    .expect("the applied configuration earns the warning")
+            };
+            let outside = prepared();
+            outside.emit();
+            let inside = prepared();
+            let mut guard = device.read();
+            guard.try_writeable(|_| {}, move |_| inside.emit());
+            drop(guard);
+            errno
+        });
+        for reader in std::mem::take(&mut *readers.lock().unwrap()) {
+            reader.join().unwrap();
+        }
+        let blocked = blocked.lock().unwrap();
+        assert_eq!(errno, 0);
+        assert_eq!(
+            &*blocked,
+            &[false, false, true],
+            "[api_set, outside-lock control, inside-lock control]: the reader \
+             started by the warning callback was blocked"
+        );
+        assert_eq!(
+            device.read().config.amnezia.timers.reject_after_time,
+            (60, 80)
+        );
+    }
+
+    /// The warning belongs to the configuration a `set=1` actually applies,
+    /// through the production `api_set`, one per application:
+    ///
+    /// - unfavourable timers applied: errno 0, one warning (reject 60);
+    /// - coherent timers applied: errno 0, none;
+    /// - malformed timers (a 0 in a set range): EINVAL, nothing applied, none;
+    /// - timers applied, then a peer line fails: EINVAL -- the parser applies
+    ///   the AmneziaWG settings before the peer section and does not roll them
+    ///   back -- and one warning for those applied timers (reject 50);
+    /// - a peer-only transaction over unfavourable stored timers: errno 0 and
+    ///   none: the warning is not rebuilt from the device's state;
+    /// - timer ticks and `get=1` afterwards: none.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn timer_warnings_follow_the_configuration_a_set_applies() {
+        let public = "02".repeat(32);
+        let (device, _tun_peer, _api_peer) = socket_device();
+        assert_eq!(
+            uapi_set(&device, &format!("private_key={}\n\n", "01".repeat(32))),
+            0,
+            "[SETUP]"
+        );
+        let mut steps = Vec::new();
+        let captured = capture_warnings(
+            || {
+                steps.clear();
+                let mut step = |name: &'static str, request: String| {
+                    let errno = uapi_set(&device, &request);
+                    let reject = device.read().config.amnezia.timers.reject_after_time;
+                    steps.push((name, errno, reject));
+                };
+                step("unfavourable", "reject_after_time=60-80\n\n".into());
+                step("coherent", "reject_after_time=200-220\n\n".into());
+                step(
+                    "malformed",
+                    "reject_after_time=60-80\nrekey_timeout=0-2\n\n".into(),
+                );
+                step(
+                    "applied then failed",
+                    format!(
+                        "reject_after_time=50-80\npublic_key={}\nallowed_ip=invalid\n\n",
+                        public
+                    ),
+                );
+                step(
+                    "peer only",
+                    format!(
+                        "public_key={}\npersistent_keepalive_interval=25\n\n",
+                        public
+                    ),
+                );
+                let d = device.read();
+                let mut out = vec![0u8; 2048];
+                for peer in d.peers.values() {
+                    for _ in 0..5 {
+                        let _ = peer.lock().tunnel.update_timers(&mut out);
+                    }
+                }
+                drop(d);
+                let (server, _client) = UnixStream::pair().unwrap();
+                let mut writer = BufWriter::new(&server);
+                assert_eq!(api_get(&mut writer, &device.read()), 0);
+            },
+            |c| timer_warnings(c).len() >= 2,
+        );
+        assert_eq!(
+            steps,
+            vec![
+                ("unfavourable", 0, (60, 80)),
+                ("coherent", 0, (200, 220)),
+                ("malformed", EINVAL, (200, 220)),
+                ("applied then failed", EINVAL, (50, 80)),
+                ("peer only", 0, (50, 80)),
+            ],
+            "errno and stored values"
+        );
+        let warnings = timer_warnings(&captured);
+        assert_eq!(warnings.len(), 2, "{:?}", captured);
+        assert!(warnings[0].contains("60s"), "{}", warnings[0]);
+        assert!(warnings[1].contains("50s"), "{}", warnings[1]);
     }
 }

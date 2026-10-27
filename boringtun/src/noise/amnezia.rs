@@ -1561,15 +1561,6 @@ impl AmneziaConfig {
         self.timer_ordering_complaint().map(TimerOrderingWarning)
     }
 
-    /// Log [`Self::timer_ordering_warning`] at once, if there is one: the UAPI
-    /// door's placement, which still runs under the device write lock.
-    #[cfg(feature = "device")]
-    pub(crate) fn warn_timer_ordering(&self) {
-        if let Some(warning) = self.timer_ordering_warning() {
-            warning.emit();
-        }
-    }
-
     /// Adapt this configuration for the responder (server) side of a tunnel.
     ///
     /// A server must *tolerate* a client's pre-handshake camouflage but must
