@@ -249,6 +249,7 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
         state = destination.read_release(desired["tag"])
         require(state is not None, "draft creation outcome unresolved; inspect destination before retry")
         _check_state(state, desired)
+    release_id = state["id"]
     for name in ["RELEASE.json", *sorted(k for k in files if k != "RELEASE.json")]:
         _check_state(state, desired)
         if name in state["assets"]:
@@ -260,6 +261,7 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
             pass
         state = destination.read_release(desired["tag"])
         require(state is not None and name in state["assets"], "asset upload outcome unresolved; inspect before retry")
+        require(state["id"] == release_id, "release ID changed during upload readback")
         _check_state(state, desired)
     _check_files(desired, state["assets"])
     verify(desired, state["assets"])
@@ -269,6 +271,7 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
     except (OSError, policy.PolicyError):
         pass
     state = destination.read_release(desired["tag"])
+    require(state is not None and state["id"] == release_id, "release ID changed during publication readback")
     require(state is not None, "publish outcome unresolved")
     _check_state(state, desired)
     require(state["draft"] is False, "release remains draft; publication failed or outcome unresolved")
@@ -470,7 +473,34 @@ class GitHub:
             raise policy.PolicyError("invalid GitHub file encoding") from exc
 
     def read_release(self, tag):
-        release = self.request("GET", self.prefix + "/releases/tags/" + urllib.parse.quote(tag, safe=""), absent=True)
+        # /releases/tags/{tag} only finds published releases. A successful draft
+        # POST can therefore be followed by a 404 there. Use the authenticated
+        # inventory, reject ambiguous/changing identity, then read by numeric ID.
+        # Absence is visibility-scoped: authentication alone does not prove push
+        # access. Read-only preparation may not see drafts. Publication uses its
+        # contents:write job token; operator recovery must require the known ID.
+        require(self.token, "authenticated release inventory required")
+        inventory = self.pages(self.prefix + "/releases")
+        seen, matches = set(), []
+        for item in inventory:
+            require(type(item) is dict, "invalid release inventory entry")
+            release_id = policy._int(item.get("id"), "inventory release ID")
+            require(release_id not in seen, "duplicate release inventory ID")
+            seen.add(release_id)
+            require(type(item.get("tag_name")) is str, "invalid release inventory tag")
+            if item["tag_name"] == tag:
+                matches.append(item)
+        require(len(matches) <= 1, "ambiguous release tag in inventory")
+        release = None
+        if matches:
+            candidate = matches[0]
+            release = self.get(self.prefix + f"/releases/{candidate['id']}")
+            require(type(release) is dict and type(release.get("draft")) is bool,
+                    "invalid release ID readback")
+            policy._int(release.get("id"), "release ID readback")
+            require(all(release.get(key) == candidate.get(key)
+                        for key in ("id", "tag_name", "target_commitish", "draft", "body")),
+                    "release identity changed after inventory")
         tag_ref = self.request("GET", self.prefix + "/git/ref/tags/" + urllib.parse.quote(tag, safe=""), absent=True)
         if release is None:
             require(tag_ref is None, "tag already exists without a verified release")

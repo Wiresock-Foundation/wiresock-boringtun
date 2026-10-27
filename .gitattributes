@@ -8,3 +8,4 @@ packaging/boringtun/runtime-notices-macos.txt whitespace=-blank-at-eol
 tests/fixtures/attestation-40401950322-1/gh-verification.json -text
 tests/fixtures/attestation-40401950322-1/RELEASE.json -text
 tests/fixtures/attestation-40401950322-1/receipt.json text eol=lf
+tests/fixtures/draft-424839667/release.json -text
