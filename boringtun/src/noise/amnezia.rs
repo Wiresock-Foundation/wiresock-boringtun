@@ -582,10 +582,10 @@ impl AwgTimers {
     /// (draw, low, low) and its `max(0, ..)` clamp as saturating subtraction.
     /// amneziawg-go's `keyRefreshTimeoutReceiving`.
     ///
-    /// Saturating even though [`AmneziaConfig::validate`] refuses orderings
-    /// that could go negative: the raw `Tunn` builder path does not validate,
-    /// and a `Duration` underflow is a panic that crosses the FFI boundary as
-    /// a process abort.
+    /// Saturating because orderings that make it negative are accepted (with
+    /// a warning, see [`AmneziaConfig::timer_ordering_complaint`]), and the
+    /// raw `Tunn` builder path does not validate at all: a `Duration`
+    /// underflow is a panic that crosses the FFI boundary as a process abort.
     pub(crate) fn key_refresh_receiving(&self, rng: &mut impl RngCore) -> Duration {
         Self::pick(self.reject_after_time, REJECT_AFTER_TIME, rng)
             .saturating_sub(Self::lo(self.keepalive_timeout, KEEPALIVE_TIMEOUT))
@@ -1460,12 +1460,28 @@ impl AmneziaConfig {
             }
         }
 
-        // The orderings the timer state machine depends on, checked against
-        // the worst draw of every participating range; the classic constant
-        // stands in for an unset one, so a lone shortened key is still caught.
-        // Through the accessors, not a third hand-copy of the sentinel rule:
-        // the validator's whole job is to agree with what the timer wheel will
-        // actually do, so it has to read the ranges the same way.
+        // The cross-timer orderings are not checked here: they are warnings,
+        // not refusals -- see `timer_ordering_complaint`. Every value above is
+        // still refused when malformed; only the relation between valid
+        // ranges is left to the operator, as amneziawg-go and the kernel
+        // module leave it.
+        Ok(())
+    }
+
+    /// The warning for tunable timer ranges whose relative order can expire
+    /// a session before its renewal completes, or `None` when the orderings
+    /// hold. Both conditions are checked against the worst draw of every
+    /// participating range, with the classic constant standing in for an
+    /// unset one -- through the same accessors the timer wheel reads, so the
+    /// warning agrees with what the timers will actually do.
+    ///
+    /// Not a refusal: amneziawg-go and the kernel module load such profiles,
+    /// and servers hand them out, so refusing them only made this client the
+    /// one that could not connect. The values are applied exactly as
+    /// configured. The text names the timers and their bounds and nothing
+    /// else -- timers carry no key material.
+    pub(crate) fn timer_ordering_complaint(&self) -> Option<String> {
+        let t = &self.timers;
         let eff = |range: (u32, u32), default: Duration| -> (u64, u64) {
             (
                 AwgTimers::lo(range, default).as_secs(),
@@ -1477,38 +1493,52 @@ impl AmneziaConfig {
         let (_, rekey_timeout_hi) = eff(t.rekey_timeout, REKEY_TIMEOUT);
         let (_, keepalive_hi) = eff(t.keepalive_timeout, KEEPALIVE_TIMEOUT);
 
-        // A key must be replaceable before it is rejectable: the rekey that
+        let mut complaints = Vec::new();
+        // A key should be replaceable before it is rejectable: the rekey that
         // replaces a session begins at rekey_after_time and needs a
-        // rekey_timeout to complete, so a reject_after_time draw shorter than
-        // that discards keys the peer still considers live.
-        if reject_lo < rekey_after_hi + rekey_timeout_hi {
-            return Err(format!(
+        // rekey_timeout to complete, so a shorter reject_after_time draw can
+        // discard keys before their replacement exists.
+        let renewal = rekey_after_hi + rekey_timeout_hi;
+        if reject_lo < renewal {
+            complaints.push(format!(
                 "reject_after_time can draw {}s while rekey_after_time + rekey_timeout \
-                 can draw {}s: keys would be rejected before the rekey replacing them \
-                 completes. Raise reject_after_time to at least {}, or lower \
-                 rekey_after_time/rekey_timeout.",
-                reject_lo,
-                rekey_after_hi + rekey_timeout_hi,
-                rekey_after_hi + rekey_timeout_hi
+                 can draw {}s, so a session can expire before the rekey replacing it \
+                 completes",
+                reject_lo, renewal
             ));
         }
-
         // The last-minute rekey window is reject - keepalive - rekey_timeout;
         // a draw combination that zeroes it turns the receive-side refresh
-        // into "rekey immediately, always".
-        if reject_lo <= keepalive_hi + rekey_timeout_hi {
-            return Err(format!(
+        // into "rekey on the next received packet".
+        let last_minute = keepalive_hi + rekey_timeout_hi;
+        if reject_lo <= last_minute {
+            complaints.push(format!(
                 "reject_after_time can draw {}s while keepalive_timeout + rekey_timeout \
-                 can draw {}s: the last-minute rekey window (reject - keepalive - \
-                 rekey_timeout) would be zero or negative. Raise reject_after_time \
-                 above {}, or lower keepalive_timeout/rekey_timeout.",
-                reject_lo,
-                keepalive_hi + rekey_timeout_hi,
-                keepalive_hi + rekey_timeout_hi
+                 can draw {}s, so the last-minute rekey window (reject - keepalive - \
+                 rekey_timeout) can be zero",
+                reject_lo, last_minute
             ));
         }
+        if complaints.is_empty() {
+            None
+        } else {
+            Some(complaints.join("; "))
+        }
+    }
 
-        Ok(())
+    /// Log [`Self::timer_ordering_complaint`] at WARN, if there is one. Called
+    /// by the doors that accept a configuration -- UAPI `set=1` and the C
+    /// struct constructor -- once per accepted configuration, never per tick
+    /// or packet, and never through `last_tunnel_error()`.
+    pub(crate) fn warn_timer_ordering(&self) {
+        if let Some(complaint) = self.timer_ordering_complaint() {
+            tracing::warn!(
+                message = "AmneziaWG timer ranges are accepted as configured, but their \
+                           order can expire a session before it is renewed; traffic may \
+                           stall until a new handshake completes",
+                detail = %complaint
+            );
+        }
     }
 
     /// Adapt this configuration for the responder (server) side of a tunnel.
@@ -4568,11 +4598,11 @@ mod tests {
             complaint
         );
 
-        // The universal rules are all still there. A timer ordering that
-        // rejects keys before their rekey completes is self-harm regardless of
-        // which end of the tunnel runs it.
+        // The universal rules are all still there. A zero-second timer draw
+        // is self-harm regardless of which end of the tunnel runs it. (An
+        // unfavourable timer *ordering* is a warning since WRS-225.)
         let incoherent = AmneziaConfig::new(0, 0, 0, 0).with_tunable_timers(AwgTimers {
-            reject_after_time: (20, 20),
+            reject_after_time: (0, 20),
             ..Default::default()
         });
         let err = incoherent.validate().expect_err(
@@ -5178,26 +5208,192 @@ mod tests {
             "a count range containing 0 must be accepted"
         );
 
+        // Unfavourable orderings are not refused any more (WRS-225): they
+        // validate, and earn the warning `timer_ordering_complaint` words.
         // reject_after_time shorter than the (default) rekey_after_time +
-        // rekey_timeout: keys would be rejected before the rekey replacing
-        // them completes.
-        let err = check(AwgTimers {
-            reject_after_time: (60, 80),
-            ..AwgTimers::default()
-        })
-        .unwrap_err();
-        assert!(err.contains("rekey_after_time + rekey_timeout"), "{}", err);
+        // rekey_timeout, and one at exactly keepalive + rekey_timeout.
+        for t in [
+            AwgTimers {
+                reject_after_time: (60, 80),
+                ..AwgTimers::default()
+            },
+            AwgTimers {
+                rekey_after_time: (10, 10),
+                reject_after_time: (15, 15),
+                ..AwgTimers::default()
+            },
+        ] {
+            assert!(check(t).is_ok(), "{:?}", t);
+        }
+    }
 
-        // Passing the first ordering is not enough: with rekey_after lowered,
-        // a reject_after_time at exactly keepalive + rekey_timeout still
-        // zeroes the last-minute-rekey window.
-        let err = check(AwgTimers {
-            rekey_after_time: (10, 10),
+    fn ordering(t: AwgTimers) -> Option<String> {
+        AmneziaConfig::default()
+            .with_tunable_timers(t)
+            .timer_ordering_complaint()
+    }
+
+    /// The owner's WRS-225 reproducer, verbatim:
+    ///
+    /// ```ini
+    /// ContentPaddingAddition = 18-80
+    /// RekeyAfterTime = 92-137
+    /// RekeyTimeout = 8-12
+    /// RejectAfterTime = 97-127
+    /// KeepaliveTimeout = 8-22
+    /// MaxHandshakeAttempts = 24-30
+    /// ```
+    ///
+    /// The parent refused it at `97 < 137 + 12`. It now validates, keeps every
+    /// value, and earns the first ordering warning -- not the second, since
+    /// `97 > 22 + 12`.
+    #[test]
+    fn the_wrs225_timer_reproducer_validates_unchanged_with_a_warning() {
+        let cfg = AmneziaConfig::default()
+            .with_content_padding_addition(18, 80, 1420)
+            .with_tunable_timers(AwgTimers {
+                rekey_after_time: (92, 137),
+                rekey_timeout: (8, 12),
+                reject_after_time: (97, 127),
+                keepalive_timeout: (8, 22),
+                max_handshake_attempts: (24, 30),
+            });
+        cfg.validate().expect("the reproducer is valid");
+        assert_eq!(cfg.timers.rekey_after_time, (92, 137));
+        assert_eq!(cfg.timers.rekey_timeout, (8, 12));
+        assert_eq!(cfg.timers.reject_after_time, (97, 127));
+        assert_eq!(cfg.timers.keepalive_timeout, (8, 22));
+        assert_eq!(cfg.timers.max_handshake_attempts, (24, 30));
+        let complaint = cfg.timer_ordering_complaint().expect("an ordering warning");
+        assert!(
+            complaint.contains("rekey_after_time + rekey_timeout")
+                && complaint.contains("97s")
+                && complaint.contains("149s"),
+            "{}",
+            complaint
+        );
+        assert!(
+            !complaint.contains("keepalive_timeout + rekey_timeout"),
+            "{}",
+            complaint
+        );
+    }
+
+    /// Each ordering warns on its own side of its boundary only, and both
+    /// sides validate. First: with rekey 92-137 and retry 8-12, reject 148
+    /// warns and 149 does not. Second: with rekey 1, retry 12 and passive
+    /// keepalive 22, reject 34 warns and 35 does not. Defaults and a coherent
+    /// tuning are silent.
+    #[test]
+    fn timer_ordering_warnings_have_exact_boundaries() {
+        let first = |reject: u32| AwgTimers {
+            rekey_after_time: (92, 137),
+            rekey_timeout: (8, 12),
+            reject_after_time: (reject, reject + 30),
+            ..AwgTimers::default()
+        };
+        let second = |reject: u32| AwgTimers {
+            rekey_after_time: (1, 1),
+            rekey_timeout: (12, 12),
+            keepalive_timeout: (22, 22),
+            reject_after_time: (reject, reject),
+            ..AwgTimers::default()
+        };
+        let valid = |t: AwgTimers| {
+            AmneziaConfig::default()
+                .with_tunable_timers(t)
+                .validate()
+                .unwrap_or_else(|e| panic!("{:?} must validate: {}", t, e))
+        };
+        for t in [first(148), first(149), second(34), second(35)] {
+            valid(t);
+        }
+
+        let warned = ordering(first(148)).expect("148 < 137 + 12 warns");
+        assert!(
+            warned.contains("rekey_after_time + rekey_timeout"),
+            "{}",
+            warned
+        );
+        assert!(!warned.contains("keepalive_timeout"), "{}", warned);
+        assert_eq!(ordering(first(149)), None);
+
+        let warned = ordering(second(34)).expect("34 <= 22 + 12 warns");
+        assert!(
+            warned.contains("keepalive_timeout + rekey_timeout"),
+            "{}",
+            warned
+        );
+        assert!(!warned.contains("rekey_after_time"), "{}", warned);
+        assert_eq!(ordering(second(35)), None);
+
+        // Both together, in one message.
+        let both = ordering(AwgTimers {
             reject_after_time: (15, 15),
             ..AwgTimers::default()
         })
-        .unwrap_err();
-        assert!(err.contains("keepalive_timeout + rekey_timeout"), "{}", err);
+        .expect("15 < 120 + 5 and 15 <= 10 + 5");
+        assert!(
+            both.contains("rekey_after_time + rekey_timeout")
+                && both.contains("keepalive_timeout + rekey_timeout"),
+            "{}",
+            both
+        );
+
+        assert_eq!(ordering(AwgTimers::default()), None);
+        assert_eq!(
+            ordering(AwgTimers {
+                rekey_after_time: (30, 40),
+                reject_after_time: (60, 80),
+                ..AwgTimers::default()
+            }),
+            None
+        );
+    }
+
+    /// The hard refusals stay hard: a zero inside a set duration range is
+    /// refused alone and alongside an ordering complaint -- the warning never
+    /// turns a refusal into success -- while `(0, 0)` keeps its default
+    /// meaning and a zero-containing `max_handshake_attempts` stays a valid
+    /// count.
+    #[test]
+    fn ordering_warnings_do_not_relax_the_hard_timer_refusals() {
+        let check = |t: AwgTimers| AmneziaConfig::default().with_tunable_timers(t).validate();
+        for label in [
+            "rekey_after_time",
+            "rekey_timeout",
+            "reject_after_time",
+            "keepalive_timeout",
+        ] {
+            let mut t = AwgTimers {
+                // An ordering complaint is present too.
+                reject_after_time: (20, 20),
+                ..AwgTimers::default()
+            };
+            let slot = match label {
+                "rekey_after_time" => &mut t.rekey_after_time,
+                "rekey_timeout" => &mut t.rekey_timeout,
+                "reject_after_time" => &mut t.reject_after_time,
+                _ => &mut t.keepalive_timeout,
+            };
+            *slot = (0, 30);
+            let err = check(t).expect_err(label);
+            assert!(err.contains(label), "{}: {}", label, err);
+        }
+        assert!(check(AwgTimers {
+            rekey_after_time: (0, 0),
+            rekey_timeout: (0, 0),
+            reject_after_time: (0, 0),
+            keepalive_timeout: (0, 0),
+            max_handshake_attempts: (0, 0),
+        })
+        .is_ok());
+        assert!(check(AwgTimers {
+            max_handshake_attempts: (0, 30),
+            reject_after_time: (20, 20),
+            ..AwgTimers::default()
+        })
+        .is_ok());
     }
 
     /// The Jc capacity preflight's maximum is the draw's own upper bound, read

@@ -6208,4 +6208,295 @@ mod tests {
             seen
         );
     }
+
+    /// The WRS-225 timer reproducer's ranges -- `RekeyAfterTime = 92-137`,
+    /// `RekeyTimeout = 8-12`, `RejectAfterTime = 97-127`,
+    /// `KeepaliveTimeout = 8-22`, `MaxHandshakeAttempts = 24-30`, with
+    /// `ContentPaddingAddition = 18-80` -- on two seeded tunnels, handshaken.
+    #[cfg(feature = "mock-instant")]
+    fn wrs225_tuns(seed: u64) -> (Tunn, Tunn) {
+        let amnezia = AmneziaConfig::default()
+            .with_content_padding_addition(18, 80, 1420)
+            .with_tunable_timers(amnezia::AwgTimers {
+                rekey_after_time: (92, 137),
+                rekey_timeout: (8, 12),
+                reject_after_time: (97, 127),
+                keepalive_timeout: (8, 22),
+                max_handshake_attempts: (24, 30),
+            });
+        wrs225_tuns_with(amnezia, seed)
+    }
+
+    #[cfg(feature = "mock-instant")]
+    fn wrs225_tuns_with(amnezia: AmneziaConfig, seed: u64) -> (Tunn, Tunn) {
+        use rand_core::SeedableRng;
+        let (mut my_tun, mut their_tun) = create_two_tuns_with_amnezia(amnezia);
+        my_tun.handshake.rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+        my_tun.timers.jitter_rng = rand_chacha::ChaCha8Rng::seed_from_u64(!seed);
+        their_tun.handshake.rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed + 1);
+        their_tun.timers.jitter_rng = rand_chacha::ChaCha8Rng::seed_from_u64(!seed - 1);
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+        (my_tun, their_tun)
+    }
+
+    /// Deliver `wire` from `a` to `b` and everything the exchange provokes,
+    /// both ways, flushing each side's queue after a network write. Returns
+    /// the inner packets each side wrote to its tunnel, `(to_a, to_b)`, and
+    /// how many decapsulations failed.
+    #[cfg(feature = "mock-instant")]
+    fn settle(a: &mut Tunn, b: &mut Tunn, wire: Vec<u8>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, usize) {
+        let mut queue = std::collections::VecDeque::from([(true, wire)]);
+        let (mut to_a, mut to_b, mut failed) = (Vec::new(), Vec::new(), 0);
+        let mut steps = 0;
+        while let Some((towards_b, wire)) = queue.pop_front() {
+            steps += 1;
+            assert!(steps < 64, "the exchange never settled");
+            let (rx, delivered) = if towards_b {
+                (&mut *b, &mut to_b)
+            } else {
+                (&mut *a, &mut to_a)
+            };
+            let mut dst = vec![0u8; 2048];
+            match rx.decapsulate(None, &wire, &mut dst) {
+                TunnResult::WriteToNetwork(p) => {
+                    queue.push_back((!towards_b, p.to_vec()));
+                    loop {
+                        let mut more = vec![0u8; 2048];
+                        match rx.decapsulate(None, &[], &mut more) {
+                            TunnResult::WriteToNetwork(p) => {
+                                queue.push_back((!towards_b, p.to_vec()))
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
+                    delivered.push(p.to_vec())
+                }
+                TunnResult::Done => {}
+                TunnResult::Err(_) => failed += 1,
+            }
+        }
+        (to_a, to_b, failed)
+    }
+
+    /// Tick `tx` once and settle whatever it emits with `rx`; the kind of
+    /// datagram it emitted, if any. Asserts a second tick at the same instant
+    /// emits nothing: one demand per tick, no spinning.
+    #[cfg(feature = "mock-instant")]
+    fn tick_and_settle(tx: &mut Tunn, rx: &mut Tunn) -> Option<&'static str> {
+        let mut dst = vec![0u8; 2048];
+        let obf = tx.handshake.obf;
+        let (kind, wire) = match tx.update_timers(&mut dst) {
+            TunnResult::Done => return None,
+            TunnResult::WriteToNetwork(p) => match Tunn::parse_incoming_packet(obf, p) {
+                Ok(Packet::HandshakeInit(_)) => ("initiation", p.to_vec()),
+                Ok(Packet::PacketData(_)) => ("keepalive", p.to_vec()),
+                other => panic!("unexpected timer output {:?}", other.map(|_| ())),
+            },
+            other => panic!("unexpected timer result {:?}", other),
+        };
+        assert!(matches!(tx.update_timers(&mut dst), TunnResult::Done));
+        let (_, _, failed) = settle(tx, rx, wire);
+        assert_eq!(failed, 0);
+        Some(kind)
+    }
+
+    /// `tx` seals `packet` and `rx` receives it; the inner packets `rx` wrote.
+    #[cfg(feature = "mock-instant")]
+    fn send_and_settle(tx: &mut Tunn, rx: &mut Tunn, packet: &[u8]) -> Vec<Vec<u8>> {
+        let mut dst = vec![0u8; 2048];
+        let wire = unwrap_network_packet(tx.encapsulate(packet, &mut dst));
+        let (_, to_rx, failed) = settle(tx, rx, wire);
+        assert_eq!(failed, 0);
+        to_rx
+    }
+
+    /// Under the reproducer, an idle session's keys expire at the 127-second
+    /// high end of `RejectAfterTime` -- before the 137-second high end of
+    /// `RekeyAfterTime`, which is what the ordering warning is about -- and
+    /// are not used afterwards: a packet the peer sealed under them before
+    /// expiry is refused, and a new write starts a handshake instead of being
+    /// sealed. That first initiation is lost; the retransmission comes one
+    /// `RekeyTimeout` draw (8-12 s, plus at most the jitter) later, without a
+    /// burst of initiations in between, and once it is answered data flows
+    /// again, byte for byte.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn the_wrs225_timers_expire_keys_and_recover_after_a_lost_handshake() {
+        let packet = create_ipv4_udp_packet();
+        let (mut my_tun, mut their_tun) = wrs225_tuns(0x225);
+        // This session's rekey-on-send draw at its high end, so nothing but
+        // expiry ends the session.
+        my_tun.timers.rekey_after_current = Duration::from_secs(137);
+        let mut dst = vec![0u8; 2048];
+
+        advance(Duration::from_secs(10));
+        let valid = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        let stale = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        let (_, to_their, failed) = settle(&mut my_tun, &mut their_tun, valid);
+        assert_eq!(
+            (to_their.len(), failed),
+            (1, 0),
+            "inside the session's lifetime"
+        );
+
+        // Quiet, one tick a second (the passive keepalive answered), to just
+        // past the 127-second expiry.
+        for second in 11..=128 {
+            advance(Duration::from_secs(1));
+            let mine = tick_and_settle(&mut my_tun, &mut their_tun);
+            assert_ne!(mine, Some("initiation"), "at {} s", second);
+            let _ = tick_and_settle(&mut their_tun, &mut my_tun);
+        }
+        assert!(
+            my_tun.sessions.iter().all(Option::is_none),
+            "expired at 127 s"
+        );
+        assert!(their_tun.sessions.iter().all(Option::is_none), "both ends");
+        let (_, to_their, failed) = settle(&mut my_tun, &mut their_tun, stale);
+        assert_eq!(
+            (to_their.len(), failed),
+            (0, 1),
+            "an expired key is refused"
+        );
+
+        // A write now queues behind an initiation rather than being sealed.
+        let lost = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        assert!(matches!(
+            Tunn::parse_incoming_packet(my_tun.handshake.obf, &lost),
+            Ok(Packet::HandshakeInit(_))
+        ));
+
+        // The initiation is lost. Exactly one retransmission arrives, between
+        // the low end and the high end plus jitter of RekeyTimeout.
+        let mut retry = None;
+        for ms in (250..=13_000).step_by(250) {
+            advance(Duration::from_millis(250));
+            let obf = my_tun.handshake.obf;
+            match my_tun.update_timers(&mut dst) {
+                TunnResult::Done => {}
+                TunnResult::WriteToNetwork(p) => {
+                    assert!(matches!(
+                        Tunn::parse_incoming_packet(obf, p),
+                        Ok(Packet::HandshakeInit(_))
+                    ));
+                    retry = Some((ms, p.to_vec()));
+                    break;
+                }
+                other => panic!("unexpected {:?} at {} ms", other, ms),
+            }
+        }
+        let (ms, resent) = retry.expect("the lost initiation is retransmitted");
+        assert!((8_000..=12_584).contains(&ms), "retransmitted at {} ms", ms);
+        assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
+
+        // Answered: the handshake completes and the queued write reaches the
+        // peer intact, then fresh data does too.
+        let (_, to_their, failed) = settle(&mut my_tun, &mut their_tun, resent);
+        assert_eq!(failed, 0);
+        assert_eq!(to_their, vec![packet.clone()], "the queued packet, intact");
+        let fresh = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+        let (_, to_their, failed) = settle(&mut my_tun, &mut their_tun, fresh);
+        assert_eq!((to_their, failed), (vec![packet], 0));
+    }
+
+    /// A renewal that the reproducer's ordering can lose. With this session's
+    /// `RekeyAfterTime` draw at its 137-second high end, a busy initiator has
+    /// not rekeyed when the keys expire at 127 s. Traffic before that is
+    /// sealed normally; at expiry the next write starts a handshake instead,
+    /// its answer is delayed by two seconds, and data then resumes -- the
+    /// tunnel stalls for the renewal, it does not wedge, spin or panic.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn the_wrs225_timers_can_expire_before_renewal_and_then_renew() {
+        let packet = create_ipv4_udp_packet();
+        let (mut my_tun, mut their_tun) = wrs225_tuns(0x2251);
+        my_tun.timers.rekey_after_current = Duration::from_secs(137);
+        let mut dst = vec![0u8; 2048];
+
+        let mut stalled_at = None;
+        for second in 1..=140u64 {
+            advance(Duration::from_secs(1));
+            // Every keepalive is delivered, so no unanswered-data handshake.
+            let mine = tick_and_settle(&mut my_tun, &mut their_tun);
+            assert_ne!(
+                mine,
+                Some("initiation"),
+                "no rekey before 137 s ({} s)",
+                second
+            );
+            let _ = tick_and_settle(&mut their_tun, &mut my_tun);
+            let wire = unwrap_network_packet(my_tun.encapsulate(&packet, &mut dst));
+            match Tunn::parse_incoming_packet(my_tun.handshake.obf, &wire) {
+                Ok(Packet::PacketData(_)) => {
+                    let (_, to_their, failed) = settle(&mut my_tun, &mut their_tun, wire);
+                    assert_eq!((to_their.len(), failed), (1, 0), "at {} s", second);
+                }
+                Ok(Packet::HandshakeInit(_)) => {
+                    stalled_at = Some((second, wire));
+                    break;
+                }
+                _ => panic!("unexpected datagram at {} s", second),
+            }
+        }
+        let (second, init) = stalled_at.expect("the keys expire before the rekey");
+        assert_eq!(second, 128, "expired just past the 127-second high end");
+
+        // The answer is delayed two seconds; the initiator does not storm.
+        for _ in 0..8 {
+            advance(Duration::from_millis(250));
+            assert_eq!(poll_kind(&mut my_tun), None);
+        }
+        let (_, to_their, failed) = settle(&mut my_tun, &mut their_tun, init);
+        assert_eq!(failed, 0);
+        assert_eq!(to_their.len(), 1, "the write queued behind the renewal");
+        for _ in 0..30 {
+            advance(Duration::from_secs(1));
+            let _ = tick_and_settle(&mut my_tun, &mut their_tun);
+            let _ = tick_and_settle(&mut their_tun, &mut my_tun);
+            assert_eq!(
+                send_and_settle(&mut my_tun, &mut their_tun, &packet),
+                vec![packet.clone()]
+            );
+        }
+    }
+
+    /// The second ordering's boundary profile (rekey 1, retry 12, passive
+    /// keepalive 22, reject 34) zeroes the last-minute rekey window, so an
+    /// initiator receiving data renews on its next tick after every
+    /// handshake. Characterised, not endorsed: across a minute of two-way
+    /// traffic with every datagram delivered, each tick emits at most one
+    /// datagram, every renewal completes, and every data packet arrives.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_zero_last_minute_window_renews_without_spinning() {
+        let packet = create_ipv4_udp_packet();
+        let amnezia = AmneziaConfig::default().with_tunable_timers(amnezia::AwgTimers {
+            rekey_after_time: (1, 1),
+            rekey_timeout: (12, 12),
+            keepalive_timeout: (22, 22),
+            reject_after_time: (34, 34),
+            ..amnezia::AwgTimers::default()
+        });
+        assert!(amnezia.timer_ordering_complaint().is_some());
+        let (mut my_tun, mut their_tun) = wrs225_tuns_with(amnezia, 0x2252);
+        let (mut renewals, mut delivered) = (0, 0);
+        for _ in 0..60 {
+            advance(Duration::from_secs(1));
+            for kind in [
+                tick_and_settle(&mut my_tun, &mut their_tun),
+                tick_and_settle(&mut their_tun, &mut my_tun),
+            ] {
+                renewals += usize::from(kind == Some("initiation"));
+            }
+            delivered += send_and_settle(&mut my_tun, &mut their_tun, &packet).len();
+            delivered += send_and_settle(&mut their_tun, &mut my_tun, &packet).len();
+        }
+        assert!(renewals >= 1, "the zero window renews");
+        assert_eq!(delivered, 120, "every data packet arrives");
+    }
 }

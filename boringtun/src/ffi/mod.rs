@@ -1953,6 +1953,11 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
     // WARN, never through `last_tunnel_error()`.
     amnezia.warn_header_protection_nonce();
 
+    // Timer ranges whose order can expire a session before its renewal: built
+    // exactly as configured, with a WARN -- never through `last_tunnel_error()`,
+    // which `clear_last_error` above has emptied for this successful build.
+    amnezia.warn_timer_ordering();
+
     new_tunnel_with_amnezia_config(
         static_private,
         server_static_public,
@@ -3036,11 +3041,13 @@ mod tests {
         let private = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
         let public = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
 
-        // reject_after_time far below rekey_after_time + rekey_timeout: keys
-        // would be rejected before the rekey replacing them completes.
+        // A zero inside a set duration range: a zero-second timer the draw
+        // can land on. (An unfavourable timer *ordering* is a warning, not a
+        // refusal -- see
+        // `the_wrs225_timer_reproducer_builds_unchanged_with_one_warning`.)
         let params = wireguard_awg_params {
             size: AWG_PARAMS_SIZE_VER0 as u32,
-            reject_after_time: wireguard_awg_range { lo: 20, hi: 20 },
+            reject_after_time: wireguard_awg_range { lo: 0, hi: 20 },
             ..Default::default()
         };
         let tunnel = unsafe {
@@ -5563,5 +5570,274 @@ mod tests {
             "{:?}",
             all
         );
+    }
+
+    /// WARN-level events captured while `f` runs, as `(message, detail)`
+    /// pairs, under the tracing-cache retry of
+    /// `an_amplifying_s3_warns_and_leaves_the_error_slot_empty`: `f` is rerun
+    /// until `done` accepts the capture, at most five times.
+    fn capture_warnings(
+        mut f: impl FnMut(),
+        done: impl Fn(&[(String, String)]) -> bool,
+    ) -> Vec<(String, String)> {
+        let _serialized = crate::tracing_test_lock();
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Default)]
+        struct Captured(String, String);
+        impl Visit for Captured {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "message" => self.0 = value.to_owned(),
+                    "detail" => self.1 = value.to_owned(),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let slot = match field.name() {
+                    "message" => &mut self.0,
+                    "detail" => &mut self.1,
+                    _ => return,
+                };
+                if slot.is_empty() {
+                    *slot = format!("{:?}", value);
+                }
+            }
+        }
+        struct Capture(Arc<StdMutex<Vec<(String, String)>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
+                }
+                let mut c = Captured::default();
+                event.record(&mut c);
+                self.0.lock().unwrap().push((c.0, c.1));
+            }
+        }
+
+        let mut captured = Vec::new();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tracing::callsite::rebuild_interest_cache();
+            }
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            {
+                let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+                tracing::subscriber::with_default(subscriber, &mut f);
+            }
+            captured = std::mem::take(&mut *events.lock().unwrap());
+            if done(&captured) {
+                break;
+            }
+        }
+        captured
+    }
+
+    /// The owner's WRS-225 reproducer, verbatim, as the C struct carries it:
+    ///
+    /// ```ini
+    /// ContentPaddingAddition = 18-80
+    /// RekeyAfterTime = 92-137
+    /// RekeyTimeout = 8-12
+    /// RejectAfterTime = 97-127
+    /// KeepaliveTimeout = 8-22
+    /// MaxHandshakeAttempts = 24-30
+    /// ```
+    fn wrs225_reproducer() -> wireguard_awg_params {
+        wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER2 as u32,
+            content_padding_addition: wireguard_awg_range { lo: 18, hi: 80 },
+            content_padding_mtu: 1420,
+            rekey_after_time: wireguard_awg_range { lo: 92, hi: 137 },
+            rekey_timeout: wireguard_awg_range { lo: 8, hi: 12 },
+            reject_after_time: wireguard_awg_range { lo: 97, hi: 127 },
+            keepalive_timeout: wireguard_awg_range { lo: 8, hi: 22 },
+            max_handshake_attempts: wireguard_awg_range { lo: 24, hi: 30 },
+            ..Default::default()
+        }
+    }
+
+    const TIMER_ORDERING_WARNING: &str = "their order can expire a session before it is renewed";
+
+    /// The parent refused the reproducer at `97 < 137 + 12` with a NULL
+    /// return. It now builds with every value unchanged, logs exactly one
+    /// ordering warning for the construction -- none per tick afterwards --
+    /// and leaves the error slot empty, even over a stale error from an
+    /// earlier failed build on the same thread. A coherent control in the
+    /// same scope warns nothing, so the count is not an artefact of the
+    /// capture.
+    #[test]
+    fn the_wrs225_timer_reproducer_builds_unchanged_with_one_warning() {
+        let key = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+        let build = |p: &wireguard_awg_params| unsafe {
+            new_tunnel_with_awg_params(
+                key.as_ptr(),
+                key.as_ptr(),
+                ptr::null(),
+                0,
+                1,
+                p,
+                ptr::null(),
+            )
+        };
+        let coherent = wireguard_awg_params {
+            reject_after_time: wireguard_awg_range { lo: 149, hi: 180 },
+            ..wrs225_reproducer()
+        };
+        let ordering = |c: &[(String, String)]| {
+            c.iter()
+                .filter(|(m, _)| m.contains(TIMER_ORDERING_WARNING))
+                .count()
+        };
+
+        let mut built = None;
+        let captured = capture_warnings(
+            || {
+                // A stale error: a transposed range refused on this thread.
+                let refused = build(&wireguard_awg_params {
+                    reject_after_time: wireguard_awg_range { lo: 127, hi: 97 },
+                    ..wrs225_reproducer()
+                });
+                assert!(refused.is_null());
+                assert!(!last_tunnel_error().is_null());
+
+                let tunnel = build(&wrs225_reproducer());
+                assert!(!tunnel.is_null(), "the reproducer must build");
+                assert!(
+                    last_tunnel_error().is_null(),
+                    "a warned build leaves the error slot empty"
+                );
+                let t = unsafe { &*tunnel }.lock().amnezia_config().timers;
+                built = Some(t);
+                let mut dst = vec![0u8; 2048];
+                for _ in 0..8 {
+                    let _ = unsafe { wireguard_tick(tunnel, dst.as_mut_ptr(), dst.len() as u32) };
+                }
+                unsafe { tunnel_free(tunnel) };
+
+                let control = build(&coherent);
+                assert!(!control.is_null(), "{}", last_error_string());
+                unsafe { tunnel_free(control) };
+            },
+            |c| ordering(c) >= 1,
+        );
+
+        let t = built.expect("built");
+        assert_eq!(t.rekey_after_time, (92, 137));
+        assert_eq!(t.rekey_timeout, (8, 12));
+        assert_eq!(t.reject_after_time, (97, 127));
+        assert_eq!(t.keepalive_timeout, (8, 22));
+        assert_eq!(t.max_handshake_attempts, (24, 30));
+
+        assert_eq!(
+            ordering(&captured),
+            1,
+            "one warning per build: {:?}",
+            captured
+        );
+        let (_, detail) = captured
+            .iter()
+            .find(|(m, _)| m.contains(TIMER_ORDERING_WARNING))
+            .unwrap();
+        assert!(
+            detail.contains("reject_after_time")
+                && detail.contains("97s")
+                && detail.contains("149s"),
+            "{}",
+            detail
+        );
+        assert!(!detail.contains("QOGr3"), "no key material: {}", detail);
+    }
+
+    /// Both sides of both ordering boundaries build through the C door, and
+    /// only the unfavourable side warns: rekey 92-137, retry 8-12 with reject
+    /// 148 and 149; rekey 1, retry 12, passive keepalive 22 with reject 34
+    /// and 35. Retained hard refusals stay refusals: a zero inside a set
+    /// duration range, alone and with an ordering complaint.
+    #[test]
+    fn timer_ordering_boundaries_build_through_the_c_door() {
+        let key = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+        let build = |p: &wireguard_awg_params| unsafe {
+            new_tunnel_with_awg_params(
+                key.as_ptr(),
+                key.as_ptr(),
+                ptr::null(),
+                0,
+                1,
+                p,
+                ptr::null(),
+            )
+        };
+        let r = |lo, hi| wireguard_awg_range { lo, hi };
+        let first = |reject: u32| wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            rekey_after_time: r(92, 137),
+            rekey_timeout: r(8, 12),
+            reject_after_time: r(reject, reject + 30),
+            ..Default::default()
+        };
+        let second = |reject: u32| wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            rekey_after_time: r(1, 1),
+            rekey_timeout: r(12, 12),
+            keepalive_timeout: r(22, 22),
+            reject_after_time: r(reject, reject),
+            ..Default::default()
+        };
+        let cases = [
+            (first(148), true),
+            (first(149), false),
+            (second(34), true),
+            (second(35), false),
+        ];
+
+        let captured = capture_warnings(
+            || {
+                for (p, _) in &cases {
+                    let tunnel = build(p);
+                    assert!(!tunnel.is_null(), "{:?}: {}", p, last_error_string());
+                    assert!(last_tunnel_error().is_null());
+                    unsafe { tunnel_free(tunnel) };
+                }
+            },
+            |c| {
+                c.iter()
+                    .filter(|(m, _)| m.contains(TIMER_ORDERING_WARNING))
+                    .count()
+                    >= 2
+            },
+        );
+        let details: Vec<&String> = captured
+            .iter()
+            .filter(|(m, _)| m.contains(TIMER_ORDERING_WARNING))
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(details.len(), 2, "{:?}", captured);
+        assert!(details[0].contains("148s"), "{}", details[0]);
+        assert!(details[1].contains("34s"), "{}", details[1]);
+
+        for p in [
+            wireguard_awg_params {
+                rekey_timeout: r(0, 12),
+                ..first(148)
+            },
+            wireguard_awg_params {
+                keepalive_timeout: r(0, 22),
+                ..second(34)
+            },
+        ] {
+            last_tunnel_error_free();
+            assert!(build(&p).is_null(), "{:?}", p);
+            assert!(
+                last_error_string().contains("must not contain 0"),
+                "{}",
+                last_error_string()
+            );
+        }
     }
 }

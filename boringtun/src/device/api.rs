@@ -341,6 +341,11 @@ impl AwgParams {
         // that only sets the key, since imitation arrives at startup.
         amnezia.warn_header_protection_nonce();
 
+        // Timer ranges whose order can expire a session before its renewal
+        // are applied exactly as the transaction said, with a WARN once per
+        // `set=1` whose merged result earns it -- never per tick or packet.
+        amnezia.warn_timer_ordering();
+
         Ok((obf, amnezia))
     }
 }
@@ -1446,32 +1451,27 @@ mod tests {
         assert_eq!(cleared.timers.reject_after_time, (0, 0), "must clear");
         assert_eq!(cleared.timers.rekey_after_time, (30, 40), "must remain");
 
-        // The reverse clear is refused: dropping rekey_after_time resurrects
-        // its 120-second default, under which the kept 60-80 reject would
-        // discard keys before the rekey replacing them completes. The floors
-        // catch configurations that become incoherent by *clearing*, not just
-        // by setting.
+        // The reverse clear resurrects rekey_after_time's 120-second default,
+        // under which the kept 60-80 reject can discard keys before the rekey
+        // replacing them completes. Since WRS-225 that is a warning, not a
+        // refusal: the merge applies exactly what was sent, whether the
+        // ordering became unfavourable by clearing or by setting.
         let mut bad_clear = AwgParams::default();
         bad_clear.set_timer("rekey_after_time", (0, 0));
-        assert_eq!(
-            bad_clear
-                .merged(ObfuscationRanges::default(), &kept, 1420)
-                .err(),
-            Some(EINVAL),
-            "clearing rekey_after_time under a short reject must be refused"
-        );
+        let (_, unfavourable) = bad_clear
+            .merged(ObfuscationRanges::default(), &kept, 1420)
+            .expect("an unfavourable ordering loads");
+        assert_eq!(unfavourable.timers.rekey_after_time, (0, 0));
+        assert_eq!(unfavourable.timers.reject_after_time, (60, 80));
+        assert!(unfavourable.timer_ordering_complaint().is_some());
 
-        // Floors fail the merge: a reject_after_time draw shorter than the
-        // (default) rekey_after_time + rekey_timeout would reject keys before
-        // the rekey replacing them completes.
         let mut low = AwgParams::default();
         low.set_timer("reject_after_time", (60, 80));
-        assert_eq!(
-            low.merged(ObfuscationRanges::default(), &current, 1420)
-                .err(),
-            Some(EINVAL),
-            "reject 60 under default rekey_after 120 + rekey_timeout 5 must be refused"
-        );
+        let (_, low) = low
+            .merged(ObfuscationRanges::default(), &current, 1420)
+            .expect("reject 60 under default rekey_after 120 + rekey_timeout 5 loads");
+        assert_eq!(low.timers.reject_after_time, (60, 80));
+        assert!(low.timer_ordering_complaint().is_some());
 
         // A zero inside a set range is a zero-second timer, not "unset".
         let mut zero = AwgParams::default();
@@ -2622,6 +2622,150 @@ mod tests {
                 .any(|c| c.fields.contains("protocol=dns") && c.fields.contains("16-bit")),
             "the DNS warning carries its detail: {:?}",
             all
+        );
+    }
+
+    /// WARN events while `f` runs, as `(message, detail)`, rerun under the
+    /// tracing-cache retry until `done` accepts them, at most five times.
+    fn capture_warnings(
+        mut f: impl FnMut(),
+        done: impl Fn(&[(String, String)]) -> bool,
+    ) -> Vec<(String, String)> {
+        let _serialized = crate::tracing_test_lock();
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Default)]
+        struct Captured(String, String);
+        impl Visit for Captured {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "message" => self.0 = value.to_owned(),
+                    "detail" => self.1 = value.to_owned(),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let slot = match field.name() {
+                    "message" => &mut self.0,
+                    "detail" => &mut self.1,
+                    _ => return,
+                };
+                if slot.is_empty() {
+                    *slot = format!("{:?}", value);
+                }
+            }
+        }
+        struct Capture(Arc<StdMutex<Vec<(String, String)>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
+                }
+                let mut c = Captured::default();
+                event.record(&mut c);
+                self.0.lock().unwrap().push((c.0, c.1));
+            }
+        }
+
+        let mut captured = Vec::new();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tracing::callsite::rebuild_interest_cache();
+            }
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            {
+                let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+                tracing::subscriber::with_default(subscriber, &mut f);
+            }
+            captured = std::mem::take(&mut *events.lock().unwrap());
+            if done(&captured) {
+                break;
+            }
+        }
+        captured
+    }
+
+    /// The `set=1` lines of the owner's WRS-225 reproducer
+    /// (`ContentPaddingAddition = 18-80`, `RekeyAfterTime = 92-137`,
+    /// `RekeyTimeout = 8-12`, `RejectAfterTime = 97-127`,
+    /// `KeepaliveTimeout = 8-22`, `MaxHandshakeAttempts = 24-30`), parsed by
+    /// the shared range parser the `api_set` arms use.
+    fn wrs225_set(reject: &str) -> AwgParams {
+        let mut p = AwgParams::default();
+        p.set_content_padding(parse_uint_range("18-80").unwrap());
+        for (key, val) in [
+            ("rekey_after_time", "92-137"),
+            ("rekey_timeout", "8-12"),
+            ("reject_after_time", reject),
+            ("keepalive_timeout", "8-22"),
+            ("max_handshake_attempts", "24-30"),
+        ] {
+            assert!(p.set_timer(key, parse_uint_range(val).unwrap()), "{}", key);
+        }
+        p
+    }
+
+    /// The parent's `set=1` failed the reproducer with EINVAL at
+    /// `97 < 137 + 12`. It now applies every value unchanged and warns once
+    /// per application -- two applications, two warnings -- while a coherent
+    /// control (reject 149-180) in the same scope warns nothing.
+    #[test]
+    fn the_wrs225_timer_reproducer_loads_over_the_uapi_with_one_warning_per_set() {
+        const WARNING: &str = "their order can expire a session before it is renewed";
+        let ordering =
+            |c: &[(String, String)]| c.iter().filter(|(m, _)| m.contains(WARNING)).count();
+        let mut applied = Vec::new();
+        let captured = capture_warnings(
+            || {
+                applied.clear();
+                for reject in ["97-127", "97-127", "149-180"] {
+                    let (_, cfg) = wrs225_set(reject)
+                        .merged(
+                            ObfuscationRanges::default(),
+                            &AmneziaConfig::default(),
+                            1420,
+                        )
+                        .expect("loads");
+                    applied.push(cfg);
+                }
+            },
+            |c| ordering(c) >= 2,
+        );
+        let t = applied[0].timers;
+        assert_eq!(t.rekey_after_time, (92, 137));
+        assert_eq!(t.rekey_timeout, (8, 12));
+        assert_eq!(t.reject_after_time, (97, 127));
+        assert_eq!(t.keepalive_timeout, (8, 22));
+        assert_eq!(t.max_handshake_attempts, (24, 30));
+        assert_eq!(applied[0].content_padding_addition, (18, 80));
+        assert_eq!(applied[2].timers.reject_after_time, (149, 180));
+        assert_eq!(
+            ordering(&captured),
+            2,
+            "once per application: {:?}",
+            captured
+        );
+        assert!(captured
+            .iter()
+            .filter(|(m, _)| m.contains(WARNING))
+            .all(|(_, d)| d.contains("97s") && d.contains("149s")));
+
+        // Malformed timer input still fails the transaction.
+        assert_eq!(parse_uint_range("127-97"), None, "inverted");
+        let mut zero = wrs225_set("97-127");
+        zero.set_timer("rekey_timeout", (0, 12));
+        assert_eq!(
+            zero.merged(
+                ObfuscationRanges::default(),
+                &AmneziaConfig::default(),
+                1420
+            )
+            .err(),
+            Some(EINVAL)
         );
     }
 }
