@@ -54,8 +54,10 @@ class MemoryDestination:
         self.uncertain = uncertain
         self.reads = 0
 
-    def read_release(self, tag):
+    def read_release(self, tag, *, release_id=None):
         self.reads += 1
+        if release_id is not None and (self.state is None or self.state["id"] != release_id):
+            raise policy.PolicyError("known ID is unavailable")
         return copy.deepcopy(self.state)
 
     def maybe_fail(self, operation):
@@ -70,6 +72,8 @@ class MemoryDestination:
         self.state = {"id": 20, "tag": tag, "target_commit": commit, "draft": True,
                       "body": body, "assets": {}}
         self.maybe_fail("create")
+        return {"id": 20, "tag_name": tag, "target_commitish": commit, "draft": True,
+                "prerelease": False, "body": body, "assets": []}
 
     def upload_asset(self, release_id, name, content):
         if name in self.state["assets"]:

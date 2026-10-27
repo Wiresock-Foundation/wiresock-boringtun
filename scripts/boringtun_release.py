@@ -47,6 +47,10 @@ AUTH_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTE
                  "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN")
 
 
+class MutationOutcomeUnknown(policy.PolicyError):
+    """HTTP/transport failure; unlike a malformed successful API response."""
+
+
 def require(value, message):
     if not value:
         raise policy.PolicyError(message)
@@ -192,6 +196,18 @@ def _check_state(state, descriptor):
     _check_files(descriptor, state["assets"], complete=not state["draft"])
 
 
+def created_release_id(response, descriptor):
+    """Bind a successful create response before using its numeric readback ID."""
+    require(type(response) is dict, "invalid draft creation response")
+    release_id = policy._int(response.get("id"), "created release ID")
+    require(response.get("tag_name") == descriptor["tag"] and
+            response.get("target_commitish") == descriptor["source_commit"] and
+            response.get("body") == descriptor_marker(descriptor), "draft creation identity mismatch")
+    require(response.get("draft") is True and response.get("prerelease") is False and
+            response.get("assets") == [], "draft creation state mismatch")
+    return release_id
+
+
 def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
     """Plan or perform immutable publication through a narrow destination API.
 
@@ -243,10 +259,17 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
     gate()
     if state is None:
         try:
-            destination.create_draft(desired["tag"], desired["source_commit"], descriptor_marker(desired))
-        except (OSError, policy.PolicyError):
-            pass  # Outcome is uncertain until readback, including HTTP errors.
-        state = destination.read_release(desired["tag"])
+            created = destination.create_draft(desired["tag"], desired["source_commit"], descriptor_marker(desired))
+        except (OSError, MutationOutcomeUnknown):
+            # No trustworthy response ID: reconcile once through inventory.
+            # An absent/inaccessible result remains uncertain, never a new POST.
+            state = destination.read_release(desired["tag"])
+        else:
+            # A successful but malformed/conflicting response is not a transport
+            # failure. Reject it instead of silently rediscovering another ID.
+            release_id = created_release_id(created, desired)
+            state = destination.read_release(desired["tag"], release_id=release_id)
+            require(state is not None and state["id"] == release_id, "created release ID changed during readback")
         require(state is not None, "draft creation outcome unresolved; inspect destination before retry")
         _check_state(state, desired)
     release_id = state["id"]
@@ -259,7 +282,7 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
             destination.upload_asset(state["id"], name, files[name])
         except (OSError, policy.PolicyError):
             pass
-        state = destination.read_release(desired["tag"])
+        state = destination.read_release(desired["tag"], release_id=release_id)
         require(state is not None and name in state["assets"], "asset upload outcome unresolved; inspect before retry")
         require(state["id"] == release_id, "release ID changed during upload readback")
         _check_state(state, desired)
@@ -270,7 +293,7 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
         destination.publish(state["id"])
     except (OSError, policy.PolicyError):
         pass
-    state = destination.read_release(desired["tag"])
+    state = destination.read_release(desired["tag"], release_id=release_id)
     require(state is not None and state["id"] == release_id, "release ID changed during publication readback")
     require(state is not None, "publish outcome unresolved")
     _check_state(state, desired)
@@ -434,9 +457,11 @@ class GitHub:
                 with self.opener.open(urllib.request.Request(location, headers={"User-Agent": headers["User-Agent"]}), timeout=60) as response:
                     raw = response.read(MAX_TOTAL + 1)
             else:
-                raise policy.PolicyError(f"GitHub {method} failed (HTTP {exc.code}); no fallback") from exc
+                error = MutationOutcomeUnknown if method != "GET" else policy.PolicyError
+                raise error(f"GitHub {method} failed (HTTP {exc.code}); no fallback") from exc
         except (OSError, urllib.error.URLError) as exc:
-            raise policy.PolicyError("GitHub API outcome unavailable") from exc
+            error = MutationOutcomeUnknown if method != "GET" else policy.PolicyError
+            raise error("GitHub API outcome unavailable") from exc
         require(len(raw) <= MAX_TOTAL, "API response exceeds size bound")
         return raw if binary else policy.load_json(raw)
 
@@ -472,35 +497,45 @@ class GitHub:
         except (KeyError, ValueError) as exc:
             raise policy.PolicyError("invalid GitHub file encoding") from exc
 
-    def read_release(self, tag):
+    def read_release(self, tag, *, release_id=None):
         # /releases/tags/{tag} only finds published releases. A successful draft
         # POST can therefore be followed by a 404 there. Use the authenticated
         # inventory, reject ambiguous/changing identity, then read by numeric ID.
         # Absence is visibility-scoped: authentication alone does not prove push
         # access. Read-only preparation may not see drafts. Publication uses its
-        # contents:write job token; operator recovery must require the known ID.
+        # contents:write job token. Once creation/discovery binds an ID, use its
+        # endpoint directly: inventory may omit a newly created draft. Failure
+        # to read a known ID is not absence and must never trigger creation.
         require(self.token, "authenticated release inventory required")
-        inventory = self.pages(self.prefix + "/releases")
-        seen, matches = set(), []
-        for item in inventory:
-            require(type(item) is dict, "invalid release inventory entry")
-            release_id = policy._int(item.get("id"), "inventory release ID")
-            require(release_id not in seen, "duplicate release inventory ID")
-            seen.add(release_id)
-            require(type(item.get("tag_name")) is str, "invalid release inventory tag")
-            if item["tag_name"] == tag:
-                matches.append(item)
-        require(len(matches) <= 1, "ambiguous release tag in inventory")
+        candidate = None
+        if release_id is None:
+            inventory = self.pages(self.prefix + "/releases")
+            seen, matches = set(), []
+            for item in inventory:
+                require(type(item) is dict, "invalid release inventory entry")
+                item_id = policy._int(item.get("id"), "inventory release ID")
+                require(item_id not in seen, "duplicate release inventory ID")
+                seen.add(item_id)
+                require(type(item.get("tag_name")) is str, "invalid release inventory tag")
+                if item["tag_name"] == tag:
+                    matches.append(item)
+            require(len(matches) <= 1, "ambiguous release tag in inventory")
+            if matches:
+                candidate = matches[0]
+                release_id = candidate["id"]
         release = None
-        if matches:
-            candidate = matches[0]
-            release = self.get(self.prefix + f"/releases/{candidate['id']}")
+        if release_id is not None:
+            policy._int(release_id, "expected release ID")
+            release = self.get(self.prefix + f"/releases/{release_id}")
             require(type(release) is dict and type(release.get("draft")) is bool,
                     "invalid release ID readback")
             policy._int(release.get("id"), "release ID readback")
-            require(all(release.get(key) == candidate.get(key)
-                        for key in ("id", "tag_name", "target_commitish", "draft", "body")),
-                    "release identity changed after inventory")
+            require(release["id"] == release_id and release.get("tag_name") == tag,
+                    "release ID or tag changed during readback")
+            if candidate is not None:
+                require(all(release.get(key) == candidate.get(key)
+                            for key in ("id", "tag_name", "target_commitish", "draft", "body")),
+                        "release identity changed after inventory")
         tag_ref = self.request("GET", self.prefix + "/git/ref/tags/" + urllib.parse.quote(tag, safe=""), absent=True)
         if release is None:
             require(tag_ref is None, "tag already exists without a verified release")

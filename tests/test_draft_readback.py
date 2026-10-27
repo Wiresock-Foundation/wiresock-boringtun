@@ -38,6 +38,9 @@ class ReleaseService:
         self.replace_id_on_upload = False
         self.reject_create = False
         self.hide_drafts = False
+        self.hide_after_writes = False
+        self.override_create_response = False
+        self.create_response = None
 
     def error(self, request, code):
         raise urllib.error.HTTPError(request.full_url, code, "fixture response", {}, io.BytesIO(b"{}"))
@@ -57,7 +60,7 @@ class ReleaseService:
             if self.denied_inventory:
                 self.error(request, 403)
             inventory = self.before + ([self.state] if self.state else []) + self.after
-            if self.hide_drafts:
+            if self.hide_drafts or (self.hide_after_writes and self.writes):
                 inventory = [item for item in inventory if not item["draft"]]
             page, limit = int(query["page"][0]), int(query["per_page"][0])
             result = inventory[(page - 1) * limit:page * limit]
@@ -86,8 +89,9 @@ class ReleaseService:
                 raise urllib.error.URLError("outcome unavailable; request was not accepted")
             if self.state:
                 self.error(request, 422)
-            self.state = dict(json.loads(request.data), id=20)
-            operation, result = "create", self.state
+            self.state = dict(json.loads(request.data), id=20, assets=[])
+            operation = "create"
+            result = self.create_response if self.override_create_response else self.state
         elif method == "POST" and self.state and resource == f"/releases/{self.state['id']}/assets":
             name = query["name"][0]
             if name in self.files:
@@ -99,6 +103,8 @@ class ReleaseService:
         elif method == "PATCH" and self.state and resource == f"/releases/{self.state['id']}":
             self.state.update(json.loads(request.data))
             operation, result = "publish", self.state
+        elif method == "GET" and resource.removeprefix('/releases/').isdigit():
+            self.error(request, 404)
         else:
             raise AssertionError("unexpected endpoint: " + method + " " + resource)
         if operation:
@@ -122,6 +128,13 @@ class DraftReadbackTests(unittest.TestCase):
         self.assertEqual((state["id"], state["tag"], state["target_commit"], state["draft"], state["assets"]),
                          (424839667, TAG, SOURCE, True, {}))
         self.assertEqual(state["body"], self.draft["body"])
+
+    def test_known_id_reads_captured_draft_without_inventory_visibility(self):
+        self.service.hide_drafts = True
+        state = self.api.read_release(TAG, release_id=424839667)
+        self.assertEqual((state['id'], state['tag'], state['target_commit']), (424839667, TAG, SOURCE))
+        self.assertEqual(state['body'], self.draft['body'])
+        self.assertNotIn(('GET', self.api.prefix + '/releases'), self.service.requests)
 
     def test_lookup_requires_authentication_before_claiming_absence(self):
         self.api.token = ""
@@ -245,6 +258,114 @@ class DraftReadbackTests(unittest.TestCase):
             release.publish_release(self.api, descriptor, files, fixture.verified, fixture.ready, dry_run=False)
         self.assertEqual(len(self.service.writes), 1)
         self.assertNotIn("publish", self.service.writes)
+
+    def test_successful_creation_uses_returned_id_when_inventory_never_shows_draft(self):
+        fixture, descriptor, files = self.publishing_fixture(empty=True)
+        self.service.state = None
+        self.service.hide_drafts = True
+        result = release.publish_release(self.api, descriptor, files, fixture.verified, fixture.ready, dry_run=False)
+        self.assertEqual(result, 'published')
+        self.assertEqual(self.service.files, files)
+        self.assertEqual(self.service.writes.count('create'), 1)
+        self.assertEqual(self.service.requests.count(('GET', self.api.prefix + '/releases')), 1)
+        self.assertIn(('GET', self.api.prefix + '/releases/20'), self.service.requests)
+
+    def test_preexisting_draft_keeps_id_when_inventory_disappears_after_upload(self):
+        fixture, descriptor, files = self.publishing_fixture()
+        self.service.hide_after_writes = True
+        result = release.publish_release(self.api, descriptor, files, fixture.verified, fixture.ready, dry_run=False)
+        self.assertEqual(result, 'published')
+        self.assertNotIn('create', self.service.writes)
+        self.assertNotIn('upload:RELEASE.json', self.service.writes)
+        self.assertEqual(self.service.files, files)
+        self.assertEqual(self.service.requests.count(('GET', self.api.prefix + '/releases')), 1)
+
+    def test_malformed_or_conflicting_success_response_never_uploads(self):
+        fixture, descriptor, files = self.publishing_fixture(empty=True)
+        valid = dict(id=20, tag_name=descriptor['tag'], target_commitish=descriptor['source_commit'],
+                     body=release.descriptor_marker(descriptor), draft=True, prerelease=False, assets=[])
+        responses = [None, [], {}, *[dict(valid, id=value) for value in (True, 0, -1, '20', '../assets/1', 21)],
+                     dict(valid, tag_name='other'), dict(valid, target_commitish='f' * 40),
+                     dict(valid, body='different descriptor'), dict(valid, draft=False),
+                     dict(valid, prerelease=True), dict(valid, assets=[{'id': 123}])]
+        for index, response in enumerate(responses):
+            with self.subTest(case=index):
+                self.service = ReleaseService()
+                self.service.override_create_response = True
+                self.service.create_response = response
+                self.api.opener = self.service
+                with self.assertRaises(policy.PolicyError):
+                    release.publish_release(self.api, descriptor, files, fixture.verified, fixture.ready, dry_run=False)
+                self.assertEqual(self.service.writes, ['create'])
+
+    def test_successful_create_with_inaccessible_id_stops_without_inventory_fallback(self):
+        fixture, descriptor, files = self.publishing_fixture(empty=True)
+        self.service.state = None
+        self.service.hide_drafts = True
+        self.service.unavailable_id = True
+        with self.assertRaises(policy.PolicyError):
+            release.publish_release(self.api, descriptor, files, fixture.verified, fixture.ready, dry_run=False)
+        self.assertEqual(self.service.writes, ['create'])
+        self.assertIn(('GET', self.api.prefix + '/releases/20'), self.service.requests)
+        self.assertEqual(self.service.requests.count(('GET', self.api.prefix + '/releases')), 1)
+
+    def test_malformed_json_in_successful_create_response_never_falls_back(self):
+        fixture, descriptor, files = self.publishing_fixture(empty=True)
+        for raw in (b'not json', b'{"id":20,"id":21}', b'{"id":NaN}', b'\xff'):
+            with self.subTest(raw=raw):
+                self.service = ReleaseService()
+                self.service.override_create_response = True
+                self.service.create_response = raw
+                self.api.opener = self.service
+                with self.assertRaises(policy.PolicyError):
+                    release.publish_release(self.api, descriptor, files, fixture.verified, fixture.ready, dry_run=False)
+                self.assertEqual(self.service.writes, ['create'])
+                self.assertEqual(self.service.requests.count(('GET', self.api.prefix + '/releases')), 1)
+
+    def test_successful_creation_still_checks_id_endpoint_source_and_marker(self):
+        fixture, descriptor, files = self.publishing_fixture(empty=True)
+        valid = dict(id=20, tag_name=descriptor['tag'], target_commitish=descriptor['source_commit'],
+                     body=release.descriptor_marker(descriptor), draft=True, prerelease=False, assets=[])
+        for changes in ({'id': 21}, {'tag_name': 'other'}, {'target_commitish': 'f' * 40},
+                        {'body': 'changed marker'}, {'draft': False}):
+            with self.subTest(field=next(iter(changes))):
+                self.service = ReleaseService()
+                self.service.hide_drafts = True
+                self.service.id_override = dict(valid, **changes)
+                self.api.opener = self.service
+                with self.assertRaises(policy.PolicyError):
+                    release.publish_release(self.api, descriptor, files, fixture.verified, fixture.ready, dry_run=False)
+                self.assertEqual(self.service.writes, ['create'])
+
+    def test_explicit_id_readback_rejects_unsafe_ids_before_transport(self):
+        for value in (True, 0, -1, '20', '../assets/1'):
+            with self.subTest(value=value):
+                with self.assertRaises(policy.PolicyError):
+                    self.api.read_release(TAG, release_id=value)
+                self.assertEqual(self.service.requests, [])
+
+    def test_uncertain_creation_hidden_from_inventory_is_not_recreated(self):
+        fixture, descriptor, files = self.publishing_fixture(empty=True)
+        self.service.state = None
+        self.service.hide_drafts = True
+        self.service.uncertain = 'create'
+        with self.assertRaises(policy.PolicyError):
+            release.publish_release(self.api, descriptor, files, fixture.verified, fixture.ready, dry_run=False)
+        self.assertIsNotNone(self.service.state)
+        self.assertEqual(self.service.writes, ['create'])
+
+    def test_uncertain_upload_and_publish_use_known_id_without_duplicate_mutations(self):
+        fixture, descriptor, files = self.publishing_fixture(empty=True)
+        for operation in ('upload:RELEASE.json', 'publish'):
+            with self.subTest(operation=operation):
+                self.service = ReleaseService()
+                self.service.hide_drafts = True
+                self.service.uncertain = operation
+                self.api.opener = self.service
+                self.assertEqual(release.publish_release(self.api, descriptor, files, fixture.verified,
+                                                         fixture.ready, dry_run=False), 'published')
+                self.assertEqual(self.service.writes.count(operation), 1)
+                self.assertEqual(self.service.files, files)
 
 
 if __name__ == "__main__":
