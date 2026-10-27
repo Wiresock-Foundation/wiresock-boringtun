@@ -314,9 +314,13 @@ impl Peer {
         self.tunnel.set_preshared_key(preshared_key);
     }
 
-    /// Replace this peer's persistent-keepalive interval, keeping sessions.
-    pub(crate) fn set_persistent_keepalive(&mut self, keepalive: Option<u16>) {
-        self.tunnel.set_persistent_keepalive(keepalive);
+    /// Replace this peer's persistent-keepalive bounds (normalized; `(0, 0)`
+    /// is off), keeping sessions.
+    pub(crate) fn set_persistent_keepalive_range(&mut self, (lo, hi): (u16, u16)) {
+        let applied = self
+            .tunnel
+            .set_persistent_keepalive_range(u32::from(lo), u32::from(hi));
+        debug_assert!(applied, "normalized bounds are ordered");
     }
 
     // Deliberately no `is_allowed_ip` / `allowed_ips` here. Which prefixes
@@ -332,6 +336,11 @@ impl Peer {
 
     pub fn persistent_keepalive(&self) -> Option<u16> {
         self.tunnel.persistent_keepalive()
+    }
+
+    /// The configured persistent-keepalive bounds, `None` when off.
+    pub fn persistent_keepalive_range(&self) -> Option<(u16, u16)> {
+        self.tunnel.persistent_keepalive_range()
     }
 
     pub fn preshared_key(&self) -> Option<&[u8; 32]> {

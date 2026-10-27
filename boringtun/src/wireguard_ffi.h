@@ -645,7 +645,7 @@ struct wireguard_awg_params
 ///
 /// Unlike the constructors above, the whole configuration is validated before a
 /// tunnel exists, and a failure is a NULL return rather than a tunnel that
-/// silently never works. Five classes are refused:
+/// silently never works. Four classes are refused:
 ///
 ///   * parameters that could never emit a valid datagram, or that would be
 ///     silently rewritten into a different configuration -- an out-of-range
@@ -662,9 +662,17 @@ struct wireguard_awg_params
 ///     is below 12, the header-protection nonce length, or set with SIP
 ///     imitation while any of them is 31 or more. See that field;
 ///   * content_padding_addition set while content_padding_mtu is 0, which would
-///     disable the clamp that keeps a padded packet inside the tunnel MTU;
-///   * timers ordered so that keys would be rejected before the rekey replacing
-///     them completes.
+///     disable the clamp that keeps a padded packet inside the tunnel MTU.
+///
+/// Timer ranges ordered so that a session can expire before its renewal --
+/// min(reject_after_time) < max(rekey_after_time) + max(rekey_timeout), or
+/// min(reject_after_time) <= max(keepalive_timeout) + max(rekey_timeout), unset
+/// ranges taking their defaults -- are NOT refused: the tunnel is built with
+/// exactly the requested values and one WARN is logged per construction, never
+/// through last_tunnel_error(). Such a profile can stall traffic until a new
+/// handshake completes; whether it does depends on the draws and the peer.
+/// Malformed timer values (a transposed range, a 0 inside a set duration range)
+/// are still refused.
 ///
 /// ONE CLASS IS DELIBERATELY NOT REFUSED HERE, nor by the UAPI set=1 path:
 /// S-value combinations that make the cookie reply larger than the request it
@@ -991,6 +999,31 @@ struct stats wireguard_stats(const struct wireguard_tunnel *tunnel);
 /// process down. New entry points return a value instead.
 bool wireguard_set_content_padding_mtu(const struct wireguard_tunnel *tunnel,
                                        uint32_t mtu);
+
+/// Set a randomized persistent-keepalive interval of low..high seconds,
+/// inclusive, on a live tunnel. Each time authenticated traffic in either
+/// direction rearms the keepalive, the next one is due a fresh uniform draw
+/// from the range (amneziawg-go's PersistentKeepalive = low-high). low == high
+/// is a fixed interval and 0, 0 disables keepalives. Normalization is this
+/// library's policy: both bounds saturate at 65535, and unequal bounds draw at
+/// least 1 second, so 0, 30 means 1..30, never off.
+///
+/// Additive: the constructors' keep_alive argument is unchanged, and the range
+/// does not enable any other AmneziaWG behaviour. Sessions and queued packets
+/// are kept; turning keepalives on owes one at the next tick.
+///
+/// Returns false, changing nothing, for a NULL tunnel or low > high.
+bool wireguard_set_persistent_keepalive_range(const struct wireguard_tunnel *tunnel,
+                                              uint32_t low,
+                                              uint32_t high);
+
+/// The configured persistent-keepalive bounds after normalization: *low ==
+/// *high for a fixed interval, both 0 when keepalives are off. Never the last
+/// random draw. Returns false, writing nothing, for a NULL tunnel or output
+/// pointer.
+bool wireguard_get_persistent_keepalive_range(const struct wireguard_tunnel *tunnel,
+                                              uint32_t *low,
+                                              uint32_t *high);
 
 #ifdef __cplusplus
 } // extern "C"

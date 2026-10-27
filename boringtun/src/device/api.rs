@@ -5,8 +5,9 @@ use super::dev_lock::LockReadGuard;
 use super::drop_privileges::get_saved_ids;
 use super::{AllowedIP, Device, Error, SocketAddr};
 use crate::device::Action;
-use crate::noise::amnezia::{AmneziaConfig, AwgTimers};
+use crate::noise::amnezia::{AmneziaConfig, AwgTimers, TimerOrderingWarning};
 use crate::noise::handshake::ObfuscationRanges;
+use crate::noise::normalize_persistent_keepalive_range;
 use crate::serialization::KeyBytes;
 use crate::x25519;
 use hex::encode as encode_hex;
@@ -188,9 +189,15 @@ impl AwgParams {
     /// Apply the accumulated values, merging with whatever the device already
     /// has. A no-op when the transaction carried no AmneziaWG keys, so plain
     /// WireGuard configurations are untouched.
-    fn apply(&self, device: &mut Device) -> Result<(), i32> {
+    ///
+    /// Returns the timer-ordering warning of the configuration it applied, for
+    /// `api_set` to log once the device write lock and its writer intent are
+    /// released -- a subscriber that reads the device must not wait on the
+    /// lock this runs under. `None` when nothing was applied or the applied
+    /// timers are coherent; a refused merge applies nothing and warns nothing.
+    fn apply(&self, device: &mut Device) -> Result<Option<TimerOrderingWarning>, i32> {
         if !self.seen {
-            return Ok(());
+            return Ok(None);
         }
         // The padding is clamped against the interface MTU. This snapshot is
         // one of three writers keeping it fresh: `Device::new` seeds it at
@@ -202,10 +209,11 @@ impl AwgParams {
         // place that must fail closed.
         let mtu = device.mtu.load(Ordering::Relaxed).min(u16::MAX as usize) as u16;
         let (obf, amnezia) = self.merged(device.config.obf, &device.config.amnezia, mtu)?;
+        let timer_warning = amnezia.timer_ordering_warning();
         if device.set_obfuscation(obf, amnezia) {
             tracing::info!(message = "AmneziaWG parameters updated");
         }
-        Ok(())
+        Ok(timer_warning)
     }
 
     /// Merge this transaction over the device's current settings.
@@ -341,6 +349,13 @@ impl AwgParams {
         // that only sets the key, since imitation arrives at startup.
         amnezia.warn_header_protection_nonce();
 
+        // Timer ranges whose order can expire a session before its renewal
+        // are applied exactly as the transaction said. Their WARN is not
+        // logged here, under the device write lock: `apply` prepares it from
+        // the configuration it applies and `api_set` logs it after the lock
+        // is released -- once per `set=1` that applies such a configuration,
+        // never per tick or packet.
+
         Ok((obf, amnezia))
     }
 }
@@ -357,7 +372,7 @@ struct PeerSection {
     update_only: bool,
     replace_ips: bool,
     endpoint: Option<SocketAddr>,
-    keepalive: Option<u16>,
+    keepalive: Option<(u16, u16)>,
     preshared_key: Option<[u8; 32]>,
     allowed_ips: Vec<AllowedIP>,
 }
@@ -722,7 +737,7 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
             writeln!(writer, "preshared_key={}", encode_hex(key));
         }
 
-        if let Some(keepalive) = p.persistent_keepalive() {
+        if let Some(keepalive) = keepalive_interval_value(p.persistent_keepalive_range()) {
             writeln!(writer, "persistent_keepalive_interval={}", keepalive);
         }
 
@@ -781,7 +796,17 @@ fn device_errno(e: &Error) -> i32 {
 }
 
 fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -> i32 {
-    d.try_writeable(
+    // The timer-ordering warning of the AmneziaWG configuration this
+    // transaction applies, logged only after `try_writeable` has released the
+    // device write lock and lowered its writer intent: a logging subscriber
+    // that reads the device would otherwise wait on this transaction, and
+    // with it every device worker. It belongs to the configuration actually
+    // applied -- including one a later peer section's error does not roll
+    // back (the parser applies sections as it reads them) -- so it is logged
+    // whatever errno the transaction ends with; a refused merge applies
+    // nothing and leaves it empty.
+    let mut timer_warning = None;
+    let status = d.try_writeable(
         |device| device.trigger_yield(),
         |device| {
             device.cancel_yield();
@@ -798,7 +823,10 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                 cmd.pop(); // remove newline if any
                 if cmd.is_empty() {
                     match awg.apply(device) {
-                        Ok(()) => return 0, // Done
+                        Ok(warning) => {
+                            timer_warning = warning;
+                            return 0; // Done
+                        }
                         Err(code) => return code,
                     }
                 }
@@ -851,8 +879,11 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                             Ok(key_bytes) => {
                                 // Apply before the first peer is built: peers
                                 // snapshot the device's AmneziaWG settings.
-                                if let Err(code) = awg.apply(device) {
-                                    return code;
+                                // Applied now, so warned about even if a peer
+                                // line below fails the transaction.
+                                match awg.apply(device) {
+                                    Ok(warning) => timer_warning = warning,
+                                    Err(code) => return code,
                                 }
                                 return api_set_peer(
                                     reader,
@@ -945,8 +976,14 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
 
             0
         },
-    )
-    .unwrap_or(EIO)
+    );
+    let status = status.unwrap_or(EIO);
+    // Both the write lock and the writer intent are released here; only this
+    // thread's ordinary read guard remains, which other readers share.
+    if let Some(warning) = timer_warning {
+        warning.emit();
+    }
+    status
 }
 
 /// A boolean in exactly the spellings Go's `strconv.ParseBool` accepts, which
@@ -964,91 +1001,61 @@ fn parse_go_bool(val: &str) -> Option<bool> {
     }
 }
 
-/// A peer's `persistent_keepalive_interval`, in seconds.
+/// A peer's `persistent_keepalive_interval`, in seconds, as normalized
+/// inclusive bounds; `(0, 0)` is off.
 ///
-/// amneziawg-go stores this as a `UintRange` and re-picks within it, so a v3
-/// config may carry `25-35` rather than a bare `25`. A bare value is by far the
-/// common form; the range only has to not abort the transaction.
+/// amneziawg-go stores this as a `UintRange` and re-picks within it each time
+/// authenticated traffic rearms the keepalive, so a v3 config may carry
+/// `25-35` rather than a bare `25`. This build does the same: the range is
+/// kept and `Timers` draws from it per rearm.
 ///
-/// The low end, not the middle: sending keepalives more often than asked is
-/// safe, sending them less often risks the NAT mapping expiring, which is the
-/// failure this setting exists to prevent. Clamped up to 1 when the low end is
-/// 0, because 0 does not mean "as often as possible" here -- `Timers` gates the
-/// keepalive on `persistent_keepalive > 0`, so `0-30` taken literally would
-/// switch keepalives *off* for a peer that asked for them, which is exactly the
-/// failure taking the low end is meant to avoid. amneziawg-go treats `0-30` as
-/// on (`UintRange::IsZero` tests the whole packed range, not the low end).
+/// Normalized by [`normalize_persistent_keepalive_range`], WireSock's policy
+/// for the edges: both bounds saturate at the 65535 s a peer stores, and
+/// unequal bounds draw at least 1 s, because `Timers` reads `(0, 0)` as off
+/// and `0-30` taken literally would switch keepalives *off* for a peer that
+/// asked for them. amneziawg-go treats `0-30` as on too (`UintRange::IsZero`
+/// tests the whole packed range). A bare `0` still means off, as in vanilla
+/// WireGuard.
 ///
-/// A bare `0` still means off, as in vanilla WireGuard.
-///
-/// Only the *low* end is bounded by the `u16` a peer stores, because only the
-/// low end is ever applied -- and it is bounded by capping, not by refusing.
-/// 65535 s is already 18 hours, an order of magnitude past any UDP NAT mapping
-/// lifetime, so the cap and every value above it are equally "as good as off"
-/// to every middlebox on the path; refusing instead aborts the whole
-/// transaction.
+/// Capped, not refused: amneziawg-go parses both ends as u32
+/// (`UintRange::FromString` uses `ParseUint(_, 10, 32)`) and accepts a bare
+/// `70000`, so refusing it would abort the whole `set=1` mid-stream, after
+/// `replace_peers` may already have cleared the peer table, over the
+/// difference between two intervals far past any NAT mapping lifetime. The u32
+/// ceiling and an inverted range are still refusals, the same ones
+/// amneziawg-go makes, so the two accept the same configuration lines.
 ///
 /// Note this accepts surrounding whitespace where the previous `parse::<u16>()`
 /// did not; no tool emits it, and the shared range parser has to trim for the
 /// `min - max` form anyway.
-fn parse_keepalive_interval(val: &str) -> Option<u16> {
+fn parse_keepalive_interval(val: &str) -> Option<(u16, u16)> {
     let (lo, hi) = parse_uint_range(val)?;
-    // Cap the low end. The low end is the value we apply, so this is what
-    // stops `lo as u16` truncating -- `65536-70000` would otherwise become 0,
-    // switching the keepalive off for a peer that asked for one. The high end
-    // is discarded, so its magnitude cannot matter at all.
-    //
-    // Capped and not refused, because refusing is the worse of the two errors.
-    // amneziawg-go parses both ends as u32 (`UintRange::FromString` uses
-    // `ParseUint(_, 10, 32)`), accepts a bare `70000`, re-emits it verbatim on
-    // `get=1`, and applies it as `time.Duration(PickOne()) * time.Second` --
-    // so `70000` is a config it can legitimately produce. Refusing it returns
-    // EINVAL from `api_set_peer`, which aborts the whole `set=1` mid-stream,
-    // after `replace_peers` may already have cleared the peer table. What that
-    // abort bought was the difference between 65535 s and 70000 s -- two
-    // intervals no NAT on the path can tell apart, both being far past any
-    // UDP mapping lifetime.
-    //
-    // The cap errs in the safe direction, the same one the `max(1)` below errs
-    // in: a keepalive sent more often than asked costs one 32-byte packet, one
-    // sent less often costs the NAT mapping this setting exists to hold open.
-    //
-    // The u32 ceiling above this is still a refusal rather than a cap, and it
-    // is the same refusal amneziawg-go makes (`strconv.ParseUint: value out of
-    // range`), so the two accept exactly the same set of configuration lines.
-    let capped = lo.min(u32::from(u16::MAX));
-    if lo != hi {
-        // Report the value applied, not a description of how it was chosen.
-        // "Using the low end" was false for exactly the inputs where `lo == 0`:
-        // the clamp below sends 1, not 0, and 0 is the one low end an operator
-        // is likely to write. A field carrying the number cannot drift from the
-        // arithmetic the way a sentence about it can.
-        let fixed = capped.max(1) as u16;
+    let applied = normalize_persistent_keepalive_range(lo, hi)?;
+    if (u32::from(applied.0), u32::from(applied.1)) != (lo, hi) {
+        // Report the bounds applied, not a description of how they were
+        // chosen: a field carrying the numbers cannot drift from the
+        // arithmetic the way a sentence about it can. Silence would be worse:
+        // the operator's interval quietly replaced, invisible until someone
+        // diffs `get=1` against the config that produced it.
         tracing::warn!(
-            message = "randomised keepalive intervals are not implemented; \
-                       the range is narrowed to a single interval",
+            message = "the keepalive interval is outside what this build applies;                        it is normalized",
             requested_low = lo,
             requested_high = hi,
-            fixed_interval = fixed
-        );
-        return Some(fixed);
-    }
-    if capped != lo {
-        // A bare value we cannot store. Silence would be the one outcome worse
-        // than either alternative: the operator's interval quietly replaced by
-        // a different one, invisible until someone diffs `get=1` against the
-        // config that produced it. Two warn sites rather than one merged one,
-        // because "range narrowed" and "value capped" are different diagnoses
-        // and a bare 70000 must not be told its range was narrowed.
-        tracing::warn!(
-            message = "the keepalive interval is above the maximum this build \
-                       stores; it is capped",
-            requested_low = lo,
-            requested_high = hi,
-            fixed_interval = capped
+            applied_low = applied.0,
+            applied_high = applied.1
         );
     }
-    Some(capped as u16)
+    Some(applied)
+}
+
+/// A peer's configured keepalive bounds as `get=1` reports them, the way
+/// amneziawg-go's `UintRange::ToString` prints them -- `n` or `lo-hi` -- and
+/// never the interval last drawn; `None` (the line omitted) when off.
+fn keepalive_interval_value(range: Option<(u16, u16)>) -> Option<String> {
+    match range? {
+        (lo, hi) if lo == hi => Some(lo.to_string()),
+        (lo, hi) => Some(format!("{}-{}", lo, hi)),
+    }
 }
 
 /// Apply one accumulated `[Peer]` section.
@@ -1446,32 +1453,27 @@ mod tests {
         assert_eq!(cleared.timers.reject_after_time, (0, 0), "must clear");
         assert_eq!(cleared.timers.rekey_after_time, (30, 40), "must remain");
 
-        // The reverse clear is refused: dropping rekey_after_time resurrects
-        // its 120-second default, under which the kept 60-80 reject would
-        // discard keys before the rekey replacing them completes. The floors
-        // catch configurations that become incoherent by *clearing*, not just
-        // by setting.
+        // The reverse clear resurrects rekey_after_time's 120-second default,
+        // under which the kept 60-80 reject can discard keys before the rekey
+        // replacing them completes. Since WRS-225 that is a warning, not a
+        // refusal: the merge applies exactly what was sent, whether the
+        // ordering became unfavourable by clearing or by setting.
         let mut bad_clear = AwgParams::default();
         bad_clear.set_timer("rekey_after_time", (0, 0));
-        assert_eq!(
-            bad_clear
-                .merged(ObfuscationRanges::default(), &kept, 1420)
-                .err(),
-            Some(EINVAL),
-            "clearing rekey_after_time under a short reject must be refused"
-        );
+        let (_, unfavourable) = bad_clear
+            .merged(ObfuscationRanges::default(), &kept, 1420)
+            .expect("an unfavourable ordering loads");
+        assert_eq!(unfavourable.timers.rekey_after_time, (0, 0));
+        assert_eq!(unfavourable.timers.reject_after_time, (60, 80));
+        assert!(unfavourable.timer_ordering_complaint().is_some());
 
-        // Floors fail the merge: a reject_after_time draw shorter than the
-        // (default) rekey_after_time + rekey_timeout would reject keys before
-        // the rekey replacing them completes.
         let mut low = AwgParams::default();
         low.set_timer("reject_after_time", (60, 80));
-        assert_eq!(
-            low.merged(ObfuscationRanges::default(), &current, 1420)
-                .err(),
-            Some(EINVAL),
-            "reject 60 under default rekey_after 120 + rekey_timeout 5 must be refused"
-        );
+        let (_, low) = low
+            .merged(ObfuscationRanges::default(), &current, 1420)
+            .expect("reject 60 under default rekey_after 120 + rekey_timeout 5 loads");
+        assert_eq!(low.timers.reject_after_time, (60, 80));
+        assert!(low.timer_ordering_complaint().is_some());
 
         // A zero inside a set range is a zero-second timer, not "unset".
         let mut zero = AwgParams::default();
@@ -2241,12 +2243,11 @@ mod tests {
         );
     }
 
-    /// The warning must report the interval it applied, not describe it.
-    ///
-    /// It used to say "using the low end of the range", which is false for
-    /// exactly the inputs where `lo == 0` -- the clamp sends 1, and 0 is the
-    /// one low end an operator is likely to write. A sentence about the
-    /// arithmetic can drift from it; a field carrying the number cannot.
+    /// The warning must report the bounds it applied, not describe them, and
+    /// only when they differ from the request. Since WRS-225 a range is
+    /// applied as a range -- amneziawg-go re-picks inside it, and so does
+    /// `Timers` -- so `25-35` is applied verbatim and silently; the parent
+    /// narrowed it to 25 with a "not implemented" warning.
     #[test]
     fn the_keepalive_warning_reports_the_interval_it_applied() {
         let _serialized = crate::tracing_test_lock();
@@ -2259,13 +2260,16 @@ mod tests {
         #[derive(Default)]
         struct Captured {
             message: String,
-            fixed_interval: Option<u64>,
+            applied_low: Option<u64>,
+            applied_high: Option<u64>,
         }
 
         impl Visit for Captured {
             fn record_u64(&mut self, field: &Field, value: u64) {
-                if field.name() == "fixed_interval" {
-                    self.fixed_interval = Some(value);
+                match field.name() {
+                    "applied_low" => self.applied_low = Some(value),
+                    "applied_high" => self.applied_high = Some(value),
+                    _ => {}
                 }
             }
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
@@ -2293,31 +2297,25 @@ mod tests {
             (applied, captured)
         };
 
-        // (the value as it arrives over the UAPI, the interval applied, the
-        // number of warnings the log gets, a word the diagnosis must contain --
-        // "narrowed" and "capped" are different statements and a bare 70000
-        // must not be told its range was narrowed)
-        let cases: &[(&str, Option<u16>, usize, &str)] = &[
-            // A range is narrowed, and the narrowed value is 1, not the 0 the
-            // low end literally is.
-            ("0-30", Some(1), 1, "narrowed"),
-            // Narrowing a range we *can* apply verbatim is still a difference
-            // from the peer -- it re-picks inside the range and we do not.
-            ("25-35", Some(25), 1, "narrowed"),
+        // (the value as it arrives over the UAPI, the bounds applied, the
+        // number of warnings the log gets)
+        let cases: &[(&str, Option<(u16, u16)>, usize)] = &[
+            // A range we can apply verbatim is applied verbatim, silently.
+            ("25-35", Some((25, 35)), 0),
+            // The positive floor changes the operator's numbers, so it says so.
+            ("0-30", Some((1, 30)), 1),
             // A bare value we can store is applied verbatim and silently. A
             // warning on the common case is a warning that gets tuned out.
-            ("25", Some(25), 0, ""),
-            ("0", Some(0), 0, ""),
-            ("65535", Some(65535), 0, ""),
-            // A bare value we cannot store is capped, and a cap is a change to
-            // the operator's number, so it says so.
-            ("65536", Some(65535), 1, "capped"),
-            ("70000", Some(65535), 1, "capped"),
-            // Both at once: one warning, carrying what survived.
-            ("70000-80000", Some(65535), 1, "narrowed"),
+            ("25", Some((25, 25)), 0),
+            ("0", Some((0, 0)), 0),
+            ("65535", Some((65535, 65535)), 0),
+            // A value we cannot store is capped, and says so.
+            ("65536", Some((65535, 65535)), 1),
+            ("70000", Some((65535, 65535)), 1),
+            ("70000-80000", Some((65535, 65535)), 1),
         ];
 
-        for &(val, expected, warnings, diagnosis) in cases {
+        for &(val, expected, warnings) in cases {
             let (applied, events) = capture(val);
             assert_eq!(applied, expected, "{} applied the wrong interval", val);
             let messages: Vec<&str> = events.iter().map(|e| e.message.as_str()).collect();
@@ -2331,81 +2329,95 @@ mod tests {
             if warnings == 0 {
                 continue;
             }
+            let (lo, hi) = expected.unwrap();
             assert_eq!(
-                events[0].fixed_interval,
-                expected.map(u64::from),
-                "{}: the warning must carry the interval actually applied",
+                (events[0].applied_low, events[0].applied_high),
+                (Some(u64::from(lo)), Some(u64::from(hi))),
+                "{}: the warning must carry the bounds actually applied",
                 val
             );
             assert!(
-                events[0].message.contains(diagnosis),
-                "{}: the warning gives the wrong diagnosis, expected {:?}: {}",
-                val,
-                diagnosis,
-                events[0].message
-            );
-            assert!(
-                !events[0].message.contains("low end"),
-                "{}: the message claims the low end was used: {}",
+                !events[0].message.contains("not implemented"),
+                "{}: {}",
                 val,
                 events[0].message
             );
         }
     }
 
+    /// The WireSock normalization table (WRS-225), through the UAPI parser.
+    /// A range is kept as a range; the edges are this build's policy, not a
+    /// claim about amneziawg-go's: both bounds saturate at the 65535 s a peer
+    /// stores, unequal bounds draw at least 1 s (`0-30` must not read as
+    /// off), the order is checked before saturating, and the u32 ceiling and
+    /// an inverted range are refusals, as amneziawg-go refuses them.
     #[test]
     fn a_keepalive_range_never_silently_disables_the_keepalive() {
-        // A bare value is the common form and must round-trip exactly, 0
-        // included -- that is vanilla WireGuard's "off".
-        assert_eq!(parse_keepalive_interval("25"), Some(25));
-        assert_eq!(parse_keepalive_interval("0"), Some(0));
-        assert_eq!(parse_keepalive_interval("65535"), Some(65535));
-        // The low end of a range, not the high end: sending keepalives more
-        // often than asked is safe, sending them less often risks the NAT
-        // mapping expiring.
-        assert_eq!(parse_keepalive_interval("25-35"), Some(25));
-        // ...except that 0 is not "more often", it is never. `Timers` gates the
-        // keepalive on `persistent_keepalive > 0`, so taking the low end of
-        // `0-30` literally would switch keepalives off for a peer that asked for
-        // them -- the exact failure taking the low end is meant to avoid, and
-        // invisible afterwards because `get=1` omits a zero keepalive.
-        // amneziawg-go treats `0-30` as on.
-        assert_eq!(parse_keepalive_interval("0-30"), Some(1));
-        assert_eq!(parse_keepalive_interval("0-0"), Some(0), "0-0 is still off");
-        // A bare value above u16::MAX is capped to what we can store, not
-        // refused. amneziawg-go accepts it (`ParseUint(_, 10, 32)`), re-emits
-        // it verbatim on `get=1`, and applies it as ~19.4 h; refusing it
-        // returned EINVAL from `api_set_peer`, aborting a whole `set=1` over
-        // the difference between two intervals that are equally "off" as far
-        // as any NAT on the path is concerned.
-        assert_eq!(parse_keepalive_interval("70000"), Some(65535));
+        assert_eq!(parse_keepalive_interval("25"), Some((25, 25)));
+        assert_eq!(parse_keepalive_interval("25-25"), Some((25, 25)));
+        assert_eq!(parse_keepalive_interval("0"), Some((0, 0)));
+        assert_eq!(
+            parse_keepalive_interval("0-0"),
+            Some((0, 0)),
+            "0-0 is still off"
+        );
+        assert_eq!(parse_keepalive_interval("65535"), Some((65535, 65535)));
+        assert_eq!(parse_keepalive_interval("25-35"), Some((25, 35)));
+        assert_eq!(parse_keepalive_interval("0-30"), Some((1, 30)));
+        assert_eq!(parse_keepalive_interval("0-1"), Some((1, 1)));
         // Capped, not cast: `65536 as u16` is 0 -- the keepalive off for a
         // peer that asked for one, which is what this test is named after.
-        assert_eq!(parse_keepalive_interval("65536"), Some(65535));
-        assert_eq!(parse_keepalive_interval(&u32::MAX.to_string()), Some(65535));
-        // The u32 ceiling is still a refusal, and it is the same one
-        // amneziawg-go makes, so the two accept the same set of lines.
-        assert_eq!(parse_keepalive_interval("4294967296"), None);
-        assert_eq!(parse_keepalive_interval("25-4294967296"), None);
-        // ...but the high end of a range is discarded, so it never has to fit.
-        // amneziawg-go parses both ends as u32 and re-emits them on `get=1`, so
-        // refusing these aborted a whole `set=1` over a number we do not read.
-        assert_eq!(parse_keepalive_interval("25-70000"), Some(25));
-        assert_eq!(parse_keepalive_interval("0-70000"), Some(1));
+        assert_eq!(parse_keepalive_interval("70000"), Some((65535, 65535)));
+        assert_eq!(parse_keepalive_interval("65536"), Some((65535, 65535)));
+        assert_eq!(
+            parse_keepalive_interval(&u32::MAX.to_string()),
+            Some((65535, 65535))
+        );
+        assert_eq!(parse_keepalive_interval("25-70000"), Some((25, 65535)));
+        assert_eq!(parse_keepalive_interval("0-70000"), Some((1, 65535)));
         assert_eq!(
             parse_keepalive_interval(&format!("65535-{}", u32::MAX)),
-            Some(65535)
+            Some((65535, 65535))
         );
-        // The low end of a range is capped for the same reason, and by the
-        // same expression.
         assert_eq!(
             parse_keepalive_interval("65536-70000"),
-            Some(65535),
-            "the low end is what we apply, so it is capped rather than cast"
+            Some((65535, 65535))
         );
-        assert_eq!(parse_keepalive_interval("70000-80000"), Some(65535));
+        assert_eq!(
+            parse_keepalive_interval("70000-80000"),
+            Some((65535, 65535))
+        );
+        assert_eq!(parse_keepalive_interval("4294967296"), None);
+        assert_eq!(parse_keepalive_interval("25-4294967296"), None);
         assert_eq!(parse_keepalive_interval("35-25"), None, "inverted range");
+        assert_eq!(
+            parse_keepalive_interval("80000-70000"),
+            None,
+            "inverted before the cap"
+        );
+        assert_eq!(parse_keepalive_interval("-5"), None, "negative");
         assert_eq!(parse_keepalive_interval("notanumber"), None);
+        assert_eq!(parse_keepalive_interval(""), None);
+    }
+
+    /// What `set=1` accepts, `get=1` reports back as the configured bounds:
+    /// a range round-trips as a range, a bare value as itself, off as an
+    /// omitted line, and an edge the normalization moved as what is applied.
+    #[test]
+    fn a_keepalive_range_round_trips_through_get() {
+        for (set, get) in [
+            ("25-35", Some("25-35")),
+            ("25", Some("25")),
+            ("25-25", Some("25")),
+            ("0", None),
+            ("0-0", None),
+            ("0-30", Some("1-30")),
+            ("70000-80000", Some("65535")),
+        ] {
+            let applied = parse_keepalive_interval(set).expect(set);
+            let range = if applied.1 > 0 { Some(applied) } else { None };
+            assert_eq!(keepalive_interval_value(range).as_deref(), get, "{}", set);
+        }
     }
 
     #[test]
@@ -2623,5 +2635,388 @@ mod tests {
             "the DNS warning carries its detail: {:?}",
             all
         );
+    }
+
+    /// WARN events while `f` runs, as `(message, detail)`, rerun under the
+    /// tracing-cache retry until `done` accepts them, at most five times.
+    fn capture_warnings(
+        mut f: impl FnMut(),
+        done: impl Fn(&[(String, String)]) -> bool,
+    ) -> Vec<(String, String)> {
+        let _serialized = crate::tracing_test_lock();
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Default)]
+        struct Captured(String, String);
+        impl Visit for Captured {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "message" => self.0 = value.to_owned(),
+                    "detail" => self.1 = value.to_owned(),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let slot = match field.name() {
+                    "message" => &mut self.0,
+                    "detail" => &mut self.1,
+                    _ => return,
+                };
+                if slot.is_empty() {
+                    *slot = format!("{:?}", value);
+                }
+            }
+        }
+        struct Capture(Arc<StdMutex<Vec<(String, String)>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
+                }
+                let mut c = Captured::default();
+                event.record(&mut c);
+                self.0.lock().unwrap().push((c.0, c.1));
+            }
+        }
+
+        let mut captured = Vec::new();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tracing::callsite::rebuild_interest_cache();
+            }
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            {
+                let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+                tracing::subscriber::with_default(subscriber, &mut f);
+            }
+            captured = std::mem::take(&mut *events.lock().unwrap());
+            if done(&captured) {
+                break;
+            }
+        }
+        captured
+    }
+
+    /// The `set=1` lines of the owner's WRS-225 reproducer
+    /// (`ContentPaddingAddition = 18-80`, `RekeyAfterTime = 92-137`,
+    /// `RekeyTimeout = 8-12`, `RejectAfterTime = 97-127`,
+    /// `KeepaliveTimeout = 8-22`, `MaxHandshakeAttempts = 24-30`), parsed by
+    /// the shared range parser the `api_set` arms use.
+    fn wrs225_set(reject: &str) -> AwgParams {
+        let mut p = AwgParams::default();
+        p.set_content_padding(parse_uint_range("18-80").unwrap());
+        for (key, val) in [
+            ("rekey_after_time", "92-137"),
+            ("rekey_timeout", "8-12"),
+            ("reject_after_time", reject),
+            ("keepalive_timeout", "8-22"),
+            ("max_handshake_attempts", "24-30"),
+        ] {
+            assert!(p.set_timer(key, parse_uint_range(val).unwrap()), "{}", key);
+        }
+        p
+    }
+
+    const TIMER_ORDERING_WARNING: &str = "their order can expire a session before it is renewed";
+
+    fn timer_warnings(c: &[(String, String)]) -> Vec<&String> {
+        c.iter()
+            .filter(|(m, _)| m.contains(TIMER_ORDERING_WARNING))
+            .map(|(_, d)| d)
+            .collect()
+    }
+
+    /// The merge that `set=1` runs under the device write lock is silent: it
+    /// returns the reproducer's values unchanged and the warning its
+    /// configuration earns, prepared as owned text, and logs nothing -- the
+    /// warning is logged by `api_set` after the lock is released
+    /// (`timer_warnings_follow_the_configuration_a_set_applies`). A malformed
+    /// timer still fails the merge. The parent refused the reproducer here
+    /// with EINVAL at `97 < 137 + 12`.
+    #[test]
+    fn the_wrs225_timer_reproducer_merges_unchanged_and_silently() {
+        let mut applied = Vec::new();
+        let captured = capture_warnings(
+            || {
+                applied.clear();
+                for reject in ["97-127", "149-180"] {
+                    let (_, cfg) = wrs225_set(reject)
+                        .merged(
+                            ObfuscationRanges::default(),
+                            &AmneziaConfig::default(),
+                            1420,
+                        )
+                        .expect("loads");
+                    applied.push(cfg);
+                }
+            },
+            |_| true,
+        );
+        let t = applied[0].timers;
+        assert_eq!(t.rekey_after_time, (92, 137));
+        assert_eq!(t.rekey_timeout, (8, 12));
+        assert_eq!(t.reject_after_time, (97, 127));
+        assert_eq!(t.keepalive_timeout, (8, 22));
+        assert_eq!(t.max_handshake_attempts, (24, 30));
+        assert_eq!(applied[0].content_padding_addition, (18, 80));
+        assert_eq!(applied[1].timers.reject_after_time, (149, 180));
+        assert!(
+            timer_warnings(&captured).is_empty(),
+            "the merge logs nothing: {:?}",
+            captured
+        );
+        let prepared = applied[0]
+            .timer_ordering_warning()
+            .expect("the reproducer earns the warning");
+        assert_eq!(
+            prepared,
+            applied[0].timer_ordering_warning().unwrap(),
+            "value only"
+        );
+        assert_eq!(applied[1].timer_ordering_warning(), None, "coherent");
+
+        // Malformed timer input still fails the transaction.
+        assert_eq!(parse_uint_range("127-97"), None, "inverted");
+        let mut zero = wrs225_set("97-127");
+        zero.set_timer("rekey_timeout", (0, 12));
+        assert_eq!(
+            zero.merged(
+                ObfuscationRanges::default(),
+                &AmneziaConfig::default(),
+                1420
+            )
+            .err(),
+            Some(EINVAL)
+        );
+    }
+
+    /// A `Device` on local socket pairs -- no TUN, root or traffic -- for the
+    /// real `api_set` / `api_get` paths, with its UAPI fd kept open.
+    #[cfg(target_os = "linux")]
+    fn socket_device() -> (
+        crate::device::dev_lock::Lock<Device>,
+        std::os::unix::net::UnixDatagram,
+        UnixStream,
+    ) {
+        use std::os::fd::IntoRawFd;
+        let (tun, tun_peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let (api, api_peer) = UnixStream::pair().unwrap();
+        let config = crate::device::DeviceConfig {
+            n_threads: 1,
+            use_connected_socket: false,
+            use_multi_queue: false,
+            uapi_fd: api.into_raw_fd(),
+            ..Default::default()
+        };
+        let device = Device::new(&tun.into_raw_fd().to_string(), config).unwrap();
+        (
+            crate::device::dev_lock::Lock::new(device),
+            tun_peer,
+            api_peer,
+        )
+    }
+
+    /// One `set=1` transaction body through the production `api_set`, under
+    /// an ordinary device read guard as the UAPI handlers hold one.
+    #[cfg(target_os = "linux")]
+    fn uapi_set(d: &crate::device::dev_lock::Lock<Device>, request: &str) -> i32 {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        drop(client);
+        let mut reader = BufReader::new(&server);
+        api_set(&mut reader, &mut d.read())
+    }
+
+    /// WRS-225 review finding 1. A subscriber that reads the device while
+    /// handling the timer-ordering warning must not wait on the `set=1` that
+    /// logged it. Each warning's callback starts a device reader and waits up
+    /// to two seconds for it:
+    ///
+    /// 1. the production path: `api_set` with `reject_after_time=60-80` --
+    ///    the reader must finish (the parent blocked it until the callback
+    ///    returned: the warning was logged under the write lock);
+    /// 2. outside-lock control: the same prepared warning emitted with no
+    ///    device lock held -- the reader finishes;
+    /// 3. inside-lock control: the same warning emitted inside
+    ///    `try_writeable`'s mutation -- the reader is blocked, which shows the
+    ///    probe detects the dependency rather than passing on timing alone.
+    ///
+    /// Every reader thread is joined before any assertion.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_timer_warning_is_logged_after_the_device_lock_is_released() {
+        use std::sync::{mpsc, Mutex as StdMutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+        let _serialized = crate::tracing_test_lock();
+
+        #[derive(Default)]
+        struct Message(String);
+        impl Visit for Message {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{:?}", value);
+                }
+            }
+        }
+        struct Probe {
+            device: Arc<crate::device::dev_lock::Lock<Device>>,
+            blocked: Arc<StdMutex<Vec<bool>>>,
+            readers: Arc<StdMutex<Vec<std::thread::JoinHandle<()>>>>,
+        }
+        impl<S: Subscriber> Layer<S> for Probe {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let mut message = Message::default();
+                event.record(&mut message);
+                if !message.0.contains(TIMER_ORDERING_WARNING) {
+                    return;
+                }
+                let device = Arc::clone(&self.device);
+                let (started_tx, started_rx) = mpsc::channel();
+                let (done_tx, done_rx) = mpsc::channel();
+                let reader = std::thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    let _guard = device.read();
+                    let _ = done_tx.send(());
+                });
+                started_rx.recv().unwrap();
+                let blocked = done_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_err();
+                self.blocked.lock().unwrap().push(blocked);
+                self.readers.lock().unwrap().push(reader);
+            }
+        }
+
+        let (device, _tun_peer, _api_peer) = socket_device();
+        let device = Arc::new(device);
+        let blocked = Arc::new(StdMutex::new(Vec::new()));
+        let readers = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Probe {
+            device: Arc::clone(&device),
+            blocked: Arc::clone(&blocked),
+            readers: Arc::clone(&readers),
+        });
+        let errno = tracing::subscriber::with_default(subscriber, || {
+            let errno = uapi_set(&device, "reject_after_time=60-80\n\n");
+            let prepared = || {
+                device
+                    .read()
+                    .config
+                    .amnezia
+                    .timer_ordering_warning()
+                    .expect("the applied configuration earns the warning")
+            };
+            let outside = prepared();
+            outside.emit();
+            let inside = prepared();
+            let mut guard = device.read();
+            guard.try_writeable(|_| {}, move |_| inside.emit());
+            drop(guard);
+            errno
+        });
+        for reader in std::mem::take(&mut *readers.lock().unwrap()) {
+            reader.join().unwrap();
+        }
+        let blocked = blocked.lock().unwrap();
+        assert_eq!(errno, 0);
+        assert_eq!(
+            &*blocked,
+            &[false, false, true],
+            "[api_set, outside-lock control, inside-lock control]: the reader \
+             started by the warning callback was blocked"
+        );
+        assert_eq!(
+            device.read().config.amnezia.timers.reject_after_time,
+            (60, 80)
+        );
+    }
+
+    /// The warning belongs to the configuration a `set=1` actually applies,
+    /// through the production `api_set`, one per application:
+    ///
+    /// - unfavourable timers applied: errno 0, one warning (reject 60);
+    /// - coherent timers applied: errno 0, none;
+    /// - malformed timers (a 0 in a set range): EINVAL, nothing applied, none;
+    /// - timers applied, then a peer line fails: EINVAL -- the parser applies
+    ///   the AmneziaWG settings before the peer section and does not roll them
+    ///   back -- and one warning for those applied timers (reject 50);
+    /// - a peer-only transaction over unfavourable stored timers: errno 0 and
+    ///   none: the warning is not rebuilt from the device's state;
+    /// - timer ticks and `get=1` afterwards: none.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn timer_warnings_follow_the_configuration_a_set_applies() {
+        let public = "02".repeat(32);
+        let (device, _tun_peer, _api_peer) = socket_device();
+        assert_eq!(
+            uapi_set(&device, &format!("private_key={}\n\n", "01".repeat(32))),
+            0,
+            "[SETUP]"
+        );
+        let mut steps = Vec::new();
+        let captured = capture_warnings(
+            || {
+                steps.clear();
+                let mut step = |name: &'static str, request: String| {
+                    let errno = uapi_set(&device, &request);
+                    let reject = device.read().config.amnezia.timers.reject_after_time;
+                    steps.push((name, errno, reject));
+                };
+                step("unfavourable", "reject_after_time=60-80\n\n".into());
+                step("coherent", "reject_after_time=200-220\n\n".into());
+                step(
+                    "malformed",
+                    "reject_after_time=60-80\nrekey_timeout=0-2\n\n".into(),
+                );
+                step(
+                    "applied then failed",
+                    format!(
+                        "reject_after_time=50-80\npublic_key={}\nallowed_ip=invalid\n\n",
+                        public
+                    ),
+                );
+                step(
+                    "peer only",
+                    format!(
+                        "public_key={}\npersistent_keepalive_interval=25\n\n",
+                        public
+                    ),
+                );
+                let d = device.read();
+                let mut out = vec![0u8; 2048];
+                for peer in d.peers.values() {
+                    for _ in 0..5 {
+                        let _ = peer.lock().tunnel.update_timers(&mut out);
+                    }
+                }
+                drop(d);
+                let (server, _client) = UnixStream::pair().unwrap();
+                let mut writer = BufWriter::new(&server);
+                assert_eq!(api_get(&mut writer, &device.read()), 0);
+            },
+            |c| timer_warnings(c).len() >= 2,
+        );
+        assert_eq!(
+            steps,
+            vec![
+                ("unfavourable", 0, (60, 80)),
+                ("coherent", 0, (200, 220)),
+                ("malformed", EINVAL, (200, 220)),
+                ("applied then failed", EINVAL, (50, 80)),
+                ("peer only", 0, (50, 80)),
+            ],
+            "errno and stored values"
+        );
+        let warnings = timer_warnings(&captured);
+        assert_eq!(warnings.len(), 2, "{:?}", captured);
+        assert!(warnings[0].contains("60s"), "{}", warnings[0]);
+        assert!(warnings[1].contains("50s"), "{}", warnings[1]);
     }
 }

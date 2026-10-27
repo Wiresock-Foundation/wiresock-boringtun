@@ -1953,7 +1953,15 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
     // WARN, never through `last_tunnel_error()`.
     amnezia.warn_header_protection_nonce();
 
-    new_tunnel_with_amnezia_config(
+    // Timer ranges whose order can expire a session before its renewal are
+    // built exactly as configured, with a WARN -- but only for a tunnel that
+    // is actually built: the keys are validated below, and a NULL return must
+    // not have been announced as accepted. Prepared here because `amnezia`
+    // moves into the constructor; logged after it returns, with no tunnel
+    // lock held, and never through `last_tunnel_error()`.
+    let timer_warning = amnezia.timer_ordering_warning();
+
+    let tunnel = new_tunnel_with_amnezia_config(
         static_private,
         server_static_public,
         preshared_key,
@@ -1968,7 +1976,13 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
         h4.lo,
         h4.hi,
         amnezia,
-    )
+    );
+    if !tunnel.is_null() {
+        if let Some(warning) = timer_warning {
+            warning.emit();
+        }
+    }
+    tunnel
 }
 
 /// Drops the Tunn object
@@ -2200,6 +2214,49 @@ pub unsafe extern "C" fn wireguard_set_content_padding_mtu(
         return false;
     };
     tunnel.lock().set_content_padding_mtu(mtu);
+    true
+}
+
+/// Set a randomized persistent-keepalive interval of `low..=high` seconds on a
+/// live tunnel: each time authenticated traffic in either direction rearms the
+/// keepalive, the next one is due a fresh uniform draw from the range. A bare
+/// interval is `low == high`; `0, 0` disables keepalives. Bounds above 65535
+/// saturate to 65535, and unequal bounds draw at least 1 second, so `0, 30`
+/// never means off ([`crate::noise::normalize_persistent_keepalive_range`]).
+///
+/// Additive: the constructors' scalar `keep_alive` is unchanged, and a later
+/// scalar update replaces the range. Takes the tunnel's mutex like every other
+/// call. Keeps sessions and queued packets; turning keepalives on owes one at
+/// the next tick, as the constructors do.
+///
+/// Returns false, changing nothing, for a NULL tunnel or `low > high`.
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_set_persistent_keepalive_range(
+    tunnel: *const Mutex<Tunn>,
+    low: u32,
+    high: u32,
+) -> bool {
+    let Some(tunnel) = tunnel.as_ref() else {
+        return false;
+    };
+    tunnel.lock().set_persistent_keepalive_range(low, high)
+}
+
+/// The configured persistent-keepalive bounds, normalized: `*low == *high` for
+/// a fixed interval and both 0 when keepalives are off. Never the last random
+/// draw. Returns false, writing nothing, for a NULL tunnel or output pointer.
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_get_persistent_keepalive_range(
+    tunnel: *const Mutex<Tunn>,
+    low: *mut u32,
+    high: *mut u32,
+) -> bool {
+    let (Some(tunnel), false, false) = (tunnel.as_ref(), low.is_null(), high.is_null()) else {
+        return false;
+    };
+    let (lo, hi) = tunnel.lock().persistent_keepalive_range().unwrap_or((0, 0));
+    *low = u32::from(lo);
+    *high = u32::from(hi);
     true
 }
 
@@ -3036,11 +3093,13 @@ mod tests {
         let private = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
         let public = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
 
-        // reject_after_time far below rekey_after_time + rekey_timeout: keys
-        // would be rejected before the rekey replacing them completes.
+        // A zero inside a set duration range: a zero-second timer the draw
+        // can land on. (An unfavourable timer *ordering* is a warning, not a
+        // refusal -- see
+        // `the_wrs225_timer_reproducer_builds_unchanged_with_one_warning`.)
         let params = wireguard_awg_params {
             size: AWG_PARAMS_SIZE_VER0 as u32,
-            reject_after_time: wireguard_awg_range { lo: 20, hi: 20 },
+            reject_after_time: wireguard_awg_range { lo: 0, hi: 20 },
             ..Default::default()
         };
         let tunnel = unsafe {
@@ -5562,6 +5621,523 @@ mod tests {
                 .all(|c| c.level == "WARN"),
             "{:?}",
             all
+        );
+    }
+
+    /// WARN-level events captured while `f` runs, as `(message, detail)`
+    /// pairs, under the tracing-cache retry of
+    /// `an_amplifying_s3_warns_and_leaves_the_error_slot_empty`: `f` is rerun
+    /// until `done` accepts the capture, at most five times.
+    fn capture_warnings(
+        mut f: impl FnMut(),
+        done: impl Fn(&[(String, String)]) -> bool,
+    ) -> Vec<(String, String)> {
+        let _serialized = crate::tracing_test_lock();
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing::field::{Field, Visit};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Default)]
+        struct Captured(String, String);
+        impl Visit for Captured {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "message" => self.0 = value.to_owned(),
+                    "detail" => self.1 = value.to_owned(),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let slot = match field.name() {
+                    "message" => &mut self.0,
+                    "detail" => &mut self.1,
+                    _ => return,
+                };
+                if slot.is_empty() {
+                    *slot = format!("{:?}", value);
+                }
+            }
+        }
+        struct Capture(Arc<StdMutex<Vec<(String, String)>>>);
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
+                }
+                let mut c = Captured::default();
+                event.record(&mut c);
+                self.0.lock().unwrap().push((c.0, c.1));
+            }
+        }
+
+        let mut captured = Vec::new();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tracing::callsite::rebuild_interest_cache();
+            }
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            {
+                let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+                tracing::subscriber::with_default(subscriber, &mut f);
+            }
+            captured = std::mem::take(&mut *events.lock().unwrap());
+            if done(&captured) {
+                break;
+            }
+        }
+        captured
+    }
+
+    /// The owner's WRS-225 reproducer, verbatim, as the C struct carries it:
+    ///
+    /// ```ini
+    /// ContentPaddingAddition = 18-80
+    /// RekeyAfterTime = 92-137
+    /// RekeyTimeout = 8-12
+    /// RejectAfterTime = 97-127
+    /// KeepaliveTimeout = 8-22
+    /// MaxHandshakeAttempts = 24-30
+    /// ```
+    fn wrs225_reproducer() -> wireguard_awg_params {
+        wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER2 as u32,
+            content_padding_addition: wireguard_awg_range { lo: 18, hi: 80 },
+            content_padding_mtu: 1420,
+            rekey_after_time: wireguard_awg_range { lo: 92, hi: 137 },
+            rekey_timeout: wireguard_awg_range { lo: 8, hi: 12 },
+            reject_after_time: wireguard_awg_range { lo: 97, hi: 127 },
+            keepalive_timeout: wireguard_awg_range { lo: 8, hi: 22 },
+            max_handshake_attempts: wireguard_awg_range { lo: 24, hi: 30 },
+            ..Default::default()
+        }
+    }
+
+    const TIMER_ORDERING_WARNING: &str = "their order can expire a session before it is renewed";
+
+    /// The parent refused the reproducer at `97 < 137 + 12` with a NULL
+    /// return. It now builds with every value unchanged, logs exactly one
+    /// ordering warning for the construction -- none per tick afterwards --
+    /// and leaves the error slot empty, even over a stale error from an
+    /// earlier failed build on the same thread. A coherent control in the
+    /// same scope warns nothing, so the count is not an artefact of the
+    /// capture.
+    #[test]
+    fn the_wrs225_timer_reproducer_builds_unchanged_with_one_warning() {
+        let key = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+        let build = |p: &wireguard_awg_params| unsafe {
+            new_tunnel_with_awg_params(
+                key.as_ptr(),
+                key.as_ptr(),
+                ptr::null(),
+                0,
+                1,
+                p,
+                ptr::null(),
+            )
+        };
+        let coherent = wireguard_awg_params {
+            reject_after_time: wireguard_awg_range { lo: 149, hi: 180 },
+            ..wrs225_reproducer()
+        };
+        let ordering = |c: &[(String, String)]| {
+            c.iter()
+                .filter(|(m, _)| m.contains(TIMER_ORDERING_WARNING))
+                .count()
+        };
+
+        let mut built = None;
+        let captured = capture_warnings(
+            || {
+                // A stale error: a transposed range refused on this thread.
+                let refused = build(&wireguard_awg_params {
+                    reject_after_time: wireguard_awg_range { lo: 127, hi: 97 },
+                    ..wrs225_reproducer()
+                });
+                assert!(refused.is_null());
+                assert!(!last_tunnel_error().is_null());
+
+                let tunnel = build(&wrs225_reproducer());
+                assert!(!tunnel.is_null(), "the reproducer must build");
+                assert!(
+                    last_tunnel_error().is_null(),
+                    "a warned build leaves the error slot empty"
+                );
+                let t = unsafe { &*tunnel }.lock().amnezia_config().timers;
+                built = Some(t);
+                let mut dst = vec![0u8; 2048];
+                for _ in 0..8 {
+                    let _ = unsafe { wireguard_tick(tunnel, dst.as_mut_ptr(), dst.len() as u32) };
+                }
+                unsafe { tunnel_free(tunnel) };
+
+                let control = build(&coherent);
+                assert!(!control.is_null(), "{}", last_error_string());
+                unsafe { tunnel_free(control) };
+            },
+            |c| ordering(c) >= 1,
+        );
+
+        let t = built.expect("built");
+        assert_eq!(t.rekey_after_time, (92, 137));
+        assert_eq!(t.rekey_timeout, (8, 12));
+        assert_eq!(t.reject_after_time, (97, 127));
+        assert_eq!(t.keepalive_timeout, (8, 22));
+        assert_eq!(t.max_handshake_attempts, (24, 30));
+
+        assert_eq!(
+            ordering(&captured),
+            1,
+            "one warning per build: {:?}",
+            captured
+        );
+        let (_, detail) = captured
+            .iter()
+            .find(|(m, _)| m.contains(TIMER_ORDERING_WARNING))
+            .unwrap();
+        assert!(
+            detail.contains("reject_after_time")
+                && detail.contains("97s")
+                && detail.contains("149s"),
+            "{}",
+            detail
+        );
+        assert!(!detail.contains("QOGr3"), "no key material: {}", detail);
+    }
+
+    /// Both sides of both ordering boundaries build through the C door, and
+    /// only the unfavourable side warns: rekey 92-137, retry 8-12 with reject
+    /// 148 and 149; rekey 1, retry 12, passive keepalive 22 with reject 34
+    /// and 35. Retained hard refusals stay refusals: a zero inside a set
+    /// duration range, alone and with an ordering complaint.
+    #[test]
+    fn timer_ordering_boundaries_build_through_the_c_door() {
+        let key = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+        let build = |p: &wireguard_awg_params| unsafe {
+            new_tunnel_with_awg_params(
+                key.as_ptr(),
+                key.as_ptr(),
+                ptr::null(),
+                0,
+                1,
+                p,
+                ptr::null(),
+            )
+        };
+        let r = |lo, hi| wireguard_awg_range { lo, hi };
+        let first = |reject: u32| wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            rekey_after_time: r(92, 137),
+            rekey_timeout: r(8, 12),
+            reject_after_time: r(reject, reject + 30),
+            ..Default::default()
+        };
+        let second = |reject: u32| wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            rekey_after_time: r(1, 1),
+            rekey_timeout: r(12, 12),
+            keepalive_timeout: r(22, 22),
+            reject_after_time: r(reject, reject),
+            ..Default::default()
+        };
+        let cases = [
+            (first(148), true),
+            (first(149), false),
+            (second(34), true),
+            (second(35), false),
+        ];
+
+        let captured = capture_warnings(
+            || {
+                for (p, _) in &cases {
+                    let tunnel = build(p);
+                    assert!(!tunnel.is_null(), "{:?}: {}", p, last_error_string());
+                    assert!(last_tunnel_error().is_null());
+                    unsafe { tunnel_free(tunnel) };
+                }
+            },
+            |c| {
+                c.iter()
+                    .filter(|(m, _)| m.contains(TIMER_ORDERING_WARNING))
+                    .count()
+                    >= 2
+            },
+        );
+        let details: Vec<&String> = captured
+            .iter()
+            .filter(|(m, _)| m.contains(TIMER_ORDERING_WARNING))
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(details.len(), 2, "{:?}", captured);
+        assert!(details[0].contains("148s"), "{}", details[0]);
+        assert!(details[1].contains("34s"), "{}", details[1]);
+
+        for p in [
+            wireguard_awg_params {
+                rekey_timeout: r(0, 12),
+                ..first(148)
+            },
+            wireguard_awg_params {
+                keepalive_timeout: r(0, 22),
+                ..second(34)
+            },
+        ] {
+            last_tunnel_error_free();
+            assert!(build(&p).is_null(), "{:?}", p);
+            assert!(
+                last_error_string().contains("must not contain 0"),
+                "{}",
+                last_error_string()
+            );
+        }
+    }
+
+    /// `wireguard_set_persistent_keepalive_range` and its getter: the getter
+    /// reports a scalar constructor's interval as `(k, k)`, the setter applies
+    /// the WireSock normalization table, refuses NULL and inverted input
+    /// without changing anything, and the getter refuses NULL pointers. A
+    /// range alone enables no other AmneziaWG behaviour.
+    #[test]
+    fn the_keepalive_range_setter_normalizes_refuses_and_reports_configuration() {
+        let key = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+        let tunnel = unsafe {
+            new_tunnel(
+                key.as_ptr(),
+                key.as_ptr(),
+                ptr::null(),
+                25,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        assert!(!tunnel.is_null(), "{}", last_error_string());
+        let get = || {
+            let (mut lo, mut hi) = (u32::MAX, u32::MAX);
+            assert!(unsafe { wireguard_get_persistent_keepalive_range(tunnel, &mut lo, &mut hi) });
+            (lo, hi)
+        };
+        assert_eq!(get(), (25, 25), "the scalar constructor's interval");
+
+        for ((lo, hi), expected) in [
+            ((25, 35), (25, 35)),
+            ((25, 25), (25, 25)),
+            ((0, 30), (1, 30)),
+            ((70_000, 80_000), (65_535, 65_535)),
+            ((0, 0), (0, 0)),
+            ((25, 35), (25, 35)),
+        ] {
+            assert!(unsafe { wireguard_set_persistent_keepalive_range(tunnel, lo, hi) });
+            assert_eq!(get(), expected, "{}-{}", lo, hi);
+        }
+        for (lo, hi) in [(35, 25), (80_000, 70_000), (u32::MAX, 0)] {
+            assert!(!unsafe { wireguard_set_persistent_keepalive_range(tunnel, lo, hi) });
+            assert_eq!(get(), (25, 35), "{}-{} changed the configuration", lo, hi);
+        }
+        assert!(!unsafe { wireguard_set_persistent_keepalive_range(ptr::null(), 25, 35) });
+
+        let mut out = 7u32;
+        assert!(!unsafe {
+            wireguard_get_persistent_keepalive_range(ptr::null(), &mut out, &mut out)
+        });
+        assert!(!unsafe {
+            wireguard_get_persistent_keepalive_range(tunnel, ptr::null_mut(), &mut out)
+        });
+        assert!(!unsafe {
+            wireguard_get_persistent_keepalive_range(tunnel, &mut out, ptr::null_mut())
+        });
+        assert_eq!(out, 7, "nothing written on refusal");
+
+        {
+            let t = unsafe { &*tunnel }.lock();
+            let amnezia = t.amnezia_config();
+            assert_eq!(amnezia.timers, crate::noise::amnezia::AwgTimers::default());
+            assert_eq!(amnezia.content_padding_addition, (0, 0));
+        }
+        unsafe { tunnel_free(tunnel) };
+
+        // The strict constructor's scalar is reported the same way, and an
+        // off keepalive as (0, 0).
+        let p = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER2 as u32,
+            ..Default::default()
+        };
+        for (keep_alive, expected) in [(0u16, (0, 0)), (40, (40, 40))] {
+            let tunnel = unsafe {
+                new_tunnel_with_awg_params(
+                    key.as_ptr(),
+                    key.as_ptr(),
+                    ptr::null(),
+                    keep_alive,
+                    1,
+                    &p,
+                    ptr::null(),
+                )
+            };
+            assert!(!tunnel.is_null(), "{}", last_error_string());
+            let (mut lo, mut hi) = (u32::MAX, u32::MAX);
+            assert!(unsafe { wireguard_get_persistent_keepalive_range(tunnel, &mut lo, &mut hi) });
+            assert_eq!((lo, hi), expected);
+            unsafe { tunnel_free(tunnel) };
+        }
+    }
+
+    /// WRS-225 review finding 2. The timer acceptance warning is logged only
+    /// for a tunnel `new_tunnel_with_awg_params` actually builds. With the
+    /// reproducer's unfavourable timers, every refused key -- NULL or
+    /// malformed private and public keys, an invalid or wrong-length preshared
+    /// key -- returns NULL with the existing key error and no timer warning
+    /// (the parent logged one before validating the keys); so does a refused
+    /// AWG configuration. In the same capture scope a valid build logs exactly
+    /// one and returns a handle that initiates a handshake, and coherent timers
+    /// log none, so a
+    /// count of zero for the refusals is not an empty capture.
+    #[test]
+    fn refused_constructors_emit_no_timer_acceptance_warning() {
+        let key = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+        let malformed = CString::new("not-a-key").unwrap();
+        let short = CString::new("AAAA").unwrap();
+        let build = |private: *const c_char,
+                     public: *const c_char,
+                     preshared: *const c_char,
+                     p: &wireguard_awg_params| unsafe {
+            new_tunnel_with_awg_params(private, public, preshared, 0, 1, p, ptr::null())
+        };
+        let refused_awg = wireguard_awg_params {
+            reject_after_time: wireguard_awg_range { lo: 127, hi: 97 },
+            ..wrs225_reproducer()
+        };
+        let coherent = wireguard_awg_params {
+            reject_after_time: wireguard_awg_range { lo: 149, hi: 180 },
+            ..wrs225_reproducer()
+        };
+        let repro = wrs225_reproducer();
+        let refusals: [(
+            &str,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            &wireguard_awg_params,
+            &str,
+        ); 7] = [
+            (
+                "NULL private key",
+                ptr::null(),
+                key.as_ptr(),
+                ptr::null(),
+                &repro,
+                "Missing static private key",
+            ),
+            (
+                "malformed private key",
+                malformed.as_ptr(),
+                key.as_ptr(),
+                ptr::null(),
+                &repro,
+                "Invalid static private key",
+            ),
+            (
+                "NULL public key",
+                key.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                &repro,
+                "Missing server static public key",
+            ),
+            (
+                "malformed public key",
+                key.as_ptr(),
+                malformed.as_ptr(),
+                ptr::null(),
+                &repro,
+                "Invalid server static public key",
+            ),
+            (
+                "malformed preshared key",
+                key.as_ptr(),
+                key.as_ptr(),
+                malformed.as_ptr(),
+                &repro,
+                "Invalid preshared key",
+            ),
+            (
+                "short preshared key",
+                key.as_ptr(),
+                key.as_ptr(),
+                short.as_ptr(),
+                &repro,
+                "Invalid preshared key",
+            ),
+            (
+                "transposed timer range",
+                key.as_ptr(),
+                key.as_ptr(),
+                ptr::null(),
+                &refused_awg,
+                "reject_after_time",
+            ),
+        ];
+
+        let mut errors = Vec::new();
+        let mut initiated = None;
+        let captured = capture_warnings(
+            || {
+                errors.clear();
+                for (name, private, public, preshared, p, _) in refusals.iter() {
+                    let tunnel = build(*private, *public, *preshared, p);
+                    assert!(tunnel.is_null(), "{} built a tunnel", name);
+                    errors.push(last_error_string());
+                }
+                let tunnel = build(key.as_ptr(), key.as_ptr(), ptr::null(), &repro);
+                assert!(!tunnel.is_null(), "{}", last_error_string());
+                assert!(
+                    last_tunnel_error().is_null(),
+                    "a successful build clears the slot"
+                );
+                let mut dst = vec![0u8; 2048];
+                initiated = Some(
+                    unsafe {
+                        wireguard_force_handshake(tunnel, dst.as_mut_ptr(), dst.len() as u32)
+                    }
+                    .op,
+                );
+                unsafe { tunnel_free(tunnel) };
+                let control = build(key.as_ptr(), key.as_ptr(), ptr::null(), &coherent);
+                assert!(!control.is_null(), "{}", last_error_string());
+                unsafe { tunnel_free(control) };
+            },
+            |c| c.iter().any(|(m, _)| m.contains(TIMER_ORDERING_WARNING)),
+        );
+
+        for ((name, _, _, _, _, expected), error) in refusals.iter().zip(&errors) {
+            assert!(error.contains(expected), "{}: {}", name, error);
+        }
+        assert!(
+            matches!(initiated, Some(result_type::WRITE_TO_NETWORK)),
+            "the built handle is usable: it initiates a handshake"
+        );
+        let warnings: Vec<&String> = captured
+            .iter()
+            .filter(|(m, _)| m.contains(TIMER_ORDERING_WARNING))
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the successful unfavourable build warns: {:?}",
+            captured
+        );
+        assert!(
+            warnings[0].contains("97s") && warnings[0].contains("149s"),
+            "{}",
+            warnings[0]
         );
     }
 }
