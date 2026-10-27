@@ -2208,6 +2208,49 @@ pub unsafe extern "C" fn wireguard_set_content_padding_mtu(
     true
 }
 
+/// Set a randomized persistent-keepalive interval of `low..=high` seconds on a
+/// live tunnel: each time authenticated traffic in either direction rearms the
+/// keepalive, the next one is due a fresh uniform draw from the range. A bare
+/// interval is `low == high`; `0, 0` disables keepalives. Bounds above 65535
+/// saturate to 65535, and unequal bounds draw at least 1 second, so `0, 30`
+/// never means off ([`crate::noise::normalize_persistent_keepalive_range`]).
+///
+/// Additive: the constructors' scalar `keep_alive` is unchanged, and a later
+/// scalar update replaces the range. Takes the tunnel's mutex like every other
+/// call. Keeps sessions and queued packets; turning keepalives on owes one at
+/// the next tick, as the constructors do.
+///
+/// Returns false, changing nothing, for a NULL tunnel or `low > high`.
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_set_persistent_keepalive_range(
+    tunnel: *const Mutex<Tunn>,
+    low: u32,
+    high: u32,
+) -> bool {
+    let Some(tunnel) = tunnel.as_ref() else {
+        return false;
+    };
+    tunnel.lock().set_persistent_keepalive_range(low, high)
+}
+
+/// The configured persistent-keepalive bounds, normalized: `*low == *high` for
+/// a fixed interval and both 0 when keepalives are off. Never the last random
+/// draw. Returns false, writing nothing, for a NULL tunnel or output pointer.
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_get_persistent_keepalive_range(
+    tunnel: *const Mutex<Tunn>,
+    low: *mut u32,
+    high: *mut u32,
+) -> bool {
+    let (Some(tunnel), false, false) = (tunnel.as_ref(), low.is_null(), high.is_null()) else {
+        return false;
+    };
+    let (lo, hi) = tunnel.lock().persistent_keepalive_range().unwrap_or((0, 0));
+    *low = u32::from(lo);
+    *high = u32::from(hi);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5838,6 +5881,102 @@ mod tests {
                 "{}",
                 last_error_string()
             );
+        }
+    }
+
+    /// `wireguard_set_persistent_keepalive_range` and its getter: the getter
+    /// reports a scalar constructor's interval as `(k, k)`, the setter applies
+    /// the WireSock normalization table, refuses NULL and inverted input
+    /// without changing anything, and the getter refuses NULL pointers. A
+    /// range alone enables no other AmneziaWG behaviour.
+    #[test]
+    fn the_keepalive_range_setter_normalizes_refuses_and_reports_configuration() {
+        let key = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+        let tunnel = unsafe {
+            new_tunnel(
+                key.as_ptr(),
+                key.as_ptr(),
+                ptr::null(),
+                25,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        assert!(!tunnel.is_null(), "{}", last_error_string());
+        let get = || {
+            let (mut lo, mut hi) = (u32::MAX, u32::MAX);
+            assert!(unsafe { wireguard_get_persistent_keepalive_range(tunnel, &mut lo, &mut hi) });
+            (lo, hi)
+        };
+        assert_eq!(get(), (25, 25), "the scalar constructor's interval");
+
+        for ((lo, hi), expected) in [
+            ((25, 35), (25, 35)),
+            ((25, 25), (25, 25)),
+            ((0, 30), (1, 30)),
+            ((70_000, 80_000), (65_535, 65_535)),
+            ((0, 0), (0, 0)),
+            ((25, 35), (25, 35)),
+        ] {
+            assert!(unsafe { wireguard_set_persistent_keepalive_range(tunnel, lo, hi) });
+            assert_eq!(get(), expected, "{}-{}", lo, hi);
+        }
+        for (lo, hi) in [(35, 25), (80_000, 70_000), (u32::MAX, 0)] {
+            assert!(!unsafe { wireguard_set_persistent_keepalive_range(tunnel, lo, hi) });
+            assert_eq!(get(), (25, 35), "{}-{} changed the configuration", lo, hi);
+        }
+        assert!(!unsafe { wireguard_set_persistent_keepalive_range(ptr::null(), 25, 35) });
+
+        let mut out = 7u32;
+        assert!(!unsafe {
+            wireguard_get_persistent_keepalive_range(ptr::null(), &mut out, &mut out)
+        });
+        assert!(!unsafe {
+            wireguard_get_persistent_keepalive_range(tunnel, ptr::null_mut(), &mut out)
+        });
+        assert!(!unsafe {
+            wireguard_get_persistent_keepalive_range(tunnel, &mut out, ptr::null_mut())
+        });
+        assert_eq!(out, 7, "nothing written on refusal");
+
+        {
+            let t = unsafe { &*tunnel }.lock();
+            let amnezia = t.amnezia_config();
+            assert_eq!(amnezia.timers, crate::noise::amnezia::AwgTimers::default());
+            assert_eq!(amnezia.content_padding_addition, (0, 0));
+        }
+        unsafe { tunnel_free(tunnel) };
+
+        // The strict constructor's scalar is reported the same way, and an
+        // off keepalive as (0, 0).
+        let p = wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER2 as u32,
+            ..Default::default()
+        };
+        for (keep_alive, expected) in [(0u16, (0, 0)), (40, (40, 40))] {
+            let tunnel = unsafe {
+                new_tunnel_with_awg_params(
+                    key.as_ptr(),
+                    key.as_ptr(),
+                    ptr::null(),
+                    keep_alive,
+                    1,
+                    &p,
+                    ptr::null(),
+                )
+            };
+            assert!(!tunnel.is_null(), "{}", last_error_string());
+            let (mut lo, mut hi) = (u32::MAX, u32::MAX);
+            assert!(unsafe { wireguard_get_persistent_keepalive_range(tunnel, &mut lo, &mut hi) });
+            assert_eq!((lo, hi), expected);
+            unsafe { tunnel_free(tunnel) };
         }
     }
 }

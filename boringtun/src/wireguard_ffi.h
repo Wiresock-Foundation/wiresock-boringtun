@@ -1000,6 +1000,31 @@ struct stats wireguard_stats(const struct wireguard_tunnel *tunnel);
 bool wireguard_set_content_padding_mtu(const struct wireguard_tunnel *tunnel,
                                        uint32_t mtu);
 
+/// Set a randomized persistent-keepalive interval of low..high seconds,
+/// inclusive, on a live tunnel. Each time authenticated traffic in either
+/// direction rearms the keepalive, the next one is due a fresh uniform draw
+/// from the range (amneziawg-go's PersistentKeepalive = low-high). low == high
+/// is a fixed interval and 0, 0 disables keepalives. Normalization is this
+/// library's policy: both bounds saturate at 65535, and unequal bounds draw at
+/// least 1 second, so 0, 30 means 1..30, never off.
+///
+/// Additive: the constructors' keep_alive argument is unchanged, and the range
+/// does not enable any other AmneziaWG behaviour. Sessions and queued packets
+/// are kept; turning keepalives on owes one at the next tick.
+///
+/// Returns false, changing nothing, for a NULL tunnel or low > high.
+bool wireguard_set_persistent_keepalive_range(const struct wireguard_tunnel *tunnel,
+                                              uint32_t low,
+                                              uint32_t high);
+
+/// The configured persistent-keepalive bounds after normalization: *low ==
+/// *high for a fixed interval, both 0 when keepalives are off. Never the last
+/// random draw. Returns false, writing nothing, for a NULL tunnel or output
+/// pointer.
+bool wireguard_get_persistent_keepalive_range(const struct wireguard_tunnel *tunnel,
+                                              uint32_t *low,
+                                              uint32_t *high);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

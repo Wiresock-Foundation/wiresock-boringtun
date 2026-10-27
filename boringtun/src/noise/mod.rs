@@ -64,6 +64,7 @@ use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::inbound::Inbound;
 use crate::noise::rate_limiter::{RateLimiter, Source};
+pub use crate::noise::timers::normalize_persistent_keepalive_range;
 use crate::noise::timers::{TimerName, Timers};
 use crate::x25519;
 
@@ -933,9 +934,30 @@ impl Tunn {
     /// Update the persistent-keepalive interval.
     ///
     /// Purely a timer change, so live sessions are kept: the peer's keys are
-    /// unaffected and re-handshaking would be gratuitous.
+    /// unaffected and re-handshaking would be gratuitous. A fixed interval
+    /// replaces any range set by [`Self::set_persistent_keepalive_range`].
     pub fn set_persistent_keepalive(&mut self, keepalive: Option<u16>) {
         self.timers.set_persistent_keepalive(keepalive);
+    }
+
+    /// Update the persistent keepalive to a randomized interval: each time
+    /// authenticated traffic rearms it, the next one is due a uniform draw
+    /// from `low..=high` seconds later, as amneziawg-go re-picks its range.
+    /// The bounds are normalized by [`normalize_persistent_keepalive_range`]:
+    /// `(0, 0)` disables it, a bare `n` is `(n, n)`.
+    ///
+    /// Returns `false` and changes nothing for an inverted range. Like
+    /// [`Self::set_persistent_keepalive`], it keeps live sessions and queued
+    /// packets, owes a keepalive when it turns the timer on, and an identical
+    /// update changes nothing.
+    pub fn set_persistent_keepalive_range(&mut self, low: u32, high: u32) -> bool {
+        match normalize_persistent_keepalive_range(low, high) {
+            Some(range) => {
+                self.timers.set_persistent_keepalive_range(range);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The peer's optional pre-shared key.
@@ -6498,5 +6520,362 @@ mod tests {
         }
         assert!(renewals >= 1, "the zero window renews");
         assert_eq!(delivered, 120, "every data packet arrives");
+    }
+
+    /// The WireSock normalization table for a persistent-keepalive range.
+    #[test]
+    fn persistent_keepalive_ranges_normalize_by_the_wiresock_table() {
+        for (input, expected) in [
+            ((25, 25), Some((25, 25))),
+            ((25, 35), Some((25, 35))),
+            ((0, 0), Some((0, 0))),
+            ((0, 30), Some((1, 30))),
+            ((0, 1), Some((1, 1))),
+            ((70_000, 80_000), Some((65_535, 65_535))),
+            ((65_535, 70_000), Some((65_535, 65_535))),
+            ((65_534, u32::MAX), Some((65_534, 65_535))),
+            ((u32::MAX, u32::MAX), Some((65_535, 65_535))),
+            ((35, 25), None),
+            ((80_000, 70_000), None),
+        ] {
+            assert_eq!(
+                normalize_persistent_keepalive_range(input.0, input.1),
+                expected,
+                "{:?}",
+                input
+            );
+        }
+    }
+
+    /// The draw reaches both inclusive ends, rejects the biased tail rather
+    /// than folding it in with a modulo, and cannot overflow at the 65535
+    /// cap.
+    #[test]
+    fn persistent_keepalive_draws_are_inclusive_and_unbiased() {
+        struct Script(std::collections::VecDeque<u64>);
+        impl rand_core::RngCore for Script {
+            fn next_u32(&mut self) -> u32 {
+                self.next_u64() as u32
+            }
+            fn next_u64(&mut self) -> u64 {
+                self.0.pop_front().expect("script exhausted")
+            }
+            fn fill_bytes(&mut self, _: &mut [u8]) {
+                unreachable!()
+            }
+            fn try_fill_bytes(&mut self, _: &mut [u8]) -> Result<(), rand_core::Error> {
+                unreachable!()
+            }
+        }
+        let draw = |lo, hi, script: &[u64]| {
+            let mut rng = Script(script.iter().copied().collect());
+            let v = amnezia::random_usize_inclusive(lo, hi, &mut rng);
+            assert!(rng.0.is_empty(), "draws left over");
+            v
+        };
+        assert_eq!(draw(25, 35, &[0]), 25);
+        assert_eq!(draw(25, 35, &[10]), 35);
+        assert_eq!(draw(25, 35, &[11]), 25);
+        // The last full block ends at u64::MAX - u64::MAX % 11; above it a
+        // modulo would favour the low values, so it draws again.
+        let threshold = u64::MAX - (u64::MAX % 11);
+        assert_eq!(
+            draw(25, 35, &[threshold - 1]),
+            25 + ((threshold - 1) % 11) as usize
+        );
+        assert_eq!(draw(25, 35, &[threshold, u64::MAX, 7]), 32);
+        assert_eq!(draw(1, 65_535, &[0]), 1);
+        assert_eq!(draw(1, 65_535, &[65_534]), 65_535);
+        assert_eq!(draw(65_534, 65_535, &[1]), 65_535);
+    }
+
+    /// Seconds-resolution polling: tick `tun` once a second and return the
+    /// second at which it first emits a keepalive, failing on anything else
+    /// or if none comes within `limit` seconds.
+    #[cfg(feature = "mock-instant")]
+    fn seconds_to_keepalive(tun: &mut Tunn, limit: u64) -> u64 {
+        for second in 1..=limit {
+            advance(Duration::from_secs(1));
+            match poll_kind(tun) {
+                None => {}
+                Some("keepalive") => return second,
+                other => panic!("unexpected {:?} at {} s", other, second),
+            }
+        }
+        panic!("no keepalive within {} s", limit);
+    }
+
+    /// A `25-35` range waits a fresh draw after each rearm, and only then:
+    /// scripted draws of 35, 25 and an interior 30 each set the next
+    /// deadline exactly, and the polls in between draw nothing. A fixed-low
+    /// implementation (always 25) fails at the 35-second draw.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_ranged_persistent_keepalive_waits_each_rearms_draw() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        advance(Duration::from_secs(1));
+        assert_eq!(poll_kind(&mut my_tun), None);
+        my_tun
+            .timers
+            .persistent_keepalive_script
+            .extend([31, 35, 25, 30, 27]);
+        assert!(my_tun.set_persistent_keepalive_range(25, 35));
+        assert_eq!(my_tun.persistent_keepalive_range(), Some((25, 35)));
+        assert_eq!(
+            my_tun.persistent_keepalive(),
+            Some(25),
+            "the low bound, not a draw"
+        );
+        assert_eq!(
+            my_tun.timers.persistent_keepalive_draws, 1,
+            "the update draws once"
+        );
+        // Turning it on owes one at once; sending it rearms with the next draw.
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+        assert_eq!(my_tun.timers.persistent_keepalive_draws, 2);
+        assert_eq!(
+            my_tun.persistent_keepalive_interval(),
+            Duration::from_secs(35)
+        );
+
+        for expected in [35, 25, 30] {
+            let draws = my_tun.timers.persistent_keepalive_draws;
+            assert_eq!(seconds_to_keepalive(&mut my_tun, 40), expected);
+            assert_eq!(
+                my_tun.timers.persistent_keepalive_draws,
+                draws + 1,
+                "polling draws nothing; the sent keepalive draws once"
+            );
+            // The getters still report the configuration.
+            assert_eq!(my_tun.persistent_keepalive_range(), Some((25, 35)));
+        }
+    }
+
+    /// Both directions of authenticated traffic rearm with a draw: a received
+    /// keepalive, then sent data. A datagram that fails authentication draws
+    /// nothing and moves nothing.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn either_direction_rearms_a_ranged_keepalive_with_a_draw() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        my_tun
+            .timers
+            .persistent_keepalive_script
+            .extend([30, 30, 33, 28]);
+        assert!(my_tun.set_persistent_keepalive_range(25, 35));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+
+        // Received: their keepalive at +10 s draws 33.
+        advance(Duration::from_secs(10));
+        deliver(&mut their_tun, &mut my_tun, &[]);
+        assert_eq!(my_tun.timers.persistent_keepalive_draws, 3);
+        assert_eq!(
+            my_tun.persistent_keepalive_interval(),
+            Duration::from_secs(33)
+        );
+
+        // A forged datagram does not rearm or draw.
+        advance(Duration::from_secs(10));
+        let mut forged = unwrap_network_packet(their_tun.encapsulate(&[], &mut [0u8; 2048]));
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        let mut dst = vec![0u8; 2048];
+        assert!(matches!(
+            my_tun.decapsulate(None, &forged, &mut dst),
+            TunnResult::Err(_)
+        ));
+        assert_eq!(my_tun.timers.persistent_keepalive_draws, 3);
+        assert_eq!(
+            seconds_to_keepalive(&mut my_tun, 40),
+            23,
+            "33 s after the receive"
+        );
+
+        // Sent: data draws (the keepalive above drew too). Polled first, so
+        // the send is stamped with the current time.
+        let draws = my_tun.timers.persistent_keepalive_draws;
+        my_tun.timers.persistent_keepalive_script.clear();
+        my_tun.timers.persistent_keepalive_script.extend([28, 31]);
+        advance(Duration::from_secs(5));
+        assert_eq!(poll_kind(&mut my_tun), None);
+        let data = unwrap_network_packet(my_tun.encapsulate(&create_ipv4_udp_packet(), &mut dst));
+        assert_eq!(my_tun.timers.persistent_keepalive_draws, draws + 1);
+        assert_eq!(
+            my_tun.persistent_keepalive_interval(),
+            Duration::from_secs(28)
+        );
+        // Answered a second later, which rearms it again with the next draw.
+        // Their side polls first too, so its receive is stamped now.
+        assert_eq!(poll_kind(&mut their_tun), None);
+        let (_, to_their, failed) = settle(&mut my_tun, &mut their_tun, data);
+        assert_eq!((to_their.len(), failed), (1, 0));
+        advance(Duration::from_secs(1));
+        deliver(&mut their_tun, &mut my_tun, &[]);
+        assert_eq!(my_tun.timers.persistent_keepalive_draws, draws + 2);
+        assert_eq!(seconds_to_keepalive(&mut my_tun, 40), 31);
+    }
+
+    /// Disabled, scalar and range configurations in every transition: the
+    /// first enablement owes a keepalive, a scalar replaces a range (and draws
+    /// nothing), an identical update neither draws nor moves the deadline,
+    /// off sends nothing, and an inverted range is refused with the whole
+    /// prior timer state intact. Sessions and queued packets survive all of
+    /// it.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn persistent_keepalive_range_transitions_keep_state() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        let session = my_tun.current;
+        assert!(my_tun.sessions[session % N_SESSIONS].is_some());
+
+        // Scalar on, then a range: the scalar was the activation.
+        my_tun.set_persistent_keepalive(Some(25));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+        my_tun.timers.persistent_keepalive_script.extend([34, 34]);
+        assert!(my_tun.set_persistent_keepalive_range(25, 35));
+        assert_eq!(
+            poll_kind(&mut my_tun),
+            None,
+            "a change while on owes nothing"
+        );
+        assert_eq!(
+            my_tun.persistent_keepalive_interval(),
+            Duration::from_secs(34)
+        );
+
+        // An identical update: no draw, deadline unmoved.
+        advance(Duration::from_secs(20));
+        assert_eq!(poll_kind(&mut my_tun), None);
+        let draws = my_tun.timers.persistent_keepalive_draws;
+        assert!(my_tun.set_persistent_keepalive_range(25, 35));
+        assert_eq!(my_tun.timers.persistent_keepalive_draws, draws);
+        assert_eq!(
+            seconds_to_keepalive(&mut my_tun, 20),
+            14,
+            "34 s after the last send"
+        );
+
+        // An inverted range is refused and changes nothing.
+        let before = (
+            my_tun.persistent_keepalive_range(),
+            my_tun.persistent_keepalive_interval(),
+            my_tun.timers.persistent_keepalive_state(),
+            my_tun.timers.persistent_keepalive_draws,
+        );
+        assert!(!my_tun.set_persistent_keepalive_range(35, 25));
+        assert!(!my_tun.set_persistent_keepalive_range(80_000, 70_000));
+        let after = (
+            my_tun.persistent_keepalive_range(),
+            my_tun.persistent_keepalive_interval(),
+            my_tun.timers.persistent_keepalive_state(),
+            my_tun.timers.persistent_keepalive_draws,
+        );
+        assert_eq!(before, after);
+
+        // A scalar replaces the range, drawing nothing.
+        let draws = my_tun.timers.persistent_keepalive_draws;
+        my_tun.set_persistent_keepalive(Some(30));
+        assert_eq!(my_tun.persistent_keepalive_range(), Some((30, 30)));
+        assert_eq!(my_tun.timers.persistent_keepalive_draws, draws);
+        assert_eq!(seconds_to_keepalive(&mut my_tun, 40), 30);
+        assert_eq!(
+            my_tun.timers.persistent_keepalive_draws, draws,
+            "a fixed interval"
+        );
+
+        // Off: nothing is sent, and the range getter says so.
+        assert!(my_tun.set_persistent_keepalive_range(0, 0));
+        assert_eq!(my_tun.persistent_keepalive_range(), None);
+        assert_eq!(my_tun.persistent_keepalive(), None);
+        for _ in 0..100 {
+            advance(Duration::from_secs(1));
+            assert_eq!(poll_kind(&mut my_tun), None);
+        }
+        // Back on as `0-30`: 1..=30, owed at once.
+        my_tun.timers.persistent_keepalive_script.extend([1, 1]);
+        assert!(my_tun.set_persistent_keepalive_range(0, 30));
+        assert_eq!(my_tun.persistent_keepalive_range(), Some((1, 30)));
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+        assert_eq!(seconds_to_keepalive(&mut my_tun, 5), 1);
+
+        assert_eq!(my_tun.current, session, "no rekey");
+        assert!(
+            my_tun.sessions[session % N_SESSIONS].is_some(),
+            "session kept"
+        );
+
+        // Queued packets survive a range update on a tunnel without a session.
+        let (mut fresh, _) = create_two_tuns();
+        let mut dst = vec![0u8; 2048];
+        unwrap_network_packet(fresh.encapsulate(&create_ipv4_udp_packet(), &mut dst));
+        let queued = fresh.packet_queue.len();
+        assert_eq!(queued, 1);
+        assert!(fresh.set_persistent_keepalive_range(25, 35));
+        assert!(!fresh.set_persistent_keepalive_range(9, 1));
+        assert_eq!(fresh.packet_queue.len(), queued);
+    }
+
+    /// The owed keepalive of a range turned on without a session starts the
+    /// handshake, as a scalar does; and a keepalive the budget refuses gives
+    /// back the draw it was due under, so the next tick with room sends it at
+    /// once rather than one interval later.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn a_ranged_keepalive_keeps_its_demand_through_refusals() {
+        let (mut fresh, _) = create_two_tuns();
+        assert!(fresh.set_persistent_keepalive_range(25, 35));
+        assert_eq!(poll_kind(&mut fresh), Some("initiation"));
+
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        my_tun
+            .timers
+            .persistent_keepalive_script
+            .extend([33, 29, 26]);
+        assert!(my_tun.set_persistent_keepalive_range(25, 35));
+        let tight = budget::OutputBudget {
+            transport: 1,
+            ..budget::OutputBudget::UNBOUNDED
+        };
+        let mut dst = vec![0u8; 2048];
+        let before = (
+            my_tun.timers.persistent_keepalive_state(),
+            my_tun.persistent_keepalive_interval(),
+        );
+        assert!(matches!(
+            my_tun.update_timers_with_budget(&mut dst, tight),
+            TunnResult::Err(WireGuardError::OutputBudgetExceeded)
+        ));
+        assert_eq!(
+            (
+                my_tun.timers.persistent_keepalive_state(),
+                my_tun.persistent_keepalive_interval()
+            ),
+            before,
+            "the refusal gives back what it took"
+        );
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"), "still owed");
+        assert_eq!(seconds_to_keepalive(&mut my_tun, 40), 29);
+
+        // A deadline refused later keeps its draw too, and is sent at the
+        // next tick with room.
+        for _ in 0..25 {
+            advance(Duration::from_secs(1));
+            assert_eq!(poll_kind(&mut my_tun), None);
+        }
+        advance(Duration::from_secs(1));
+        let draws = my_tun.timers.persistent_keepalive_draws;
+        let before = my_tun.timers.persistent_keepalive_state();
+        assert!(matches!(
+            my_tun.update_timers_with_budget(&mut dst, tight),
+            TunnResult::Err(WireGuardError::OutputBudgetExceeded)
+        ));
+        assert_eq!(
+            my_tun.persistent_keepalive_interval(),
+            Duration::from_secs(26)
+        );
+        assert_eq!(my_tun.timers.persistent_keepalive_state(), before);
+        assert_eq!(my_tun.timers.persistent_keepalive_draws, draws);
+        assert_eq!(poll_kind(&mut my_tun), Some("keepalive"));
+        assert_eq!(my_tun.timers.persistent_keepalive_draws, draws + 1);
     }
 }

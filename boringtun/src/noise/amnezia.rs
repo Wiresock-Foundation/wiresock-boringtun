@@ -2701,7 +2701,7 @@ impl<R: RngCore> RngCore for OneWord<'_, R> {
     }
 }
 
-fn random_usize_inclusive(min: usize, max: usize, rng: &mut impl RngCore) -> usize {
+pub(crate) fn random_usize_inclusive(min: usize, max: usize, rng: &mut impl RngCore) -> usize {
     if min >= max {
         return min;
     }

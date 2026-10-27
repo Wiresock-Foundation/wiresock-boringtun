@@ -87,7 +87,23 @@ pub struct Timers {
     /// it). Measured from the send, not from the last receive, or the first
     /// packet after a long quiet spell would start a handshake at once.
     pub(super) want_handshake: Option<Duration>,
-    persistent_keepalive: usize,
+    /// The configured persistent-keepalive interval as normalized inclusive
+    /// bounds in seconds ([`normalize_persistent_keepalive_range`]); `(0, 0)`
+    /// is off. A fixed interval is `(n, n)`.
+    persistent_keepalive: (u16, u16),
+    /// The interval the armed persistent keepalive waits: one uniform draw
+    /// from `persistent_keepalive`, made when authenticated traffic rearms it
+    /// (upstream `timersAnyAuthenticatedPacketTraversal` re-picks the range
+    /// there) and kept while ticks poll -- a draw per poll would postpone the
+    /// deadline and bias it towards the low end. A fixed interval never
+    /// touches the RNG.
+    persistent_keepalive_current: Duration,
+    /// Scripted persistent-keepalive draws and a count of draws, for the
+    /// tests that pin which interval each rearm armed.
+    #[cfg(test)]
+    pub(super) persistent_keepalive_script: std::collections::VecDeque<u16>,
+    #[cfg(test)]
+    pub(super) persistent_keepalive_draws: u32,
     /// A persistent keepalive is owed at the next poll: set when the interval
     /// is configured at construction or enabled later, so the peer is reached
     /// at once rather than one interval later -- as Linux and wireguard-go do
@@ -142,7 +158,17 @@ impl Timers {
             session_timers: Default::default(),
             want_keepalive: None,
             want_handshake: None,
-            persistent_keepalive: usize::from(persistent_keepalive.unwrap_or(0)),
+            persistent_keepalive: (
+                persistent_keepalive.unwrap_or(0),
+                persistent_keepalive.unwrap_or(0),
+            ),
+            persistent_keepalive_current: Duration::from_secs(u64::from(
+                persistent_keepalive.unwrap_or(0),
+            )),
+            #[cfg(test)]
+            persistent_keepalive_script: Default::default(),
+            #[cfg(test)]
+            persistent_keepalive_draws: 0,
             persistent_keepalive_due: persistent_keepalive.unwrap_or(0) > 0,
             jitter_rng: ChaCha8Rng::seed_from_u64(OsRng.next_u64()),
             should_reset_rr: reset_rr,
@@ -182,6 +208,47 @@ impl Timers {
         self.want_keepalive = None;
     }
 
+    /// Rearm the persistent keepalive's interval: a fresh uniform draw from
+    /// a configured range, from the timers' own generator so the handshake
+    /// RNG's Jc and padding draws stay where they were; a fixed interval or
+    /// off draws nothing.
+    fn rearm_persistent_keepalive(&mut self) {
+        let (lo, hi) = self.persistent_keepalive;
+        if lo == hi {
+            self.persistent_keepalive_current = Duration::from_secs(u64::from(lo));
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.persistent_keepalive_draws += 1;
+            if let Some(scripted) = self.persistent_keepalive_script.pop_front() {
+                assert!(
+                    (lo..=hi).contains(&scripted),
+                    "scripted draw outside the range"
+                );
+                self.persistent_keepalive_current = Duration::from_secs(u64::from(scripted));
+                return;
+            }
+        }
+        let secs = super::amnezia::random_usize_inclusive(
+            usize::from(lo),
+            usize::from(hi),
+            &mut self.jitter_rng,
+        );
+        self.persistent_keepalive_current = Duration::from_secs(secs as u64);
+    }
+
+    /// Whether a persistent keepalive is owed, and the stamp its deadline
+    /// runs from. For the tests that check a refusal gives them back.
+    #[cfg(test)]
+    pub(crate) fn persistent_keepalive_state(&self) -> (bool, Duration) {
+        (self.persistent_keepalive_due, self[TimePersistentKeepalive])
+    }
+
+    fn persistent_keepalive_on(&self) -> bool {
+        self.persistent_keepalive.1 > 0
+    }
+
     /// One draw of handshake jitter; see [`REKEY_TIMEOUT_JITTER_MAX_MS`].
     pub(super) fn jitter(&mut self) -> Duration {
         let ms = self.jitter_rng.next_u32() % REKEY_TIMEOUT_JITTER_MAX_MS;
@@ -214,10 +281,12 @@ impl Tunn {
             TimeLastPacketReceived => {
                 self.timers.want_handshake = None;
                 self.timers[TimePersistentKeepalive] = time;
+                self.timers.rearm_persistent_keepalive();
             }
             TimeLastPacketSent => {
                 self.timers.want_keepalive = None;
                 self.timers[TimePersistentKeepalive] = time;
+                self.timers.rearm_persistent_keepalive();
                 // Any authenticated send reaches the peer as the owed
                 // keepalive would -- an initiation started by hand or by a Jc
                 // burst included -- so it is no longer owed.
@@ -456,6 +525,7 @@ impl Tunn {
             self.timers.persistent_keepalive_due,
             self.timers[TimePersistentKeepalive],
             self.timers.want_keepalive,
+            self.timers.persistent_keepalive_current,
         );
 
         let time = Instant::now();
@@ -498,7 +568,7 @@ impl Tunn {
             // does: with no session it is queued behind a fresh initiation
             // (`format_handshake_initiation` on an Expired handshake). An
             // interval that was already on owes nothing and stays expired.
-            if self.timers.persistent_keepalive == 0 || !self.timers.persistent_keepalive_due {
+            if !self.timers.persistent_keepalive_on() || !self.timers.persistent_keepalive_due {
                 return TunnResult::Err(WireGuardError::ConnectionExpired);
             }
             tracing::debug!("KEEPALIVE(PERSISTENT_KEEPALIVE)");
@@ -511,7 +581,7 @@ impl Tunn {
         let session_established = self.timers[TimeSessionEstablished];
         let data_packet_received = self.timers[TimeLastDataPacketReceived];
         let data_packet_sent = self.timers[TimeLastDataPacketSent];
-        let persistent_keepalive = self.timers.persistent_keepalive;
+        let persistent_keepalive_on = self.timers.persistent_keepalive_on();
 
         {
             // Clear cookie after COOKIE_EXPIRATION_TIME
@@ -625,10 +695,11 @@ impl Tunn {
 
                     // Persistent KEEPALIVE: one interval after the last
                     // authenticated packet either way, or at once when owed.
-                    if persistent_keepalive > 0
+                    // The interval was drawn when that packet rearmed it.
+                    if persistent_keepalive_on
                         && (self.timers.persistent_keepalive_due
                             || now.saturating_sub(self.timers[TimePersistentKeepalive])
-                                >= Duration::from_secs(persistent_keepalive as _))
+                                >= self.timers.persistent_keepalive_current)
                     {
                         tracing::debug!("KEEPALIVE(PERSISTENT_KEEPALIVE)");
                         self.timers.persistent_keepalive_due = false;
@@ -679,7 +750,7 @@ impl Tunn {
     fn send_keepalive<'a>(
         &mut self,
         dst: &'a mut [u8],
-        rollback: (bool, Duration, Option<Duration>),
+        rollback: (bool, Duration, Option<Duration>, Duration),
         budget: OutputBudget,
     ) -> TunnResult<'a> {
         let result = self.encapsulate_with_budget(&[], dst, budget);
@@ -689,10 +760,11 @@ impl Tunn {
                 WireGuardError::DestinationBufferTooSmall | WireGuardError::OutputBudgetExceeded
             )
         ) {
-            let (due, persistent, passive) = rollback;
+            let (due, persistent, passive, interval) = rollback;
             self.timers.persistent_keepalive_due = due;
             self.timers[TimePersistentKeepalive] = persistent;
             self.timers.want_keepalive = passive;
+            self.timers.persistent_keepalive_current = interval;
         }
         if matches!(result, TunnResult::Err(_)) {
             self.meta.note(event::TICK_DEMAND_REFUSED);
@@ -740,15 +812,59 @@ impl Tunn {
         }
     }
 
+    /// The persistent-keepalive interval in seconds, `None` when off. For a
+    /// range, its normalized low bound -- the configuration, never the last
+    /// draw; [`Self::persistent_keepalive_range`] reports both bounds.
     pub fn persistent_keepalive(&self) -> Option<u16> {
-        let keepalive = self.timers.persistent_keepalive;
+        self.persistent_keepalive_range().map(|(lo, _)| lo)
+    }
 
-        if keepalive > 0 {
-            Some(keepalive as u16)
+    /// The configured persistent-keepalive bounds in seconds, normalized as
+    /// [`normalize_persistent_keepalive_range`] does; `(n, n)` for a fixed
+    /// interval and `None` when off. Never the last random draw.
+    pub fn persistent_keepalive_range(&self) -> Option<(u16, u16)> {
+        if self.timers.persistent_keepalive_on() {
+            Some(self.timers.persistent_keepalive)
         } else {
             None
         }
     }
+
+    /// The interval the armed persistent keepalive waits. For the tests that
+    /// pin which draw each rearm made.
+    #[cfg(test)]
+    pub(crate) fn persistent_keepalive_interval(&self) -> Duration {
+        self.timers.persistent_keepalive_current
+    }
+}
+
+/// Normalize a persistent-keepalive interval given as inclusive bounds in
+/// seconds -- a bare `n` is `(n, n)` -- or `None` for an inverted range.
+///
+/// WireSock's compatibility policy, not a claim about amneziawg-go's edge
+/// behaviour: both bounds saturate at 65535 seconds (18 hours, past any NAT
+/// mapping, and what the interval is stored as), and a range whose original
+/// bounds differ draws at least 1 second, so `0-30` never reads as off.
+/// `(0, 0)` is off. The order is checked before saturating, so `80000-70000`
+/// is refused rather than becoming a fixed 65535.
+///
+/// | input         | normalized       |
+/// |---------------|------------------|
+/// | `25`, `25-25` | `(25, 25)`       |
+/// | `25-35`       | `(25, 35)`       |
+/// | `0`, `0-0`    | `(0, 0)`, off    |
+/// | `0-30`        | `(1, 30)`        |
+/// | `70000-80000` | `(65535, 65535)` |
+pub fn normalize_persistent_keepalive_range(low: u32, high: u32) -> Option<(u16, u16)> {
+    if low > high {
+        return None;
+    }
+    let cap = |v: u32| v.min(u32::from(u16::MAX)) as u16;
+    let (lo, hi) = (cap(low), cap(high));
+    if low == high {
+        return Some((lo, lo));
+    }
+    Some((lo.max(1), hi))
 }
 
 impl Timers {
@@ -759,13 +875,27 @@ impl Timers {
     /// one when an interval is set where there was none; changing an interval
     /// that was already on does not.
     pub(super) fn set_persistent_keepalive(&mut self, keepalive: Option<u16>) {
-        let interval = usize::from(keepalive.unwrap_or(0));
-        if self.persistent_keepalive == 0 && interval > 0 {
+        let interval = keepalive.unwrap_or(0);
+        self.set_persistent_keepalive_range((interval, interval));
+    }
+
+    /// Replace the persistent-keepalive bounds, already normalized; `(0, 0)`
+    /// disables it. Owes a keepalive at once when turning it on, as
+    /// [`Self::set_persistent_keepalive`]. A changed configuration takes
+    /// effect for the armed deadline at once -- a fixed interval as itself, a
+    /// range by a fresh draw -- and an identical one changes nothing, so a
+    /// periodic reload neither redraws nor postpones the deadline.
+    pub(super) fn set_persistent_keepalive_range(&mut self, range: (u16, u16)) {
+        if range == self.persistent_keepalive {
+            return;
+        }
+        let was_on = self.persistent_keepalive_on();
+        self.persistent_keepalive = range;
+        if !self.persistent_keepalive_on() {
+            self.persistent_keepalive_due = false;
+        } else if !was_on {
             self.persistent_keepalive_due = true;
         }
-        if interval == 0 {
-            self.persistent_keepalive_due = false;
-        }
-        self.persistent_keepalive = interval;
+        self.rearm_persistent_keepalive();
     }
 }
