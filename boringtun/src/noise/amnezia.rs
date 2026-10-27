@@ -525,6 +525,30 @@ impl AmneziaPreHandshakeJunk {
     }
 }
 
+/// The timer-ordering warning of one accepted configuration
+/// ([`AmneziaConfig::timer_ordering_warning`]): the text only -- field names
+/// and bounds, no key material and no reference to a device, peer or tunnel
+/// -- so the door that prepared it can carry it past its locks and emit it
+/// when the acceptance is complete.
+#[cfg(any(feature = "device", feature = "ffi-bindings"))]
+#[must_use = "a prepared timer-ordering warning is emitted once its configuration is accepted"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TimerOrderingWarning(String);
+
+#[cfg(any(feature = "device", feature = "ffi-bindings"))]
+impl TimerOrderingWarning {
+    /// Log the warning at WARN. Call with no lock held that a logging
+    /// subscriber could need.
+    pub(crate) fn emit(self) {
+        tracing::warn!(
+            message = "AmneziaWG timer ranges are accepted as configured, but their \
+                       order can expire a session before it is renewed; traffic may \
+                       stall until a new handshake completes",
+            detail = %self.0
+        );
+    }
+}
+
 /// AmneziaWG 3.0 tunable timers, each an inclusive `(lo, hi)` range --
 /// seconds, except `max_handshake_attempts`, which counts retries. `(0, 0)` is
 /// the unset sentinel, matching amneziawg-go's `UintRange`: the classic
@@ -1526,18 +1550,23 @@ impl AmneziaConfig {
         }
     }
 
-    /// Log [`Self::timer_ordering_complaint`] at WARN, if there is one. Called
-    /// by the doors that accept a configuration -- UAPI `set=1` and the C
-    /// struct constructor -- once per accepted configuration, never per tick
-    /// or packet, and never through `last_tunnel_error()`.
+    /// The warning [`Self::timer_ordering_complaint`] words, prepared as owned
+    /// text so the door that accepts this configuration can log it once the
+    /// acceptance is complete: UAPI `set=1` after the device write lock and its
+    /// writer intent are released, the C struct constructor only for a tunnel
+    /// it actually built. Never per tick or packet, and never through
+    /// `last_tunnel_error()`.
+    #[cfg(any(feature = "device", feature = "ffi-bindings"))]
+    pub(crate) fn timer_ordering_warning(&self) -> Option<TimerOrderingWarning> {
+        self.timer_ordering_complaint().map(TimerOrderingWarning)
+    }
+
+    /// Log [`Self::timer_ordering_warning`] at once, if there is one: the UAPI
+    /// door's placement, which still runs under the device write lock.
+    #[cfg(feature = "device")]
     pub(crate) fn warn_timer_ordering(&self) {
-        if let Some(complaint) = self.timer_ordering_complaint() {
-            tracing::warn!(
-                message = "AmneziaWG timer ranges are accepted as configured, but their \
-                           order can expire a session before it is renewed; traffic may \
-                           stall until a new handshake completes",
-                detail = %complaint
-            );
+        if let Some(warning) = self.timer_ordering_warning() {
+            warning.emit();
         }
     }
 

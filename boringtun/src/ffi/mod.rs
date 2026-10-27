@@ -1953,12 +1953,15 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
     // WARN, never through `last_tunnel_error()`.
     amnezia.warn_header_protection_nonce();
 
-    // Timer ranges whose order can expire a session before its renewal: built
-    // exactly as configured, with a WARN -- never through `last_tunnel_error()`,
-    // which `clear_last_error` above has emptied for this successful build.
-    amnezia.warn_timer_ordering();
+    // Timer ranges whose order can expire a session before its renewal are
+    // built exactly as configured, with a WARN -- but only for a tunnel that
+    // is actually built: the keys are validated below, and a NULL return must
+    // not have been announced as accepted. Prepared here because `amnezia`
+    // moves into the constructor; logged after it returns, with no tunnel
+    // lock held, and never through `last_tunnel_error()`.
+    let timer_warning = amnezia.timer_ordering_warning();
 
-    new_tunnel_with_amnezia_config(
+    let tunnel = new_tunnel_with_amnezia_config(
         static_private,
         server_static_public,
         preshared_key,
@@ -1973,7 +1976,13 @@ pub unsafe extern "C" fn new_tunnel_with_awg_params(
         h4.lo,
         h4.hi,
         amnezia,
-    )
+    );
+    if !tunnel.is_null() {
+        if let Some(warning) = timer_warning {
+            warning.emit();
+        }
+    }
+    tunnel
 }
 
 /// Drops the Tunn object
@@ -5978,5 +5987,157 @@ mod tests {
             assert_eq!((lo, hi), expected);
             unsafe { tunnel_free(tunnel) };
         }
+    }
+
+    /// WRS-225 review finding 2. The timer acceptance warning is logged only
+    /// for a tunnel `new_tunnel_with_awg_params` actually builds. With the
+    /// reproducer's unfavourable timers, every refused key -- NULL or
+    /// malformed private and public keys, an invalid or wrong-length preshared
+    /// key -- returns NULL with the existing key error and no timer warning
+    /// (the parent logged one before validating the keys); so does a refused
+    /// AWG configuration. In the same capture scope a valid build logs exactly
+    /// one and returns a handle that initiates a handshake, and coherent timers
+    /// log none, so a
+    /// count of zero for the refusals is not an empty capture.
+    #[test]
+    fn refused_constructors_emit_no_timer_acceptance_warning() {
+        let key = CString::new("QOGr3GnKZlfhAQrJ2ZQaBRfhVAqYrHUpEE1QBLjHtF4=").unwrap();
+        let malformed = CString::new("not-a-key").unwrap();
+        let short = CString::new("AAAA").unwrap();
+        let build = |private: *const c_char,
+                     public: *const c_char,
+                     preshared: *const c_char,
+                     p: &wireguard_awg_params| unsafe {
+            new_tunnel_with_awg_params(private, public, preshared, 0, 1, p, ptr::null())
+        };
+        let refused_awg = wireguard_awg_params {
+            reject_after_time: wireguard_awg_range { lo: 127, hi: 97 },
+            ..wrs225_reproducer()
+        };
+        let coherent = wireguard_awg_params {
+            reject_after_time: wireguard_awg_range { lo: 149, hi: 180 },
+            ..wrs225_reproducer()
+        };
+        let repro = wrs225_reproducer();
+        let refusals: [(
+            &str,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            &wireguard_awg_params,
+            &str,
+        ); 7] = [
+            (
+                "NULL private key",
+                ptr::null(),
+                key.as_ptr(),
+                ptr::null(),
+                &repro,
+                "Missing static private key",
+            ),
+            (
+                "malformed private key",
+                malformed.as_ptr(),
+                key.as_ptr(),
+                ptr::null(),
+                &repro,
+                "Invalid static private key",
+            ),
+            (
+                "NULL public key",
+                key.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                &repro,
+                "Missing server static public key",
+            ),
+            (
+                "malformed public key",
+                key.as_ptr(),
+                malformed.as_ptr(),
+                ptr::null(),
+                &repro,
+                "Invalid server static public key",
+            ),
+            (
+                "malformed preshared key",
+                key.as_ptr(),
+                key.as_ptr(),
+                malformed.as_ptr(),
+                &repro,
+                "Invalid preshared key",
+            ),
+            (
+                "short preshared key",
+                key.as_ptr(),
+                key.as_ptr(),
+                short.as_ptr(),
+                &repro,
+                "Invalid preshared key",
+            ),
+            (
+                "transposed timer range",
+                key.as_ptr(),
+                key.as_ptr(),
+                ptr::null(),
+                &refused_awg,
+                "reject_after_time",
+            ),
+        ];
+
+        let mut errors = Vec::new();
+        let mut initiated = None;
+        let captured = capture_warnings(
+            || {
+                errors.clear();
+                for (name, private, public, preshared, p, _) in refusals.iter() {
+                    let tunnel = build(*private, *public, *preshared, p);
+                    assert!(tunnel.is_null(), "{} built a tunnel", name);
+                    errors.push(last_error_string());
+                }
+                let tunnel = build(key.as_ptr(), key.as_ptr(), ptr::null(), &repro);
+                assert!(!tunnel.is_null(), "{}", last_error_string());
+                assert!(
+                    last_tunnel_error().is_null(),
+                    "a successful build clears the slot"
+                );
+                let mut dst = vec![0u8; 2048];
+                initiated = Some(
+                    unsafe {
+                        wireguard_force_handshake(tunnel, dst.as_mut_ptr(), dst.len() as u32)
+                    }
+                    .op,
+                );
+                unsafe { tunnel_free(tunnel) };
+                let control = build(key.as_ptr(), key.as_ptr(), ptr::null(), &coherent);
+                assert!(!control.is_null(), "{}", last_error_string());
+                unsafe { tunnel_free(control) };
+            },
+            |c| c.iter().any(|(m, _)| m.contains(TIMER_ORDERING_WARNING)),
+        );
+
+        for ((name, _, _, _, _, expected), error) in refusals.iter().zip(&errors) {
+            assert!(error.contains(expected), "{}: {}", name, error);
+        }
+        assert!(
+            matches!(initiated, Some(result_type::WRITE_TO_NETWORK)),
+            "the built handle is usable: it initiates a handshake"
+        );
+        let warnings: Vec<&String> = captured
+            .iter()
+            .filter(|(m, _)| m.contains(TIMER_ORDERING_WARNING))
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "only the successful unfavourable build warns: {:?}",
+            captured
+        );
+        assert!(
+            warnings[0].contains("97s") && warnings[0].contains("149s"),
+            "{}",
+            warnings[0]
+        );
     }
 }
