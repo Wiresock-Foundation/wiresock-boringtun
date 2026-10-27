@@ -1,4 +1,4 @@
-// Copyright (c) 2026 WireSock. All rights reserved.
+// Copyright (c) 2026 Vadim Smirnov (doing business as WireSock). All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Per-call output budgets of the C `wireguard_*_ex` entry points

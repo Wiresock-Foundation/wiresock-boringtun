@@ -1,0 +1,128 @@
+{
+  "source": "1cee1afadd6be4251d6a19273b1882090bd2038e",
+  "build_run": 40398953473,
+  "build_attempt": 1,
+  "publisher_run": 40401950322,
+  "publisher_attempt": 1,
+  "attestation_id": 60103716,
+  "ci_verification_job": 121850244631,
+  "cryptographic_verification": "performed by checksum-pinned gh2.100.0 in the successful installed CI job",
+  "local_check": "artifact digests, archive contents and shared producer/consumer policy rechecked against unchanged raw gh stdout; no signing or cryptographic rerun",
+  "shared_policy_sha256": "5a4cd4310dc6bdd6ab7ca3a601e4405ca7dd52aa75afe4e3051ff3b84deedecf",
+  "artifacts": {
+    "prepared.zip": {
+      "id": 12688842832,
+      "sha256": "8f3472e2a46beb602652b9fffb59889ddae15581655c14850305cd5938fc304e",
+      "size": 4045664
+    },
+    "verification.zip": {
+      "id": 12689855439,
+      "sha256": "84bee65f190ab9d3a1b6ca34cd12c280fcf76c2603773d38d5dbc44ce6b040bd",
+      "size": 55310
+    }
+  },
+  "subjects": [
+    {
+      "subject": "boringtun-cli-0.7.1-g1cee1afadd6b-macos-aarch64.tar.gz",
+      "sha256": "3ef6ab87c5061f895227633af5d363336cc9d948970d5225cadfce9a10270ce9",
+      "verification_json_sha256": "5c64aae36e1281173993c11b12e4115f714225c3be83e2dad27cc46afc04adb0",
+      "binding": {
+        "invocation": "https://github.com/Wiresock-Foundation/wiresock-boringtun/actions/runs/40401950322/attempts/1",
+        "subjects": {
+          "RELEASE.json": "9079626c8f302c3f3a5220cb2b36ea995f0eb6907f150d7b125c4baf5149fa9d",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-aarch64-musl.tar.gz": "9cc130be24343bd32ce9f086ed981edee759b39514fcfe559469a1b06db38e02",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-armv7-musleabihf.tar.gz": "872b472c54b31c42894163346c6f0202bcbb58658617132d3f0f65e94743de95",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-x86_64-musl.tar.gz": "1385a9a2fe0bcec075878f8490d3de9d22f5a8813c0db06e238f3a0867a84f77",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-macos-aarch64.tar.gz": "3ef6ab87c5061f895227633af5d363336cc9d948970d5225cadfce9a10270ce9",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-macos-x86_64.tar.gz": "de8d1e22f871ac18a37160c64ff421665b30a588a9f9eaaaf82f6996e2be8db4"
+        },
+        "recipe_commit": "1cee1afadd6be4251d6a19273b1882090bd2038e"
+      }
+    },
+    {
+      "subject": "boringtun-cli-0.7.1-g1cee1afadd6b-linux-aarch64-musl.tar.gz",
+      "sha256": "9cc130be24343bd32ce9f086ed981edee759b39514fcfe559469a1b06db38e02",
+      "verification_json_sha256": "5c64aae36e1281173993c11b12e4115f714225c3be83e2dad27cc46afc04adb0",
+      "binding": {
+        "invocation": "https://github.com/Wiresock-Foundation/wiresock-boringtun/actions/runs/40401950322/attempts/1",
+        "subjects": {
+          "RELEASE.json": "9079626c8f302c3f3a5220cb2b36ea995f0eb6907f150d7b125c4baf5149fa9d",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-aarch64-musl.tar.gz": "9cc130be24343bd32ce9f086ed981edee759b39514fcfe559469a1b06db38e02",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-armv7-musleabihf.tar.gz": "872b472c54b31c42894163346c6f0202bcbb58658617132d3f0f65e94743de95",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-x86_64-musl.tar.gz": "1385a9a2fe0bcec075878f8490d3de9d22f5a8813c0db06e238f3a0867a84f77",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-macos-aarch64.tar.gz": "3ef6ab87c5061f895227633af5d363336cc9d948970d5225cadfce9a10270ce9",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-macos-x86_64.tar.gz": "de8d1e22f871ac18a37160c64ff421665b30a588a9f9eaaaf82f6996e2be8db4"
+        },
+        "recipe_commit": "1cee1afadd6be4251d6a19273b1882090bd2038e"
+      }
+    },
+    {
+      "subject": "boringtun-cli-0.7.1-g1cee1afadd6b-linux-armv7-musleabihf.tar.gz",
+      "sha256": "872b472c54b31c42894163346c6f0202bcbb58658617132d3f0f65e94743de95",
+      "verification_json_sha256": "5c64aae36e1281173993c11b12e4115f714225c3be83e2dad27cc46afc04adb0",
+      "binding": {
+        "invocation": "https://github.com/Wiresock-Foundation/wiresock-boringtun/actions/runs/40401950322/attempts/1",
+        "subjects": {
+          "RELEASE.json": "9079626c8f302c3f3a5220cb2b36ea995f0eb6907f150d7b125c4baf5149fa9d",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-aarch64-musl.tar.gz": "9cc130be24343bd32ce9f086ed981edee759b39514fcfe559469a1b06db38e02",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-armv7-musleabihf.tar.gz": "872b472c54b31c42894163346c6f0202bcbb58658617132d3f0f65e94743de95",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-x86_64-musl.tar.gz": "1385a9a2fe0bcec075878f8490d3de9d22f5a8813c0db06e238f3a0867a84f77",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-macos-aarch64.tar.gz": "3ef6ab87c5061f895227633af5d363336cc9d948970d5225cadfce9a10270ce9",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-macos-x86_64.tar.gz": "de8d1e22f871ac18a37160c64ff421665b30a588a9f9eaaaf82f6996e2be8db4"
+        },
+        "recipe_commit": "1cee1afadd6be4251d6a19273b1882090bd2038e"
+      }
+    },
+    {
+      "subject": "boringtun-cli-0.7.1-g1cee1afadd6b-macos-x86_64.tar.gz",
+      "sha256": "de8d1e22f871ac18a37160c64ff421665b30a588a9f9eaaaf82f6996e2be8db4",
+      "verification_json_sha256": "5c64aae36e1281173993c11b12e4115f714225c3be83e2dad27cc46afc04adb0",
+      "binding": {
+        "invocation": "https://github.com/Wiresock-Foundation/wiresock-boringtun/actions/runs/40401950322/attempts/1",
+        "subjects": {
+          "RELEASE.json": "9079626c8f302c3f3a5220cb2b36ea995f0eb6907f150d7b125c4baf5149fa9d",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-aarch64-musl.tar.gz": "9cc130be24343bd32ce9f086ed981edee759b39514fcfe559469a1b06db38e02",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-armv7-musleabihf.tar.gz": "872b472c54b31c42894163346c6f0202bcbb58658617132d3f0f65e94743de95",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-x86_64-musl.tar.gz": "1385a9a2fe0bcec075878f8490d3de9d22f5a8813c0db06e238f3a0867a84f77",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-macos-aarch64.tar.gz": "3ef6ab87c5061f895227633af5d363336cc9d948970d5225cadfce9a10270ce9",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-macos-x86_64.tar.gz": "de8d1e22f871ac18a37160c64ff421665b30a588a9f9eaaaf82f6996e2be8db4"
+        },
+        "recipe_commit": "1cee1afadd6be4251d6a19273b1882090bd2038e"
+      }
+    },
+    {
+      "subject": "boringtun-cli-0.7.1-g1cee1afadd6b-linux-x86_64-musl.tar.gz",
+      "sha256": "1385a9a2fe0bcec075878f8490d3de9d22f5a8813c0db06e238f3a0867a84f77",
+      "verification_json_sha256": "5c64aae36e1281173993c11b12e4115f714225c3be83e2dad27cc46afc04adb0",
+      "binding": {
+        "invocation": "https://github.com/Wiresock-Foundation/wiresock-boringtun/actions/runs/40401950322/attempts/1",
+        "subjects": {
+          "RELEASE.json": "9079626c8f302c3f3a5220cb2b36ea995f0eb6907f150d7b125c4baf5149fa9d",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-aarch64-musl.tar.gz": "9cc130be24343bd32ce9f086ed981edee759b39514fcfe559469a1b06db38e02",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-armv7-musleabihf.tar.gz": "872b472c54b31c42894163346c6f0202bcbb58658617132d3f0f65e94743de95",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-x86_64-musl.tar.gz": "1385a9a2fe0bcec075878f8490d3de9d22f5a8813c0db06e238f3a0867a84f77",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-macos-aarch64.tar.gz": "3ef6ab87c5061f895227633af5d363336cc9d948970d5225cadfce9a10270ce9",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-macos-x86_64.tar.gz": "de8d1e22f871ac18a37160c64ff421665b30a588a9f9eaaaf82f6996e2be8db4"
+        },
+        "recipe_commit": "1cee1afadd6be4251d6a19273b1882090bd2038e"
+      }
+    },
+    {
+      "subject": "RELEASE.json",
+      "sha256": "9079626c8f302c3f3a5220cb2b36ea995f0eb6907f150d7b125c4baf5149fa9d",
+      "verification_json_sha256": "5c64aae36e1281173993c11b12e4115f714225c3be83e2dad27cc46afc04adb0",
+      "binding": {
+        "invocation": "https://github.com/Wiresock-Foundation/wiresock-boringtun/actions/runs/40401950322/attempts/1",
+        "subjects": {
+          "RELEASE.json": "9079626c8f302c3f3a5220cb2b36ea995f0eb6907f150d7b125c4baf5149fa9d",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-aarch64-musl.tar.gz": "9cc130be24343bd32ce9f086ed981edee759b39514fcfe559469a1b06db38e02",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-armv7-musleabihf.tar.gz": "872b472c54b31c42894163346c6f0202bcbb58658617132d3f0f65e94743de95",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-linux-x86_64-musl.tar.gz": "1385a9a2fe0bcec075878f8490d3de9d22f5a8813c0db06e238f3a0867a84f77",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-macos-aarch64.tar.gz": "3ef6ab87c5061f895227633af5d363336cc9d948970d5225cadfce9a10270ce9",
+          "boringtun-cli-0.7.1-g1cee1afadd6b-macos-x86_64.tar.gz": "de8d1e22f871ac18a37160c64ff421665b30a588a9f9eaaaf82f6996e2be8db4"
+        },
+        "recipe_commit": "1cee1afadd6be4251d6a19273b1882090bd2038e"
+      }
+    }
+  ]
+}

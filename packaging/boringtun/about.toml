@@ -1,0 +1,35 @@
+# cargo-about configuration for THIRD-PARTY-LICENSES in the boringtun-cli
+# artifacts: the crates linked into the binary for all five reviewed targets.
+# deny.toml gates the same graph plus build dependencies; both must accept the
+# same licenses. Run by `scripts/boringtun-artifact.sh licenses`.
+accepted = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "armv7-unknown-linux-musleabihf", "x86_64-apple-darwin", "aarch64-apple-darwin"]
+ignore-dev-dependencies = true
+# Build scripts and their dependencies (cc, cfg_aliases, ...) run on the build
+# host and are not part of the binary, so they are not redistributed.
+ignore-build-dependencies = true
+# The script runs cargo-about with --frozen, so license texts come only from the
+# crate sources in the lockfile and from its bundled SPDX texts, never from the
+# network, and the output is deterministic for a given pin.
+
+# curve25519-dalek ships one LICENSE file with two BSD-3-Clause notices: its
+# authors' (isis agora lovecruft, Henry de Valence) and, for code derived from
+# Adam Langley's Go ed25519, The Go Authors'. cargo-about does not match that
+# combined file and would print the bare SPDX BSD-3-Clause text, which names no
+# copyright holder. This reproduces the file verbatim. The checksum pins it: a
+# crate version with a different LICENSE fails generation until it is reviewed.
+# required-notices lists the lines that must appear.
+[curve25519-dalek.clarify]
+license = "BSD-3-Clause"
+
+[[curve25519-dalek.clarify.files]]
+path = "LICENSE"
+license = "BSD-3-Clause"
+checksum = "cca0bd3c4fcdba74145ef9d49c62337e2c9fbf9368288f11d0547f1b0273219f"
