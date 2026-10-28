@@ -1188,8 +1188,8 @@ impl Device {
         // The replacements inherit the device's fwmark: `set_fwmark` marks
         // the listeners it finds, and these are about to be them. Marked
         // here, not after the commit, because it can fail (EPERM without
-        // CAP_NET_ADMIN), and failing here costs only the candidates. Before
-        // the clone only for clarity: SO_MARK belongs to the socket, which a
+        // sufficient SO_MARK permissions), and failure costs only the candidates.
+        // Before the clone only for clarity: SO_MARK belongs to the socket, which a
         // clone shares, so the registered descriptor carries it either way.
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         for listener in std::iter::once(&udp4).chain(udp6.as_ref()) {
@@ -1402,6 +1402,7 @@ impl Device {
     }
 
     /// Set SO_MARK on one of the device's sockets.
+    /// Linux requires CAP_NET_ADMIN, or CAP_NET_RAW since Linux 5.17.
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     fn apply_mark(&self, socket: &socket2::Socket, mark: u32) -> io::Result<()> {
         #[cfg(test)]
@@ -1444,7 +1445,7 @@ impl Device {
     }
 
     /// Let the next `allowed` SO_MARK writes through and fail the one after
-    /// with EPERM, once -- what `set_mark` returns without CAP_NET_ADMIN.
+    /// with EPERM, once -- what `set_mark` returns without SO_MARK permission.
     #[cfg(all(
         test,
         any(target_os = "android", target_os = "fuchsia", target_os = "linux")
@@ -2633,7 +2634,7 @@ mod upgrade_scope_tests {
                 libc::EINVAL,
                 "a `blackhole` route, or a scopeless IPv6 link-local",
             ),
-            (libc::EPERM, "SO_MARK without CAP_NET_ADMIN"),
+            (libc::EPERM, "SO_MARK without permission"),
             (libc::EADDRNOTAVAIL, "no usable local address"),
         ];
         for &(errno, why) in cases {
