@@ -113,9 +113,17 @@ The transport accepts at most 32 simultaneous socket clients, 1 MiB per request
 `EOVERFLOW`. Requests and response delivery each have an absolute five-second
 deadline, checked at 100 ms intervals; trickle traffic does not extend it. Accepted
 clients must also begin within that deadline. An inherited control fd may remain
-idle between transactions. Timeouts close the affected connection. Closing or
-failing the inherited control fd stops the device, as EOF does. Supervisors should
-reconnect or restart as appropriate and must check each `errno` response.
+idle indefinitely between transactions. A timeout closes an accepted socket
+client without stopping the device; that client can reconnect.
+
+An inherited `--uapi-fd` is the supervisor's lifecycle channel. EOF, a broken
+transport, an input or output deadline, or an oversized request (`E2BIG`) closes
+that channel and stops the entire device. A supervisor must restart the device
+with a fresh fd after these failures; the running device has no replacement-fd
+API. A complete request with an ordinary configuration error remains nonfatal,
+as does an oversized response whose `EOVERFLOW` reply is delivered within its
+deadline. Supervisors must check every `errno` response and account for the
+existing partial-apply behavior of complete `set=1` requests.
 
 Logging goes to `WG_LOG_FILE` at `WG_LOG_LEVEL`. Note that a daemonised process loses its log
 writer — use `--foreground` when you need output.

@@ -89,6 +89,14 @@ impl<H: Send + Sync> EventPoll<H> {
         })
     }
 
+    /// Test-only live registration count, including timers and notifiers.
+    #[cfg(test)]
+    pub(crate) fn registered_count(&self) -> usize {
+        self.events.lock().iter().flatten().count()
+            + self.custom.lock().iter().flatten().count()
+            + self.signals.lock().iter().flatten().count()
+    }
+
     /// Add and enable a new event with the factory.
     /// The event is triggered when a Read operation on the provided trigger becomes available
     /// If the trigger fd is closed, the event won't be triggered anymore, but it's data won't be

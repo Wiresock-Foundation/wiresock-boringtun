@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Vadim Smirnov (doing business as WireSock). All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use super::*;
 use crate::device::{DeviceConfig, DeviceHandle};
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 struct LiveApi {
     handle: DeviceHandle,
     client: UnixStream,
-    _tun: UnixDatagram,
+    _tun: Option<UnixDatagram>,
     paths: Vec<std::path::PathBuf>,
 }
 
@@ -25,7 +25,16 @@ impl LiveApi {
     }
 
     fn with_threads(n_threads: usize) -> Self {
-        let (tun, tun_peer) = UnixDatagram::pair().unwrap();
+        #[cfg(target_os = "linux")]
+        let (tun_name, tun_peer) = {
+            let (tun, peer) = UnixDatagram::pair().unwrap();
+            (tun.into_raw_fd().to_string(), Some(peer))
+        };
+        // macOS has no inherited numeric TUN-fd constructor. Allocate a real,
+        // unnamed utun in the existing privileged CI job, without configuring
+        // addresses, routes or host networking. Closing the device destroys it.
+        #[cfg(target_os = "macos")]
+        let (tun_name, tun_peer) = ("utun".to_owned(), None);
         let (api, client) = UnixStream::pair().unwrap();
         socket2::SockRef::from(&api)
             .set_send_buffer_size(4096)
@@ -37,7 +46,7 @@ impl LiveApi {
             .set_write_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let handle = DeviceHandle::new(
-            &tun.into_raw_fd().to_string(),
+            &tun_name,
             DeviceConfig {
                 n_threads,
                 use_connected_socket: false,
@@ -148,6 +157,10 @@ fn connect(path: &std::path::Path) -> UnixStream {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn pipelined_commands_each_receive_a_reply() {
     let mut api = LiveApi::new();
     api.client
@@ -162,6 +175,10 @@ fn pipelined_commands_each_receive_a_reply() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn an_incomplete_request_does_not_occupy_the_only_worker() {
     let mut api = LiveApi::new();
     let (event, receive) = api.worker_probe();
@@ -193,6 +210,10 @@ fn configure_large_reply(api: &mut LiveApi) {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn a_stalled_response_does_not_occupy_the_only_worker() {
     let mut api = LiveApi::new();
     configure_large_reply(&mut api);
@@ -210,6 +231,10 @@ fn a_stalled_response_does_not_occupy_the_only_worker() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn split_headers_and_blank_terminators_are_retained() {
     let mut api = LiveApi::new();
     for part in [b"g".as_slice(), b"et=1", b"\n"] {
@@ -237,6 +262,10 @@ fn split_headers_and_blank_terminators_are_retained() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn buffered_complete_frames_do_not_consume_a_following_partial_frame() {
     let mut api = LiveApi::new();
     api.client.write_all(b"get=1\n\nget=1\n\nset=1\n").unwrap();
@@ -251,6 +280,10 @@ fn buffered_complete_frames_do_not_consume_a_following_partial_frame() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn malformed_complete_transactions_preserve_partial_apply_and_next_frame() {
     let mut api = LiveApi::new();
     let request = format!(
@@ -268,6 +301,10 @@ fn malformed_complete_transactions_preserve_partial_apply_and_next_frame() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn a_half_close_drains_complete_frames_then_exits_the_inherited_device() {
     let mut api = LiveApi::new();
     api.client
@@ -282,6 +319,10 @@ fn a_half_close_drains_complete_frames_then_exits_the_inherited_device() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn incomplete_eof_does_not_apply_a_transaction() {
     let mut api = LiveApi::new();
     api.client
@@ -293,6 +334,10 @@ fn incomplete_eof_does_not_apply_a_transaction() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn inherited_eof_reclaims_its_stream_registration() {
     let api = LiveApi::new();
     let before = api.handle.device.read().queue.registered_count();
@@ -305,6 +350,10 @@ fn inherited_eof_reclaims_its_stream_registration() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn a_busy_pipeline_yields_to_other_device_events() {
     let mut api = LiveApi::new();
     let (event, receive) = api.worker_probe();
@@ -324,6 +373,10 @@ fn a_busy_pipeline_yields_to_other_device_events() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn a_stalled_socket_client_does_not_block_other_clients_and_is_reclaimed() {
     let mut api = LiveApi::new();
     let path = api.listener();
@@ -342,6 +395,10 @@ fn a_stalled_socket_client_does_not_block_other_clients_and_is_reclaimed() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn accepted_connection_limit_recovers_after_clients_close() {
     let mut api = LiveApi::new();
     let path = api.listener();
@@ -365,6 +422,10 @@ fn accepted_connection_limit_recovers_after_clients_close() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn oversized_requests_are_refused_without_partial_mutation() {
     let mut api = LiveApi::new();
     let mut request = format!("set=1\nprivate_key={}\n", encode_hex([1; 32])).into_bytes();
@@ -379,6 +440,10 @@ fn oversized_requests_are_refused_without_partial_mutation() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn a_complete_frame_at_the_size_limit_is_parsed() {
     let mut api = LiveApi::new();
     // Unknown key makes the parser reject the complete frame with EINVAL;
@@ -398,6 +463,10 @@ fn a_complete_frame_at_the_size_limit_is_parsed() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn trickle_input_cannot_extend_the_transaction_deadline() {
     let mut api = LiveApi::new();
     api.client.write_all(b"set=1\n").unwrap();
@@ -412,6 +481,10 @@ fn trickle_input_cannot_extend_the_transaction_deadline() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn idle_inherited_control_remains_available_between_transactions() {
     let mut api = LiveApi::new();
     api.client.write_all(b"get=1\n\n").unwrap();
@@ -426,6 +499,10 @@ fn idle_inherited_control_remains_available_between_transactions() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn a_slow_reader_receives_the_whole_response_then_the_next_reply() {
     let mut api = LiveApi::new();
     configure_large_reply(&mut api);
@@ -444,6 +521,10 @@ fn a_slow_reader_receives_the_whole_response_then_the_next_reply() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn an_abandoned_response_expires_and_exits_the_inherited_device() {
     let mut api = LiveApi::new();
     configure_large_reply(&mut api);
@@ -458,6 +539,10 @@ fn an_abandoned_response_expires_and_exits_the_inherited_device() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn accepted_idle_clients_expire_without_stopping_the_device() {
     let mut api = LiveApi::new();
     let path = api.listener();
@@ -475,6 +560,10 @@ fn accepted_idle_clients_expire_without_stopping_the_device() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "requires root to allocate a temporary utun"
+)]
 fn concurrent_clients_can_upgrade_device_guards_on_multiple_workers() {
     let mut api = LiveApi::with_threads(4);
     let path = api.listener();

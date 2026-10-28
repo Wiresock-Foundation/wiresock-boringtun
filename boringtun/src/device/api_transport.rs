@@ -118,6 +118,13 @@ impl Connection {
         self.respond(status, now)
     }
 
+    fn refuse_oversized_request(&mut self, now: Instant) -> Action {
+        self.input.clear();
+        self.scanned = 0;
+        self.close_after_write = true; // The remainder cannot be resynchronized safely.
+        self.respond(libc::E2BIG, now)
+    }
+
     fn step(&mut self, d: &mut LockReadGuard<Device>) -> Action {
         let now = Instant::now();
         if self.expired || self.timed_out(now) {
@@ -156,9 +163,7 @@ impl Connection {
             return self.process_frame(end, d, now);
         }
         if self.input.len() == MAX_REQUEST {
-            self.input.clear();
-            self.close_after_write = true; // The remainder cannot be resynchronized safely.
-            return self.respond(libc::E2BIG, now);
+            return self.refuse_oversized_request(now);
         }
 
         let mut bytes = [0u8; IO_BUDGET];
@@ -183,9 +188,7 @@ impl Connection {
         if let Some(end) = self.frame_end() {
             self.process_frame(end, d, now)
         } else if self.input.len() == MAX_REQUEST {
-            self.input.clear();
-            self.close_after_write = true;
-            self.respond(libc::E2BIG, now)
+            self.refuse_oversized_request(now)
         } else {
             Action::WaitForRead
         }
@@ -283,6 +286,27 @@ pub(super) fn register_listener(d: &Device, listener: UnixListener) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_request_discards_the_scan_position_with_the_input() {
+        let (stream, _client) = UnixStream::pair().unwrap();
+        let mut connection = Connection::new(stream, true).unwrap();
+        connection.input.resize(MAX_REQUEST, b'x');
+        assert_eq!(connection.frame_end(), None);
+        assert!(connection.scanned > 0);
+        assert!(matches!(
+            connection.refuse_oversized_request(Instant::now()),
+            Action::WaitForWrite
+        ));
+        assert!(connection.input.is_empty());
+        assert_eq!(connection.scanned, 0);
+        assert_eq!(connection.frame_end(), None);
+        assert!(connection.close_after_write);
+        assert_eq!(
+            connection.output.bytes,
+            format!("errno={}\n\n", libc::E2BIG).as_bytes()
+        );
+    }
 
     #[test]
     fn response_limit_refuses_overflow_without_releasing_a_partial_dump() {

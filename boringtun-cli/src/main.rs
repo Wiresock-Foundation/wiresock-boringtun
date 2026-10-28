@@ -59,7 +59,8 @@ fn main() {
             Arg::new("uapi-fd")
                 .long("uapi-fd")
                 .env("WG_UAPI_FD")
-                .help("File descriptor for the user API")
+                .help("Supervisor UAPI fd; transport failure stops the device (see --help)")
+                .long_help("Inherited supervisor UAPI fd. May idle indefinitely between requests. Active requests and response delivery have absolute five-second deadlines, with limits of 1 MiB per request and 4 MiB per response. EOF, broken transport, a deadline, or an oversized request (E2BIG) stops the entire device; restart with a fresh fd. Ordinary complete-request configuration errors are nonfatal and may partially apply. A delivered EOVERFLOW response is also nonfatal.")
                 .default_value("-1"),
             Arg::new("tun-fd")
                 .long("tun-fd")
