@@ -2897,22 +2897,9 @@ mod tests {
             reader.read_line(&mut reply).unwrap();
             assert_eq!(reply, "errno=0\n\n");
 
-            // The poller reclaims shut-down socket handlers asynchronously.
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while retired.iter().any(
-                |p: &std::sync::Weak<parking_lot::Mutex<super::super::Peer>>| p.upgrade().is_some(),
-            ) && Instant::now() < deadline
-            {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert!(
-                retired.iter().all(|p| p.upgrade().is_none()),
-                "round {} leaked retired peers",
-                round
-            );
-            assert_eq!(device.device.read().queue.registered_count(), baseline);
-            retired.clear();
-
+            // Send immediately after the UAPI reply: waiting for the old
+            // handlers here would hide a shutdown-to-reclamation blackhole.
+            let old_peers = std::mem::take(&mut retired);
             for (id, key, public_key, socket) in &peers {
                 let mut client = Tunn::new_with_obfuscation(
                     key.clone(),
@@ -2958,6 +2945,19 @@ mod tests {
                 assert!(peer.lock().endpoint().conn.is_some());
                 retired.push(Arc::downgrade(peer));
             }
+            // Reclamation is asynchronous, but must not gate the traffic above.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while old_peers.iter().any(
+                |p: &std::sync::Weak<parking_lot::Mutex<super::super::Peer>>| p.upgrade().is_some(),
+            ) && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                old_peers.iter().all(|p| p.upgrade().is_none()),
+                "round {} leaked retired peers",
+                round
+            );
             assert_eq!(
                 device.device.read().queue.registered_count(),
                 baseline + peers.len()
