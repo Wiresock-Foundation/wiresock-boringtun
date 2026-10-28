@@ -7,6 +7,7 @@ use super::*;
 use crate::device::{DeviceConfig, DeviceHandle};
 use std::io::{self, Read};
 use std::net::Shutdown;
+#[cfg(target_os = "linux")]
 use std::os::fd::IntoRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::sync::mpsc;
@@ -50,12 +51,19 @@ impl LiveApi {
             DeviceConfig {
                 n_threads,
                 use_connected_socket: false,
+                #[cfg(target_os = "linux")]
                 use_multi_queue: false,
+                #[cfg(target_os = "linux")]
                 uapi_fd: api.into_raw_fd(),
                 ..Default::default()
             },
         )
         .unwrap();
+        // The production inherited-fd constructor is Linux-only. On macOS
+        // attach the same transport to the live utun device explicitly, with
+        // ownership of the UnixStream, to exercise kqueue and device guards.
+        #[cfg(target_os = "macos")]
+        transport::register_inherited(&handle.device.read(), api).unwrap();
         Self {
             handle,
             client,
