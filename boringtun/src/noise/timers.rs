@@ -728,18 +728,6 @@ impl Tunn {
         )
     }
 
-    pub fn time_since_last_handshake(&self) -> Option<Duration> {
-        let current_session = self.current;
-        if self.sessions[current_session % super::N_SESSIONS].is_some() {
-            let duration_since_tun_start = Instant::now().duration_since(self.timers.time_started);
-            let duration_since_session_established = self.timers[TimeSessionEstablished];
-
-            Some(duration_since_tun_start.saturating_sub(duration_since_session_established))
-        } else {
-            None
-        }
-    }
-
     /// The current session's active-rekey age: once the session is older than
     /// this, the initiator re-keys on its next data send. One uniform draw from
     /// the AmneziaWG `rekey_after_time` range per established session (whole
@@ -756,6 +744,18 @@ impl Tunn {
     /// race this one, and handshakes would come at the minimum of the two.
     pub fn rekey_after_time(&self) -> Duration {
         self.timers.rekey_after_current
+    }
+
+    pub fn time_since_last_handshake(&self) -> Option<Duration> {
+        let current_session = self.current;
+        if self.sessions[current_session % super::N_SESSIONS].is_some() {
+            let duration_since_tun_start = Instant::now().duration_since(self.timers.time_started);
+            let duration_since_session_established = self.timers[TimeSessionEstablished];
+
+            Some(duration_since_tun_start.saturating_sub(duration_since_session_established))
+        } else {
+            None
+        }
     }
 
     pub fn persistent_keepalive(&self) -> Option<u16> {
