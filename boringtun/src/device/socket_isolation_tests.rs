@@ -722,7 +722,7 @@ fn connected_demultiplexing_roaming_and_rebind_keep_both_families_working() {
         Some(libc::EADDRINUSE)
     );
     assert_eq!(d.udp_listener_fds, fds);
-    d.queue.fail_registration_after(1);
+    d.queue.fail_non_stream_registration_after(1);
     assert_eq!(
         d.open_listen_socket(0).unwrap_err().raw_os_error(),
         Some(libc::EBADF)
