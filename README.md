@@ -128,6 +128,35 @@ existing partial-apply behavior of complete `set=1` requests.
 Logging goes to `WG_LOG_FILE` at `WG_LOG_LEVEL`. Note that a daemonised process loses its log
 writer — use `--foreground` when you need output.
 
+### Linux UDP port ownership and startup
+
+Linux listeners and connected peer sockets share their port with `SO_REUSEPORT`,
+without `SO_REUSEADDR`. Linux checks socket-owner UIDs for this sharing, preventing
+a different unprivileged UID from joining the listener port with either reuse
+option. Processes running under the same UID can still share it; this is not
+isolation between applications under one account. See [socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html).
+Unsupported `SO_REUSEPORT` is a startup error, with no weaker fallback. Other
+platforms retain their existing socket options.
+
+The CLI prepares its TUN queues and UAPI before dropping privileges, then creates
+UDP listeners and starts workers under the final UID. `--disable-drop-privileges`
+retains the caller's credentials. `--disable-multi-queue`, `--disable-connected-udp`,
+and Linux `--tun-fd`/`--uapi-fd` retain their roles; an inherited TUN fd is shared
+between workers and is never reopened as a queue. Queue setup failures now fail
+startup instead of panicking or being ignored in a worker.
+
+Library users can use `DeviceHandle::new_with_privilege_drop` for that ordering.
+It permanently changes process-wide credentials using the existing identity
+selection, including when a later startup step fails; call it before starting
+other devices or application threads. `DeviceHandle::new` keeps credentials
+unchanged. Its callers must keep the same socket-creating UID during later peer
+upgrades and listener rebinds. Dropping UID after `new` can prevent connected
+upgrades from sharing the old port, leaving peers on the shared listener, and
+can prevent a rebind from reusing a port still owned by the previous UID.
+Neither constructor retains extra capabilities. Startup-error path cleanup is
+best-effort; a supervisor may need to remove published UAPI paths if the final
+UID cannot unlink them.
+
 ### Server imitation auto mode
 
 ```bash

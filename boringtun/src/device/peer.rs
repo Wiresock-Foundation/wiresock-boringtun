@@ -259,7 +259,7 @@ impl Peer {
 
         let udp_conn =
             socket2::Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        udp_conn.set_reuse_address(true)?;
+        super::configure_udp_sharing(&udp_conn)?;
         let bind_addr = if addr.is_ipv4() {
             SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into()
         } else {
