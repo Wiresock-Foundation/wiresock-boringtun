@@ -21,6 +21,20 @@ pub struct Endpoint {
     pub conn: Option<socket2::Socket>,
 }
 
+pub(super) fn canonical_endpoint(addr: SocketAddr) -> SocketAddr {
+    // Linux listeners and connected sockets keep the reuse-port groups
+    // separate by family. Preserve mapped endpoint support by selecting
+    // IPv4 at storage, so timers, fallback sends and upgrades all agree.
+    // Do not reinterpret IPv4-compatible IPv6 addresses or native scopes.
+    #[cfg(target_os = "linux")]
+    if let SocketAddr::V6(v6) = addr {
+        if let Some(v4) = v6.ip().to_ipv4_mapped() {
+            return SocketAddr::V4(SocketAddrV4::new(v4, v6.port()));
+        }
+    }
+    addr
+}
+
 /// Report a failed endpoint shutdown without taking the process with it.
 ///
 /// `endpoint.conn` is a `dup(2)`, so closing it does NOT close the descriptor
@@ -140,7 +154,7 @@ impl Peer {
             tunnel,
             index,
             endpoint: RwLock::new(Endpoint {
-                addr: endpoint,
+                addr: endpoint.map(canonical_endpoint),
                 conn: None,
             }),
             preshared_key,
@@ -216,6 +230,7 @@ impl Peer {
     }
 
     fn move_endpoint(&self, addr: SocketAddr, reset_window: bool) {
+        let addr = canonical_endpoint(addr);
         let mut endpoint = self.endpoint.write();
         if endpoint.addr != Some(addr) {
             // We only need to update the endpoint if it differs from the current one
@@ -259,7 +274,11 @@ impl Peer {
 
         let udp_conn =
             socket2::Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        udp_conn.set_reuse_address(true)?;
+        super::configure_udp_sharing(&udp_conn)?;
+        #[cfg(target_os = "linux")]
+        if addr.is_ipv6() {
+            udp_conn.set_only_v6(true)?;
+        }
         let bind_addr = if addr.is_ipv4() {
             SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into()
         } else {

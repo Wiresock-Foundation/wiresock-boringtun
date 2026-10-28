@@ -12,6 +12,8 @@ pub mod peer;
 mod probe_budget;
 mod probe_reply;
 mod reply_policy;
+#[cfg(all(test, target_os = "linux"))]
+mod socket_isolation_tests;
 mod udp_diagnostics;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
@@ -65,6 +67,17 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 const MAX_ITR: usize = 100; // Number of packets to handle per handler call
+
+fn configure_udp_sharing(socket: &socket2::Socket) -> io::Result<()> {
+    // REUSEADDR permits another UID to share UDP ports on Linux. REUSEPORT
+    // alone preserves listener/connected-socket sharing with a UID check.
+    #[cfg(target_os = "linux")]
+    socket.set_reuse_port(true)?;
+    // Other kernels have different sharing rules; preserve their behavior.
+    #[cfg(not(target_os = "linux"))]
+    socket.set_reuse_address(true)?;
+    Ok(())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -657,26 +670,117 @@ fn require_key_pair(
 }
 
 impl DeviceHandle {
+    /// Start without changing credentials. Keep the socket-creating UID for
+    /// the lifetime of the device, including listener rebinds and peer upgrades.
     pub fn new(name: &str, config: DeviceConfig) -> Result<DeviceHandle, Error> {
-        let n_threads = config.n_threads;
-        let mut wg_interface = Device::new(name, config)?;
-        wg_interface.open_listen_socket(0)?; // Start listening on a random port
+        Self::new_with_startup(name, config, |_, _| Ok(()))
+    }
 
-        let interface_lock = Arc::new(Lock::new(wg_interface));
+    /// Prepare TUN queues and UAPI, drop privileges, then create UDP sockets
+    /// and start workers. All Linux UDP sockets consequently share the final UID.
+    ///
+    /// This changes process-wide credentials irreversibly, even if a later
+    /// startup step fails. Call before starting other devices or application
+    /// threads. Uses the same identity selection as `drop_privileges`.
+    pub fn new_with_privilege_drop(
+        name: &str,
+        config: DeviceConfig,
+    ) -> Result<DeviceHandle, Error> {
+        Self::new_with_startup(name, config, |_, _| drop_privileges::drop_privileges())
+    }
 
-        let mut threads = vec![];
+    fn new_with_startup(
+        name: &str,
+        config: DeviceConfig,
+        before_sockets: impl FnOnce(&Device, &[Arc<TunSocket>]) -> Result<(), Error>,
+    ) -> Result<DeviceHandle, Error> {
+        Self::start_device(Device::new(name, config)?, before_sockets)
+    }
 
-        for i in 0..n_threads {
-            threads.push({
-                let dev = Arc::clone(&interface_lock);
-                thread::spawn(move || DeviceHandle::event_loop(i, &dev))
-            });
-        }
+    fn start_device(
+        mut wg_interface: Device,
+        before_sockets: impl FnOnce(&Device, &[Arc<TunSocket>]) -> Result<(), Error>,
+    ) -> Result<DeviceHandle, Error> {
+        let n_threads = wg_interface.config.n_threads;
+        let prepared = (|| {
+            let mut ifaces = Vec::with_capacity(n_threads);
+            for _i in 0..n_threads {
+                #[cfg(target_os = "linux")]
+                let iface = if _i > 0
+                    && wg_interface.config.use_multi_queue
+                    && wg_interface.iface.can_add_queue()
+                {
+                    let iface =
+                        Arc::new(TunSocket::new(&wg_interface.iface.name()?)?.set_non_blocking()?);
+                    wg_interface.register_iface_handler(Arc::clone(&iface))?;
+                    iface
+                } else {
+                    // An inherited decimal fd is one owned descriptor, not a
+                    // TUN name that can be reopened for an additional queue.
+                    Arc::clone(&wg_interface.iface)
+                };
+                #[cfg(not(target_os = "linux"))]
+                let iface = Arc::clone(&wg_interface.iface);
+                ifaces.push(iface);
+            }
+            before_sockets(&wg_interface, &ifaces)?;
+            wg_interface.open_listen_socket(0)?;
+            Ok::<_, Error>(ifaces)
+        })();
+        let ifaces = match prepared {
+            Ok(ifaces) => ifaces,
+            Err(error) => {
+                // The UAPI may already be published. Cleanup is best-effort:
+                // a completed privilege drop can remove directory access.
+                for path in &wg_interface.cleanup_paths {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(error);
+            }
+        };
 
-        Ok(DeviceHandle {
-            device: interface_lock,
-            threads,
+        Self::start_workers(wg_interface, ifaces, |work| {
+            thread::Builder::new().spawn(work)
         })
+    }
+
+    fn start_workers(
+        wg_interface: Device,
+        ifaces: Vec<Arc<TunSocket>>,
+        mut spawn: impl FnMut(Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>,
+    ) -> Result<DeviceHandle, Error> {
+        let mut handle = DeviceHandle {
+            device: Arc::new(Lock::new(wg_interface)),
+            threads: Vec::with_capacity(ifaces.len()),
+        };
+        let mut starts = Vec::with_capacity(ifaces.len());
+        for iface in ifaces {
+            let dev = Arc::clone(&handle.device);
+            let (start, ready) = std::sync::mpsc::channel();
+            match spawn(Box::new(move || {
+                // No event handler runs until every worker exists. In
+                // particular, UAPI input cannot block partial-startup cleanup.
+                if ready.recv().is_ok() {
+                    DeviceHandle::event_loop(iface, &dev);
+                }
+            })) {
+                Ok(thread) => {
+                    handle.threads.push(thread);
+                    starts.push(start);
+                }
+                Err(error) => {
+                    // Disconnect the gates: started threads exit without
+                    // entering the event loop or acquiring a device guard.
+                    drop(starts);
+                    handle.wait();
+                    return Err(error.into());
+                }
+            }
+        }
+        for start in starts {
+            let _ = start.send(());
+        }
+        Ok(handle)
     }
 
     pub fn wait(&mut self) {
@@ -692,48 +796,13 @@ impl DeviceHandle {
         }
     }
 
-    fn event_loop(_i: usize, device: &Lock<Device>) {
-        #[cfg(target_os = "linux")]
+    fn event_loop(iface: Arc<TunSocket>, device: &Lock<Device>) {
         let mut thread_local = ThreadData {
             src_buf: [0u8; MAX_UDP_SIZE],
             dst_buf: [0u8; MAX_UDP_SIZE],
             junk_rng: ChaCha8Rng::from_rng(OsRng).expect("OsRng must seed ChaCha8"),
             probe_rng: ChaCha8Rng::from_rng(OsRng).expect("OsRng must seed ChaCha8"),
-            // `can_add_queue`: an embedder-provided fd cannot be cloned into
-            // a new queue -- `TunSocket::new` would re-parse the decimal name
-            // and alias the same fd, no second queue, with each alias's Drop
-            // closing the one descriptor.
-            iface: if _i == 0
-                || !device.read().config.use_multi_queue
-                || !device.read().iface.can_add_queue()
-            {
-                // For the first thread use the original iface
-                Arc::clone(&device.read().iface)
-            } else {
-                // For for the rest create a new iface queue
-                let iface_local = Arc::new(
-                    TunSocket::new(&device.read().iface.name().unwrap())
-                        .unwrap()
-                        .set_non_blocking()
-                        .unwrap(),
-                );
-
-                device
-                    .read()
-                    .register_iface_handler(Arc::clone(&iface_local))
-                    .ok();
-
-                iface_local
-            },
-        };
-
-        #[cfg(not(target_os = "linux"))]
-        let mut thread_local = ThreadData {
-            src_buf: [0u8; MAX_UDP_SIZE],
-            dst_buf: [0u8; MAX_UDP_SIZE],
-            junk_rng: ChaCha8Rng::from_rng(OsRng).expect("OsRng must seed ChaCha8"),
-            probe_rng: ChaCha8Rng::from_rng(OsRng).expect("OsRng must seed ChaCha8"),
-            iface: Arc::clone(&device.read().iface),
+            iface,
         };
 
         #[cfg(not(target_os = "linux"))]
@@ -852,6 +921,7 @@ impl Device {
             let mut p = peer.lock();
 
             if let Some(addr) = endpoint {
+                let addr = peer::canonical_endpoint(addr);
                 if p.endpoint().addr != Some(addr) {
                     // As for a roam in `commit_anonymous`: the tunnel's
                     // unverified evidence describes the endpoint being left.
@@ -1204,7 +1274,7 @@ impl Device {
         mut port: u16,
     ) -> Result<(socket2::Socket, Option<socket2::Socket>, u16), Error> {
         let udp4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        udp4.set_reuse_address(true)?;
+        configure_udp_sharing(&udp4)?;
         udp4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
         udp4.set_nonblocking(true)?;
 
@@ -1239,7 +1309,12 @@ impl Device {
             }
             Err(e) => return Err(e.into()),
         };
-        udp6.set_reuse_address(true)?;
+        configure_udp_sharing(&udp6)?;
+        // Keep Linux's reuse-port groups disjoint by family. A dual-stack
+        // candidate can match our IPv4 socket and bypass an exclusive IPv6
+        // holder. Mapped endpoints are normalized by Peer to use IPv4.
+        #[cfg(target_os = "linux")]
+        udp6.set_only_v6(true)?;
         udp6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
         udp6.set_nonblocking(true)?;
 

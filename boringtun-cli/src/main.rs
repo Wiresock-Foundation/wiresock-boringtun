@@ -1,7 +1,6 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use boringtun::device::drop_privileges::drop_privileges;
 use boringtun::device::{DeviceConfig, DeviceHandle, DEFAULT_PROBE_REPLY_BYTES_PER_SEC};
 use boringtun::noise::amnezia::{AmneziaConfig, AmneziaImitation, AmneziaImitationProtocol};
 use clap::builder::PossibleValuesParser;
@@ -291,7 +290,12 @@ fn main() {
         ..Default::default()
     };
 
-    let mut device_handle: DeviceHandle = match DeviceHandle::new(tun_name, config) {
+    let start_device = if matches.get_flag("disable-drop-privileges") {
+        DeviceHandle::new
+    } else {
+        DeviceHandle::new_with_privilege_drop
+    };
+    let mut device_handle: DeviceHandle = match start_device(tun_name, config) {
         Ok(d) => d,
         Err(e) => {
             // Notify parent that tunnel initialization failed
@@ -300,14 +304,6 @@ fn main() {
             exit(1);
         }
     };
-
-    if !matches.get_flag("disable-drop-privileges") {
-        if let Err(error) = drop_privileges() {
-            tracing::error!(?error, "Failed to drop privileges");
-            sock1.send(&[0]).unwrap();
-            exit(1);
-        }
-    }
 
     // Notify parent that tunnel initialization succeeded
     sock1.send(&[1]).unwrap();
