@@ -2831,6 +2831,142 @@ mod tests {
         api_set(&mut reader, &mut d.read())
     }
 
+    /// Replacing connected peers must retire their sockets and event closures,
+    /// including when the same keys and endpoints are immediately re-added.
+    /// Uses an inherited datagram fd as the TUN: no privileges or host routes.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn replacing_connected_peers_releases_old_events_and_restores_traffic() {
+        use crate::device::{DeviceConfig, DeviceHandle};
+        use crate::noise::{Tunn, TunnResult};
+        use std::net::UdpSocket;
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixDatagram;
+        use std::time::{Duration, Instant};
+
+        let (tun, tun_peer) = UnixDatagram::pair().unwrap();
+        tun_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (api, mut control) = UnixStream::pair().unwrap();
+        control
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut device = DeviceHandle::new(
+            &tun.into_raw_fd().to_string(),
+            DeviceConfig {
+                n_threads: 2,
+                use_multi_queue: false,
+                use_connected_socket: true,
+                uapi_fd: api.into_raw_fd(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let port = device.device.read().listen_port;
+        let secret = x25519::StaticSecret::from([1; 32]);
+        let public = x25519::PublicKey::from(&secret);
+        let mut config = format!(
+            "private_key={}\nreplace_peers=true\n",
+            encode_hex(secret.to_bytes())
+        );
+        let mut peers = Vec::new();
+        for id in [2u8, 3] {
+            let key = x25519::StaticSecret::from([id; 32]);
+            let public_key = x25519::PublicKey::from(&key);
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.connect(("127.0.0.1", port)).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            config.push_str(&format!(
+                "public_key={}\nendpoint={}\nallowed_ip=10.0.0.{}/32\n",
+                encode_hex(public_key.as_bytes()),
+                socket.local_addr().unwrap(),
+                id,
+            ));
+            peers.push((id, key, public_key, socket));
+        }
+        let mut reader = BufReader::new(control.try_clone().unwrap());
+        let mut retired = Vec::new();
+        let baseline = device.device.read().queue.registered_count();
+        for round in 0..4 {
+            write!(control, "set=1\n{}\n", config).unwrap();
+            let mut reply = String::new();
+            reader.read_line(&mut reply).unwrap();
+            reader.read_line(&mut reply).unwrap();
+            assert_eq!(reply, "errno=0\n\n");
+
+            // The poller reclaims shut-down socket handlers asynchronously.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while retired.iter().any(
+                |p: &std::sync::Weak<parking_lot::Mutex<super::super::Peer>>| p.upgrade().is_some(),
+            ) && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                retired.iter().all(|p| p.upgrade().is_none()),
+                "round {} leaked retired peers",
+                round
+            );
+            assert_eq!(device.device.read().queue.registered_count(), baseline);
+            retired.clear();
+
+            for (id, key, public_key, socket) in &peers {
+                let mut client = Tunn::new_with_obfuscation(
+                    key.clone(),
+                    public,
+                    None,
+                    None,
+                    1,
+                    None,
+                    Default::default(),
+                    Default::default(),
+                )
+                .unwrap();
+                let mut buf = [0u8; 2048];
+                let mut rx = [0u8; 2048];
+                let TunnResult::WriteToNetwork(init) =
+                    client.format_handshake_initiation(&mut buf, false)
+                else {
+                    panic!("no initiation")
+                };
+                socket.send(init).unwrap();
+                let n = socket
+                    .recv(&mut rx)
+                    .expect("replacement peer did not handshake");
+                let TunnResult::WriteToNetwork(keepalive) =
+                    client.decapsulate(None, &rx[..n], &mut buf)
+                else {
+                    panic!("no handshake response")
+                };
+                socket.send(keepalive).unwrap();
+                let packet = [
+                    0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, *id, 10, 0, 0, 1,
+                ];
+                let TunnResult::WriteToNetwork(data) = client.encapsulate(&packet, &mut buf) else {
+                    panic!("no transport packet")
+                };
+                socket.send(data).unwrap();
+                let n = tun_peer
+                    .recv(&mut rx)
+                    .expect("replacement peer did not deliver data");
+                assert_eq!(&rx[..n], &packet);
+                let d = device.device.read();
+                let peer = &d.peers[public_key];
+                assert!(peer.lock().endpoint().conn.is_some());
+                retired.push(Arc::downgrade(peer));
+            }
+            assert_eq!(
+                device.device.read().queue.registered_count(),
+                baseline + peers.len()
+            );
+        }
+        device.device.read().trigger_exit();
+        device.wait();
+    }
+
     /// WRS-225 review finding 1. A subscriber that reads the device while
     /// handling the timer-ordering warning must not wait on the `set=1` that
     /// logged it. Each warning's callback starts a device reader and waits up
