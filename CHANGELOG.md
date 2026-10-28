@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Breaking (Rust): `noise::errors::WireGuardError` gains `PacketQueueFull`; exhaustive `match`es need an arm. All discriminants are now explicit and the existing values 0-16 are unchanged; C and JNI callers see the new error as code 17 through the existing `WIREGUARD_ERROR` result, with no ABI change.
 
 ### Fixed
+- Replacing all peers through UAPI now shuts down their connected UDP endpoints before clearing the peer maps, allowing the event loop to reclaim the retired sockets and peers. Reclamation is asynchronous, as with individual peer removal and roaming; this does not promise lossless traffic during replacement.
 - A cookie reply no longer counts as a received packet for the timers, so it cannot defer the new-handshake attempt that follows unanswered traffic.
 - A decapsulated IPv4 packet whose IHL is below 5, or whose total length does not cover the header length IHL declares, is refused as `InvalidPacket` instead of being delivered shorter than its own header. Fragments and header checksums are still passed through unchanged to the receiving stack.
 - A peer added after the device's private key was set got a private rate limiter (10 a second, its own cookie secret) instead of the device's; its connected socket then rated it apart from the listener, and a cookie the listener issued failed mac2 there. Every peer now shares the device's limiter.

@@ -1473,6 +1473,12 @@ impl Device {
 
     fn clear_peers(&mut self) {
         self.imitation_hints.clear();
+        // Connected-socket handlers retain their peers. As in remove_peer,
+        // shut down the sockets before dropping the maps so the poller can
+        // reclaim those handlers and stop intercepting replacement traffic.
+        for peer in self.peers.values() {
+            peer.lock().shutdown_endpoint();
+        }
         self.peers.clear();
         self.peers_by_idx.clear();
         self.peers_by_ip.clear();
