@@ -164,7 +164,7 @@ WG_STATIC_ASSERT(sizeof(((struct wireguard_result *)0)->size) == sizeof(size_t),
 WG_STATIC_ASSERT(sizeof(((struct wireguard_result *)0)->op) == sizeof(int),
                  "wireguard_result::op must be a plain enum");
 
-// The five published `stats` members, pinned where they are. `reserved` is
+// The six published `stats` members, pinned where they are. `reserved` is
 // deliberately NOT pinned by offset: shrinking it to make room for a new field
 // is the documented, size-preserving way to extend this struct, and an
 // offsetof(reserved) assertion would fail on exactly that safe path.
@@ -175,6 +175,8 @@ WG_STATIC_ASSERT(offsetof(struct stats, estimated_loss) == 8 + 2 * sizeof(size_t
                  "stats::estimated_loss moved");
 WG_STATIC_ASSERT(offsetof(struct stats, estimated_rtt) == 12 + 2 * sizeof(size_t),
                  "stats::estimated_rtt moved");
+WG_STATIC_ASSERT(offsetof(struct stats, rekey_after_time) == 16 + 2 * sizeof(size_t),
+                 "stats::rekey_after_time moved");
 WG_STATIC_ASSERT(sizeof(((struct stats *)0)->time_since_last_handshake) == 8,
                  "stats::time_since_last_handshake must be int64_t");
 WG_STATIC_ASSERT(sizeof(((struct stats *)0)->tx_bytes) == sizeof(size_t),
@@ -185,16 +187,18 @@ WG_STATIC_ASSERT(sizeof(((struct stats *)0)->estimated_loss) == 4,
                  "stats::estimated_loss must be float");
 WG_STATIC_ASSERT(sizeof(((struct stats *)0)->estimated_rtt) == 4,
                  "stats::estimated_rtt must be int32_t");
+WG_STATIC_ASSERT(sizeof(((struct stats *)0)->rekey_after_time) == 4,
+                 "stats::rekey_after_time must be uint32_t");
 // `reserved`'s WIDTH, which the total below cannot see. `stats` has tail
 // padding on both word sizes, so shrinking `reserved` by up to seven bytes
-// leaves `sizeof(struct stats)` exactly where it was: `uint8_t reserved[55]`
+// leaves `sizeof(struct stats)` exactly where it was: `uint8_t reserved[51]`
 // compiles clean here under both -m32 and -m64. The Rust counterpart already
 // asserts this width, so without it a header-only edit passes CI while the
 // identical Rust edit fails -- the one-sided blindness this file exists to
 // remove, pointing the other way. (Found by mutating the header and watching
 // the check pass.)
-WG_STATIC_ASSERT(sizeof(((struct stats *)0)->reserved) == 56,
-                 "stats::reserved must be 56 bytes; tail padding hides a shrink from sizeof");
+WG_STATIC_ASSERT(sizeof(((struct stats *)0)->reserved) == 52,
+                 "stats::reserved must be 52 bytes; tail padding hides a shrink from sizeof");
 // The rule `reserved`'s comment states -- "decrement appropriately when adding
 // new fields" -- made mechanical. The TOTAL is what must not move: 88 bytes on
 // LP64, 80 on ILP32. Adding a field and shrinking `reserved` to match keeps
