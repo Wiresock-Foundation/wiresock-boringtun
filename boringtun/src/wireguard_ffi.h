@@ -47,7 +47,16 @@ struct stats
     size_t rx_bytes;
     float estimated_loss;
     int32_t estimated_rtt; // rtt estimated on time it took to complete latest initiated handshake in ms
-    uint8_t reserved[56];  // decrement appropriately when adding new fields
+    // The current session's active-rekey age in seconds: once the session is
+    // older than this, the initiator re-keys on its next data send. One uniform
+    // draw from the AmneziaWG rekey_after_time range per established session,
+    // re-drawn by a live timer reconfiguration; 120 when the range is unset.
+    // Meaningful while time_since_last_handshake >= 0. A caller that initiates
+    // handshakes of its own on an idle tunnel (a liveness probe) should time
+    // them to this value rather than draw its own: handshakes would otherwise
+    // come at the minimum of two independent draws.
+    uint32_t rekey_after_time;
+    uint8_t reserved[52];  // decrement appropriately when adding new fields
 };
 
 struct x25519_key

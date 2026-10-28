@@ -5486,6 +5486,34 @@ mod tests {
         );
     }
 
+    /// `rekey_after_time()` -- what `wireguard_stats` exports -- is the cached
+    /// per-session draw on both ends, and follows a live timer edit that
+    /// re-draws it. Anything else (the range, a fresh draw per call) would
+    /// let an embedder that probes an idle tunnel race the engine's deadline.
+    #[test]
+    fn rekey_after_time_is_the_cached_session_draw() {
+        let timers = amnezia::AwgTimers {
+            rekey_after_time: (30, 90),
+            ..amnezia::AwgTimers::default()
+        };
+        let amnezia = AmneziaConfig::default().with_tunable_timers(timers);
+        let (mut my_tun, their_tun) = create_two_tuns_and_handshake_with_amnezia(amnezia.clone());
+
+        for t in [&my_tun, &their_tun] {
+            assert_eq!(t.rekey_after_time(), t.timers.rekey_after_current);
+            assert!((30..=90).contains(&t.rekey_after_time().as_secs()));
+        }
+
+        let mut retuned = amnezia;
+        retuned.timers.rekey_after_time = (500, 900);
+        my_tun.set_obfuscation(my_tun.handshake.obf, retuned);
+        assert_eq!(my_tun.rekey_after_time(), my_tun.timers.rekey_after_current);
+        assert!(
+            (500..=900).contains(&my_tun.rekey_after_time().as_secs()),
+            "a live timer edit did not reach rekey_after_time()"
+        );
+    }
+
     /// A wide `rekey_timeout` range must not eat the attempt budget.
     ///
     /// The give-up rule used to be a wall-clock window sized as `attempts x

@@ -740,6 +740,24 @@ impl Tunn {
         }
     }
 
+    /// The current session's active-rekey age: once the session is older than
+    /// this, the initiator re-keys on its next data send. One uniform draw from
+    /// the AmneziaWG `rekey_after_time` range per established session (whole
+    /// seconds, as the range is), re-drawn by a live timer reconfiguration;
+    /// `REKEY_AFTER_TIME` when the range is unset.
+    ///
+    /// Meaningful while a session exists ([`Self::time_since_last_handshake`]
+    /// is `Some`). Before the first session it is `REKEY_AFTER_TIME`, and after
+    /// the sessions are dropped it keeps the last draw.
+    ///
+    /// For an embedder that initiates handshakes of its own on an idle tunnel
+    /// (a liveness probe): timing them to this deadline keeps the handshake
+    /// cadence the one the range configures. A second, independent draw would
+    /// race this one, and handshakes would come at the minimum of the two.
+    pub fn rekey_after_time(&self) -> Duration {
+        self.timers.rekey_after_current
+    }
+
     pub fn persistent_keepalive(&self) -> Option<u16> {
         let keepalive = self.timers.persistent_keepalive;
 

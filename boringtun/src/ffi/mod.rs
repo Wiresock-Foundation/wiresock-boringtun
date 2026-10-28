@@ -116,7 +116,10 @@ pub struct stats {
     pub rx_bytes: usize,
     pub estimated_loss: f32,
     pub estimated_rtt: i32,
-    reserved: [u8; 56], // Make sure to add new fields in this space, keeping total size constant
+    /// The current session's active-rekey age in seconds; see
+    /// [`Tunn::rekey_after_time`].
+    pub rekey_after_time: u32,
+    reserved: [u8; 52], // Make sure to add new fields in this space, keeping total size constant
 }
 
 impl<'a> From<TunnResult<'a>> for wireguard_result {
@@ -2117,6 +2120,7 @@ pub unsafe extern "C" fn wireguard_force_handshake_ex(
 /// Time of last handshake in seconds (or -1 if no handshake occurred)
 /// Number of data bytes encapsulated
 /// Number of data bytes decapsulated
+/// The current session's active-rekey age in seconds
 #[no_mangle]
 pub unsafe extern "C" fn wireguard_stats(tunnel: *const Mutex<Tunn>) -> stats {
     let tunnel = tunnel.as_ref().unwrap().lock();
@@ -2127,7 +2131,10 @@ pub unsafe extern "C" fn wireguard_stats(tunnel: *const Mutex<Tunn>) -> stats {
         rx_bytes,
         estimated_loss,
         estimated_rtt: estimated_rtt.map(|r| r as i32).unwrap_or(-1),
-        reserved: [0u8; 56],
+        // The draw comes from a u32 range in whole seconds, so this never
+        // saturates; saturating rather than truncating keeps it that way.
+        rekey_after_time: u32::try_from(tunnel.rekey_after_time().as_secs()).unwrap_or(u32::MAX),
+        reserved: [0u8; 52],
     }
 }
 
@@ -2490,7 +2497,8 @@ mod tests {
             rx_bytes: 0,
             estimated_loss: 0.0,
             estimated_rtt: 0,
-            reserved: [0u8; 56],
+            rekey_after_time: 0,
+            reserved: [0u8; 52],
         };
         let base = &s as *const _ as usize;
         assert_eq!(
@@ -2507,12 +2515,150 @@ mod tests {
             &s.estimated_rtt as *const i32 as usize - base,
             12 + 2 * word
         );
+        assert_eq!(
+            &s.rekey_after_time as *const u32 as usize - base,
+            16 + 2 * word
+        );
         assert_eq!(std::mem::size_of_val(&s.time_since_last_handshake), 8);
         assert_eq!(std::mem::size_of_val(&s.tx_bytes), word);
         assert_eq!(std::mem::size_of_val(&s.rx_bytes), word);
         assert_eq!(std::mem::size_of_val(&s.estimated_loss), 4);
         assert_eq!(std::mem::size_of_val(&s.estimated_rtt), 4);
-        assert_eq!(std::mem::size_of_val(&s.reserved), 56);
+        assert_eq!(std::mem::size_of_val(&s.rekey_after_time), 4);
+        assert_eq!(std::mem::size_of_val(&s.reserved), 52);
+    }
+
+    /// `stats.rekey_after_time` is the engine's own rekey deadline: the classic
+    /// 120 s without the AmneziaWG range, and with it one draw per session, on
+    /// both ends, inside the range. An embedder that probes an idle tunnel
+    /// times its handshakes to this value, so it has to be the draw the engine
+    /// acts on, re-drawn per session -- not the range, and not a fixed value.
+    #[test]
+    fn stats_report_the_sessions_rekey_draw() {
+        last_tunnel_error_free();
+        let secret = |k: &x25519_key| x25519_key { key: k.key };
+        let b64 = |k: x25519_key| unsafe {
+            let p = x25519_key_to_base64(k);
+            let s = CStr::from_ptr(p).to_owned();
+            x25519_key_to_str_free(p);
+            s
+        };
+        let pair = |params: &wireguard_awg_params| {
+            let c_sec = x25519_secret_key();
+            let c_pub = x25519_public_key(secret(&c_sec));
+            let s_sec = x25519_secret_key();
+            let s_pub = x25519_public_key(secret(&s_sec));
+            let (c_sec, c_pub, s_sec, s_pub) = (b64(c_sec), b64(c_pub), b64(s_sec), b64(s_pub));
+            let build = |private: &CString, public: &CString, index: u32| unsafe {
+                let t = new_tunnel_with_awg_params(
+                    private.as_ptr(),
+                    public.as_ptr(),
+                    ptr::null(),
+                    0,
+                    index,
+                    params,
+                    ptr::null(),
+                );
+                assert!(!t.is_null(), "{}", last_error_string());
+                t
+            };
+            (build(&c_sec, &s_pub, 1), build(&s_sec, &c_pub, 2))
+        };
+        // One complete client-initiated handshake. The clock moves first, so
+        // each initiation carries a newer TAI64N timestamp than the last one
+        // under the mock clock too, and the server does not drop it as a
+        // replay.
+        let handshake = |client: *mut Mutex<Tunn>, server: *mut Mutex<Tunn>| {
+            #[cfg(feature = "mock-instant")]
+            mock_instant::thread_local::MockClock::advance(std::time::Duration::from_millis(1));
+            #[cfg(not(feature = "mock-instant"))]
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let mut a = vec![0u8; 2048];
+            let mut b = vec![0u8; 2048];
+            let r = unsafe { wireguard_force_handshake(client, a.as_mut_ptr(), a.len() as u32) };
+            assert!(matches!(r.op, result_type::WRITE_TO_NETWORK));
+            let r = unsafe {
+                wireguard_read(
+                    server,
+                    a.as_ptr(),
+                    r.size as u32,
+                    b.as_mut_ptr(),
+                    b.len() as u32,
+                )
+            };
+            assert!(
+                matches!(r.op, result_type::WRITE_TO_NETWORK),
+                "the server answers the initiation: {}/{}",
+                r.op as u32,
+                r.size
+            );
+            let r = unsafe {
+                wireguard_read(
+                    client,
+                    b.as_ptr(),
+                    r.size as u32,
+                    a.as_mut_ptr(),
+                    a.len() as u32,
+                )
+            };
+            assert!(matches!(
+                r.op,
+                result_type::WRITE_TO_NETWORK | result_type::WIREGUARD_DONE
+            ));
+            assert!(unsafe { wireguard_stats(client) }.time_since_last_handshake >= 0);
+        };
+        let rekey = |t: *mut Mutex<Tunn>| unsafe { wireguard_stats(t) }.rekey_after_time;
+
+        // No range: the classic REKEY_AFTER_TIME, before and after a session.
+        let (client, server) = pair(&wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            ..Default::default()
+        });
+        assert_eq!((rekey(client), rekey(server)), (120, 120));
+        handshake(client, server);
+        assert_eq!((rekey(client), rekey(server)), (120, 120));
+        unsafe {
+            tunnel_free(client);
+            tunnel_free(server);
+        }
+
+        // A range: the classic value until the first session, then one draw
+        // per session on each end. 3001 values, so four sessions that all drew
+        // the same one would mean the value is not re-drawn per session
+        // (chance 3001^-3 if it is). Four, because the server's own handshake
+        // rate limiter answers UnderLoad to a fifth initiation from the same
+        // source within a second.
+        let (client, server) = pair(&wireguard_awg_params {
+            size: AWG_PARAMS_SIZE_VER0 as u32,
+            rekey_after_time: wireguard_awg_range { lo: 600, hi: 3600 },
+            reject_after_time: wireguard_awg_range { lo: 4000, hi: 4000 },
+            ..Default::default()
+        });
+        assert_eq!((rekey(client), rekey(server)), (120, 120));
+        let mut seen = (Vec::new(), Vec::new());
+        for _ in 0..4 {
+            handshake(client, server);
+            seen.0.push(rekey(client));
+            seen.1.push(rekey(server));
+        }
+        for (end, draws) in [("client", &seen.0), ("server", &seen.1)] {
+            assert!(
+                draws.iter().all(|s| (600..=3600).contains(s)),
+                "{} drew outside 600-3600: {:?}",
+                end,
+                draws
+            );
+            assert!(
+                draws.iter().any(|&s| s != draws[0]),
+                "{} reported one value for every session: {:?}",
+                end,
+                draws
+            );
+        }
+        unsafe {
+            tunnel_free(client);
+            tunnel_free(server);
+        }
     }
 
     /// A filled-in struct reaches every AmneziaWG feature, including the three
