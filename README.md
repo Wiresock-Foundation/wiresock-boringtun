@@ -138,6 +138,12 @@ isolation between applications under one account. See [socket(7)](https://man7.o
 Unsupported `SO_REUSEPORT` is a startup error, with no weaker fallback. Other
 platforms retain their existing socket options.
 
+Linux uses separate IPv4 and IPv6-only sockets so the IPv4 reuse-port group
+cannot mask an exclusive IPv6 holder during a rebind. IPv4-mapped IPv6 peer
+endpoints such as `[::ffff:192.0.2.1]:51820` are stored and reported as IPv4
+(`192.0.2.1:51820`) and use the IPv4 send path, including timers and connected
+upgrades. Native IPv6 addresses and scope IDs retain their existing meaning.
+
 The CLI prepares its TUN queues and UAPI before dropping privileges, then creates
 UDP listeners and starts workers under the final UID. `--disable-drop-privileges`
 retains the caller's credentials. `--disable-multi-queue`, `--disable-connected-udp`,

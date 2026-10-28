@@ -176,7 +176,13 @@ fn failed_transition_releases_descriptors_and_cleans_published_paths() {
 fn different_uid_cannot_join_listener_ports() {
     const PORT: &str = "BT_TEST_ISOLATION_PORT";
     if let Ok(port) = std::env::var(PORT) {
-        assert_ne!(unsafe { libc::geteuid() }, 0);
+        // Exec while the parent can traverse the runner's private build
+        // directory, then lower credentials before creating any contender.
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        assert_eq!(unsafe { libc::setgroups(0, std::ptr::null()) }, 0);
+        assert_eq!(unsafe { libc::setgid(65534) }, 0);
+        assert_eq!(unsafe { libc::setuid(65534) }, 0);
+        assert_eq!(unsafe { libc::geteuid() }, 65534);
         let port: u16 = port.parse().unwrap();
         for ip in [
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -208,7 +214,6 @@ fn different_uid_cannot_join_listener_ports() {
         }
         return;
     }
-    use std::os::unix::process::CommandExt;
     assert_eq!(
         unsafe { libc::geteuid() },
         0,
@@ -224,9 +229,7 @@ fn different_uid_cannot_join_listener_ports() {
                 "--ignored",
                 "--nocapture",
             ])
-            .env(PORT, d.listen_port.to_string())
-            .uid(65534)
-            .gid(65534),
+            .env(PORT, d.listen_port.to_string()),
     );
     assert!(
         output.status.success(),
@@ -474,6 +477,179 @@ fn receive(socket: &socket2::Socket) -> (Vec<u8>, SocketAddr) {
 }
 
 #[test]
+fn exclusive_ipv6_holder_refuses_rebind_and_preserves_the_old_listeners() {
+    for ip in [Ipv6Addr::UNSPECIFIED, Ipv6Addr::LOCALHOST] {
+        let (mut d, _tun, _api) = device();
+        d.open_listen_socket(0).unwrap();
+        let old = d.listen_port;
+        let fds = d.udp_listener_fds.clone();
+        let holder = socket2::Socket::new(Domain::IPV6, Type::DGRAM, None).unwrap();
+        holder.set_only_v6(true).unwrap();
+        holder.bind(&SocketAddr::from((ip, 0)).into()).unwrap();
+        let target = holder.local_addr().unwrap().as_socket().unwrap().port();
+        assert_eq!(
+            d.open_listen_socket(target).unwrap_err().raw_os_error(),
+            Some(libc::EADDRINUSE),
+            "exclusive IPv6 holder at {}",
+            ip
+        );
+        assert_eq!(d.listen_port, old);
+        assert_eq!(d.udp_listener_fds, fds);
+        // The failed IPv6 bind must release its already-bound IPv4 candidate.
+        assert!(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, target)).is_ok());
+        for loopback in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let remote = UdpSocket::bind((loopback, 0)).unwrap();
+            remote.send_to(b"old listener", (loopback, old)).unwrap();
+            let listener = if loopback.is_ipv4() {
+                d.udp4.as_ref()
+            } else {
+                d.udp6.as_ref()
+            };
+            assert_eq!(receive(listener.unwrap()).0, b"old listener");
+        }
+        drop(holder);
+        d.open_listen_socket(target).unwrap();
+        assert_eq!(d.listen_port, target);
+    }
+}
+
+#[test]
+fn mapped_endpoints_use_ipv4_for_timer_tun_connected_and_roaming_traffic() {
+    let (mut d, _tun, _api) = device();
+    d.open_listen_socket(0).unwrap();
+    let a = socket2::Socket::from(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
+    let b = socket2::Socket::from(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
+    a.set_nonblocking(true).unwrap();
+    b.set_nonblocking(true).unwrap();
+    let mapped = |s: &socket2::Socket| {
+        SocketAddr::V6(SocketAddrV6::new(
+            Ipv4Addr::LOCALHOST.to_ipv6_mapped(),
+            s.local_addr().unwrap().as_socket().unwrap().port(),
+            0,
+            0,
+        ))
+    };
+    let mut p = peer(mapped(&a));
+    // Canonicalizing at storage makes all existing send sites choose IPv4,
+    // and treats a later native-IPv4 source as the same endpoint.
+    assert_eq!(p.endpoint().addr, a.local_addr().unwrap().as_socket());
+    let send_listener = |p: &mut Peer, remote: &socket2::Socket| {
+        let addr = p.endpoint().addr.unwrap();
+        udp_diagnostics::timer_send_step(
+            &d.udp_diag,
+            p,
+            d.udp4.as_ref().unwrap(),
+            d.listener_id(Family::V4),
+            d.udp6.as_ref(),
+            d.listener_id(Family::V6),
+            addr,
+            b"timer",
+        );
+        assert_eq!(receive(remote).0, b"timer");
+        assert!(udp_diagnostics::tun_send_step(
+            &d.udp_diag,
+            p,
+            d.udp4.as_ref().unwrap(),
+            d.listener_id(Family::V4),
+            d.udp6.as_ref(),
+            d.listener_id(Family::V6),
+            b"tun"
+        ));
+        assert_eq!(receive(remote).0, b"tun");
+    };
+    send_listener(&mut p, &a);
+    let conn = p.connect_endpoint(d.listen_port, None).unwrap();
+    assert!(conn.local_addr().unwrap().as_socket().unwrap().is_ipv4());
+    conn.send(b"connected").unwrap();
+    assert_eq!(receive(&a).0, b"connected");
+    a.send_to(
+        b"reply",
+        &SocketAddr::from((Ipv4Addr::LOCALHOST, d.listen_port)).into(),
+    )
+    .unwrap();
+    assert_eq!(receive(&conn).0, b"reply");
+    let fd = p.endpoint().conn.as_ref().unwrap().as_raw_fd();
+    p.set_endpoint(mapped(&a));
+    p.adopt_endpoint(a.local_addr().unwrap().as_socket().unwrap());
+    assert_eq!(p.endpoint().conn.as_ref().unwrap().as_raw_fd(), fd);
+    p.set_endpoint(mapped(&b));
+    assert!(p.endpoint().conn.is_none());
+    drop(conn);
+    send_listener(&mut p, &b);
+    let conn = p.connect_endpoint(d.listen_port, None).unwrap();
+    conn.send(b"roamed").unwrap();
+    assert_eq!(receive(&b).0, b"roamed");
+    // Native IPv6 scope/flow information and IPv4-compatible (not mapped)
+    // addresses must not be reinterpreted as IPv4.
+    for addr in [
+        "[::1]:99".parse().unwrap(),
+        "[::127.0.0.1]:99".parse().unwrap(),
+        SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 99, 7, 3)),
+    ] {
+        p.set_endpoint(addr);
+        assert_eq!(p.endpoint().addr, Some(addr));
+    }
+}
+
+#[test]
+fn equivalent_mapped_peer_updates_preserve_pending_imitation_evidence() {
+    use crate::noise::amnezia::AmneziaImitationProtocol as P;
+    let (mut d, _tun, _api) = device();
+    d.set_key(x25519::StaticSecret::random_from_rng(OsRng));
+    let key = x25519::PublicKey::from(&x25519::StaticSecret::random_from_rng(OsRng));
+    let mapped: SocketAddr = "[::ffff:127.0.0.1]:51820".parse().unwrap();
+    let native: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+    d.update_peer(key, false, false, Some(mapped), &[], None, None)
+        .unwrap();
+    let peer = Arc::clone(&d.peers[&key]);
+    {
+        let mut p = peer.lock();
+        p.tunnel
+            .try_set_obfuscation(
+                ObfuscationRanges::default(),
+                AmneziaConfig::default().with_protocol_imitation(P::Auto, None),
+            )
+            .unwrap();
+        let prelude = AmneziaConfig::default()
+            .with_protocol_imitation(P::Stun, None)
+            .pre_handshake_imitation_datagrams(&mut OsRng)
+            .pop_front()
+            .unwrap()
+            .1;
+        let _ = p
+            .tunnel
+            .decapsulate(Some(native.ip()), &prelude, &mut [0; MAX_UDP_SIZE]);
+        assert!(p.tunnel.has_imitation_hint(), "precondition: pending hint");
+    }
+    for endpoint in [mapped, native, mapped] {
+        d.update_peer(key, false, false, Some(endpoint), &[], None, None)
+            .unwrap();
+        assert!(
+            peer.lock().tunnel.has_imitation_hint(),
+            "equivalent endpoint {}",
+            endpoint
+        );
+    }
+    d.update_peer(
+        key,
+        false,
+        false,
+        Some("127.0.0.1:51821".parse().unwrap()),
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !peer.lock().tunnel.has_imitation_hint(),
+        "a real endpoint change discards the hint"
+    );
+}
+
+#[test]
 fn listeners_and_connected_peers_use_uid_checked_port_sharing() {
     let (mut d, _tun, _api) = device();
     d.open_listen_socket(0).unwrap();
@@ -485,6 +661,9 @@ fn listeners_and_connected_peers_use_uid_checked_port_sharing() {
         let p = peer(remote.local_addr().unwrap());
         let conn = p.connect_endpoint(d.listen_port, None).unwrap();
         assert_isolated(&conn);
+        if addr.is_ipv6() {
+            assert!(conn.only_v6().unwrap());
+        }
         assert_eq!(
             conn.local_addr().unwrap().as_socket().unwrap().port(),
             d.listen_port
@@ -492,6 +671,7 @@ fn listeners_and_connected_peers_use_uid_checked_port_sharing() {
     }
     assert_isolated(d.udp4.as_ref().unwrap());
     assert_isolated(d.udp6.as_ref().unwrap());
+    assert!(d.udp6.as_ref().unwrap().only_v6().unwrap());
 }
 
 #[test]

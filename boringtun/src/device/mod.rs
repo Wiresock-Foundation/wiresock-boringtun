@@ -921,6 +921,7 @@ impl Device {
             let mut p = peer.lock();
 
             if let Some(addr) = endpoint {
+                let addr = peer::canonical_endpoint(addr);
                 if p.endpoint().addr != Some(addr) {
                     // As for a roam in `commit_anonymous`: the tunnel's
                     // unverified evidence describes the endpoint being left.
@@ -1309,6 +1310,11 @@ impl Device {
             Err(e) => return Err(e.into()),
         };
         configure_udp_sharing(&udp6)?;
+        // Keep Linux's reuse-port groups disjoint by family. A dual-stack
+        // candidate can match our IPv4 socket and bypass an exclusive IPv6
+        // holder. Mapped endpoints are normalized by Peer to use IPv4.
+        #[cfg(target_os = "linux")]
+        udp6.set_only_v6(true)?;
         udp6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
         udp6.set_nonblocking(true)?;
 

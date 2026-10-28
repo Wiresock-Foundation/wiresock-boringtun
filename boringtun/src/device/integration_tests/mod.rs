@@ -2725,7 +2725,7 @@ allowed_ip=10.66.66.2/32",
     }
 
     /// As `bindable`, for sockets made the way the device makes its
-    /// listeners: with SO_REUSEADDR, IPv6 dual-stack.
+    /// listeners: with SO_REUSEPORT, IPv6-only on Linux.
     #[cfg(target_os = "linux")]
     fn listener_bindable(port: u16) -> (bool, bool) {
         use socket2::{Domain, Socket, Type};
@@ -2734,7 +2734,10 @@ allowed_ip=10.66.66.2/32",
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let bind = |domain, addr: SocketAddr| {
             let s = Socket::new(domain, Type::DGRAM, None).unwrap();
-            s.set_reuse_address(true).unwrap();
+            super::super::configure_udp_sharing(&s).unwrap();
+            if domain == Domain::IPV6 {
+                s.set_only_v6(true).unwrap();
+            }
             s.bind(&addr.into()).is_ok()
         };
         let v4 = bind(
@@ -3016,11 +3019,11 @@ allowed_ip=10.66.66.2/32",
                 .unwrap();
             s
         };
-        // With each holder, which of the candidates' binds (SO_REUSEADDR, as
-        // `bind_listen_pair` makes them) succeed: none, or the IPv4 one only.
+        // Probe the candidates separately with the production socket options.
+        // The unoccupied family remains independently bindable.
         type Hold<'a> = &'a dyn Fn() -> socket2::Socket;
         let holders: [(&str, Hold, (bool, bool)); 2] = [
-            ("IPv4", &hold_v4, (false, false)),
+            ("IPv4", &hold_v4, (false, true)),
             ("IPv6-only", &hold_v6_only, (true, false)),
         ];
         for (family, hold, candidates) in holders {
