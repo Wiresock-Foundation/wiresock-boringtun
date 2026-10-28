@@ -163,6 +163,41 @@ Neither constructor retains extra capabilities. Startup-error path cleanup is
 best-effort; a supervisor may need to remove published UAPI paths if the final
 UID cannot unlink them.
 
+### Linux fwmark and supervisor readiness
+
+`fwmark=` applies `SO_MARK` to the listeners and existing connected peer sockets;
+successful later listener rebinds and new connected sockets inherit the stored
+mark. Linux requires `CAP_NET_ADMIN`, or `CAP_NET_RAW` on Linux 5.17 and newer,
+to set `SO_MARK` ([socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html)).
+An inherited TUN and UAPI (`--tun-fd` and `--uapi-fd`) avoid the engine needing
+interface-creation privileges, but do not remove this marking requirement.
+This assumes unprivileged listen ports; other setup operations retain their own
+permission requirements. The engine does not arrange capability retention across
+its privilege drop.
+
+The initial listeners are unmarked. A refused `fwmark=` returns a nonzero UAPI
+errno and leaves the engine running. Any failed update can leave sockets with
+their previous marks, or a mixture of previous and requested marks if restoring
+an earlier socket also fails. This includes the first attempt: some sockets can
+retain mark zero while others keep the requested mark. `get=1` reports the last
+successfully stored device mark, not a fresh audit of every socket. Explicit
+`fwmark=0` clears the mark and still requires permission.
+
+If routing safety depends on the mark, the supervisor must keep egress blocked
+before launching the engine, through configuration, and after any marking or
+configuration failure. Send the initial `fwmark=` in a separate first `set=1`
+request and require `errno=0` before configuring peers or permitting traffic.
+Putting it first in a combined request only orders application of those keys:
+the listeners already exist, probe replies may be enabled, and UAPI updates can
+partially apply. It is not a fail-closed startup guarantee. Likewise, block egress
+before a live mark change; reacting to an error cannot undo packets already sent.
+On failure, keep the gate closed and stop/recreate the engine or reconcile all
+socket marks before declaring readiness. The engine does not install this gate.
+
+An optional required-mark mode is described in
+[the design proposal](docs/REQUIRED_FWMARK_PROPOSAL.md). It is not implemented;
+there is currently no `--require-fwmark` option.
+
 ### Server imitation auto mode
 
 ```bash
