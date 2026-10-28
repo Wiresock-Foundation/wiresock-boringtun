@@ -1,16 +1,12 @@
 name: PR Status Checks
 
-# `awg-2.0-extensions` alongside `master`: it is this fork's long-lived
-# integration branch, and every PR so far has targeted it rather than master.
-# With only `master` listed, none of the jobs below had ever run against that
-# work -- 47 commits, with only Semgrep and the review bot for company. A
-# `pull_request` entry filters on the *base* branch, so this covers the
-# short-lived branches that merge into it too.
+# Check every PR base, including the preceding feature branch in a stack.
+# Filtering pull_request to long-lived branches would skip combined Linux
+# and macOS integration tests for the later changes in that stack.
 on:
   push:
     branches: [ "master", "awg-2.0-extensions" ]
   pull_request:
-    branches: [ "master", "awg-2.0-extensions" ]
 
 permissions:
   contents: read
