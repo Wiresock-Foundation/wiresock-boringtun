@@ -33,12 +33,12 @@ pub struct EventPoll<H: Sized> {
     /// process that is out of watches and stays out.
     #[cfg(test)]
     fail_all_adds: std::sync::atomic::AtomicBool,
-    /// Counts `EPOLL_CTL_ADD` attempts, so a test can assert that a failed
-    /// upgrade is not retried per datagram.
+    /// Counts non-stream `EPOLL_CTL_ADD` attempts, so UDP listener/upgrade
+    /// tests do not count the UAPI connections used to drive them.
     #[cfg(test)]
     add_attempts: std::sync::atomic::AtomicUsize,
     /// A one-shot fault a given number of registrations ahead: `n` means let
-    /// the next `n` `EPOLL_CTL_ADD`s through and fail the one after.
+    /// the next `n` non-stream `EPOLL_CTL_ADD`s through and fail the one after.
     /// `usize::MAX` is disarmed. For failing one registration in the middle of
     /// a sequence -- the second of a listener pair, say.
     #[cfg(test)]
@@ -65,6 +65,7 @@ struct Event<H> {
     handler: H,         // The associated data
     notifier: bool,     // Is a notification event
     needs_read: bool,   // This event needs to be read to be cleared
+    drain_eof: bool,    // Stream handler must consume buffered bytes before EOF
 }
 
 impl<H> Drop for EventPoll<H> {
@@ -80,6 +81,26 @@ mod tests {
     use std::sync::Arc;
 
     type H = Box<dyn Fn() + Send + Sync>;
+
+    #[test]
+    fn uapi_streams_do_not_consume_listener_registration_faults() {
+        use std::os::unix::net::{UnixDatagram, UnixStream};
+
+        let poll = EventPoll::new().unwrap();
+        let (api, _client) = UnixStream::pair().unwrap();
+        let (first, _first_peer) = UnixDatagram::pair().unwrap();
+        let (second, _second_peer) = UnixDatagram::pair().unwrap();
+        poll.fail_non_stream_registration_after(1);
+        poll.new_stream_event(api.as_raw_fd(), ()).unwrap();
+        assert_eq!(poll.non_stream_registration_attempts(), 0);
+        assert_eq!(poll.registered_non_stream_count(), 0);
+        poll.new_event(first.as_raw_fd(), ()).unwrap();
+        let error = poll.new_event(second.as_raw_fd(), ()).err().unwrap();
+        assert!(matches!(error, Error::EventQueue(e) if e.raw_os_error() == Some(EBADF)));
+        assert_eq!(poll.non_stream_registration_attempts(), 2);
+        assert_eq!(poll.registered_count(), 2);
+        assert_eq!(poll.registered_non_stream_count(), 1);
+    }
 
     /// A handler epoll refused must not stay in the events vector.
     ///
@@ -275,6 +296,19 @@ impl<H: Sync + Send> EventPoll<H> {
     /// appropriate EventGuard. It is guaranteed that only a single thread can have a reference to
     /// the handler at any given time.
     pub fn new_event(&self, trigger: RawFd, handler: H) -> Result<EventRef, Error> {
+        self.new_read_event(trigger, handler, false)
+    }
+
+    pub fn new_stream_event(&self, trigger: RawFd, handler: H) -> Result<EventRef, Error> {
+        self.new_read_event(trigger, handler, true)
+    }
+
+    fn new_read_event(
+        &self,
+        trigger: RawFd,
+        handler: H,
+        drain_eof: bool,
+    ) -> Result<EventRef, Error> {
         // Create an event descriptor
         let flags = EPOLLIN | EPOLLONESHOT;
         let ev = Event {
@@ -286,6 +320,7 @@ impl<H: Sync + Send> EventPoll<H> {
             handler,
             notifier: false,
             needs_read: false,
+            drain_eof,
         };
 
         self.register_event(ev)
@@ -307,6 +342,7 @@ impl<H: Sync + Send> EventPoll<H> {
             handler,
             notifier: false,
             needs_read: false,
+            drain_eof: false,
         };
 
         self.register_event(ev)
@@ -357,6 +393,7 @@ impl<H: Sync + Send> EventPoll<H> {
             handler,
             notifier: false,
             needs_read: true,
+            drain_eof: false,
         };
 
         self.register_event(ev)
@@ -386,6 +423,7 @@ impl<H: Sync + Send> EventPoll<H> {
             handler,
             notifier: true,
             needs_read: false,
+            drain_eof: false,
         };
 
         self.register_event(ev)
@@ -413,6 +451,7 @@ impl<H: Sync + Send> EventPoll<H> {
             handler,
             notifier: false,
             needs_read: true,
+            drain_eof: false,
         };
 
         self.register_event(ev)
@@ -438,7 +477,7 @@ impl<H: Sync + Send> EventPoll<H> {
             poll: self,
         };
 
-        if event.events & EPOLLHUP as u32 != 0 {
+        if event.events & EPOLLHUP as u32 != 0 && !guard.event.drain_eof {
             // End of file flag
             WaitResult::EoF(guard)
         } else {
@@ -454,6 +493,8 @@ impl<H: Sync + Send> EventPoll<H> {
         // * Dispose of a previous Event under same fd if any
         // * Add the Event to epoll
         let trigger = ev.fd;
+        #[cfg(test)]
+        let is_stream = ev.drain_eof;
         let mut ev = Box::new(ev);
         // The inner event points back to the wrapper
         ev.event.u64 = ev.as_mut() as *mut Event<H> as _;
@@ -471,17 +512,20 @@ impl<H: Sync + Send> EventPoll<H> {
         #[cfg(test)]
         let epoll_fd = {
             use std::sync::atomic::Ordering::Relaxed;
-            self.add_attempts.fetch_add(1, Relaxed);
+            if !is_stream {
+                self.add_attempts.fetch_add(1, Relaxed);
+            }
             // Counts down the armed `fail_after_adds`; true exactly once, on
             // the registration it was armed to fail, which also disarms it.
-            let scheduled = self
-                .fail_after_adds
-                .fetch_update(Relaxed, Relaxed, |n| match n {
-                    usize::MAX => None,
-                    0 => Some(usize::MAX),
-                    n => Some(n - 1),
-                })
-                == Ok(0);
+            let scheduled = !is_stream
+                && self
+                    .fail_after_adds
+                    .fetch_update(Relaxed, Relaxed, |n| match n {
+                        usize::MAX => None,
+                        0 => Some(usize::MAX),
+                        n => Some(n - 1),
+                    })
+                    == Ok(0);
             if self.fail_next_add.swap(false, Relaxed)
                 || self.fail_all_adds.load(Relaxed)
                 || scheduled
@@ -547,6 +591,17 @@ impl<H: Sync + Send> EventPoll<H> {
         self.events.lock().iter().filter(|e| e.is_some()).count()
     }
 
+    /// UDP lifecycle checks must not race transient UAPI stream teardown.
+    #[cfg(test)]
+    pub(crate) fn registered_non_stream_count(&self) -> usize {
+        self.events
+            .lock()
+            .iter()
+            .flatten()
+            .filter(|e| !e.drain_eof)
+            .count()
+    }
+
     /// Make the next `register_event` on this poll fail, as `epoll_ctl` does
     /// with ENOSPC once this UID is out of `max_user_watches`.
     #[cfg(test)]
@@ -565,18 +620,18 @@ impl<H: Sync + Send> EventPoll<H> {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Let the next `allowed` registrations on this poll succeed and fail the
+    /// Let the next `allowed` non-stream registrations succeed and fail the
     /// one after, once -- the way `fail_next_registration` fails it, with a
     /// real `epoll_ctl` error and the real rollback.
     #[cfg(test)]
-    pub(crate) fn fail_registration_after(&self, allowed: usize) {
+    pub(crate) fn fail_non_stream_registration_after(&self, allowed: usize) {
         self.fail_after_adds
             .store(allowed, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// How many `EPOLL_CTL_ADD` calls this poll has attempted.
+    /// How many non-stream `EPOLL_CTL_ADD` calls this poll has attempted.
     #[cfg(test)]
-    pub(crate) fn registration_attempts(&self) -> usize {
+    pub(crate) fn non_stream_registration_attempts(&self) -> usize {
         self.add_attempts.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -736,7 +791,9 @@ impl<'a, H> EventGuard<'a, H> {
     /// Change the event flags to enable or disable notifying when the fd is writable
     pub fn notify_writable(&mut self, enabled: bool) {
         let flags = if enabled {
-            EPOLLOUT | EPOLLIN | EPOLLET | EPOLLONESHOT
+            // Read readiness while output is blocked would spin. Level
+            // triggering also resumes buffered work after each bounded write.
+            EPOLLOUT | EPOLLONESHOT
         } else {
             EPOLLIN | EPOLLONESHOT
         };

@@ -100,6 +100,31 @@ Configure it with `wg`, or with `awg` from amneziawg-tools for the AmneziaWG par
 UAPI socket is published in both `/var/run/wireguard/` and `/var/run/amneziawg/`, because `wg`
 searches the first and `awg` the second.
 
+UAPI requests end with a blank line, including `get=1\n\n`. Socket clients receive
+one response per connection; on Linux an inherited `--uapi-fd` supports repeated and
+pipelined requests in order. Partial frames are buffered without blocking the
+datapath. An incomplete frame at EOF is discarded. A complete `set=1` request can
+still apply earlier settings before a later setting fails; an error is not a
+transaction rollback.
+
+The transport accepts at most 32 simultaneous socket clients, 1 MiB per request
+(including the terminator), and 4 MiB per response. An oversized request receives
+`E2BIG` and the connection closes; an oversized response is replaced by
+`EOVERFLOW`. Requests and response delivery each have an absolute five-second
+deadline, checked at 100 ms intervals; trickle traffic does not extend it. Accepted
+clients must also begin within that deadline. An inherited control fd may remain
+idle indefinitely between transactions. A timeout closes an accepted socket
+client without stopping the device; that client can reconnect.
+
+On Linux, an inherited `--uapi-fd` is the supervisor's lifecycle channel. EOF, a broken
+transport, an input or output deadline, or an oversized request (`E2BIG`) closes
+that channel and stops the entire device. A supervisor must restart the device
+with a fresh fd after these failures; the running device has no replacement-fd
+API. A complete request with an ordinary configuration error remains nonfatal,
+as does an oversized response whose `EOVERFLOW` reply is delivered within its
+deadline. Supervisors must check every `errno` response and account for the
+existing partial-apply behavior of complete `set=1` requests.
+
 Logging goes to `WG_LOG_FILE` at `WG_LOG_LEVEL`. Note that a daemonised process loses its log
 writer — use `--foreground` when you need output.
 

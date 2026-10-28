@@ -640,13 +640,18 @@ mod tests {
                 .device
                 .read()
                 .queue
-                .fail_registration_after(allowed);
+                .fail_non_stream_registration_after(allowed);
         }
 
-        /// How many `EPOLL_CTL_ADD` calls this device has attempted.
+        /// Non-stream `EPOLL_CTL_ADD` attempts; exclude UAPI requests that
+        /// drive the UDP operation under test.
         #[cfg(target_os = "linux")]
         fn event_registration_attempts(&self) -> usize {
-            self._device.device.read().queue.registration_attempts()
+            self._device
+                .device
+                .read()
+                .queue
+                .non_stream_registration_attempts()
         }
 
         /// Block until this device has attempted at least `n` more
@@ -2635,7 +2640,7 @@ allowed_ip=10.66.66.2/32",
                 ..Default::default()
             },
         );
-        let registered = || wg._device.device.read().queue.registered_count();
+        let registered = || wg._device.device.read().queue.registered_non_stream_count();
 
         let (a, b, c) = (next_port(), next_port(), next_port());
         assert_eq!(wg.wg_set_port(a), OK);
@@ -2770,7 +2775,7 @@ allowed_ip=10.66.66.2/32",
 
     #[cfg(target_os = "linux")]
     fn registered_events(wg: &WGHandle) -> usize {
-        wg._device.device.read().queue.registered_count()
+        wg._device.device.read().queue.registered_non_stream_count()
     }
 
     #[cfg(target_os = "linux")]

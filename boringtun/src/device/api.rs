@@ -14,13 +14,18 @@ use hex::encode as encode_hex;
 use libc::*;
 use std::collections::HashMap;
 use std::fs::{create_dir, remove_file};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, Write};
+#[cfg(test)]
+use std::io::{BufReader, BufWriter};
 use std::net::IpAddr;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "api_transport.rs"]
+mod transport;
 
 const SOCK_DIR: &str = "/var/run/wireguard/";
 /// Where `amneziawg-tools` looks for a userspace implementation's UAPI socket.
@@ -432,32 +437,7 @@ impl Device {
             ),
         }
 
-        self.queue.new_event(
-            api_listener.as_raw_fd(),
-            Box::new(move |d, _| {
-                // This is the closure that listens on the api unix socket
-                let (api_conn, _) = match api_listener.accept() {
-                    Ok(conn) => conn,
-                    _ => return Action::Continue,
-                };
-
-                let mut reader = BufReader::new(&api_conn);
-                let mut writer = BufWriter::new(&api_conn);
-                let mut cmd = String::new();
-                if reader.read_line(&mut cmd).is_ok() {
-                    cmd.pop(); // pop the new line character
-                    let status = match cmd.as_ref() {
-                        // Only two commands are legal according to the protocol, get=1 and set=1.
-                        "get=1" => api_get(&mut writer, d),
-                        "set=1" => api_set(&mut reader, d),
-                        _ => EIO,
-                    };
-                    // The protocol requires to return an error code as the response, or zero on success
-                    writeln!(writer, "errno={}\n", status).ok();
-                }
-                Action::Continue // Indicates the worker thread should continue as normal
-            }),
-        )?;
+        transport::register_listener(self, api_listener)?;
 
         self.register_monitor(path)?;
         self.register_api_signal_handlers()
@@ -466,35 +446,7 @@ impl Device {
     pub fn register_api_fd(&mut self, fd: i32) -> Result<(), Error> {
         let io_file = unsafe { UnixStream::from_raw_fd(fd) };
 
-        self.queue.new_event(
-            io_file.as_raw_fd(),
-            Box::new(move |d, _| {
-                // This is the closure that listens on the api file descriptor
-
-                let mut reader = BufReader::new(&io_file);
-                let mut writer = BufWriter::new(&io_file);
-                let mut cmd = String::new();
-                if reader.read_line(&mut cmd).is_ok() {
-                    cmd.pop(); // pop the new line character
-                    let status = match cmd.as_ref() {
-                        // Only two commands are legal according to the protocol, get=1 and set=1.
-                        "get=1" => api_get(&mut writer, d),
-                        "set=1" => api_set(&mut reader, d),
-                        _ => EIO,
-                    };
-                    // The protocol requires to return an error code as the response, or zero on success
-                    writeln!(writer, "errno={}\n", status).ok();
-                } else {
-                    // The remote side is likely closed; we should trigger an exit.
-                    d.trigger_exit();
-                    return Action::Exit;
-                }
-
-                Action::Continue // Indicates the worker thread should continue as normal
-            }),
-        )?;
-
-        Ok(())
+        transport::register_inherited(self, io_file)
     }
 
     fn register_monitor(&self, path: String) -> Result<(), Error> {
@@ -700,8 +652,8 @@ fn write_awg_interface_params(
 }
 
 #[allow(unused_must_use)]
-fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
-    // get command requires an empty line, but there is no reason to be religious about it
+fn api_get(writer: &mut impl Write, d: &Device) -> i32 {
+    // The transport has already validated the complete get=1 frame.
     if let Some(ref k) = d.key_pair {
         writeln!(writer, "own_public_key={}", encode_hex(k.1.as_bytes()));
     }
@@ -795,7 +747,7 @@ fn device_errno(e: &Error) -> i32 {
     }
 }
 
-fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -> i32 {
+fn api_set(reader: &mut impl BufRead, d: &mut LockReadGuard<Device>) -> i32 {
     // The timer-ordering warning of the AmneziaWG configuration this
     // transaction applies, logged only after `try_writeable` has released the
     // device write lock and lowered its writer intent: a logging subscriber
@@ -1098,11 +1050,7 @@ fn commit_peer(
     Ok(())
 }
 
-fn api_set_peer(
-    reader: &mut BufReader<&UnixStream>,
-    d: &mut Device,
-    pub_key: x25519::PublicKey,
-) -> i32 {
+fn api_set_peer(reader: &mut impl BufRead, d: &mut Device, pub_key: x25519::PublicKey) -> i32 {
     let mut cmd = String::new();
 
     let mut public_key = pub_key;
@@ -1214,6 +1162,10 @@ fn api_set_peer(
     }
     0
 }
+
+#[cfg(test)]
+#[path = "api_transport_tests.rs"]
+mod transport_tests;
 
 #[cfg(test)]
 mod tests {
