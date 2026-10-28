@@ -100,6 +100,23 @@ Configure it with `wg`, or with `awg` from amneziawg-tools for the AmneziaWG par
 UAPI socket is published in both `/var/run/wireguard/` and `/var/run/amneziawg/`, because `wg`
 searches the first and `awg` the second.
 
+UAPI requests end with a blank line, including `get=1\n\n`. Socket clients receive
+one response per connection; an inherited `--uapi-fd` supports repeated and
+pipelined requests in order. Partial frames are buffered without blocking the
+datapath. An incomplete frame at EOF is discarded. A complete `set=1` request can
+still apply earlier settings before a later setting fails; an error is not a
+transaction rollback.
+
+The transport accepts at most 32 simultaneous socket clients, 1 MiB per request
+(including the terminator), and 4 MiB per response. An oversized request receives
+`E2BIG` and the connection closes; an oversized response is replaced by
+`EOVERFLOW`. Requests and response delivery each have an absolute five-second
+deadline, checked at 100 ms intervals; trickle traffic does not extend it. Accepted
+clients must also begin within that deadline. An inherited control fd may remain
+idle between transactions. Timeouts close the affected connection. Closing or
+failing the inherited control fd stops the device, as EOF does. Supervisors should
+reconnect or restart as appropriate and must check each `errno` response.
+
 Logging goes to `WG_LOG_FILE` at `WG_LOG_LEVEL`. Note that a daemonised process loses its log
 writer — use `--foreground` when you need output.
 

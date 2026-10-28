@@ -178,6 +178,9 @@ enum Action {
     Continue, // Continue the loop
     Yield,    // Yield the read lock and acquire it again
     Exit,     // Stop the loop
+    WaitForRead,
+    WaitForWrite,
+    Close,
 }
 
 // Event handler function
@@ -745,10 +748,13 @@ impl DeviceHandle {
 
             loop {
                 match queue.wait() {
-                    WaitResult::Ok(handler) => {
+                    WaitResult::Ok(mut handler) => {
                         let action = (*handler)(&mut device_lock, &mut thread_local);
                         match action {
                             Action::Continue => {}
+                            Action::WaitForRead => handler.notify_writable(false),
+                            Action::WaitForWrite => handler.notify_writable(true),
+                            Action::Close => handler.cancel(),
                             Action::Yield => break,
                             Action::Exit => {
                                 device_lock.trigger_exit();

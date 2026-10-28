@@ -8,6 +8,7 @@ use std::io;
 use std::ops::Deref;
 use std::os::unix::io::RawFd;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// A return type for the EventPoll::wait() function
@@ -26,6 +27,8 @@ pub struct EventPoll<H: Sized> {
     custom: Mutex<Vec<Option<Box<Event<H>>>>>, // Other events (i.e. timers & notifiers)
     signals: Mutex<Vec<Option<Box<Event<H>>>>>, // Signal handlers
     kqueue: RawFd,                             // The OS kqueue
+    #[cfg(test)]
+    fail_next_stream_read: AtomicBool,
 }
 
 /// A type that hold a reference to a triggered Event
@@ -55,6 +58,8 @@ struct Event<H> {
     event: kevent, // The kqueue event description
     handler: H,    // The associated data
     kind: EventKind,
+    drain_eof: bool,
+    write_interest: AtomicBool,
 }
 
 impl<H> Drop for EventPoll<H> {
@@ -79,6 +84,8 @@ impl<H: Send + Sync> EventPoll<H> {
             custom: Mutex::new(vec![]),
             signals: Mutex::new(vec![]),
             kqueue,
+            #[cfg(test)]
+            fail_next_stream_read: AtomicBool::new(false),
         })
     }
 
@@ -95,6 +102,19 @@ impl<H: Send + Sync> EventPoll<H> {
     /// appropriate EventGuard. It is guaranteed that only a single thread can have a reference to
     /// the handler at any given time.
     pub fn new_event(&self, trigger: RawFd, handler: H) -> Result<EventRef, Error> {
+        self.new_read_event(trigger, handler, false)
+    }
+
+    pub fn new_stream_event(&self, trigger: RawFd, handler: H) -> Result<EventRef, Error> {
+        self.new_read_event(trigger, handler, true)
+    }
+
+    fn new_read_event(
+        &self,
+        trigger: RawFd,
+        handler: H,
+        drain_eof: bool,
+    ) -> Result<EventRef, Error> {
         // Create an event descriptor
         let flags = EV_ENABLE | EV_DISPATCH;
 
@@ -109,6 +129,8 @@ impl<H: Send + Sync> EventPoll<H> {
             },
             handler,
             kind: EventKind::FD,
+            drain_eof,
+            write_interest: AtomicBool::new(false),
         };
 
         self.register_event(ev)
@@ -132,6 +154,8 @@ impl<H: Send + Sync> EventPoll<H> {
             },
             handler,
             kind: EventKind::Timer,
+            drain_eof: false,
+            write_interest: AtomicBool::new(false),
         };
 
         self.register_event(ev)
@@ -150,6 +174,8 @@ impl<H: Send + Sync> EventPoll<H> {
             },
             handler,
             kind: EventKind::Notifier,
+            drain_eof: false,
+            write_interest: AtomicBool::new(false),
         };
 
         self.register_event(ev)
@@ -168,6 +194,8 @@ impl<H: Send + Sync> EventPoll<H> {
             },
             handler,
             kind: EventKind::Signal,
+            drain_eof: false,
+            write_interest: AtomicBool::new(false),
         };
 
         self.register_event(ev)
@@ -199,7 +227,7 @@ impl<H: Send + Sync> EventPoll<H> {
             poll: self,
         };
 
-        if event.flags & EV_EOF != 0 {
+        if event.flags & EV_EOF != 0 && !event_data.drain_eof {
             WaitResult::EoF(guard)
         } else {
             WaitResult::Ok(guard)
@@ -240,17 +268,53 @@ impl<H: Send + Sync> EventPoll<H> {
                 events.push(None); // resize doesn't work because Clone is not satisfied
             }
 
+            // Streams own their descriptor. Refuse replacement rather than
+            // disturbing an existing two-filter registration during rollback.
+            if ev.drain_eof && events[index].is_some() {
+                drop(events);
+                return Err(Error::EventQueue(io::Error::from_raw_os_error(EEXIST)));
+            }
+
             let mut ev = Box::new(ev);
             // The inner event points back to the wrapper
             ev.event.ident = trigger as _;
             ev.event.udata = ev.as_mut() as *mut Event<H> as _;
 
+            // Reserve WRITE while registering the stream, before READ can
+            // dispatch. Later switches only enable an existing filter and
+            // cannot strand a connection on a failed allocation in Drop.
+            if ev.drain_eof {
+                let mut write = ev.event;
+                write.filter = EVFILT_WRITE;
+                write.flags = EV_ADD | EV_DISABLE | EV_DISPATCH;
+                if unsafe { kevent(self.kqueue, &write, 1, null_mut(), 0, null()) } == -1 {
+                    let err = io::Error::last_os_error();
+                    drop(events);
+                    return Err(Error::EventQueue(err));
+                }
+            }
+
             let mut kev = ev.event;
             kev.flags |= EV_ADD;
 
-            if unsafe { kevent(self.kqueue, &kev, 1, null_mut(), 0, null()) } == -1 {
+            #[cfg(test)]
+            let queue = if ev.drain_eof && self.fail_next_stream_read.swap(false, Ordering::Relaxed)
+            {
+                -1
+            } else {
+                self.kqueue
+            };
+            #[cfg(not(test))]
+            let queue = self.kqueue;
+            if unsafe { kevent(queue, &kev, 1, null_mut(), 0, null()) } == -1 {
                 // errno before the unlock, and the unlock before `ev` drops.
                 let err = io::Error::last_os_error();
+                if ev.drain_eof {
+                    let mut write = ev.event;
+                    write.filter = EVFILT_WRITE;
+                    write.flags = EV_DELETE;
+                    unsafe { kevent(self.kqueue, &write, 1, null_mut(), 0, null()) };
+                }
                 drop(events);
                 return Err(Error::EventQueue(err));
             }
@@ -277,6 +341,14 @@ impl<H: Send + Sync> EventPoll<H> {
             // every handler owns the trigger it is indexed by, so the number
             // cannot be re-issued while the entry exists.
             let displaced = events[index].take();
+            if displaced.as_ref().is_some_and(|old| old.drain_eof) {
+                // A normal READ event can replace a stream. READ was replaced
+                // above, but its reserved WRITE filter must leave with it.
+                let mut write = kev;
+                write.filter = EVFILT_WRITE;
+                write.flags = EV_DELETE;
+                unsafe { kevent(self.kqueue, &write, 1, null_mut(), 0, null()) };
+            }
 
             if ev.kind == EventKind::Signal {
                 // Mask the signal if successfully added to kqueue
@@ -359,6 +431,10 @@ impl<H> EventPoll<H> {
                 // Properly remove any previous event first
                 event.event.flags = EV_DELETE;
                 kevent(self.kqueue, &event.event, 1, null_mut(), 0, null());
+                if event.drain_eof {
+                    event.event.filter = EVFILT_WRITE;
+                    kevent(self.kqueue, &event.event, 1, null_mut(), 0, null());
+                }
             }
             cleared
         };
@@ -375,14 +451,30 @@ impl<'a, H> Deref for EventGuard<'a, H> {
 
 impl<'a, H> Drop for EventGuard<'a, H> {
     fn drop(&mut self) {
+        let mut event = self.event.event;
+        if self.event.drain_eof {
+            let desired = if self.event.write_interest.load(Ordering::Relaxed) {
+                EVFILT_WRITE
+            } else {
+                EVFILT_READ
+            };
+            // EV_DISPATCH already disabled the filter that fired. The other
+            // filter was reserved disabled at registration; enabling exactly
+            // one keeps ownership exclusive without a fresh EV_ADD allocation.
+            event.filter = desired;
+        }
         unsafe {
             // Re-enable the event once EventGuard goes out of scope
-            kevent(self.kqueue, &self.event.event, 1, null_mut(), 0, null());
+            kevent(self.kqueue, &event, 1, null_mut(), 0, null());
         }
     }
 }
 
 impl<'a, H> EventGuard<'a, H> {
+    pub fn notify_writable(&mut self, enabled: bool) {
+        self.event.write_interest.store(enabled, Ordering::Relaxed);
+    }
+
     /// Cancel and remove the event represented by this guard
     pub fn cancel(self) {
         unsafe { self.poll.clear_event_by_fd(self.event.event.ident as RawFd) };
@@ -392,5 +484,91 @@ impl<'a, H> EventGuard<'a, H> {
     /// Stub: only used for Linux-specific features.
     pub fn fd(&self) -> i32 {
         -1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+
+    // Bounded version of wait for these socket-only tests, so a broken rearm
+    // reports a failure rather than hanging the macOS test job.
+    fn ready<H>(poll: &EventPoll<H>) -> (EventGuard<'_, H>, i16) {
+        let mut event = unsafe { std::mem::zeroed::<kevent>() };
+        let timeout = timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { kevent(poll.kqueue, null(), 0, &mut event, 1, &timeout) },
+            1
+        );
+        (
+            EventGuard {
+                kqueue: poll.kqueue,
+                event: unsafe { &*(event.udata as *const Event<H>) },
+                poll,
+            },
+            event.filter,
+        )
+    }
+
+    fn filter_is_absent(queue: RawFd, fd: RawFd, filter: i16) -> bool {
+        let mut event = unsafe { std::mem::zeroed::<kevent>() };
+        event.ident = fd as _;
+        event.filter = filter;
+        event.flags = EV_ENABLE;
+        (unsafe { kevent(queue, &event, 1, null_mut(), 0, null()) }) == -1
+            && io::Error::last_os_error().raw_os_error() == Some(ENOENT)
+    }
+
+    #[test]
+    fn stream_filters_switch_exclusively_and_cancel_together() {
+        let poll = EventPoll::new().unwrap();
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        poll.new_stream_event(server.as_raw_fd(), ()).unwrap();
+        for _ in 0..4 {
+            client.write_all(b"r").unwrap();
+            let (mut event, filter) = ready(&poll);
+            assert_eq!(filter, EVFILT_READ);
+            assert_eq!(server.read(&mut [0; 1]).unwrap(), 1);
+            event.notify_writable(true);
+            drop(event);
+            let (mut event, filter) = ready(&poll);
+            assert_eq!(filter, EVFILT_WRITE);
+            server.write_all(b"w").unwrap();
+            event.notify_writable(false);
+            drop(event);
+            assert_eq!(client.read(&mut [0; 1]).unwrap(), 1);
+        }
+        client.write_all(b"r").unwrap();
+        ready(&poll).0.cancel();
+        for filter in [EVFILT_READ, EVFILT_WRITE] {
+            assert!(filter_is_absent(poll.kqueue, server.as_raw_fd(), filter));
+        }
+    }
+
+    #[test]
+    fn failed_stream_registration_rolls_back_its_reserved_write_filter() {
+        let poll = EventPoll::new().unwrap();
+        let (server, _client) = UnixStream::pair().unwrap();
+        let marker = Arc::new(());
+        poll.fail_next_stream_read.store(true, Ordering::Relaxed);
+        assert!(poll
+            .new_stream_event(server.as_raw_fd(), Arc::clone(&marker))
+            .is_err());
+        assert_eq!(Arc::strong_count(&marker), 1);
+        for filter in [EVFILT_READ, EVFILT_WRITE] {
+            assert!(filter_is_absent(poll.kqueue, server.as_raw_fd(), filter));
+        }
+        poll.new_stream_event(server.as_raw_fd(), marker).unwrap();
     }
 }

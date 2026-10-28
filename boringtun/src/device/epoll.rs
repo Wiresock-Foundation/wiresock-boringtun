@@ -65,6 +65,7 @@ struct Event<H> {
     handler: H,         // The associated data
     notifier: bool,     // Is a notification event
     needs_read: bool,   // This event needs to be read to be cleared
+    drain_eof: bool,    // Stream handler must consume buffered bytes before EOF
 }
 
 impl<H> Drop for EventPoll<H> {
@@ -275,6 +276,19 @@ impl<H: Sync + Send> EventPoll<H> {
     /// appropriate EventGuard. It is guaranteed that only a single thread can have a reference to
     /// the handler at any given time.
     pub fn new_event(&self, trigger: RawFd, handler: H) -> Result<EventRef, Error> {
+        self.new_read_event(trigger, handler, false)
+    }
+
+    pub fn new_stream_event(&self, trigger: RawFd, handler: H) -> Result<EventRef, Error> {
+        self.new_read_event(trigger, handler, true)
+    }
+
+    fn new_read_event(
+        &self,
+        trigger: RawFd,
+        handler: H,
+        drain_eof: bool,
+    ) -> Result<EventRef, Error> {
         // Create an event descriptor
         let flags = EPOLLIN | EPOLLONESHOT;
         let ev = Event {
@@ -286,6 +300,7 @@ impl<H: Sync + Send> EventPoll<H> {
             handler,
             notifier: false,
             needs_read: false,
+            drain_eof,
         };
 
         self.register_event(ev)
@@ -307,6 +322,7 @@ impl<H: Sync + Send> EventPoll<H> {
             handler,
             notifier: false,
             needs_read: false,
+            drain_eof: false,
         };
 
         self.register_event(ev)
@@ -357,6 +373,7 @@ impl<H: Sync + Send> EventPoll<H> {
             handler,
             notifier: false,
             needs_read: true,
+            drain_eof: false,
         };
 
         self.register_event(ev)
@@ -386,6 +403,7 @@ impl<H: Sync + Send> EventPoll<H> {
             handler,
             notifier: true,
             needs_read: false,
+            drain_eof: false,
         };
 
         self.register_event(ev)
@@ -413,6 +431,7 @@ impl<H: Sync + Send> EventPoll<H> {
             handler,
             notifier: false,
             needs_read: true,
+            drain_eof: false,
         };
 
         self.register_event(ev)
@@ -438,7 +457,7 @@ impl<H: Sync + Send> EventPoll<H> {
             poll: self,
         };
 
-        if event.events & EPOLLHUP as u32 != 0 {
+        if event.events & EPOLLHUP as u32 != 0 && !guard.event.drain_eof {
             // End of file flag
             WaitResult::EoF(guard)
         } else {
@@ -736,7 +755,9 @@ impl<'a, H> EventGuard<'a, H> {
     /// Change the event flags to enable or disable notifying when the fd is writable
     pub fn notify_writable(&mut self, enabled: bool) {
         let flags = if enabled {
-            EPOLLOUT | EPOLLIN | EPOLLET | EPOLLONESHOT
+            // Read readiness while output is blocked would spin. Level
+            // triggering also resumes buffered work after each bounded write.
+            EPOLLOUT | EPOLLONESHOT
         } else {
             EPOLLIN | EPOLLONESHOT
         };
