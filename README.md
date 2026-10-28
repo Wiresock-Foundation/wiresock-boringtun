@@ -101,7 +101,7 @@ UAPI socket is published in both `/var/run/wireguard/` and `/var/run/amneziawg/`
 searches the first and `awg` the second.
 
 UAPI requests end with a blank line, including `get=1\n\n`. Socket clients receive
-one response per connection; an inherited `--uapi-fd` supports repeated and
+one response per connection; on Linux an inherited `--uapi-fd` supports repeated and
 pipelined requests in order. Partial frames are buffered without blocking the
 datapath. An incomplete frame at EOF is discarded. A complete `set=1` request can
 still apply earlier settings before a later setting fails; an error is not a
@@ -116,7 +116,7 @@ clients must also begin within that deadline. An inherited control fd may remain
 idle indefinitely between transactions. A timeout closes an accepted socket
 client without stopping the device; that client can reconnect.
 
-An inherited `--uapi-fd` is the supervisor's lifecycle channel. EOF, a broken
+On Linux, an inherited `--uapi-fd` is the supervisor's lifecycle channel. EOF, a broken
 transport, an input or output deadline, or an oversized request (`E2BIG`) closes
 that channel and stops the entire device. A supervisor must restart the device
 with a fresh fd after these failures; the running device has no replacement-fd
