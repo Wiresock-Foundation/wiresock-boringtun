@@ -150,6 +150,23 @@ class SourceTransitionTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertFalse(output.exists())
 
+    def test_none_build_completion_skips_promotion_without_failure(self):
+        self.head = snapshot('0.8.0', 'none')
+        self.changed = [INTENT, 'docs/guide.md']
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'prepared'
+            with patch.object(release, 'GitHub', return_value=self.api), \
+                 patch.object(release, 'trusted_context', return_value={}), \
+                 patch.object(release, 'triggered_build', return_value=(1, 1)), \
+                 patch.object(release, 'pinned_gh', return_value='gh'), \
+                 patch.object(release, 'resolve_build_request', return_value={'source_commit': self.source, 'pr': 115}), \
+                 patch.object(self.api, 'get', side_effect=lambda path: {} if '/actions/runs/' in path else original_get(path)):
+                original_get = type(self.api).get.__get__(self.api)
+                result = release.main(['prepare', '--build-run', '1', '--attempt', '1', '--output', str(output),
+                                       '--gh', 'gh', '--gh-archive', 'gh.tar.gz'])
+            self.assertEqual(result, 0)
+            self.assertFalse(output.exists())
+
 
 if __name__ == '__main__':
     unittest.main()

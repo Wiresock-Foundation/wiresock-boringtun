@@ -355,6 +355,63 @@ def projection(data, fields):
     return {key: deepcopy(data[key]) for key in fields.split()}
 
 
+def stable_tag_version(tag):
+    require(type(tag) is str, 'invalid release tag')
+    match = re.fullmatch(r'boringtun-cli-([0-9]+\.[0-9]+\.[0-9]+)-g[0-9a-f]{12}-b[1-9][0-9]*', tag)
+    return versioning.semver(match[1]) if match else None
+
+
+def reconcile_latest(api, verify, gate, *, dry_run=True, body_for=descriptor_marker):
+    """Reconcile all releases under the workflow's shared Latest job lock.
+
+    Publication jobs keep make_latest:false. Only this serialized operation
+    writes Latest; pending jobs may coalesce because no triggering PR is used.
+    GitHub has no conditional Latest update: manual/external writers must use
+    the same coordination boundary. No release body, tag or asset is rewritten.
+    """
+    eligible, seen_ids = {}, set()
+    for item in api.pages(api.prefix + '/releases'):
+        release_id = policy._int(item.get('id'), 'release inventory ID')
+        require(release_id not in seen_ids and type(item.get('draft')) is bool and
+                type(item.get('prerelease')) is bool, 'ambiguous release inventory')
+        seen_ids.add(release_id)
+        version = stable_tag_version(item.get('tag_name'))
+        if item['draft'] or item['prerelease'] or version is None or version < (0, 8, 0):
+            continue
+        require(version not in eligible, 'duplicate stable semantic version')
+        eligible[version] = item
+    if not eligible:
+        return 'no-eligible-release'
+    version = max(eligible)
+    item = eligible[version]
+    state = api.read_release(item['tag_name'], release_id=item['id'])
+    require(state is not None and state['id'] == item['id'] and state['draft'] is False, 'Latest candidate changed')
+    descriptor, raw = recorded_descriptor(state['body'])
+    require(descriptor['tag'] == item['tag_name'] and versioning.semver(descriptor['version']) == version and
+            state['assets'].get('RELEASE.json') == raw, 'Latest candidate descriptor differs')
+    _check_state(state, descriptor, body_for)
+    verify(descriptor, state['assets'])
+    gate(descriptor)
+    current = api.request('GET', api.prefix + '/releases/latest', absent=True)
+    if current is not None:
+        current_version = stable_tag_version(current.get('tag_name'))
+        require(current_version is not None and current_version <= version, 'refusing to regress or replace unknown Latest')
+        if current.get('id') == item['id']:
+            require(current.get('tag_name') == item['tag_name'], 'Latest ID/tag conflict')
+            return 'already-latest'
+    if dry_run:
+        return 'would-update-latest'
+    gate(descriptor)
+    try:
+        api.request('PATCH', api.prefix + f"/releases/{item['id']}", {'make_latest': 'true'})
+    except (OSError, MutationOutcomeUnknown):
+        pass
+    current = api.request('GET', api.prefix + '/releases/latest', absent=True)
+    require(current is not None and current.get('id') == item['id'] and current.get('tag_name') == item['tag_name'],
+            'Latest update outcome unresolved; inspect before retry')
+    return 'updated-latest'
+
+
 def project_repository(data):
     """REST run associations contain id/url/name, not always full_name."""
     require(type(data) is dict, "missing repository evidence")
@@ -586,9 +643,9 @@ class GitHub:
             policy._int(release.get("id"), "release ID readback")
             require(release["id"] == release_id and release.get("tag_name") == tag,
                     "release ID or tag changed during readback")
-            descriptor, _raw = recorded_descriptor(release.get('body'))
-            if versioning.semver(descriptor['version']) >= (0, 8, 0):
-                require(release.get('name') == 'WireSock BoringTun ' + descriptor['version'] and
+            version = re.fullmatch(r'boringtun-cli-([0-9]+\.[0-9]+\.[0-9]+)-g[0-9a-f]{12}-b[1-9][0-9]*', tag)
+            if version and versioning.semver(version[1]) >= (0, 8, 0):
+                require(release.get('name') == 'WireSock BoringTun ' + version[1] and
                         release.get('prerelease') is False, 'release title or stable status changed')
             if candidate is not None:
                 require(all(release.get(key) == candidate.get(key)
@@ -1318,6 +1375,10 @@ def parser():
     reconciliation.add_argument("--since", required=True, help="inclusive UTC boundary, e.g. 2026-10-26T00:00:00Z")
     reconciliation.add_argument("--gh", required=True)
     reconciliation.add_argument("--gh-archive", required=True)
+    latest = commands.add_parser('latest', help='reconcile highest verified stable version under shared workflow lock')
+    latest.add_argument('--gh', required=True)
+    latest.add_argument('--gh-archive', required=True)
+    latest.add_argument('--execute', action='store_true')
     resolve = commands.add_parser("resolve", help="read-only merged-PR request and temporary pin")
     resolve.add_argument("--pr", type=int, help="explicit merged PR for maintenance dry runs only")
     resolve.add_argument("--run-id", type=int, required=True)
@@ -1433,8 +1494,24 @@ def main(argv=None):
             write_new(args.output, files)
             return 0
         gh = pinned_gh(args.gh, args.gh_archive, config)
+        if args.command == 'latest':
+            require(not args.execute or os.environ.get('BORINGTUN_LATEST_LOCK') == 'workflow-latest-v1',
+                    'Latest mutation requires the serialized workflow job')
+            action = reconcile_latest(api,
+                lambda descriptor, files: verify_release(api, descriptor, files, config, gh),
+                lambda descriptor: live_gate(api, config, descriptor), dry_run=not args.execute,
+                body_for=lambda descriptor: release_body(api, descriptor))
+            output_values({'action': action})
+            return 0
         if args.command == "prepare":
             require((args.build_run, args.attempt) == triggered_build(), "requested build differs from triggering event")
+            raw_build = api.get(api.prefix + f'/actions/runs/{args.build_run}/attempts/{args.attempt}')
+            request = resolve_build_request(api, raw_build)
+            intent = source_intent(api, request['source_commit'])
+            if intent is not None and intent['bump'] == 'none':
+                output_values({'action': 'none', 'publishable': False, 'validation': False, 'attest': False,
+                               'pr': request['pr'], 'reason': 'reviewed none intent; no release requested'})
+                return 0
             descriptor, files, action, attest = prepare_release(api, args.build_run, args.attempt, context, config, gh)
             write_new(args.output, files)
             publishable = True
