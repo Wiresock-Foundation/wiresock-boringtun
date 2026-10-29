@@ -23,6 +23,18 @@ No dependency resolution change is needed. The historical `pin.env` describes
 its historical commit and stays paired with that commit; automatic builds and
 PR candidates derive a temporary pin from their exact source and version.
 
+After reviewing the Cargo.lock diff for dependency/native-notice changes, add
+its Git-blob SHA256 to `source_lock_sha256` in
+`packaging/boringtun/notice-policy.json`. Even a package-version-only change
+changes that hash. The early version gate checks this binding; the full notice
+gate still validates all policy fields and exact license text. Keep earlier
+reviewed hashes for historical builds; never auto-allow an unreviewed lockfile.
+For the committed snapshot, compute the exact bytes with:
+
+```sh
+git show HEAD:Cargo.lock | sha256sum
+```
+
 For a release, add `docs/releases/<version>.md`. Write English prose with a
 short impact summary, New / Fixed / Security sections as applicable, and
 `## Compatibility & upgrade notes`. Explain upgrade requirements and limits;

@@ -1,5 +1,6 @@
 """Version intent is a source transition, never a counter advanced by a retry."""
 import copy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -27,6 +28,9 @@ def snapshot(value, bump=None, base='0.8.0'):
         'Cargo.lock': (f'version=4\n[[package]]\nname="boringtun"\nversion="{value}"\n'
                        f'[[package]]\nname="boringtun-cli"\nversion="{value}"\n').encode(),
     }
+    result['packaging/boringtun/notice-policy.json'] = json.dumps({
+        'source_lock_sha256': [hashlib.sha256(result['Cargo.lock']).hexdigest()]
+    }).encode()
     if bump:
         result[INTENT] = json.dumps(dict(schema=1, bump=bump, base_version=base,
                                         version=value, reason='Explain this reviewed change.')).encode()
@@ -98,6 +102,15 @@ class VersionTests(unittest.TestCase):
             bad['docs/releases/0.8.1.md'] = prose
             with self.subTest(prose=prose[:20]), self.assertRaises(ValueError):
                 self.check(snapshot('0.8.0'), bad)
+
+    def test_version_bump_requires_reviewed_notice_lock_checksum(self):
+        base, source = snapshot('0.8.0'), snapshot('0.8.1', 'patch')
+        path = 'packaging/boringtun/notice-policy.json'
+        for unreviewed in [base[path], b'{}', b'{"source_lock_sha256":[]}', b'[]', b'null']:
+            with self.subTest(policy=unreviewed):
+                source[path] = unreviewed
+                with self.assertRaisesRegex(ValueError, 'notice policy'):
+                    self.check(base, source)
 
 
 class SourceTransitionTests(unittest.TestCase):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -61,6 +62,12 @@ def notes(read, value):
 
 def check_transition(read_base, read_source, changed_paths):
     before, after = check_versions(read_base), check_versions(read_source)
+    notice_policy = policy.load_json(read_data(read_source, 'packaging/boringtun/notice-policy.json'))
+    require(type(notice_policy) is dict, 'notice policy must be an object')
+    reviewed_locks = notice_policy.get('source_lock_sha256')
+    require(type(reviewed_locks) is list and
+            hashlib.sha256(read_data(read_source, 'Cargo.lock')).hexdigest() in reviewed_locks,
+            'Cargo.lock checksum missing from reviewed notice policy')
     raw = read_data(read_source, INTENT)
     require(len(raw) <= 4096 and raw != read_base(INTENT), 'each PR must update its release intent')
     intent = policy.load_json(raw)

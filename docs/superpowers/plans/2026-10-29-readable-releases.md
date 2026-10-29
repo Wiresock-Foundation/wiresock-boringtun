@@ -114,3 +114,12 @@ Independent review and dispositions:
 
 The draft PR and exact-head CI results are recorded in the delivery report;
 the final task remains pending until those checks reach terminal states.
+
+CI follow-up: draft PR #115 initially passed PR Status Checks and Semgrep but
+the candidate notice gate rejected the changed Cargo.lock checksum. Inspection
+confirmed that the lock diff changes only the two workspace versions, with no
+dependency/native runtime changes. Added the new exact Git-blob hash to the
+reviewed notice allowlist, retaining historical hashes. A failing regression
+now makes the early version gate catch a missing/stale notice binding; the full
+notice gate remains unchanged. Maintainer instructions and PR template include
+this required step for future version bumps.
