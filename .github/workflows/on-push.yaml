@@ -74,7 +74,8 @@ jobs:
         if: github.event_name == 'push'
         env:
           SOURCE: ${{ github.sha }}
-        run: python3 scripts/boringtun_version.py --base "$(git rev-parse "$SOURCE^1")" --source "$SOURCE"
+          BASE: ${{ github.event.before }}
+        run: python3 scripts/boringtun_version.py --base "$BASE" --source "$SOURCE"
 
   # `src/jni.rs` cannot be reached by `cargo test`: its entry points take a
   # `JNIEnv` and only exist to be called through JNI dispatch, so every other

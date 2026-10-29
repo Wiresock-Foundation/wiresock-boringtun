@@ -39,8 +39,11 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 PR checks validate the candidate merge against its base snapshot. If another
 release merges first, refresh the PR's versions, intent and notes before merging.
-The trusted resolver and promoter validate again against the **actual first
-parent of the merged source**. An outdated PR cannot publish a duplicate
+The trusted resolver and promoter validate again against GitHub's **recorded
+merged-PR base SHA**. It must be the first parent for a merge commit and a strict
+ancestor for squash/rebase. The source builder also requires that it match the
+server push event's `before` SHA. This covers every rebased commit, not just
+the final commit's diff. An outdated PR cannot publish a duplicate
 semantic version, even if an old PR check was green. The build fails closed
 until a corrective reviewed PR supplies a valid transition. Retries always
 reuse the committed version; they never bump, amend or create source commits.

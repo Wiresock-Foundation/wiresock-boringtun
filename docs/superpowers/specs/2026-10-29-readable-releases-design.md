@@ -17,7 +17,10 @@ deriving versions from commit titles would not make intent reliably reviewed.
 Implementation choice: a small JSON intent file records `base_version`,
 `version`, `bump` (`patch`, `minor`, `none`) and a reason. Markdown notes live at
 `docs/releases/<version>.md`. A read-only PR gate compares against the base;
-trusted promotion repeats validation against the actual merge first parent.
+trusted promotion repeats validation against GitHub's recorded merged-PR base.
+For merge commits that base must equal the first parent; for squash/rebase it
+must be a strict ancestor of C. The builder additionally binds it to the
+server push event's `before`, covering the full multi-commit rebase range.
 Stale concurrent changes fail closed and must be refreshed in a PR. Retries
 read the same source version and never generate a new commit or bump.
 `none` requires unchanged versions and only documentation/tests changes plus

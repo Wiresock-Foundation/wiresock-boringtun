@@ -180,7 +180,7 @@ def release_body(api, descriptor):
     if versioning.semver(descriptor['version']) < (0, 8, 0):
         return descriptor_marker(descriptor)
     source = descriptor['source_commit']
-    intent = source_intent(api, source)
+    intent = source_intent(api, source, descriptor['pr'])
     require(intent is not None and intent['bump'] != 'none' and intent['version'] == descriptor['version'],
             'release notes source/version differs')
     prose = versioning.notes(lambda path: api.contents(path, source), descriptor['version'])
@@ -758,11 +758,12 @@ def check_retirement(api, config):
     require(not any(item["draft"] for item in api.pages(prefix + "/releases")), "legacy draft release remains")
 
 
-def source_intent(api, source):
+def source_intent(api, source, number):
     """Only ancestors of the fixed migration baseline use historical semantics.
 
     A missing intent or a downgrade after that baseline cannot opt out. Reads
-    use immutable C and its actual first parent, never today's moving base.
+    use immutable C and the server-recorded merged PR base, never today's
+    moving master. In a rebase merge C's first parent can be inside the PR.
     """
     policy._sha(source)
     if source == versioning.BASELINE:
@@ -774,10 +775,19 @@ def source_intent(api, source):
             'source is outside the release version history')
     commit = api.get(api.prefix + '/commits/' + source)
     require(commit.get('sha') == source and type(commit.get('parents')) is list and commit['parents'], 'source parent unavailable')
-    parent = policy._sha(commit['parents'][0]['sha'])
+    policy._int(number, 'version intent PR')
+    pull = api.get(api.prefix + f'/pulls/{number}')
+    require(pull.get('number') == number and pull.get('state') == 'closed' and pull.get('merged') is True and
+            pull.get('merge_commit_sha') == source and pull.get('base', {}).get('ref') == 'master' and
+            pull.get('base', {}).get('repo', {}).get('full_name') == policy.REPOSITORY,
+            'version boundary is not the canonical merged PR')
+    parent = policy._sha(pull['base'].get('sha'))
+    require(len(commit['parents']) in (1, 2), 'unsupported merged source parent shape')
+    if len(commit['parents']) == 2:
+        require(commit['parents'][0]['sha'] == parent, 'merged PR base differs from merge first parent')
     diff = api.get(api.prefix + '/compare/' + parent + '...' + source)
     require(diff.get('status') == 'ahead' and diff.get('merge_base_commit', {}).get('sha') == parent,
-            'source first-parent comparison differs')
+            'merged PR base is not a strict ancestor of source')
     entries = diff.get('files')
     # The compare API returns at most 300 paths. Never treat truncation as docs-only.
     require(type(entries) is list and 0 < len(entries) < 300, 'source path inventory missing or potentially truncated')
@@ -795,7 +805,7 @@ def source_metadata(api, request, *, trusted=True):
     source = request["source_commit"]
     manifest = tomllib.loads(api.contents("boringtun-cli/Cargo.toml", source).decode("utf-8"))
     version = manifest["package"]["version"]
-    intent = source_intent(api, source)
+    intent = source_intent(api, source, request['pr'])
     if intent is not None:
         require(intent['bump'] != 'none' and intent['version'] == version, 'source does not request a release')
     policy.release_tag(version, source, request["pr"])
@@ -1445,10 +1455,13 @@ def main(argv=None):
                 require(event_path.stat().st_size <= 1024 * 1024, "oversized push event")
                 checkout = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, env=local_environment(), check=True,
                                           capture_output=True, text=True).stdout.strip()
-                check_push_context(request, policy.load_json(event_path.read_bytes()), os.environ, checkout)
+                event = policy.load_json(event_path.read_bytes())
+                check_push_context(request, event, os.environ, checkout)
             else:
                 request = resolve_request(api, args.pr)
-            intent = source_intent(api, request['source_commit'])
+            intent = source_intent(api, request['source_commit'], request['pr'])
+            if intent is not None and os.environ.get('GITHUB_EVENT_NAME') == 'push':
+                require(event['before'] == intent['parent_commit'], 'push before differs from merged PR base')
             if intent is not None and intent['bump'] == 'none':
                 output_values({'release': False, 'pr': request['pr'], 'reason': 'reviewed none intent'})
                 return 0
@@ -1507,7 +1520,7 @@ def main(argv=None):
             require((args.build_run, args.attempt) == triggered_build(), "requested build differs from triggering event")
             raw_build = api.get(api.prefix + f'/actions/runs/{args.build_run}/attempts/{args.attempt}')
             request = resolve_build_request(api, raw_build)
-            intent = source_intent(api, request['source_commit'])
+            intent = source_intent(api, request['source_commit'], request['pr'])
             if intent is not None and intent['bump'] == 'none':
                 output_values({'action': 'none', 'publishable': False, 'validation': False, 'attest': False,
                                'pr': request['pr'], 'reason': 'reviewed none intent; no release requested'})

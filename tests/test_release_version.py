@@ -105,9 +105,12 @@ class SourceTransitionTests(unittest.TestCase):
         self.assertTrue(callable(getattr(release, 'source_intent', None)), 'trusted source intent gate is missing')
         self.source = 'a' * 40
         self.parent = 'b' * 40
+        self.direct_parent = self.parent
+        self.rebase = False
         self.base = snapshot('0.8.0')
         self.head = snapshot('0.8.1', 'patch')
         self.changed = [INTENT, 'boringtun/src/lib.rs', 'docs/releases/0.8.1.md']
+        self.final_changed = [INTENT, 'docs/guide.md']
         test = self
         class Api:
             prefix = '/repos/Wiresock-Foundation/wiresock-boringtun'
@@ -115,28 +118,80 @@ class SourceTransitionTests(unittest.TestCase):
                 if path.endswith('/compare/' + version.BASELINE + '...' + test.source):
                     return {'status': 'ahead', 'merge_base_commit': {'sha': version.BASELINE}}
                 if path.endswith('/commits/' + test.source):
-                    return {'sha': test.source, 'parents': [{'sha': test.parent}, {'sha': 'c' * 40}]}
+                    parents = [{'sha': test.direct_parent}]
+                    if not test.rebase:
+                        parents.append({'sha': 'c' * 40})
+                    return {'sha': test.source, 'parents': parents}
+                if path.endswith('/pulls/115'):
+                    return {'number': 115, 'state': 'closed', 'merged': True, 'merge_commit_sha': test.source,
+                            'base': {'sha': test.parent, 'ref': 'master', 'repo': {'full_name': release.policy.REPOSITORY}}}
                 if path.endswith('/compare/' + test.parent + '...' + test.source):
                     return {'status': 'ahead', 'merge_base_commit': {'sha': test.parent},
                             'files': [{'filename': p} for p in test.changed]}
+                if path.endswith('/compare/' + test.direct_parent + '...' + test.source):
+                    return {'status': 'ahead', 'merge_base_commit': {'sha': test.direct_parent},
+                            'files': [{'filename': p} for p in test.final_changed]}
                 raise AssertionError(path)
             def contents(self, path, ref):
-                return (test.head if ref == test.source else test.base)[path]
+                return (test.head if ref == test.source else test.intermediate if ref == test.direct_parent and test.rebase else test.base)[path]
             def optional_contents(self, path, ref):
-                return (test.head if ref == test.source else test.base).get(path)
+                return (test.head if ref == test.source else test.intermediate if ref == test.direct_parent and test.rebase else test.base).get(path)
         self.api = Api()
 
-    def test_actual_first_parent_drives_version_gate(self):
-        self.assertEqual(release.source_intent(self.api, self.source)['version'], '0.8.1')
+    def test_merge_base_drives_version_gate(self):
+        self.assertEqual(release.source_intent(self.api, self.source, 115)['version'], '0.8.1')
         self.base = snapshot('0.8.1')
         with self.assertRaises(ValueError):
-            release.source_intent(self.api, self.source)
+            release.source_intent(self.api, self.source, 115)
+
+    def test_squash_merge_uses_recorded_base(self):
+        self.rebase = True  # one parent, but it is the recorded base
+        self.intermediate = self.base
+        self.assertEqual(release.source_intent(self.api, self.source, 115)['version'], '0.8.1')
+
+    def test_boundary_requires_matching_merged_pr_and_merge_parent(self):
+        original_get = self.api.get
+        for change in [{'merged': False}, {'merge_commit_sha': 'f' * 40}, {'number': 116}]:
+            with self.subTest(change=change), patch.object(self.api, 'get', side_effect=lambda path:
+                    dict(original_get(path), **change) if '/pulls/' in path else original_get(path)):
+                with self.assertRaises(ValueError):
+                    release.source_intent(self.api, self.source, 115)
+        self.direct_parent = 'd' * 40
+        with self.assertRaises(ValueError):
+            release.source_intent(self.api, self.source, 115)
+
+    def test_bounded_full_path_inventory_rejects_none_rename_or_truncation(self):
+        self.head = snapshot('0.8.0', 'none')
+        self.changed = [INTENT, 'docs/guide.md']
+        original_get = self.api.get
+        for entries in [[{'filename': INTENT}, {'filename': 'docs/code.txt', 'previous_filename': 'boringtun/src/lib.rs'}],
+                        [{'filename': INTENT}] * 300]:
+            with self.subTest(size=len(entries)), patch.object(self.api, 'get', side_effect=lambda path:
+                    dict(original_get(path), files=entries) if '/compare/' + self.parent in path else original_get(path)):
+                with self.assertRaises(ValueError):
+                    release.source_intent(self.api, self.source, 115)
+
+    def test_multi_commit_rebase_uses_full_pr_boundary(self):
+        self.rebase = True
+        self.direct_parent = 'd' * 40
+        self.intermediate = copy.deepcopy(self.head)
+        self.final_changed = ['docs/guide.md']
+        self.assertEqual(release.source_intent(self.api, self.source, 115)['version'], '0.8.1')
+
+    def test_none_cannot_hide_product_changes_in_earlier_rebased_commit(self):
+        self.rebase = True
+        self.direct_parent = 'd' * 40
+        self.intermediate = snapshot('0.8.0')
+        self.head = snapshot('0.8.0', 'none')
+        self.changed = [INTENT, 'boringtun/src/lib.rs', 'docs/guide.md']
+        with self.assertRaises(ValueError):
+            release.source_intent(self.api, self.source, 115)
 
     def test_missing_intent_or_downgrade_after_baseline_is_not_legacy(self):
         for head in [snapshot('0.7.1'), snapshot('0.7.1', 'minor', '0.8.0')]:
             self.head = head
             with self.assertRaises(ValueError):
-                release.source_intent(self.api, self.source)
+                release.source_intent(self.api, self.source, 115)
 
     def test_none_resolve_emits_no_request_or_artifact(self):
         self.head = snapshot('0.8.0', 'none')
