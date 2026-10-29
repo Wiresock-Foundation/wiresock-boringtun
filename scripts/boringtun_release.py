@@ -31,6 +31,7 @@ import urllib.request
 import zipfile
 
 import boringtun_release_policy as policy
+import boringtun_version as versioning
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_FILE = ROOT / "packaging/boringtun/release-policy.json"
@@ -158,21 +159,59 @@ def descriptor_marker(descriptor):
     return "descriptor_sha256=" + digest(raw) + "\nRELEASE.json(base64)=" + base64.b64encode(raw).decode("ascii")
 
 
+def render_body(prose, descriptor, parent):
+    policy._sha(parent)
+    policy.check_descriptor(descriptor)
+    require(type(prose) is str and 0 < len(prose.encode('utf-8')) <= 20000 and
+            not any(marker in prose for marker in ('<', '>', 'descriptor_sha256=', 'RELEASE.json(base64)=')),
+            'invalid human release prose')
+    url = 'https://github.com/' + policy.REPOSITORY
+    tag = descriptor['tag']
+    return (prose.strip() + '\n\n## References & verification\n\n'
+            f"[Release PR #{descriptor['pr']}]({url}/pull/{descriptor['pr']}) · "
+            f"[Changes from the previous source]({url}/compare/{parent}...{descriptor['source_commit']})\n\n"
+            f"[Signed descriptor]({url}/releases/download/{tag}/RELEASE.json) · "
+            f"[Checksums]({url}/releases/download/{tag}/SHA256SUMS) · "
+            f"[Verification guide]({url}/blob/{descriptor['source_commit']}/docs/BORINGTUN_ARTIFACTS.md)\n\n"
+            '<!-- boringtun-release-metadata:v1\n' + descriptor_marker(descriptor) + '\n-->')
+
+
+def release_body(api, descriptor):
+    if versioning.semver(descriptor['version']) < (0, 8, 0):
+        return descriptor_marker(descriptor)
+    source = descriptor['source_commit']
+    intent = source_intent(api, source, descriptor['pr'])
+    require(intent is not None and intent['bump'] != 'none' and intent['version'] == descriptor['version'],
+            'release notes source/version differs')
+    prose = versioning.notes(lambda path: api.contents(path, source), descriptor['version'])
+    return render_body(prose, descriptor, intent['parent_commit'])
+
+
 def recorded_descriptor(body):
     """Recover signed bytes atomically recorded on create; NOT trusted prose.
 
     Callers must cryptographically verify these exact bytes before using any
     claims. This makes an empty draft recoverable across P/attempt changes.
     """
-    require(type(body) is str and len(body) < 64 * 1024, "invalid recorded descriptor")
-    lines = body.splitlines()
+    require(type(body) is str and len(body.encode('utf-8')) < 64 * 1024, "invalid recorded descriptor")
+    marker = body
+    if not body.startswith('descriptor_sha256='):
+        opening = '<!-- boringtun-release-metadata:v1\n'
+        require(body.count('<!--') == body.count('-->') == body.count(opening) == 1 and body.endswith('\n-->'),
+                'duplicate or malformed release metadata block')
+        prose, marker = body.split(opening)
+        require(prose.endswith('\n\n') and prose.strip() and
+                'descriptor_sha256=' not in prose and 'RELEASE.json(base64)=' not in prose,
+                'ambiguous release metadata')
+        marker = marker[:-4]
+    lines = marker.splitlines()
     require(len(lines) == 2 and lines[1].startswith("RELEASE.json(base64)="), "draft lacks recoverable signed descriptor")
     try:
         raw = base64.b64decode(lines[1].split("=", 1)[1], validate=True)
     except ValueError as exc:
         raise policy.PolicyError("invalid recorded descriptor encoding") from exc
     descriptor = policy.check_descriptor(policy.load_json(raw))
-    require(raw == policy.canonical_bytes(descriptor) and body == descriptor_marker(descriptor), "recorded descriptor digest mismatch")
+    require(raw == policy.canonical_bytes(descriptor) and marker == descriptor_marker(descriptor), "recorded descriptor digest mismatch")
     return descriptor, raw
 
 
@@ -186,29 +225,31 @@ def _check_files(descriptor, files, complete=True):
         require(type(content) is bytes and digest(content) == expected[name], "release asset hash conflict")
 
 
-def _check_state(state, descriptor):
+def _check_state(state, descriptor, body_for=descriptor_marker):
     policy._keys(state, "id tag target_commit draft body assets", "destination readback")
     policy._int(state["id"], "release ID")
     require(type(state["draft"]) is bool, "invalid release state")
     require(state["tag"] == descriptor["tag"] and state["target_commit"] == descriptor["source_commit"],
             "destination tag/source conflict")
-    require(state["body"] == descriptor_marker(descriptor), "draft descriptor marker conflict")
+    original, raw = recorded_descriptor(state['body'])
+    require(raw == policy.canonical_bytes(descriptor) and state['body'] == body_for(descriptor),
+            "release notes or descriptor marker conflict")
     _check_files(descriptor, state["assets"], complete=not state["draft"])
 
 
-def created_release_id(response, descriptor):
+def created_release_id(response, descriptor, body_for=descriptor_marker):
     """Bind a successful create response before using its numeric readback ID."""
     require(type(response) is dict, "invalid draft creation response")
     release_id = policy._int(response.get("id"), "created release ID")
     require(response.get("tag_name") == descriptor["tag"] and
             response.get("target_commitish") == descriptor["source_commit"] and
-            response.get("body") == descriptor_marker(descriptor), "draft creation identity mismatch")
+            response.get("body") == body_for(descriptor), "draft creation identity mismatch")
     require(response.get("draft") is True and response.get("prerelease") is False and
             response.get("assets") == [], "draft creation state mismatch")
     return release_id
 
 
-def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
+def publish_release(destination, desired, files, verify, gate, *, dry_run=True, body_for=descriptor_marker):
     """Plan or perform immutable publication through a narrow destination API.
 
     verify independently verifies descriptor/archives' signatures, original B/P
@@ -216,6 +257,14 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
     An exception after a mutation is uncertain: always read back; never blindly
     retry. No interface for deleting tags or replacing assets exists.
     """
+    # Source reads use immutable commit IDs; render once per retained descriptor.
+    renderer, bodies = body_for, {}
+    def body_for(descriptor):
+        key = policy.canonical_bytes(descriptor)
+        if key not in bodies:
+            bodies[key] = renderer(descriptor)
+        return bodies[key]
+
     desired = policy.check_descriptor(desired)
     _check_files(desired, files)
     gate()
@@ -226,7 +275,7 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
             original_bytes = state["assets"]["RELEASE.json"]
             original = policy.check_descriptor(policy.load_json(original_bytes))
             require(original_bytes == policy.canonical_bytes(original), "noncanonical original descriptor")
-            _check_state(state, original)
+            _check_state(state, original, body_for)
             verify(original, state["assets"])
             normalized = {key: state[key] for key in ("tag", "target_commit", "draft")}
             normalized.update(descriptor=original, assets={k: digest(v) for k, v in state["assets"].items()},
@@ -243,7 +292,7 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
             action = "resume"
         else:
             original, original_bytes = recorded_descriptor(state["body"])
-            _check_state(state, original)
+            _check_state(state, original, body_for)
             require(state["draft"] is True and not state["assets"], "unproven draft identity")
             verify(original, {"RELEASE.json": original_bytes})
             comparison = {"tag": state["tag"], "target_commit": state["target_commit"], "draft": False,
@@ -259,7 +308,7 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
     gate()
     if state is None:
         try:
-            created = destination.create_draft(desired["tag"], desired["source_commit"], descriptor_marker(desired))
+            created = destination.create_draft(desired["tag"], desired["source_commit"], body_for(desired))
         except (OSError, MutationOutcomeUnknown):
             # No trustworthy response ID: reconcile once through inventory.
             # An absent/inaccessible result remains uncertain, never a new POST.
@@ -267,14 +316,14 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
         else:
             # A successful but malformed/conflicting response is not a transport
             # failure. Reject it instead of silently rediscovering another ID.
-            release_id = created_release_id(created, desired)
+            release_id = created_release_id(created, desired, body_for)
             state = destination.read_release(desired["tag"], release_id=release_id)
             require(state is not None and state["id"] == release_id, "created release ID changed during readback")
         require(state is not None, "draft creation outcome unresolved; inspect destination before retry")
-        _check_state(state, desired)
+        _check_state(state, desired, body_for)
     release_id = state["id"]
     for name in ["RELEASE.json", *sorted(k for k in files if k != "RELEASE.json")]:
-        _check_state(state, desired)
+        _check_state(state, desired, body_for)
         if name in state["assets"]:
             continue
         gate()
@@ -285,7 +334,7 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
         state = destination.read_release(desired["tag"], release_id=release_id)
         require(state is not None and name in state["assets"], "asset upload outcome unresolved; inspect before retry")
         require(state["id"] == release_id, "release ID changed during upload readback")
-        _check_state(state, desired)
+        _check_state(state, desired, body_for)
     _check_files(desired, state["assets"])
     verify(desired, state["assets"])
     gate()
@@ -296,7 +345,7 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
     state = destination.read_release(desired["tag"], release_id=release_id)
     require(state is not None and state["id"] == release_id, "release ID changed during publication readback")
     require(state is not None, "publish outcome unresolved")
-    _check_state(state, desired)
+    _check_state(state, desired, body_for)
     require(state["draft"] is False, "release remains draft; publication failed or outcome unresolved")
     return "published"
 
@@ -304,6 +353,63 @@ def publish_release(destination, desired, files, verify, gate, *, dry_run=True):
 def projection(data, fields):
     require(type(data) is dict and all(key in data for key in fields.split()), "missing GitHub API evidence")
     return {key: deepcopy(data[key]) for key in fields.split()}
+
+
+def stable_tag_version(tag):
+    require(type(tag) is str, 'invalid release tag')
+    match = re.fullmatch(r'boringtun-cli-([0-9]+\.[0-9]+\.[0-9]+)-g[0-9a-f]{12}-b[1-9][0-9]*', tag)
+    return versioning.semver(match[1]) if match else None
+
+
+def reconcile_latest(api, verify, gate, *, dry_run=True, body_for=descriptor_marker):
+    """Reconcile all releases under the workflow's shared Latest job lock.
+
+    Publication jobs keep make_latest:false. Only this serialized operation
+    writes Latest; pending jobs may coalesce because no triggering PR is used.
+    GitHub has no conditional Latest update: manual/external writers must use
+    the same coordination boundary. No release body, tag or asset is rewritten.
+    """
+    eligible, seen_ids = {}, set()
+    for item in api.pages(api.prefix + '/releases'):
+        release_id = policy._int(item.get('id'), 'release inventory ID')
+        require(release_id not in seen_ids and type(item.get('draft')) is bool and
+                type(item.get('prerelease')) is bool, 'ambiguous release inventory')
+        seen_ids.add(release_id)
+        version = stable_tag_version(item.get('tag_name'))
+        if item['draft'] or item['prerelease'] or version is None or version < (0, 8, 0):
+            continue
+        require(version not in eligible, 'duplicate stable semantic version')
+        eligible[version] = item
+    if not eligible:
+        return 'no-eligible-release'
+    version = max(eligible)
+    item = eligible[version]
+    state = api.read_release(item['tag_name'], release_id=item['id'])
+    require(state is not None and state['id'] == item['id'] and state['draft'] is False, 'Latest candidate changed')
+    descriptor, raw = recorded_descriptor(state['body'])
+    require(descriptor['tag'] == item['tag_name'] and versioning.semver(descriptor['version']) == version and
+            state['assets'].get('RELEASE.json') == raw, 'Latest candidate descriptor differs')
+    _check_state(state, descriptor, body_for)
+    verify(descriptor, state['assets'])
+    gate(descriptor)
+    current = api.request('GET', api.prefix + '/releases/latest', absent=True)
+    if current is not None:
+        current_version = stable_tag_version(current.get('tag_name'))
+        require(current_version is not None and current_version <= version, 'refusing to regress or replace unknown Latest')
+        if current.get('id') == item['id']:
+            require(current.get('tag_name') == item['tag_name'], 'Latest ID/tag conflict')
+            return 'already-latest'
+    if dry_run:
+        return 'would-update-latest'
+    gate(descriptor)
+    try:
+        api.request('PATCH', api.prefix + f"/releases/{item['id']}", {'make_latest': 'true'})
+    except (OSError, MutationOutcomeUnknown):
+        pass
+    current = api.request('GET', api.prefix + '/releases/latest', absent=True)
+    require(current is not None and current.get('id') == item['id'] and current.get('tag_name') == item['tag_name'],
+            'Latest update outcome unresolved; inspect before retry')
+    return 'updated-latest'
 
 
 def project_repository(data):
@@ -488,9 +594,14 @@ class GitHub:
                 return result
         raise policy.PolicyError("API pagination bound exceeded")
 
-    def contents(self, path, ref, repository=policy.REPOSITORY):
+    def optional_contents(self, path, ref):
+        return self.contents(path, ref, optional=True)
+
+    def contents(self, path, ref, repository=policy.REPOSITORY, *, optional=False):
         require(repository in self.allowed, "repository outside allowlist")
-        data = self.get(f"/repos/{repository}/contents/{urllib.parse.quote(path, safe='/')}?ref={urllib.parse.quote(ref, safe='')}")
+        data = self.request("GET", f"/repos/{repository}/contents/{urllib.parse.quote(path, safe='/')}?ref={urllib.parse.quote(ref, safe='')}", absent=optional)
+        if data is None and optional:
+            return None
         require(data.get("type") == "file" and data.get("encoding") == "base64", "expected regular GitHub file")
         try:
             return base64.b64decode(data["content"].replace("\n", ""), validate=True)
@@ -532,6 +643,10 @@ class GitHub:
             policy._int(release.get("id"), "release ID readback")
             require(release["id"] == release_id and release.get("tag_name") == tag,
                     "release ID or tag changed during readback")
+            version = re.fullmatch(r'boringtun-cli-([0-9]+\.[0-9]+\.[0-9]+)-g[0-9a-f]{12}-b[1-9][0-9]*', tag)
+            if version and versioning.semver(version[1]) >= (0, 8, 0):
+                require(release.get('name') == 'WireSock BoringTun ' + version[1] and
+                        release.get('prerelease') is False, 'release title or stable status changed')
             if candidate is not None:
                 require(all(release.get(key) == candidate.get(key)
                             for key in ("id", "tag_name", "target_commitish", "draft", "body")),
@@ -557,7 +672,8 @@ class GitHub:
 
     def create_draft(self, tag, commit, body):
         return self.request("POST", self.prefix + "/releases", {"tag_name": tag, "target_commitish": commit,
-                            "name": tag, "body": body, "draft": True, "prerelease": False, "make_latest": "false"})
+                            "name": ("WireSock BoringTun " + recorded_descriptor(body)[0]["version"]
+                                     if "<!-- boringtun-release-metadata:v1" in body else tag), "body": body, "draft": True, "prerelease": False, "make_latest": "false"})
 
     def upload_asset(self, release_id, name, content):
         policy._int(release_id, "release ID")
@@ -642,10 +758,56 @@ def check_retirement(api, config):
     require(not any(item["draft"] for item in api.pages(prefix + "/releases")), "legacy draft release remains")
 
 
+def source_intent(api, source, number):
+    """Only ancestors of the fixed migration baseline use historical semantics.
+
+    A missing intent or a downgrade after that baseline cannot opt out. Reads
+    use immutable C and the server-recorded merged PR base, never today's
+    moving master. In a rebase merge C's first parent can be inside the PR.
+    """
+    policy._sha(source)
+    if source == versioning.BASELINE:
+        return None
+    comparison = api.get(api.prefix + '/compare/' + versioning.BASELINE + '...' + source)
+    if comparison.get('status') == 'behind' and comparison.get('merge_base_commit', {}).get('sha') == source:
+        return None
+    require(comparison.get('status') == 'ahead' and comparison.get('merge_base_commit', {}).get('sha') == versioning.BASELINE,
+            'source is outside the release version history')
+    commit = api.get(api.prefix + '/commits/' + source)
+    require(commit.get('sha') == source and type(commit.get('parents')) is list and commit['parents'], 'source parent unavailable')
+    policy._int(number, 'version intent PR')
+    pull = api.get(api.prefix + f'/pulls/{number}')
+    require(pull.get('number') == number and pull.get('state') == 'closed' and pull.get('merged') is True and
+            pull.get('merge_commit_sha') == source and pull.get('base', {}).get('ref') == 'master' and
+            pull.get('base', {}).get('repo', {}).get('full_name') == policy.REPOSITORY,
+            'version boundary is not the canonical merged PR')
+    parent = policy._sha(pull['base'].get('sha'))
+    require(len(commit['parents']) in (1, 2), 'unsupported merged source parent shape')
+    if len(commit['parents']) == 2:
+        require(commit['parents'][0]['sha'] == parent, 'merged PR base differs from merge first parent')
+    diff = api.get(api.prefix + '/compare/' + parent + '...' + source)
+    require(diff.get('status') == 'ahead' and diff.get('merge_base_commit', {}).get('sha') == parent,
+            'merged PR base is not a strict ancestor of source')
+    entries = diff.get('files')
+    # The compare API returns at most 300 paths. Never treat truncation as docs-only.
+    require(type(entries) is list and 0 < len(entries) < 300, 'source path inventory missing or potentially truncated')
+    paths = []
+    for item in entries:
+        paths.append(item['filename'])
+        if 'previous_filename' in item:
+            paths.append(item['previous_filename'])
+    def reader(ref):
+        return lambda path: (api.optional_contents(path, ref) if path == versioning.INTENT else api.contents(path, ref))
+    return dict(versioning.check_transition(reader(parent), reader(source), paths), parent_commit=parent)
+
+
 def source_metadata(api, request, *, trusted=True):
     source = request["source_commit"]
     manifest = tomllib.loads(api.contents("boringtun-cli/Cargo.toml", source).decode("utf-8"))
     version = manifest["package"]["version"]
+    intent = source_intent(api, source, request['pr'])
+    if intent is not None:
+        require(intent['bump'] != 'none' and intent['version'] == version, 'source does not request a release')
     policy.release_tag(version, source, request["pr"])
     provenance = api.contents("packaging/boringtun/runtime-provenance.json", source)
     if trusted:
@@ -924,7 +1086,7 @@ def prepare_release(api, run_id, attempt, publisher, config, gh):
         original_bytes = existing["assets"]["RELEASE.json"]
         original = policy.check_descriptor(policy.load_json(original_bytes))
         require(original_bytes == policy.canonical_bytes(original), "noncanonical original descriptor")
-        _check_state(existing, original)
+        _check_state(existing, original, lambda d: release_body(api, d))
         require(original["pr"] == request["pr"] and original["source_commit"] == request["source_commit"] and
                 all(original[key] == value for key, value in metadata.items()), "recorded release request differs")
         same_build = (run_id, attempt) == (original["build_run"]["id"], original["build_run"]["run_attempt"])
@@ -948,7 +1110,8 @@ def prepare_release(api, run_id, attempt, publisher, config, gh):
     contents["RELEASE.json"] = policy.canonical_bytes(descriptor)
     _check_files(descriptor, contents)
     verify = lambda original, present: verify_release(api, original, present, config, gh)
-    action = publish_release(api, descriptor, contents, verify, lambda: None, dry_run=True)
+    action = publish_release(api, descriptor, contents, verify, lambda: None, dry_run=True,
+                             body_for=lambda d: release_body(api, d))
     existing = api.read_release(descriptor["tag"])
     needs_attestation = existing is None
     if existing is not None:
@@ -1064,7 +1227,7 @@ def reconcile(api, since, config, gh):
                 else:
                     original, raw = recorded_descriptor(existing["body"])
                     present = dict(present, **{"RELEASE.json": raw})
-                _check_state(existing, original)
+                _check_state(existing, original, lambda d: release_body(api, d))
                 verify_release(api, original, present, config, gh)
                 row.update(status="draft_verified" if existing["draft"] else "published_verified",
                            reason="original signed descriptor and present assets verified; no writes")
@@ -1222,6 +1385,10 @@ def parser():
     reconciliation.add_argument("--since", required=True, help="inclusive UTC boundary, e.g. 2026-10-26T00:00:00Z")
     reconciliation.add_argument("--gh", required=True)
     reconciliation.add_argument("--gh-archive", required=True)
+    latest = commands.add_parser('latest', help='reconcile highest verified stable version under shared workflow lock')
+    latest.add_argument('--gh', required=True)
+    latest.add_argument('--gh-archive', required=True)
+    latest.add_argument('--execute', action='store_true')
     resolve = commands.add_parser("resolve", help="read-only merged-PR request and temporary pin")
     resolve.add_argument("--pr", type=int, help="explicit merged PR for maintenance dry runs only")
     resolve.add_argument("--run-id", type=int, required=True)
@@ -1288,14 +1455,21 @@ def main(argv=None):
                 require(event_path.stat().st_size <= 1024 * 1024, "oversized push event")
                 checkout = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, env=local_environment(), check=True,
                                           capture_output=True, text=True).stdout.strip()
-                check_push_context(request, policy.load_json(event_path.read_bytes()), os.environ, checkout)
+                event = policy.load_json(event_path.read_bytes())
+                check_push_context(request, event, os.environ, checkout)
             else:
                 request = resolve_request(api, args.pr)
+            intent = source_intent(api, request['source_commit'], request['pr'])
+            if intent is not None and os.environ.get('GITHUB_EVENT_NAME') == 'push':
+                require(event['before'] == intent['parent_commit'], 'push before differs from merged PR base')
+            if intent is not None and intent['bump'] == 'none':
+                output_values({'release': False, 'pr': request['pr'], 'reason': 'reviewed none intent'})
+                return 0
             metadata = source_metadata(api, request, trusted=False)
             envelope = dict(schema=1, request=request, run_id=args.run_id, run_attempt=args.attempt, **metadata)
             check_request_envelope(envelope, request, args.run_id, args.attempt, metadata)
             write_new(args.output, {"REQUEST.json": json_bytes(envelope), "pin.env": pin_text(request, metadata["version"]).encode()})
-            output_values({"source": request["source_commit"], "pr": request["pr"], "version": metadata["version"]})
+            output_values({"source": request["source_commit"], "pr": request["pr"], "version": metadata["version"], "release": True})
             return 0
         if args.command == "bundle":
             envelope = policy.load_json(Path(args.request).read_bytes())
@@ -1333,8 +1507,24 @@ def main(argv=None):
             write_new(args.output, files)
             return 0
         gh = pinned_gh(args.gh, args.gh_archive, config)
+        if args.command == 'latest':
+            require(not args.execute or os.environ.get('BORINGTUN_LATEST_LOCK') == 'workflow-latest-v1',
+                    'Latest mutation requires the serialized workflow job')
+            action = reconcile_latest(api,
+                lambda descriptor, files: verify_release(api, descriptor, files, config, gh),
+                lambda descriptor: live_gate(api, config, descriptor), dry_run=not args.execute,
+                body_for=lambda descriptor: release_body(api, descriptor))
+            output_values({'action': action})
+            return 0
         if args.command == "prepare":
             require((args.build_run, args.attempt) == triggered_build(), "requested build differs from triggering event")
+            raw_build = api.get(api.prefix + f'/actions/runs/{args.build_run}/attempts/{args.attempt}')
+            request = resolve_build_request(api, raw_build)
+            intent = source_intent(api, request['source_commit'], request['pr'])
+            if intent is not None and intent['bump'] == 'none':
+                output_values({'action': 'none', 'publishable': False, 'validation': False, 'attest': False,
+                               'pr': request['pr'], 'reason': 'reviewed none intent; no release requested'})
+                return 0
             descriptor, files, action, attest = prepare_release(api, args.build_run, args.attempt, context, config, gh)
             write_new(args.output, files)
             publishable = True
@@ -1374,7 +1564,8 @@ def main(argv=None):
             return 0
         action = publish_release(api, descriptor, files,
             lambda original, present: verify_release(api, original, present, config, gh),
-            lambda: live_gate(api, config, descriptor), dry_run=not args.execute)
+            lambda: live_gate(api, config, descriptor), dry_run=not args.execute,
+            body_for=lambda d: release_body(api, d))
         output_values({"action": action, "tag": descriptor["tag"]})
         return 0
     except (policy.PolicyError, OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError,

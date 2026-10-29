@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "bump": "minor",
+  "base_version": "0.7.1",
+  "version": "0.8.0",
+  "reason": "Start explicit release versioning for accumulated APIs and the breaking Rust PacketQueueFull error variant; this PR changes release engineering only."
+}

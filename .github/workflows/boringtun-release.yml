@@ -65,6 +65,7 @@ jobs:
             --gh "$RUNNER_TEMP/gh" --gh-archive "$RUNNER_TEMP/gh.tar.gz" --output "$RUNNER_TEMP/prepared"
       - name: Transfer immutable verified preparation for this promoter attempt
         id: upload
+        if: steps.prepare.outputs.action != 'none'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: promotion-${{ github.run_id }}-${{ github.run_attempt }}
@@ -196,6 +197,44 @@ jobs:
         if: failure()
         run: |
           printf '%s\n' 'Publication stopped. Preserve the original signed RELEASE.json and existing assets. The orchestrator reads back uncertain writes and never replaces assets. Historical-source tag permission failures require documented owner action; do not broaden credentials or create a replacement release identity.' >> "$GITHUB_STEP_SUMMARY"
+
+  latest:
+    name: Reconcile highest stable Latest
+    needs: [prepare, publish]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' &&
+      needs.prepare.outputs.publishable == 'true' &&
+      (needs.publish.result == 'success' || needs.prepare.outputs.action == 'already-published')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Coalescing pending reconciliation is safe: every job reads the complete
+    # release inventory. Publication jobs retain their independent per-PR locks.
+    concurrency:
+      group: boringtun-stable-latest
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BORINGTUN_LATEST_LOCK: workflow-latest-v1
+    steps:
+      - name: Check out trusted promoter revision R
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Install checksum-pinned GitHub CLI
+        run: |
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/gh.tar.gz"
+          python3 scripts/boringtun_release.py install-gh --archive "$RUNNER_TEMP/gh.tar.gz" --output "$RUNNER_TEMP/gh"
+      - name: Verify highest stable release and reconcile Latest
+        run: |
+          python3 scripts/boringtun_release.py latest --gh "$RUNNER_TEMP/gh" \
+            --gh-archive "$RUNNER_TEMP/gh.tar.gz" --execute
 
   verify-validation:
     name: Verify attestation-only validation
