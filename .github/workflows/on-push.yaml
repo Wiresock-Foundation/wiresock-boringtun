@@ -41,6 +41,7 @@ jobs:
       - jni-smoke
       - ffi-header-layout
       - attribution
+      - release-intent
     steps:
       - run: exit 0
 
@@ -54,6 +55,26 @@ jobs:
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
       - run: python3 tests/test-boringtun-notices.py
       - run: python3 tests/test-boringtun-platform.py
+
+  release-intent:
+    name: Release version intent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate candidate against the current base snapshot
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          SOURCE: ${{ github.sha }}
+        run: python3 scripts/boringtun_version.py --base "$BASE" --source "$SOURCE"
+      - name: Validate the actual merged transition
+        if: github.event_name == 'push'
+        env:
+          SOURCE: ${{ github.sha }}
+        run: python3 scripts/boringtun_version.py --base "$(git rev-parse "$SOURCE^1")" --source "$SOURCE"
 
   # `src/jni.rs` cannot be reached by `cargo test`: its entry points take a
   # `JNIEnv` and only exist to be called through JNI dispatch, so every other

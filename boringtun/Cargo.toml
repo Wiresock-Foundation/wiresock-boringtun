@@ -1,7 +1,7 @@
 [package]
 name = "boringtun"
 description = "a userspace WireGuard® implementation with AmneziaWG and WireSock protocol extensions, forked from Cloudflare BoringTun"
-version = "0.7.1"
+version = "0.8.0"
 # Upstream authorship retained; this fork's additions credited alongside it.
 authors = [
     "Noah Kennedy <nkennedy@cloudflare.com>",

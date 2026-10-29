@@ -38,6 +38,7 @@ jobs:
     outputs:
       source: ${{ steps.resolve.outputs.source }}
       pr: ${{ steps.resolve.outputs.pr }}
+      release: ${{ steps.resolve.outputs.release }}
     steps:
       - name: Reject nonordinary push context before checkout
         if: github.event_name == 'push'
@@ -69,6 +70,7 @@ jobs:
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
             --output "$RUNNER_TEMP/request"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: steps.resolve.outputs.release == 'true'
         with:
           name: request-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/request/*
@@ -78,6 +80,7 @@ jobs:
   licenses:
     name: License and dependency gate
     needs: resolve
+    if: needs.resolve.outputs.release == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:

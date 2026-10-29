@@ -31,6 +31,7 @@ import urllib.request
 import zipfile
 
 import boringtun_release_policy as policy
+import boringtun_version as versioning
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_FILE = ROOT / "packaging/boringtun/release-policy.json"
@@ -488,9 +489,14 @@ class GitHub:
                 return result
         raise policy.PolicyError("API pagination bound exceeded")
 
-    def contents(self, path, ref, repository=policy.REPOSITORY):
+    def optional_contents(self, path, ref):
+        return self.contents(path, ref, optional=True)
+
+    def contents(self, path, ref, repository=policy.REPOSITORY, *, optional=False):
         require(repository in self.allowed, "repository outside allowlist")
-        data = self.get(f"/repos/{repository}/contents/{urllib.parse.quote(path, safe='/')}?ref={urllib.parse.quote(ref, safe='')}")
+        data = self.request("GET", f"/repos/{repository}/contents/{urllib.parse.quote(path, safe='/')}?ref={urllib.parse.quote(ref, safe='')}", absent=optional)
+        if data is None and optional:
+            return None
         require(data.get("type") == "file" and data.get("encoding") == "base64", "expected regular GitHub file")
         try:
             return base64.b64decode(data["content"].replace("\n", ""), validate=True)
@@ -642,10 +648,46 @@ def check_retirement(api, config):
     require(not any(item["draft"] for item in api.pages(prefix + "/releases")), "legacy draft release remains")
 
 
+def source_intent(api, source):
+    """Only ancestors of the fixed migration baseline use historical semantics.
+
+    A missing intent or a downgrade after that baseline cannot opt out. Reads
+    use immutable C and its actual first parent, never today's moving base.
+    """
+    policy._sha(source)
+    if source == versioning.BASELINE:
+        return None
+    comparison = api.get(api.prefix + '/compare/' + versioning.BASELINE + '...' + source)
+    if comparison.get('status') == 'behind' and comparison.get('merge_base_commit', {}).get('sha') == source:
+        return None
+    require(comparison.get('status') == 'ahead' and comparison.get('merge_base_commit', {}).get('sha') == versioning.BASELINE,
+            'source is outside the release version history')
+    commit = api.get(api.prefix + '/commits/' + source)
+    require(commit.get('sha') == source and type(commit.get('parents')) is list and commit['parents'], 'source parent unavailable')
+    parent = policy._sha(commit['parents'][0]['sha'])
+    diff = api.get(api.prefix + '/compare/' + parent + '...' + source)
+    require(diff.get('status') == 'ahead' and diff.get('merge_base_commit', {}).get('sha') == parent,
+            'source first-parent comparison differs')
+    entries = diff.get('files')
+    # The compare API returns at most 300 paths. Never treat truncation as docs-only.
+    require(type(entries) is list and 0 < len(entries) < 300, 'source path inventory missing or potentially truncated')
+    paths = []
+    for item in entries:
+        paths.append(item['filename'])
+        if 'previous_filename' in item:
+            paths.append(item['previous_filename'])
+    def reader(ref):
+        return lambda path: (api.optional_contents(path, ref) if path == versioning.INTENT else api.contents(path, ref))
+    return versioning.check_transition(reader(parent), reader(source), paths)
+
+
 def source_metadata(api, request, *, trusted=True):
     source = request["source_commit"]
     manifest = tomllib.loads(api.contents("boringtun-cli/Cargo.toml", source).decode("utf-8"))
     version = manifest["package"]["version"]
+    intent = source_intent(api, source)
+    if intent is not None:
+        require(intent['bump'] != 'none' and intent['version'] == version, 'source does not request a release')
     policy.release_tag(version, source, request["pr"])
     provenance = api.contents("packaging/boringtun/runtime-provenance.json", source)
     if trusted:
@@ -1291,11 +1333,15 @@ def main(argv=None):
                 check_push_context(request, policy.load_json(event_path.read_bytes()), os.environ, checkout)
             else:
                 request = resolve_request(api, args.pr)
+            intent = source_intent(api, request['source_commit'])
+            if intent is not None and intent['bump'] == 'none':
+                output_values({'release': False, 'pr': request['pr'], 'reason': 'reviewed none intent'})
+                return 0
             metadata = source_metadata(api, request, trusted=False)
             envelope = dict(schema=1, request=request, run_id=args.run_id, run_attempt=args.attempt, **metadata)
             check_request_envelope(envelope, request, args.run_id, args.attempt, metadata)
             write_new(args.output, {"REQUEST.json": json_bytes(envelope), "pin.env": pin_text(request, metadata["version"]).encode()})
-            output_values({"source": request["source_commit"], "pr": request["pr"], "version": metadata["version"]})
+            output_values({"source": request["source_commit"], "pr": request["pr"], "version": metadata["version"], "release": True})
             return 0
         if args.command == "bundle":
             envelope = policy.load_json(Path(args.request).read_bytes())
