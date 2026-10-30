@@ -14,7 +14,16 @@ Update `packaging/boringtun/release-intent.json` in every PR. Choose:
 - `none`: documentation/tests only, with no package version change or release.
   Allowed paths are `docs/`, `tests/`, `README.md`, `CHANGELOG.md` and the intent
   file. A production-code change, including a Rust file with embedded tests,
-  requires a release choice. Build/publisher changes also require a release.
+  requires a release choice. Build/publisher changes also require a release,
+  except for the explicit presentation-maintenance scope below.
+
+There is one explicit maintenance scope: schema 2, `bump: none`,
+`scope: release-presentation`. It keeps all versions unchanged and additionally
+allows `scripts/boringtun_release.py` and `scripts/boringtun_version.py`.
+Runtime, dependency, build/packaging and workflow paths remain forbidden.
+Reviewers must confirm the diff concerns presentation: the path gate is not a
+semantic Python classifier. Source resolution and completion still emit no
+request/prepared artifact and never build, sign or publish a new release.
 
 Set `base_version` to the current base version and explain the choice in
 `reason`. Set `version`, both package versions, the CLI's library dependency
@@ -41,6 +50,14 @@ short impact summary, New / Fixed / Security sections as applicable, and
 do not paste raw commit titles. Notes must be UTF-8, at most 20 KB, without raw
 HTML or the reserved machine metadata markers. PR, source comparison,
 descriptor, checksums and verification-guide links are added deterministically.
+
+Keep each prose paragraph and list item on one physical source line; use blank
+lines between paragraphs. Do not wrap release prose at an editor column limit:
+GitHub Releases renders those newlines as forced breaks, leaving ragged short
+lines on narrow screens. Preview with soft breaks rendered as hard breaks, at
+both narrow and wide widths; the regular `.md` file preview is not sufficient.
+This authoring rule alone does not authorize editing an already-published body;
+the reviewed amendment procedure below applies.
 
 After committing, validate against an exact base SHA:
 
@@ -83,6 +100,31 @@ still recover their exact original signed descriptor after an uncertain create.
 Published retries verify the original descriptor/assets and do not rewrite
 them. Historical releases keep their exact old bodies: old pinned workflows
 still use their original parsers and must not be broken by cosmetic edits.
+
+### Reviewed 0.8.0 presentation amendment
+
+The owner authorized one exception: remove source-column wraps from 0.8.0
+without changing its wording, links, structure or signed metadata. The current
+verifier accepts only the exact original body or its exact reviewed amended
+hash, after parsing and comparing the canonical descriptor. All asset,
+signature, source and workflow checks remain required. Draft recovery and
+creation readbacks retain exact-body checks. Other edits are rejected.
+
+The original body hash is
+`c399060ac8860b5b494c7d49ab193aebba48705610ba0d064b454b71b1ca89e7`;
+the approved amended body hash is
+`84172db7d08d1c91ec12f5e4d246fe863de1b3a55b67386bc799a63e8bccd792`.
+After the policy is merged, back up the current body/inventory, immediately
+recheck the original body and immutable identities, then make a body-only
+update and read it back. An uncertain write must be reconciled before retry.
+GitHub has no atomic body compare-and-set; coordinate any external editor.
+
+Old pinned publication and Latest workflows still compare the original body
+exactly and will reject the amended text. They cannot be changed retroactively:
+use the current verifier, and do not rerun those obsolete workflows expecting
+success. This explicit compatibility exception does not change the descriptor,
+assets, tag, binary versions, source identity or signatures. All other released
+bodies remain immutable.
 
 ## Latest ordering
 

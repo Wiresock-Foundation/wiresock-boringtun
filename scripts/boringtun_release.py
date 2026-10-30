@@ -46,6 +46,13 @@ MANIFEST_KEYS = ("artifact_format name version source_repository source_commit s
                  "linkage rust_toolchain rustc cargo build_command build_profile rustflags binary binary_sha256 license third_party_licenses").split()
 AUTH_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
                  "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+# One reviewed 0.8.0 line-wrap amendment, keyed by the complete original body
+# rendered from its immutable source. Both hashes include the exact hidden
+# descriptor block. This is not general whitespace or Markdown normalization.
+REVIEWED_BODY_AMENDMENTS = {
+    'c399060ac8860b5b494c7d49ab193aebba48705610ba0d064b454b71b1ca89e7':
+    '84172db7d08d1c91ec12f5e4d246fe863de1b3a55b67386bc799a63e8bccd792',
+}
 
 
 class MutationOutcomeUnknown(policy.PolicyError):
@@ -225,6 +232,11 @@ def _check_files(descriptor, files, complete=True):
         require(type(content) is bytes and digest(content) == expected[name], "release asset hash conflict")
 
 
+def published_body_matches(body, expected):
+    """Accept exact source prose or its explicitly reviewed published variant."""
+    return body == expected or REVIEWED_BODY_AMENDMENTS.get(digest(expected.encode('utf-8'))) == digest(body.encode('utf-8'))
+
+
 def _check_state(state, descriptor, body_for=descriptor_marker):
     policy._keys(state, "id tag target_commit draft body assets", "destination readback")
     policy._int(state["id"], "release ID")
@@ -232,7 +244,9 @@ def _check_state(state, descriptor, body_for=descriptor_marker):
     require(state["tag"] == descriptor["tag"] and state["target_commit"] == descriptor["source_commit"],
             "destination tag/source conflict")
     original, raw = recorded_descriptor(state['body'])
-    require(raw == policy.canonical_bytes(descriptor) and state['body'] == body_for(descriptor),
+    expected = body_for(descriptor)
+    matches = state['body'] == expected if state['draft'] else published_body_matches(state['body'], expected)
+    require(raw == policy.canonical_bytes(descriptor) and matches,
             "release notes or descriptor marker conflict")
     _check_files(descriptor, state["assets"], complete=not state["draft"])
 

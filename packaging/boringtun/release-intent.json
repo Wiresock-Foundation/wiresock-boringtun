@@ -1,7 +1,8 @@
 {
-  "schema": 1,
-  "bump": "minor",
-  "base_version": "0.7.1",
+  "schema": 2,
+  "bump": "none",
+  "scope": "release-presentation",
+  "base_version": "0.8.0",
   "version": "0.8.0",
-  "reason": "Start explicit release versioning for accumulated APIs and the breaking Rust PacketQueueFull error variant; this PR changes release engineering only."
+  "reason": "Allow the exact reviewed 0.8.0 wrap-only body amendment and document its old-workflow limitation; maintain presentation verification without building or publishing another release."
 }
