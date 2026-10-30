@@ -71,8 +71,13 @@ def check_transition(read_base, read_source, changed_paths):
     raw = read_data(read_source, INTENT)
     require(len(raw) <= 4096 and raw != read_base(INTENT), 'each PR must update its release intent')
     intent = policy.load_json(raw)
-    policy._keys(intent, 'schema bump base_version version reason', 'release intent')
-    require(type(intent['schema']) is int and intent['schema'] == 1, 'unsupported release intent')
+    schema = intent.get('schema') if type(intent) is dict else None
+    require(type(schema) is int and schema in (1, 2), 'unsupported release intent')
+    keys = 'schema bump base_version version reason' + (' scope' if schema == 2 else '')
+    policy._keys(intent, keys, 'release intent')
+    if schema == 2:
+        require(intent['scope'] == 'release-presentation' and intent['bump'] == 'none',
+                'schema 2 is restricted to release-presentation with no release')
     require(intent['base_version'] == before and intent['version'] == after,
             'stale release intent: refresh against the actual base version')
     require(type(intent['reason']) is str and 10 <= len(intent['reason'].strip()) <= 1000, 'explain the version choice')
@@ -82,8 +87,10 @@ def check_transition(read_base, read_source, changed_paths):
     require(type(changed_paths) is list and changed_paths and all(type(p) is str for p in changed_paths), 'missing changed paths')
     require(INTENT in changed_paths, 'release intent is not changed by this PR')
     if intent['bump'] == 'none':
+        maintenance = {'scripts/boringtun_release.py', 'scripts/boringtun_version.py'} if schema == 2 else set()
         require(all(p == INTENT or p in ('README.md', 'CHANGELOG.md') or p.startswith(('docs/', 'tests/'))
-                    for p in changed_paths), 'none is restricted to documentation and tests')
+                    or p in maintenance for p in changed_paths),
+                'none is restricted to documentation/tests and explicitly scoped presentation maintenance')
     else:
         require(semver(after) >= (0, 8, 0), 'new releases start at 0.8.0')
         notes(read_source, after)

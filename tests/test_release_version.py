@@ -38,6 +38,14 @@ def snapshot(value, bump=None, base='0.8.0'):
     return result
 
 
+def presentation_snapshot():
+    result = snapshot('0.8.0', 'none')
+    intent = json.loads(result[INTENT])
+    intent.update(schema=2, scope='release-presentation')
+    result[INTENT] = json.dumps(intent).encode()
+    return result
+
+
 class VersionTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(version, 'version intent validator is missing')
@@ -81,6 +89,25 @@ class VersionTests(unittest.TestCase):
         same = snapshot('0.8.0', 'none')
         with self.assertRaises(ValueError):
             self.check(same, same, ['README.md'])
+
+    def test_explicit_presentation_none_is_narrow_and_never_changes_versions(self):
+        base, source = snapshot('0.8.0'), presentation_snapshot()
+        allowed = ['scripts/boringtun_release.py', 'scripts/boringtun_version.py', 'docs/guide.md', 'tests/test_fix.py', INTENT]
+        self.assertEqual(self.check(base, source, allowed)['bump'], 'none')
+        for path in ['boringtun/src/lib.rs', 'boringtun-cli/src/main.rs', 'Cargo.lock', 'Cargo.toml',
+                     'scripts/boringtun-artifact.sh', '.github/workflows/boringtun-release.yml',
+                     'packaging/boringtun/release-policy.json', 'scripts/boringtun_release_policy.py']:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                self.check(base, source, allowed + [path])
+        for update in [dict(scope='runtime'), dict(schema=1), dict(bump='patch'), dict(version='0.8.1')]:
+            bad = copy.deepcopy(source)
+            intent = json.loads(bad[INTENT]); intent.update(update)
+            bad[INTENT] = json.dumps(intent).encode()
+            with self.subTest(update=update), self.assertRaises(ValueError):
+                self.check(base, bad, allowed)
+        legacy = snapshot('0.8.0', 'none')
+        with self.assertRaises(ValueError):
+            self.check(base, legacy, allowed)
 
     def test_manifests_dependency_and_lock_must_agree(self):
         good = snapshot('0.8.1', 'patch')
@@ -207,33 +234,40 @@ class SourceTransitionTests(unittest.TestCase):
                 release.source_intent(self.api, self.source, 115)
 
     def test_none_resolve_emits_no_request_or_artifact(self):
-        self.head = snapshot('0.8.0', 'none')
-        self.changed = [INTENT, 'docs/guide.md']
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / 'request'
-            with patch.object(release, 'GitHub', return_value=self.api), \
-                 patch.object(release, 'resolve_request', return_value={'source_commit': self.source, 'pr': 115}), \
-                 patch.dict(os.environ, GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_REPOSITORY=release.policy.REPOSITORY):
-                result = release.main(['resolve', '--pr', '115', '--run-id', '1', '--attempt', '1', '--output', str(output)])
-            self.assertEqual(result, 0)
-            self.assertFalse(output.exists())
+        for scoped in [False, True]:
+            self.head = presentation_snapshot() if scoped else snapshot('0.8.0', 'none')
+            self.changed = [INTENT, 'docs/guide.md'] + (['scripts/boringtun_release.py', 'scripts/boringtun_version.py'] if scoped else [])
+            with self.subTest(scoped=scoped), tempfile.TemporaryDirectory() as directory:
+                output, outputs = Path(directory) / 'request', Path(directory) / 'outputs'
+                with patch.object(release, 'GitHub', return_value=self.api), \
+                     patch.object(release, 'resolve_request', return_value={'source_commit': self.source, 'pr': 115}), \
+                     patch.dict(os.environ, GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_REPOSITORY=release.policy.REPOSITORY,
+                                GITHUB_OUTPUT=str(outputs)):
+                    result = release.main(['resolve', '--pr', '115', '--run-id', '1', '--attempt', '1', '--output', str(output)])
+                self.assertEqual(result, 0)
+                self.assertFalse(output.exists())
+                self.assertIn('release=false\n', outputs.read_text())
 
     def test_none_build_completion_skips_promotion_without_failure(self):
-        self.head = snapshot('0.8.0', 'none')
-        self.changed = [INTENT, 'docs/guide.md']
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / 'prepared'
-            with patch.object(release, 'GitHub', return_value=self.api), \
-                 patch.object(release, 'trusted_context', return_value={}), \
-                 patch.object(release, 'triggered_build', return_value=(1, 1)), \
-                 patch.object(release, 'pinned_gh', return_value='gh'), \
-                 patch.object(release, 'resolve_build_request', return_value={'source_commit': self.source, 'pr': 115}), \
-                 patch.object(self.api, 'get', side_effect=lambda path: {} if '/actions/runs/' in path else original_get(path)):
-                original_get = type(self.api).get.__get__(self.api)
-                result = release.main(['prepare', '--build-run', '1', '--attempt', '1', '--output', str(output),
-                                       '--gh', 'gh', '--gh-archive', 'gh.tar.gz'])
-            self.assertEqual(result, 0)
-            self.assertFalse(output.exists())
+        for scoped in [False, True]:
+            self.head = presentation_snapshot() if scoped else snapshot('0.8.0', 'none')
+            self.changed = [INTENT, 'docs/guide.md'] + (['scripts/boringtun_release.py', 'scripts/boringtun_version.py'] if scoped else [])
+            with self.subTest(scoped=scoped), tempfile.TemporaryDirectory() as directory:
+                output, outputs = Path(directory) / 'prepared', Path(directory) / 'outputs'
+                with patch.object(release, 'GitHub', return_value=self.api), \
+                     patch.object(release, 'trusted_context', return_value={}), \
+                     patch.object(release, 'triggered_build', return_value=(1, 1)), \
+                     patch.object(release, 'pinned_gh', return_value='gh'), \
+                     patch.object(release, 'resolve_build_request', return_value={'source_commit': self.source, 'pr': 115}), \
+                     patch.dict(os.environ, GITHUB_OUTPUT=str(outputs)), \
+                     patch.object(self.api, 'get', side_effect=lambda path: {} if '/actions/runs/' in path else original_get(path)):
+                    original_get = type(self.api).get.__get__(self.api)
+                    result = release.main(['prepare', '--build-run', '1', '--attempt', '1', '--output', str(output),
+                                           '--gh', 'gh', '--gh-archive', 'gh.tar.gz'])
+                self.assertEqual(result, 0)
+                self.assertFalse(output.exists())
+                for value in ['action=none\n', 'publishable=false\n', 'attest=false\n', 'validation=false\n']:
+                    self.assertIn(value, outputs.read_text())
 
 
 if __name__ == '__main__':
