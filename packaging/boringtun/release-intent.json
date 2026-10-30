@@ -1,8 +1,7 @@
 {
-  "schema": 2,
+  "schema": 1,
   "bump": "none",
-  "scope": "release-presentation",
   "base_version": "0.8.0",
   "version": "0.8.0",
-  "reason": "Allow the exact reviewed 0.8.0 wrap-only body amendment and document its old-workflow limitation; maintain presentation verification without building or publishing another release."
+  "reason": "Document and independently review a DPLPMTUD-first design and conditional implementation plan; no runtime, version, build, or published release changes."
 }
