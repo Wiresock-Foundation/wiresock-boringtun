@@ -61,9 +61,25 @@ Fresh reviewer `/root/dplpmtud_compatibility_review` inspected the refinement ve
 - Old BoringTun versions, version disagreement and unconfirmed capabilities are distinct; tier changes invalidate evidence, and same-path downgrade does not raise the operational ceiling.
 - Secondary controller/FFI ownership and task-7 tests preserve evidence provenance, expiry, rate limits, legacy interoperability and host transport responsibilities.
 
-Reviewed refinement SHA-256 values (UTF-8/LF Git source bytes):
+Reviewed refinement SHA-256 values at `66d0d343860036eab50fdcc24fe45803c967bcec` (UTF-8/LF Git source bytes, before the coordinator-prompt publication update):
 
 - Design: `cfea76f61c4e523b5b0f6f655a30a1507c2bf9f5c4d643fe11658a12ccc763b9`.
 - Plan: `7f122889e1ed9879e2a24fdcc8263900780b53fcc73c01eb7277feff812e3964`.
 
-Refinement validation passed against `88423bb`: three Markdown documents, 15 links inspected with all local targets present, balanced fences/valid encoding, clean whitespace, exact docs-plus-intent change scope and schema-1 no-release transition at `0.8.0`. The commit is local only. Product tests and privileged network tests were not run, and no runtime support is claimed by this review. Remaining secondary-adapter/platform/IPv6 choices and the wire/ABI contract are still implementation gates.
+Refinement validation passed against `88423bb`: three Markdown documents, 15 links inspected with all local targets present, balanced fences/valid encoding, clean whitespace, exact docs-plus-intent change scope and schema-1 no-release transition at `0.8.0`. At completion of that refinement the commit was local only. Product tests and privileged network tests were not run, and no runtime support is claimed by this review. Remaining secondary-adapter/platform/IPv6 choices and the wire/ABI contract are still implementation gates.
+
+## Coordinator starter and authorized documentation publication
+
+At 2026-10-30 14:29:48 UTC the owner requested pushing the plan and creating the first prompt for a coordinator-reviewer that generates prompts and reviews coding-agent results. This explicitly authorizes publication of the documentation branch; it does not start the coordinator or implement the proposal. Historical no-push statements above describe the earlier tasks. No PR, merge, release, deployment or network/security setting change is included.
+
+The [starter prompt](../plans/2026-10-30-dplpmtud-coordinator-prompt.md) supplies repository context, stage-0 decision and approval gates, E/R/I/L evidence limits, actual-diff/test review, bounded corrections, reusable agent handoffs and review verdicts. It requires independent review for major protocol decisions and honest reporting of unverified coverage. No model/version is selected. The implementation plan changes only its publication note; its technical tasks and the design are unchanged.
+
+Fresh reviewer `/root/dplpmtud_coordinator_review` inspected the actual prompt, design, plan and four changed files against `66d0d343860036eab50fdcc24fe45803c967bcec`, without inheriting the author's conversation history or modifying files. Verdict: **"Sound as a documentation-only coordinator starter. No material contradictions, misleading permissions, critical omissions, or usability problems found."** It confirmed the stage-0 approvals, evidence-tier boundaries, actual-diff verification, bounded handoffs and execution restrictions. No correction was requested; the verdict does not approve protocol execution.
+
+Reviewed UTF-8/LF SHA-256 values:
+
+- Starter prompt: `87103d5c447fc37dddb438dd62d3404e098e802824aeb60ad844afff51669978`.
+- Plan with publication note: `22993c991023a1a9bac0c5104d765a2559db10754aad9315023531f757b728cc`.
+- Design is unchanged from the compatibility refinement above.
+
+Author verification passed for four Markdown documents and 20 links, local target existence, UTF-8/fences, whitespace, the exact four changed paths and schema-1 `bump: none` / `0.8.0` version transition. The reviewer independently checked local links, whitespace, change scope and the version validator. Source, Cargo/lockfiles, workflows, release content and network settings are unchanged. No product or network tests were run or claimed. The existing artifact workflow only accepts a `master` push; its release promotion also requires that branch and run provenance. Publishing this docs branch does not request those workflows. The publishing executor must separately verify the pushed remote SHA and readable GitHub documents before reporting success.
