@@ -33,7 +33,7 @@ jobs:
     steps:
       - name: Set temporary source pin path
         run: echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/candidate/pin.env" >> "$GITHUB_ENV"
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: source
@@ -111,7 +111,7 @@ jobs:
         run: |
           echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/candidate/pin.env" >> "$GITHUB_ENV"
           echo "BTA_BASH=$(command -v bash)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: source
@@ -242,7 +242,7 @@ jobs:
     steps:
       - name: Set temporary source pin path
         run: echo "BORINGTUN_PIN_FILE=$RUNNER_TEMP/candidate/pin.env" >> "$GITHUB_ENV"
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: source
@@ -259,7 +259,7 @@ jobs:
           commit="$(sed -n 's/^readonly PINNED_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' source/scripts/awg31-interop.sh)"
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: amnezia-vpn/amneziawg-go
           ref: ${{ steps.peer.outputs.commit }}
